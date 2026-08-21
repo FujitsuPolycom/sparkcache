@@ -30,8 +30,8 @@ jobs:
           expected = f"v{version}"
           if tag != expected:
               raise SystemExit(f"release tag {tag!r} does not match project version {expected!r}")
-      - run: python -m pip install --upgrade pip build twine ruff
-      - run: python -m pip install -e ".[test]"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[test,release]"
       - run: python -m ruff check .
       - run: python -m pytest sparkcache -q
       - run: python -m pytest deploy -q
