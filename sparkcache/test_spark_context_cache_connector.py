@@ -137,6 +137,7 @@ from sparkcache.spark_context_cache_connector import (  # noqa: E402
     _ReqPlan,
 )
 from sparkcache.spark_context_cache_store import (  # noqa: E402
+    CapacityPolicy,
     EntryKey,
     MaintenanceReport,
 )
@@ -1711,8 +1712,8 @@ class StreamingCapacityHandoffTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             connector = self._connector(
                 Path(directory),
-                max_bytes=60_000,
-                low_watermark_bytes=40_000,
+                max_bytes=1 << 30,
+                low_watermark_bytes=1 << 30,
             )
             first = "3" * 64
             second = "4" * 64
@@ -1727,6 +1728,16 @@ class StreamingCapacityHandoffTests(unittest.TestCase):
                 connector.wait_for_pending_capacity_commits(timeout=5)
             )
             self.assertIn(first, connector._held)
+            first_bytes = connector._store.maintain(
+                CapacityPolicy(
+                    max_bytes=1 << 60,
+                    low_watermark_bytes=1 << 60,
+                )
+            ).bytes_before
+            connector._capacity_policy = CapacityPolicy(
+                max_bytes=2 * first_bytes - 1,
+                low_watermark_bytes=first_bytes,
+            )
             first_manifest = connector._store._manifest_path(
                 connector._identity(0),
                 first,
