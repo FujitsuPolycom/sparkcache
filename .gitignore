@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+.venv/
+native/build/
+# Extracted third-party source kept for offline seam analysis, not part of the package
+analysis/
+deploy/deepseek_v4/context/

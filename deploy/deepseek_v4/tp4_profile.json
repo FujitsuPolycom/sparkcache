@@ -1,0 +1,52 @@
+{
+  "schema": "sparkcache-deployment-profile/v1",
+  "profile_id": "deepseek-v4-flash-0731-tp4-dcp1",
+  "cache_model_profile": "deepseek-v4-fp8-hma",
+  "published_runtime_base": "ghcr.io/fujitsupolycom/gb10-vllm-serving@sha256:6fc26fdad81a18f0fff67ce0a05f6d90165625ea2e1cac8a6f39bfb462017028",
+  "sparkcache": {
+    "source_sha256": "5d42f9fd41c0b9483ba2ba958f9f62cfaee67741f6839d0bbbec11497b8535d1"
+  },
+  "model": {
+    "repository": "deepseek-ai/DeepSeek-V4-Flash-0731",
+    "container_path": "/models/deepseek-v4-flash-0731",
+    "checkpoint_identity_policy": "complete-artifact-manifest-sha256"
+  },
+  "serving": {
+    "served_model_name": "deepseek-v4-flash-0731",
+    "tensor_parallel_size": 4,
+    "decode_context_parallel_size": 1,
+    "pipeline_parallel_size": 1,
+    "nodes": 4,
+    "dtype": "bfloat16",
+    "block_size": 256,
+    "kv_cache_dtype": "fp8_ds_mla",
+    "kv_cache_bytes_per_rank": 34359738368,
+    "max_model_len": 524288,
+    "max_num_seqs": 32,
+    "gpu_memory_utilization": 0.70,
+    "tokenizer_mode": "deepseek_v4",
+    "speculation_method": "dspark",
+    "speculation_tokens": 5,
+    "speculation_moe_backend": "b12x"
+  },
+  "cache": {
+    "root": "/cache/sparkcache-deepseek0731-tp4-dcp1",
+    "max_bytes": 214748364800,
+    "low_watermark_bytes": 193273528320,
+    "ttl_seconds": 0,
+    "min_span_tokens": 256,
+    "max_span_tokens": 524288,
+    "load_failure_policy": "recompute",
+    "draft_policy": "colocated_target",
+    "streaming_snapshots": false,
+    "native_restore": false
+  },
+  "vllm": {
+    "commit": "e2666d9a6",
+    "scheduler_stock_preimage_sha256": "1ea341f4cc28d282452597c25d97eea84be8b5f984d2e1a6b548356c8417fdce",
+    "scheduler_async_postimage_sha256": "d4ebec211b027b6c7f64574f79374237de0f5fde0c5c03f20f1cb1596ffadc3a",
+    "scheduler_hma_postimage_sha256": "2f34aa9d65a495a86d814c90f654fbe1ff754cfdbecd204b98d513652ca3e06d",
+    "config_preimage_sha256": "fbc581651521d8f5fb753be7bb9baa24deddac5dcc7cef5da27d6a6b9d99af5f",
+    "config_postimage_sha256": "71c4f9e622dd8b3d665f2a2b5fb932206516ddb82873ff89283c63aa80696005"
+  }
+}

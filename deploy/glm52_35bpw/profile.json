@@ -1,0 +1,46 @@
+{
+  "schema": "sparkcache-deployment-profile/v1",
+  "profile_id": "glm52-exl3-r7-3.5bpw",
+  "cache_model_profile": "glm52-exl3-r7-3.5bpw",
+  "published_runtime_base": "ghcr.io/fujitsupolycom/gb10-vllm-serving@sha256:6fc26fdad81a18f0fff67ce0a05f6d90165625ea2e1cac8a6f39bfb462017028",
+  "base_image_requirement": "exact GLM-5.2 3.5-bpw R7 image recorded by the source container inspection",
+  "sparkcache": {
+    "source_sha256": "5d42f9fd41c0b9483ba2ba958f9f62cfaee67741f6839d0bbbec11497b8535d1"
+  },
+  "model": {
+    "repository": "brandonmusic/GLM-5.2-EXL3-TR3v4-3.5bpw-MTP78",
+    "revision": "9ab9579774cc432df91567a36f6e9e863e0d4c9f",
+    "container_path": "/models/glm52-exl3-r7-3.5bpw",
+    "config_sha256": "fabb73eb513ec64f3a365da396b38de8d55b3930edfb11baeecbf34ecafa6126",
+    "index_sha256": "9fd852f69ed64442e31dce1cbc5fe7acd0a76bfb848e945d272fe98d00d0c9cd"
+  },
+  "serving": {
+    "served_model_name": "glm-5.2-exl3-r7-3.5bpw",
+    "tensor_parallel_size": 4,
+    "decode_context_parallel_size": 4,
+    "dcp_backend": "ag_rs",
+    "dcp_kv_cache_interleave_size": 1,
+    "mtp_tokens": 4,
+    "max_query_rows": 40,
+    "kv_cache_dtype": "nvfp4_ds_mla",
+    "kv_dynamic_per_token_scale": true,
+    "kv_fp8_rope": true,
+    "block_size": 64,
+    "max_model_len": 262144,
+    "kv_cache_bytes_per_rank": 9250000000,
+    "max_num_seqs": 8,
+    "max_num_batched_tokens": 4096,
+    "execution_mode": "FULL_AND_PIECEWISE",
+    "native_prefix_caching": true
+  },
+  "cache": {
+    "root": "/cache/sparkcache-glm52-r7",
+    "max_bytes": 214748364800,
+    "low_watermark_bytes": 193273528320,
+    "ttl_seconds": 0,
+    "load_failure_policy": "recompute",
+    "draft_policy": "colocated_target",
+    "streaming_snapshots": false,
+    "native_restore": false
+  }
+}

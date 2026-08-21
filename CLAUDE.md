@@ -1,0 +1,66 @@
+# Claude Code rules for this repository
+
+## Write without hidden context
+
+All repository prose — documentation, comments, docstrings, commit and PR
+text, plans, reports, names, errors, and technical summaries — must make
+sense to a technically capable reader who has the repository but none of the
+conversation or development history.
+
+- Describe the system as it exists. State its purpose, behavior, invariants,
+  interfaces, evidence, and limitations directly. Do not narrate the journey.
+- Do not use lifecycle labels as identities: `Phase 2`, `pilot`, `next`,
+  `current`, `new`, `old`, `latest`, and similar terms are not technical
+  names.
+- Do not use false definite references. Phrases such as `the 1M-token
+  capture`, `the experiment`, or `this approach` are invalid unless the exact
+  object was introduced locally and unambiguously. Counts, dates, and
+  versions are attributes, not identities.
+- On first reference, give the object's semantic role and, when relevant, its
+  durable identifier: artifact name, path, schema, revision, manifest, or
+  hash.
+- Explain concepts before identifiers. Do not make internal codenames,
+  experiment labels, profile numbers, implementation shorthand, or names such
+  as `XOR-Cheb-T12` the vocabulary of the design. Mention literal identifiers
+  only after describing what they mean and only when the reader must use them.
+- Canonical documentation is a present-state specification, not a changelog.
+  Replace stale claims instead of layering history on top. Put chronology,
+  rejected attempts, and retrospectives only in explicitly historical
+  documents.
+- Label status explicitly as `implemented`, `qualified`, `research-only`, or
+  `unsupported`. State evidence as conditions, measurement, result, and
+  conclusion — not as a story.
+- Comments explain invariants, intent, and non-obvious constraints, never
+  change history. TODOs must name the missing condition and removal criterion.
+- Commits and PRs state the resulting behavior, technical reason,
+  compatibility impact, and validation. They do not recount attempts or
+  pivots.
+
+Final test: if understanding any sentence requires "you had to be there,"
+rewrite it.
+
+## Repository-specific rules
+
+Follow [AGENTS.md](AGENTS.md) for cache-identity compatibility, fail-closed
+degradation, regression-test requirements, stable defect identifiers, and
+commit attribution. When a subagent's output becomes repository prose, include
+the write-without-hidden-context standard in its task.
+
+## Agent skills
+
+### Issue tracker
+
+Implementation plans, product requirements, and issue records use local
+Markdown files under `.scratch/<feature-slug>/`. See
+[docs/agents/issue-tracker.md](docs/agents/issue-tracker.md).
+
+### Triage labels
+
+Issue triage uses the five default status labels documented in
+[docs/agents/triage-labels.md](docs/agents/triage-labels.md).
+
+### Domain documents
+
+SparkCache uses a single-context domain-document layout. See
+[docs/agents/domain.md](docs/agents/domain.md) for discovery rules and the
+locations of architectural decision records.

@@ -1,0 +1,27 @@
+{
+  "010-sparkcache-async-rollback.patch": {
+    "target_path": "vllm/v1/core/sched/scheduler.py",
+    "preimage_sha256": "5020bfa9a8142056949357e6acfc355edb974d799e2e7ed62feb93dfef3316a6",
+    "postimage_sha256": "52bf226d9964d8ddb99f4c7444470d592496c8d4836750f3e0ba226cbbc07d75"
+  },
+  "011-sparkcache-glm52-async-rollback.patch": {
+    "target_path": "vllm/v1/core/sched/scheduler.py",
+    "preimage_sha256": "1ea341f4cc28d282452597c25d97eea84be8b5f984d2e1a6b548356c8417fdce",
+    "postimage_sha256": "d4ebec211b027b6c7f64574f79374237de0f5fde0c5c03f20f1cb1596ffadc3a"
+  },
+  "020-sparkcache-vmm-exemption.patch": {
+    "target_path": "vllm/config/vllm.py",
+    "preimage_sha256": "fbc581651521d8f5fb753be7bb9baa24deddac5dcc7cef5da27d6a6b9d99af5f",
+    "postimage_sha256": "71c4f9e622dd8b3d665f2a2b5fb932206516ddb82873ff89283c63aa80696005"
+  },
+  "030-sparkcache-hma-load-failure.patch": {
+    "target_path": "vllm/v1/core/sched/scheduler.py",
+    "preimage_sha256": "52bf226d9964d8ddb99f4c7444470d592496c8d4836750f3e0ba226cbbc07d75",
+    "postimage_sha256": "47b6cc16dc61c98beeecc4cbdb2d468844eccc08bc284ffd2be45f0c42b521ca"
+  },
+  "031-sparkcache-stock-hma-load-failure.patch": {
+    "target_path": "vllm/v1/core/sched/scheduler.py",
+    "preimage_sha256": "d4ebec211b027b6c7f64574f79374237de0f5fde0c5c03f20f1cb1596ffadc3a",
+    "postimage_sha256": "2f34aa9d65a495a86d814c90f654fbe1ff754cfdbecd204b98d513652ca3e06d"
+  }
+}

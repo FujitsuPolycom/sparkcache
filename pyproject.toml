@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sparkcache"
+version = "0.1.0a1"
+description = "Fail-closed, DCP-shard-local persistent KV context cache for vLLM (KV-Connector-V1)"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+# The storage engine, codec, replication protocol, and streaming state
+# machines are dependency-free. torch is required only by the connector and
+# native-restore modules; vLLM is required only at serve time and is
+# deliberately not a package dependency (see README: runtime pinning).
+dependencies = []
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/FujitsuPolycom/sparkcache"
+Documentation = "https://github.com/FujitsuPolycom/sparkcache#readme"
+Issues = "https://github.com/FujitsuPolycom/sparkcache/issues"
+
+[project.scripts]
+sparkcache-verify-vllm = "sparkcache.runtime_patches.verify_lease_contract:main"
+
+[project.optional-dependencies]
+connector = ["torch"]
+test = ["pytest>=8", "torch"]
+release = ["build>=1.2", "twine>=6"]
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+include = ["sparkcache*"]
+exclude = [
+    "sparkcache.native.app*",
+    "sparkcache.native.experiments*",
+    "sparkcache.native.tests*",
+]
+
+[tool.setuptools.package-data]
+"sparkcache.runtime_patches" = ["*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["sparkcache"]

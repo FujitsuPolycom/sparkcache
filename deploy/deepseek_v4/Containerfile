@@ -1,0 +1,11 @@
+ARG SOURCE_DATE_EPOCH=0
+ARG BASE_IMAGE=sparkring/glm52-exl3-r7-3.5bpw:r34-sm121a-flat2-20260810
+FROM ${BASE_IMAGE}
+
+ADD deploy/deepseek_v4/context/rootfs.tar /
+
+RUN python3 /opt/sparkcache/bin/install_overlay.py /opt/sparkcache-overlay \
+    && chmod 0755 /opt/sparkcache/bin/entrypoint.sh
+
+ENV PYTHONPATH=/opt/sparkcache-src
+ENTRYPOINT ["/opt/sparkcache/bin/entrypoint.sh"]

@@ -1,0 +1,525 @@
+"""Regression tests for the defects recorded in DEFECTS.md.
+
+Each test names the defect it pins. The vLLM stubs and connector factory are
+shared with test_spark_context_cache_connector, which installs them at import.
+"""
+
+from __future__ import annotations
+
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import torch
+import sparkcache.native.python as native_package
+import sparkcache.spark_cache_native as canonical_native
+import sparkcache.spark_context_cache_store as package_store
+import sparkcache.streaming as streaming
+import sparkcache.spark_context_cache_store as flat_store
+from sparkcache.spark_context_cache_native_placement import ParkedRestore
+
+from sparkcache.spark_context_cache_hybrid import HybridCodecError
+from sparkcache.test_spark_context_cache_connector import (
+    _drain_store,
+    _hybrid_kv_cache_config,
+    _make_connector,
+    _make_pools,
+    KVConnectorRole,
+    SparkCacheConnectorMetadata,
+    _ReqPlan,
+)
+from sparkcache.spark_context_cache_store import IncompleteEntry
+
+
+class DeadInterfaceRemovalTests(unittest.TestCase):
+    """D-10: native and streaming code expose one model-serving interface each."""
+
+    def test_native_binding_and_runtime_interfaces_have_one_owner(self) -> None:
+        self.assertIs(native_package.PlacementConfig, canonical_native.PlacementConfig)
+        self.assertIs(flat_store.ManifestStore, package_store.ManifestStore)
+        self.assertFalse(hasattr(canonical_native, "PlacementHandle"))
+        self.assertFalse(hasattr(ParkedRestore, "submit_transposed_slab"))
+        self.assertFalse(hasattr(streaming, "PreemptionDrainAdapter"))
+
+
+class RestoreBacklogAdmissionTests(unittest.TestCase):
+    """D-1: the async-restore bound must refuse admission, never evict."""
+
+    SPAN = 1024
+    BLOCKS = (3, 0, 5, 1)
+
+    def _connector_with_hit(self, root: Path):
+        connector = _make_connector(root, 0, 64)
+        connector.register_kv_caches(_make_pools(8, 64))
+        tokens = list(range(1100))
+        digest = connector._digest(tokens, self.SPAN)
+        connector.bind_connector_metadata(
+            SparkCacheConnectorMetadata(
+                plans=[_ReqPlan("seed", digest, self.SPAN, self.BLOCKS, True)]
+            )
+        )
+        connector.wait_for_save()
+        _drain_store(connector)
+        connector.clear_connector_metadata()
+        connector._quorum[digest] = set(range(4))
+        return connector, tokens
+
+    def test_full_backlog_reports_a_miss_and_evicts_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector, tokens = self._connector_with_hit(Path(directory))
+            backlog = {
+                f"parked-{index}": (f"{index:064d}", self.SPAN)
+                for index in range(connector._max_pending_restores)
+            }
+            connector._need_load.update(backlog)
+            request = types.SimpleNamespace(
+                request_id="overflow", prompt_token_ids=tokens
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(request, 0), (0, False)
+            )
+            # every already-promised entry survives untouched
+            self.assertEqual(connector._need_load, backlog)
+            self.assertEqual(connector.counters["restore_skip_backlog"], 1)
+
+    def test_below_bound_still_admits(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector, tokens = self._connector_with_hit(Path(directory))
+            request = types.SimpleNamespace(request_id="fits", prompt_token_ids=tokens)
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(request, 0),
+                (self.SPAN, True),
+            )
+            self.assertIn("fits", connector._need_load)
+
+
+class MaxPendingRestoreParsingTests(unittest.TestCase):
+    """D-11: the restore admission bound accepts only integer values."""
+
+    def test_malformed_string_has_a_labeled_startup_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "spark-context-cache: spark_cache_max_pending_restores must be an integer",
+            ):
+                _make_connector(
+                    Path(directory),
+                    0,
+                    extra_config={"spark_cache_max_pending_restores": "64x"},
+                )
+
+    def test_null_has_a_labeled_startup_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "spark-context-cache: spark_cache_max_pending_restores must be an integer",
+            ):
+                _make_connector(
+                    Path(directory),
+                    0,
+                    extra_config={"spark_cache_max_pending_restores": None},
+                )
+
+    def test_boolean_is_not_silently_coerced_to_one(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "spark-context-cache: spark_cache_max_pending_restores must be an integer",
+            ):
+                _make_connector(
+                    Path(directory),
+                    0,
+                    extra_config={"spark_cache_max_pending_restores": True},
+                )
+
+    def test_decimal_string_sets_the_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                extra_config={"spark_cache_max_pending_restores": "7"},
+            )
+        self.assertEqual(connector._max_pending_restores, 7)
+
+
+class RequestFinishedCleanupTests(unittest.TestCase):
+    """D-1: finished requests release their scheduler-side tracking state."""
+
+    def test_finished_request_clears_all_tracking_maps(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory), 0, 64, role=KVConnectorRole.SCHEDULER
+            )
+            digest = "a" * 64
+            connector._need_load["req-f"] = (digest, 1024)
+            connector._pending_async_loads["req-f"] = (digest, 1024, (1, 2))
+            connector._admitted["req-f"] = (digest, frozenset({1, 2}))
+            connector._store_progress["req-f"] = (digest, 1024, 256, [1, 2])
+            request = types.SimpleNamespace(request_id="req-f")
+            self.assertEqual(connector.request_finished(request, [1, 2]), (False, None))
+            self.assertEqual(connector._need_load, {})
+            self.assertEqual(connector._pending_async_loads, {})
+            self.assertEqual(connector._admitted, {})
+            self.assertEqual(connector._store_progress, {})
+
+
+class RowsViewAliasingTests(unittest.TestCase):
+    """D-3: the restore scatter target must alias KV storage or fail."""
+
+    def test_contiguous_tensor_yields_an_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(Path(directory), 0, 64)
+            tensor = torch.zeros(4, 8, 16, dtype=torch.float32)
+            rows = connector._rows_view(tensor)
+            self.assertEqual(rows.data_ptr(), tensor.data_ptr())
+            self.assertEqual(rows.shape, (32, 16))
+
+    def test_non_viewable_tensor_raises_instead_of_copying(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(Path(directory), 0, 64)
+            # transpose makes the row merge impossible without a copy;
+            # reshape would silently return that copy and the restore
+            # scatter would write into a discarded temporary
+            tensor = torch.zeros(8, 64, 32).transpose(1, 2)
+            with self.assertRaises(RuntimeError):
+                connector._rows_view(tensor)
+
+
+class HybridReuseWindowTests(unittest.TestCase):
+    """D-12: hybrid snapshots exclude recycled recurrent-cache block IDs."""
+
+    @staticmethod
+    def _windowed_config(sliding_window: int) -> types.SimpleNamespace:
+        class FullAttentionSpec:
+            block_size = 256
+            storage_block_size = 256
+            page_size_bytes = 64
+
+        class SlidingWindowSpec:
+            def __init__(self, window: int) -> None:
+                self.sliding_window = window
+
+        class SlidingWindowMLASpec(SlidingWindowSpec):
+            pass
+
+        return types.SimpleNamespace(
+            kv_cache_groups=(
+                types.SimpleNamespace(
+                    kv_cache_spec=FullAttentionSpec(),
+                    is_eagle_group=False,
+                    layer_names=("full",),
+                ),
+                types.SimpleNamespace(
+                    kv_cache_spec=types.SimpleNamespace(
+                        block_size=64,
+                        storage_block_size=64,
+                        page_size_bytes=64,
+                        kv_cache_specs={
+                            "swa": SlidingWindowMLASpec(sliding_window)
+                        },
+                    ),
+                    is_eagle_group=False,
+                    layer_names=("swa",),
+                ),
+                types.SimpleNamespace(
+                    kv_cache_spec=types.SimpleNamespace(
+                        block_size=4,
+                        storage_block_size=4,
+                        page_size_bytes=32,
+                        kv_cache_specs={"state": SlidingWindowMLASpec(8)},
+                    ),
+                    is_eagle_group=False,
+                    layer_names=("state",),
+                ),
+                types.SimpleNamespace(
+                    kv_cache_spec=types.SimpleNamespace(
+                        block_size=8,
+                        storage_block_size=8,
+                        page_size_bytes=32,
+                        kv_cache_specs={"state128": SlidingWindowMLASpec(128)},
+                    ),
+                    is_eagle_group=False,
+                    layer_names=("state128",),
+                ),
+            )
+        )
+
+    @staticmethod
+    def _windowed_connector(root: Path, window: int):
+        return _make_connector(
+            root,
+            0,
+            extra_config={
+                "spark_cache_model_profile": "deepseek-v4-fp8-hma",
+                "spark_cache_min_span_tokens": "256",
+            },
+            tp=2,
+            dcp=1,
+            kv_cache_config=HybridReuseWindowTests._windowed_config(window),
+        )
+
+    def test_only_the_reusable_tail_is_selected_at_the_persistent_boundary(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                extra_config={
+                    "spark_cache_model_profile": "deepseek-v4-fp8-hma",
+                    "spark_cache_min_span_tokens": "256",
+                },
+                tp=2,
+                dcp=1,
+                kv_cache_config=_hybrid_kv_cache_config(),
+            )
+
+        self.assertEqual(
+            connector._select_group_blocks_for_span(
+                ((3, 5, 9), (4, 2, 1)),
+                1024,
+            ),
+            ((3, 5), (2,)),
+        )
+
+    def test_non_aligned_sliding_window_excludes_the_current_token(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._windowed_connector(Path(directory), 65)
+
+        self.assertEqual(
+            connector._select_group_blocks_for_span(
+                (
+                    (1,),
+                    (10, 11, 12, 13),
+                    tuple(range(100, 164)),
+                    tuple(range(200, 232)),
+                ),
+                256,
+            )[1],
+            (13,),
+        )
+
+    def test_null_or_duplicate_blocks_in_selected_window_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._windowed_connector(Path(directory), 128)
+
+        for unsafe_swa in ((10, 11, 0, 13), (10, 11, 13, 13)):
+            with self.subTest(unsafe_swa=unsafe_swa):
+                with self.assertRaises(HybridCodecError):
+                    connector._select_group_blocks_for_span(
+                        (
+                            (1,),
+                            unsafe_swa,
+                            tuple(range(100, 164)),
+                            tuple(range(200, 232)),
+                        ),
+                        256,
+                    )
+
+    def test_unknown_and_mamba_specs_are_rejected_at_startup(self) -> None:
+        class MambaSpec:
+            block_size = 4
+            mamba_cache_mode = "all"
+
+        for bad_spec, message in (
+            (types.SimpleNamespace(block_size=4), "unsupported block-page"),
+            (MambaSpec(), "does not support Mamba"),
+        ):
+            config = self._windowed_config(128)
+            config.kv_cache_groups[2].kv_cache_spec.kv_cache_specs["state"] = bad_spec
+            with self.subTest(spec=type(bad_spec).__name__):
+                with tempfile.TemporaryDirectory() as directory:
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        _make_connector(
+                            Path(directory),
+                            0,
+                            extra_config={
+                                "spark_cache_model_profile": "deepseek-v4-fp8-hma"
+                            },
+                            tp=2,
+                            dcp=1,
+                            kv_cache_config=config,
+                        )
+
+    def test_sliding_and_recurrent_groups_select_their_declared_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._windowed_connector(Path(directory), 128)
+
+        self.assertEqual(
+            connector._select_group_blocks_for_span(
+                (
+                    (1,),
+                    (10, 11, 12, 13),
+                    tuple(range(100, 164)),
+                    tuple(range(200, 232)),
+                ),
+                256,
+            ),
+            (
+                (1,),
+                (12, 13),
+                (162, 163),
+                tuple(range(216, 232)),
+            ),
+        )
+
+    def test_reuse_window_geometry_forks_identity_and_old_entry_misses(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = self._windowed_connector(root, 128)
+            pools = {
+                "full": torch.arange(8 * 1 * 64, dtype=torch.uint8).reshape(8, 1, 64),
+                "swa": torch.arange(8 * 1 * 64, dtype=torch.uint8).reshape(8, 1, 64),
+                "state": torch.arange(80 * 1 * 8, dtype=torch.float32).reshape(
+                    80, 1, 8
+                ),
+                "state128": torch.arange(
+                    40 * 1 * 8, dtype=torch.float32
+                ).reshape(40, 1, 8),
+            }
+            first.register_kv_caches(pools)
+            plan = _ReqPlan(
+                "window-128",
+                "c" * 64,
+                256,
+                (3,),
+                True,
+                block_ids_by_group=(
+                    (3,),
+                    (1, 2, 3, 4),
+                    tuple(range(64)),
+                    tuple(range(1, 33)),
+                ),
+            )
+            first._store_one(plan)
+            replacement = self._windowed_connector(root, 256)
+
+            self.assertNotEqual(
+                first._identity(0).storage_key,
+                replacement._identity(0).storage_key,
+            )
+            lookup = replacement._store.lookup(
+                replacement._identity(0),
+                plan.digest,
+                verify_chunks=False,
+            )
+            self.assertFalse(lookup.is_hit)
+
+
+class DigestNamespaceTests(unittest.TestCase):
+    """D-4: context digests are identical across roles and physical ranks."""
+
+    def test_worker_rank_does_not_fork_the_digest(self) -> None:
+        tokens = list(range(1100))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scheduler = _make_connector(root, 0, 64, role=KVConnectorRole.SCHEDULER)
+            workers = [
+                _make_connector(root, rank, 64, role=KVConnectorRole.WORKER)
+                for rank in range(4)
+            ]
+            digests = {c._digest(tokens, 1024) for c in [scheduler, *workers]}
+            self.assertEqual(len(digests), 1)
+
+
+class StoreSpanCompletenessTests(unittest.TestCase):
+    """D-7: a truncated chunk sequence must fail the commit, not publish."""
+
+    def test_truncated_store_commit_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(Path(directory), 0, 64)
+            connector.register_kv_caches(_make_pools(8, 64))
+            plan = _ReqPlan("truncated", "e" * 64, 1024, (3, 0, 5, 1), True)
+            snapshot = connector._snapshot_store(plan)
+            from sparkcache.spark_context_cache_connector import _SnapshotChunks
+
+            complete = list(_SnapshotChunks(snapshot, connector._dcp_degree))
+            with self.assertRaises(IncompleteEntry):
+                connector._store.commit(
+                    identity=snapshot.identity,
+                    context_digest=plan.digest,
+                    chunks=complete[:-1],
+                    span_tokens=plan.span_tokens,
+                )
+            # the failed commit must not publish a visible manifest
+            self.assertFalse(
+                connector._store.lookup(
+                    snapshot.identity, plan.digest, verify_chunks=False
+                ).is_hit
+            )
+
+
+class FailureInvalidationTests(unittest.TestCase):
+    """D-8: load failure cleanup stays off the request critical path."""
+
+    def test_failure_invalidation_does_not_rehash_chunk_payloads(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(Path(directory), 0, 64)
+            digest = "8" * 64
+            connector._held.add(digest)
+            connector._store.invalidate = mock.Mock(return_value=True)
+
+            connector._invalidate_after_failure(digest)
+
+            connector._store.invalidate.assert_called_once_with(
+                connector._identity(0),
+                digest,
+                verify_chunk_payloads=False,
+            )
+            self.assertNotIn(digest, connector._held)
+
+    def test_republish_repairs_a_corrupt_content_addressed_chunk(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connector = _make_connector(root, 0, 64)
+            connector.register_kv_caches(_make_pools(8, 64))
+            plan = _ReqPlan("repair", "9" * 64, 1024, (3, 0, 5, 1), True)
+            connector._store_one(plan)
+            connector._held.add(plan.digest)
+            chunk_path = next((root / "chunks").glob("*.spcc"))
+            damaged = bytearray(chunk_path.read_bytes())
+            damaged[len(damaged) // 2] ^= 0x40
+            chunk_path.write_bytes(damaged)
+
+            connector._invalidate_after_failure(plan.digest)
+
+            self.assertTrue(chunk_path.exists())
+            connector._store_one(plan)
+            lookup = connector._store.lookup(connector._identity(0), plan.digest)
+            self.assertTrue(lookup.is_hit, lookup.reason)
+            self.assertIsNotNone(connector._store.restore(lookup))
+
+
+class IntegritySweepPublicationTests(unittest.TestCase):
+    """D-8: integrity sweeps preserve entries published while scanning."""
+
+    def test_sweep_merges_a_concurrent_publication_into_held_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(Path(directory), 0, 64)
+            connector.register_kv_caches(_make_pools(8, 64))
+            existing = _ReqPlan("existing", "a" * 64, 1024, (3, 0, 5, 1), True)
+            connector._store_one(existing)
+            connector._held.add(existing.digest)
+            published_during_sweep = "b" * 64
+            restore = connector._store.restore
+
+            def restore_after_publication(lookup):
+                connector._finish_store(published_during_sweep, committed=True)
+                return restore(lookup)
+
+            connector._store.restore = restore_after_publication
+
+            self.assertEqual(
+                connector.sweep_integrity(),
+                {"checked": 1, "invalidated": 0},
+            )
+            self.assertEqual(
+                connector._held,
+                {existing.digest, published_during_sweep},
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

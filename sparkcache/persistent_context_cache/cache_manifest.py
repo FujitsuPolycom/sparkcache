@@ -1,0 +1,1471 @@
+"""Model-free storage ABI for persistent context-cache state.
+
+This module deliberately treats tensor records as opaque bytes.  It proves the
+identity, completeness, atomic-publication, and corruption semantics before a
+vLLM adapter is allowed to supply real CKV or MTP buffers.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import struct
+import threading
+import time
+import uuid
+from collections import Counter
+from contextlib import AbstractContextManager
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+from types import MappingProxyType
+from typing import Any, Mapping, Sequence
+
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - Windows GPU-free test fallback
+    _fcntl = None
+
+
+FORMAT_ABI = 1
+_CHUNK_MAGIC = b"SPCKV001"
+_CHUNK_PREFIX = struct.Struct("<8sII")
+_DIGEST = re.compile(r"[0-9a-f]{64}")
+class _ProcessRootLock:
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._readers = 0
+        self._writer = False
+
+    def acquire(self, *, shared: bool, blocking: bool) -> bool:
+        with self._condition:
+            def available() -> bool:
+                return (
+                    not self._writer
+                    if shared
+                    else not self._writer and self._readers == 0
+                )
+
+            if not blocking and not available():
+                return False
+            if blocking:
+                self._condition.wait_for(available)
+            if shared:
+                self._readers += 1
+            else:
+                self._writer = True
+            return True
+
+    def release(self, *, shared: bool) -> None:
+        with self._condition:
+            if shared:
+                if self._readers <= 0:
+                    raise RuntimeError("shared root lock is not held")
+                self._readers -= 1
+            else:
+                if not self._writer:
+                    raise RuntimeError("exclusive root lock is not held")
+                self._writer = False
+            self._condition.notify_all()
+
+
+_ROOT_LOCKS: dict[str, _ProcessRootLock] = {}
+_ROOT_LOCKS_GUARD = threading.Lock()
+
+
+class StateRecord(str, Enum):
+    TARGET_CKV = "target_ckv"
+    SPARSE_INDEXER = "sparse_indexer"
+    MTP_DRAFT_KV = "mtp_draft_kv"
+    BOUNDARY_HIDDEN = "boundary_hidden"
+    LOGICAL_POSITIONS = "logical_positions"
+
+
+_REQUIRED_RECORDS = frozenset(StateRecord)
+
+
+class CacheFormatError(ValueError):
+    """Internal format failure that public lookup converts to a clean miss."""
+
+
+class CommitConflict(RuntimeError):
+    """A different immutable object already owns the cache key."""
+
+
+class IncompleteEntry(ValueError):
+    """Required target, indexer, draft, or boundary state is absent."""
+
+
+@dataclass(frozen=True)
+class CacheIdentity:
+    target_checkpoint: str
+    draft_checkpoint: str
+    quantization_layout: str
+    rope_layout: str
+    tp_degree: int
+    dcp_degree: int
+    chunk_tokens: int = 256
+    # DCP shard ownership: entries written by one rank must never restore
+    # into another. -1 means "not sharded" (DCP1 whole-context entries).
+    dcp_shard_rank: int = -1
+    # Physical TP worker identity: unique across all TP ranks.  Under
+    # TP4/DCP2, two physical workers (e.g. TP0 and TP2) can share the
+    # same dcp_shard_rank (both DCP rank 0).  Without tp_shard_rank
+    # they would share the same storage_key and could cross-restore
+    # complementary TP shards. -1 selects an identity without a physical-TP
+    # dimension and is valid only for DCP1 whole-context entries.
+    #
+    # Wire identities that omit this field hash differently from identities
+    # with a concrete tp_shard_rank. Entries without physical-worker identity
+    # therefore clean-miss and cannot be reinterpreted across TP workers.
+    tp_shard_rank: int = -1
+    # "persisted": every chunk carries a boundary_hidden record.
+    # "live_forward": boundary hidden state is not
+    # persisted; the first post-restore forward regenerates it.
+    boundary_hidden_policy: str = "persisted"
+    # "separate": chunks carry a distinct mtp_draft_kv record.
+    # "colocated_target": the runtime registers drafter KV layers in the
+    # same cache pool without a distinguishing name, so draft state is
+    # persisted and restored inside target_ckv records and no separate
+    # mtp_draft_kv record exists.
+    draft_kv_policy: str = "separate"
+    # Empty selects the policy-derived record set and its compatibility wire
+    # identity. Non-empty schemas explicitly name the records required by a
+    # storage mode whose opaque payloads do not map to the policy-derived set.
+    record_schema: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        for field in ("target_checkpoint", "draft_checkpoint"):
+            value = getattr(self, field)
+            if not isinstance(value, str) or _DIGEST.fullmatch(value) is None:
+                raise ValueError(f"{field} must be a 64-character lowercase SHA-256")
+        for field in ("quantization_layout", "rope_layout"):
+            if not getattr(self, field):
+                raise ValueError(f"{field} must be non-empty")
+        for field in ("tp_degree", "dcp_degree", "chunk_tokens"):
+            if getattr(self, field) <= 0:
+                raise ValueError(f"{field} must be positive")
+        if self.boundary_hidden_policy not in ("persisted", "live_forward"):
+            raise ValueError(
+                "boundary_hidden_policy must be 'persisted' or 'live_forward'"
+            )
+        if self.draft_kv_policy not in ("separate", "colocated_target"):
+            raise ValueError("draft_kv_policy must be 'separate' or 'colocated_target'")
+        if not -1 <= self.dcp_shard_rank < self.dcp_degree:
+            raise ValueError("dcp_shard_rank must be -1 or in [0, dcp_degree)")
+        if not -1 <= self.tp_shard_rank < self.tp_degree:
+            raise ValueError("tp_shard_rank must be -1 or in [0, tp_degree)")
+        if self.record_schema:
+            try:
+                records = tuple(StateRecord(value) for value in self.record_schema)
+            except ValueError as error:
+                raise ValueError("record_schema contains an unknown record") from error
+            if len(records) != len(set(records)):
+                raise ValueError("record_schema records must be unique")
+            if StateRecord.LOGICAL_POSITIONS not in records:
+                raise ValueError("record_schema must include logical_positions")
+
+    @property
+    def required_records(self) -> frozenset["StateRecord"]:
+        if self.record_schema:
+            return frozenset(StateRecord(value) for value in self.record_schema)
+        dropped: set[StateRecord] = set()
+        if self.boundary_hidden_policy == "live_forward":
+            dropped.add(StateRecord.BOUNDARY_HIDDEN)
+        if self.draft_kv_policy == "colocated_target":
+            dropped.add(StateRecord.MTP_DRAFT_KV)
+        return frozenset(_REQUIRED_RECORDS - dropped)
+
+    def to_wire(self) -> dict[str, Any]:
+        wire = {
+            "target_checkpoint": self.target_checkpoint,
+            "draft_checkpoint": self.draft_checkpoint,
+            "quantization_layout": self.quantization_layout,
+            "rope_layout": self.rope_layout,
+            "tp_degree": self.tp_degree,
+            "dcp_degree": self.dcp_degree,
+            "chunk_tokens": self.chunk_tokens,
+            "dcp_shard_rank": self.dcp_shard_rank,
+            "tp_shard_rank": self.tp_shard_rank,
+            "boundary_hidden_policy": self.boundary_hidden_policy,
+            "draft_kv_policy": self.draft_kv_policy,
+        }
+        if self.record_schema:
+            wire["record_schema"] = list(self.record_schema)
+        return wire
+
+    @property
+    def storage_key(self) -> str:
+        return _sha256(_canonical_json(self.to_wire()))
+
+
+@dataclass(frozen=True)
+class ContextChunk:
+    logical_start: int
+    logical_end: int
+    records: Mapping[StateRecord, bytes]
+
+    def __post_init__(self) -> None:
+        if self.logical_start < 0 or self.logical_end <= self.logical_start:
+            raise ValueError("chunk logical range must be positive and ordered")
+        normalized: dict[StateRecord, bytes] = {}
+        for supplied_kind, supplied_payload in self.records.items():
+            try:
+                kind = StateRecord(supplied_kind)
+            except ValueError as error:
+                raise ValueError(
+                    f"unsupported persistent record {supplied_kind!r}"
+                ) from error
+            if not isinstance(supplied_payload, bytes):
+                raise TypeError(f"{kind.value} payload must be bytes")
+            if not supplied_payload:
+                raise IncompleteEntry(f"{kind.value} payload must not be empty")
+            normalized[kind] = supplied_payload
+        if not normalized:
+            raise IncompleteEntry("cache chunk carries no records")
+        object.__setattr__(self, "records", MappingProxyType(normalized))
+
+
+def _require_complete_chunk(
+    chunk: ContextChunk, required: frozenset[StateRecord]
+) -> None:
+    """Chunk completeness is identity-dependent (boundary_hidden_policy),
+    so it is enforced wherever an identity is in scope, not in the chunk."""
+    missing = required - chunk.records.keys()
+    if missing:
+        names = ", ".join(sorted(item.value for item in missing))
+        raise IncompleteEntry(f"incomplete speculative cache chunk: missing {names}")
+
+
+def _required_records_for_identity_wire(
+    identity_wire: Mapping[str, Any],
+) -> frozenset[StateRecord]:
+    explicit = identity_wire.get("record_schema")
+    if explicit is not None:
+        if not isinstance(explicit, list) or not explicit:
+            raise CacheFormatError("identity record_schema is invalid")
+        try:
+            records = tuple(StateRecord(value) for value in explicit)
+        except (TypeError, ValueError) as error:
+            raise CacheFormatError("identity record_schema is invalid") from error
+        if len(records) != len(set(records)) or StateRecord.LOGICAL_POSITIONS not in records:
+            raise CacheFormatError("identity record_schema is invalid")
+        return frozenset(records)
+    dropped: set[StateRecord] = set()
+    if identity_wire.get("boundary_hidden_policy") == "live_forward":
+        dropped.add(StateRecord.BOUNDARY_HIDDEN)
+    if identity_wire.get("draft_kv_policy") == "colocated_target":
+        dropped.add(StateRecord.MTP_DRAFT_KV)
+    return frozenset(_REQUIRED_RECORDS - dropped)
+
+
+@dataclass(frozen=True)
+class CommitReceipt:
+    manifest_digest: str
+    committed_tokens: int
+    encoded_bytes: int
+    allocated_bytes_upper_bound: int
+
+
+@dataclass(frozen=True)
+class ChunkReceipt:
+    chunk_digest: str
+    encoded_bytes: int
+    logical_start: int
+    logical_end: int
+
+
+@dataclass(frozen=True)
+class LookupResult:
+    is_hit: bool
+    reason: str
+    manifest_digest: str = ""
+    _manifest: Mapping[str, Any] | None = None
+
+
+@dataclass(frozen=True, order=True)
+class EntryKey:
+    storage_key: str
+    context_digest: str
+
+
+@dataclass(frozen=True)
+class CapacityPolicy:
+    max_bytes: int = 0
+    low_watermark_bytes: int = 0
+    ttl_seconds: int = 0
+
+    def __post_init__(self) -> None:
+        for field in ("max_bytes", "low_watermark_bytes", "ttl_seconds"):
+            value = getattr(self, field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{field} must be a non-negative integer")
+        if self.max_bytes == 0 and self.low_watermark_bytes != 0:
+            raise ValueError("low_watermark_bytes requires max_bytes")
+        if self.max_bytes > 0 and not (
+            0 < self.low_watermark_bytes <= self.max_bytes
+        ):
+            raise ValueError(
+                "low_watermark_bytes must be in (0, max_bytes] when bounded"
+            )
+
+    @property
+    def enabled(self) -> bool:
+        return self.max_bytes > 0 or self.ttl_seconds > 0
+
+
+@dataclass(frozen=True)
+class MaintenanceReport:
+    bytes_before: int = 0
+    bytes_after: int = 0
+    bytes_reclaimed: int = 0
+    manifests_evicted: int = 0
+    chunks_deleted: int = 0
+    orphan_chunks_deleted: int = 0
+    evicted_entries: tuple[EntryKey, ...] = ()
+    capacity_satisfied: bool = True
+    skipped_busy: bool = False
+
+
+@dataclass(frozen=True)
+class _CapacityEntry:
+    key: EntryKey
+    path: Path
+    manifest_bytes: int
+    mtime_ns: int
+    chunks: tuple[tuple[str, int], ...]
+    valid: bool
+
+
+def _process_root_lock(root: Path) -> _ProcessRootLock:
+    key = str(root.resolve())
+    with _ROOT_LOCKS_GUARD:
+        return _ROOT_LOCKS.setdefault(key, _ProcessRootLock())
+
+
+class _RootGuard(AbstractContextManager["_RootGuard"]):
+    """Process-local plus POSIX advisory lock for one manifest root."""
+
+    def __init__(self, root: Path, *, shared: bool, blocking: bool) -> None:
+        self._root = root
+        self._shared = shared
+        self._blocking = blocking
+        self._process_lock = _process_root_lock(root)
+        self._stream: Any = None
+        self._entered = False
+
+    def __enter__(self) -> "_RootGuard":
+        if not self._process_lock.acquire(
+            shared=self._shared,
+            blocking=self._blocking,
+        ):
+            raise BlockingIOError("manifest root is busy")
+        try:
+            _ensure_durable_directory(self._root)
+            if _fcntl is not None:
+                self._stream = (self._root / ".maintenance.lock").open("a+b")
+                operation = _fcntl.LOCK_SH if self._shared else _fcntl.LOCK_EX
+                if not self._blocking:
+                    operation |= _fcntl.LOCK_NB
+                _fcntl.flock(self._stream.fileno(), operation)
+            self._entered = True
+            return self
+        except BaseException:
+            if self._stream is not None:
+                self._stream.close()
+                self._stream = None
+            self._process_lock.release(shared=self._shared)
+            raise
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        if not self._entered:
+            return
+        try:
+            if _fcntl is not None and self._stream is not None:
+                _fcntl.flock(self._stream.fileno(), _fcntl.LOCK_UN)
+        finally:
+            if self._stream is not None:
+                self._stream.close()
+            self._stream = None
+            self._entered = False
+            self._process_lock.release(shared=self._shared)
+
+
+def _canonical_json(value: Any) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii")
+
+
+def _sha256(value: bytes | bytearray | memoryview) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _allocated_bytes(metadata: os.stat_result) -> int:
+    blocks = getattr(metadata, "st_blocks", 0)
+    return int(blocks) * 512 if blocks else int(metadata.st_size)
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist directory-entry changes on POSIX filesystems.
+
+    Windows does not expose a portable directory ``fsync`` through Python.
+    SparkCache's deployment target is Linux; skipping here keeps the
+    model-free test suite portable without weakening the Linux contract.
+    """
+
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _ensure_durable_directory(path: Path) -> None:
+    """Create missing path components and persist each parent entry."""
+
+    missing: list[Path] = []
+    cursor = path
+    while not cursor.exists():
+        missing.append(cursor)
+        parent = cursor.parent
+        if parent == cursor:
+            raise OSError(f"cannot find an existing ancestor for {path}")
+        cursor = parent
+    if not cursor.is_dir():
+        raise NotADirectoryError(cursor)
+    for directory in reversed(missing):
+        try:
+            directory.mkdir()
+        except FileExistsError:
+            if not directory.is_dir():
+                raise
+        else:
+            _fsync_directory(directory)
+            _fsync_directory(directory.parent)
+
+
+def _publish_immutable(path: Path, payload: bytes) -> None:
+    """Durably publish complete bytes once without an overwrite race."""
+
+    _ensure_durable_directory(path.parent)
+    temporary = path.with_name(f".{path.name}.writing-{uuid.uuid4().hex}")
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            try:
+                existing = path.read_bytes()
+            except OSError as error:
+                raise CommitConflict(
+                    f"cannot verify existing immutable object {path}"
+                ) from error
+            if existing != payload:
+                raise CommitConflict(
+                    f"different immutable object already committed at {path}"
+                )
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        # One directory fsync after link+temporary-unlink durably records both
+        # changes. Manifest publication does not return success until this
+        # barrier completes.
+        _fsync_directory(path.parent)
+
+
+def _publish_immutable_batch(
+    objects: Sequence[tuple[Path, bytes]],
+) -> None:
+    """Durably publish one directory-local content-addressed macro-batch.
+
+    Every object's data reaches stable storage before any descriptor can be
+    appended to a transaction. File-data barriers run concurrently; all hard
+    links, repairs, and temporary-name removals share one final directory
+    barrier. A differently encoded object at the expected content-addressed
+    path is corruption, so a publisher holding the matching payload repairs it
+    by atomic replacement.
+    """
+
+    if not objects:
+        return
+    parent = objects[0][0].parent
+    if any(path.parent != parent for path, _payload in objects):
+        raise ValueError("immutable macro-batch must share one directory")
+    _ensure_durable_directory(parent)
+    staged = [
+        (
+            path,
+            payload,
+            path.with_name(f".{path.name}.writing-{uuid.uuid4().hex}"),
+        )
+        for path, payload in objects
+    ]
+
+    def stage(item: tuple[Path, bytes, Path]) -> None:
+        _path, payload, temporary = item
+        with temporary.open("xb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    try:
+        worker_count = min(8, len(staged))
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            tuple(pool.map(stage, staged))
+        for path, payload, temporary in staged:
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                try:
+                    existing = path.read_bytes()
+                except OSError as error:
+                    raise CommitConflict(
+                        f"cannot verify existing immutable object {path}"
+                    ) from error
+                if existing != payload:
+                    expected_name = f"{_sha256(payload)}.spcc"
+                    if path.name != expected_name:
+                        raise CommitConflict(
+                            f"different immutable object already committed at {path}"
+                        )
+                    os.replace(temporary, path)
+    finally:
+        for _path, _payload, temporary in staged:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+        # Chunk contents were each fsynced above. This one metadata barrier
+        # makes every successful hard link and temporary unlink durable.
+        _fsync_directory(parent)
+
+
+def _validate_digest(value: str, field: str) -> None:
+    if not isinstance(value, str) or _DIGEST.fullmatch(value) is None:
+        raise ValueError(f"{field} must be a lowercase SHA-256 digest")
+
+
+def _encode_chunk(chunk: ContextChunk) -> bytes:
+    records: list[dict[str, Any]] = []
+    ordered_records: list[bytes] = []
+    payload_bytes = 0
+    for kind in sorted(chunk.records, key=lambda item: item.value):
+        value = chunk.records[kind]
+        offset = payload_bytes
+        payload_bytes += len(value)
+        ordered_records.append(value)
+        records.append(
+            {
+                "kind": kind.value,
+                "offset": offset,
+                "length": len(value),
+                "sha256": _sha256(value),
+            }
+        )
+    header = _canonical_json(
+        {
+            "format_abi": FORMAT_ABI,
+            "logical_start": chunk.logical_start,
+            "logical_end": chunk.logical_end,
+            "records": records,
+        }
+    )
+    # bytes.join calculates the final size once and copies every component
+    # directly into that allocation. The v1 encoder first copied records into
+    # a payload bytearray and then copied that payload during concatenation.
+    # Offsets/header/checksums remain byte-identical.
+    prefix = _CHUNK_PREFIX.pack(_CHUNK_MAGIC, FORMAT_ABI, len(header))
+    return b"".join((prefix, header, *ordered_records))
+
+
+def _strict_keys(value: Mapping[str, Any], expected: set[str], label: str) -> None:
+    actual = set(value)
+    if actual != expected:
+        raise CacheFormatError(
+            f"{label} fields differ: missing={sorted(expected - actual)}, "
+            f"unexpected={sorted(actual - expected)}"
+        )
+
+
+def _decode_chunk(
+    encoded: bytes,
+    *,
+    verify_record_checksums: bool = True,
+) -> ContextChunk:
+    if len(encoded) < _CHUNK_PREFIX.size:
+        raise CacheFormatError("truncated chunk prefix")
+    magic, abi, header_length = _CHUNK_PREFIX.unpack_from(encoded)
+    if magic != _CHUNK_MAGIC or abi != FORMAT_ABI:
+        raise CacheFormatError("unsupported chunk magic or ABI")
+    header_end = _CHUNK_PREFIX.size + header_length
+    if header_end > len(encoded):
+        raise CacheFormatError("truncated chunk header")
+    try:
+        header = json.loads(encoded[_CHUNK_PREFIX.size : header_end])
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise CacheFormatError("invalid chunk header") from error
+    if not isinstance(header, dict):
+        raise CacheFormatError("chunk header is not an object")
+    _strict_keys(
+        header,
+        {"format_abi", "logical_start", "logical_end", "records"},
+        "chunk header",
+    )
+    if header["format_abi"] != FORMAT_ABI or not isinstance(header["records"], list):
+        raise CacheFormatError("unsupported chunk header")
+    # Keep the encoded chunk as the backing store while descriptors are
+    # validated. Each record is copied exactly once into its immutable bytes
+    # snapshot instead of first copying the whole payload and then slicing it.
+    raw_payload = memoryview(encoded)[header_end:]
+    records: dict[StateRecord, bytes] = {}
+    expected_offset = 0
+    for item in header["records"]:
+        if not isinstance(item, dict):
+            raise CacheFormatError("record descriptor is not an object")
+        _strict_keys(item, {"kind", "offset", "length", "sha256"}, "record")
+        try:
+            kind = StateRecord(item["kind"])
+            offset = int(item["offset"])
+            length = int(item["length"])
+        except (ValueError, TypeError) as error:
+            raise CacheFormatError("invalid record descriptor") from error
+        if kind in records or offset < 0 or length < 0 or offset != expected_offset:
+            raise CacheFormatError("duplicate or invalid record descriptor")
+        value = raw_payload[offset : offset + length]
+        if len(value) != length or (
+            verify_record_checksums and _sha256(value) != item["sha256"]
+        ):
+            raise CacheFormatError("record payload checksum mismatch")
+        records[kind] = value.tobytes()
+        expected_offset += length
+    if expected_offset != len(raw_payload):
+        raise CacheFormatError("chunk payload contains unclaimed bytes")
+    try:
+        return ContextChunk(
+            logical_start=int(header["logical_start"]),
+            logical_end=int(header["logical_end"]),
+            records=records,
+        )
+    except (TypeError, ValueError) as error:
+        raise CacheFormatError(str(error)) from error
+
+
+class ManifestTransaction:
+    """Incrementally publish chunks, then expose them with one final manifest.
+
+    Appended chunks are durable, immutable content-addressed objects. The
+    transaction retains only their small descriptors, never the chunk payloads.
+    Until ``commit_manifest`` publishes the manifest, lookup cannot observe the
+    transaction. Aborting (or crashing) may leave unreferenced chunks, which
+    are harmless and can be reclaimed by a later orphan collector.
+    """
+
+    def __init__(
+        self,
+        *,
+        store: "ManifestStore",
+        identity: CacheIdentity,
+        context_digest: str,
+        span_tokens: int | None = None,
+    ) -> None:
+        _validate_digest(context_digest, "context_digest")
+        if span_tokens is not None and span_tokens <= 0:
+            raise ValueError("span_tokens must be positive")
+        self._store = store
+        self._identity = identity
+        self._context_digest = context_digest
+        self._span_tokens = span_tokens
+        self._descriptors: list[dict[str, Any]] = []
+        self._expected_start = 0
+        self._state = "open"
+        self._receipt: CommitReceipt | None = None
+        self._lock = threading.RLock()
+        self._root_guard: _RootGuard | None = _RootGuard(
+            self._store.root,
+            shared=True,
+            blocking=True,
+        )
+        self._root_guard.__enter__()
+
+    def _release_root_guard(self) -> None:
+        guard = self._root_guard
+        if guard is None:
+            return
+        self._root_guard = None
+        guard.__exit__(None, None, None)
+
+    def __del__(self) -> None:
+        try:
+            self._release_root_guard()
+        except Exception:
+            pass
+
+    def _require_open(self) -> None:
+        if self._state != "open":
+            raise RuntimeError(f"context transaction is {self._state}")
+
+    def append_chunk(self, chunk: ContextChunk) -> ChunkReceipt:
+        """Durably append one chunk without retaining its payload in memory."""
+
+        return self.append_chunks((chunk,))[0]
+
+    def append_chunks(
+        self,
+        chunks: Sequence[ContextChunk],
+    ) -> tuple[ChunkReceipt, ...]:
+        """Durably append one contiguous macro-batch with one metadata barrier."""
+
+        with self._lock:
+            if self._state == "aborted":
+                self._require_open()
+            if not chunks:
+                raise ValueError("at least one context chunk is required")
+
+            descriptors_by_range = {
+                (descriptor["logical_start"], descriptor["logical_end"]): descriptor
+                for descriptor in self._descriptors
+            }
+            pending_descriptors: list[dict[str, Any]] = []
+            pending_objects: list[tuple[Path, bytes]] = []
+            receipts: list[ChunkReceipt] = []
+            expected_start = self._expected_start
+            previous = self._descriptors[-1] if self._descriptors else None
+
+            for chunk in chunks:
+                token_count = chunk.logical_end - chunk.logical_start
+                if token_count > self._identity.chunk_tokens:
+                    raise ValueError("chunk exceeds identity chunk_tokens")
+                if (
+                    self._span_tokens is not None
+                    and chunk.logical_end > self._span_tokens
+                ):
+                    raise ValueError("chunk exceeds the declared context span")
+                _require_complete_chunk(chunk, self._identity.required_records)
+
+                encoded = _encode_chunk(chunk)
+                chunk_digest = _sha256(encoded)
+                receipt = ChunkReceipt(
+                    chunk_digest=chunk_digest,
+                    encoded_bytes=len(encoded),
+                    logical_start=chunk.logical_start,
+                    logical_end=chunk.logical_end,
+                )
+                receipts.append(receipt)
+                logical_range = (chunk.logical_start, chunk.logical_end)
+                existing = descriptors_by_range.get(logical_range)
+                if existing is not None:
+                    if (
+                        existing["sha256"] != chunk_digest
+                        or existing["bytes"] != len(encoded)
+                    ):
+                        raise CommitConflict(
+                            "different immutable chunk already appended for "
+                            f"logical range [{chunk.logical_start},"
+                            f"{chunk.logical_end})"
+                        )
+                    continue
+
+                self._require_open()
+                if chunk.logical_start != expected_start:
+                    raise ValueError(
+                        "chunk logical ranges must be contiguous from zero"
+                    )
+                if previous is not None:
+                    previous_tokens = (
+                        previous["logical_end"] - previous["logical_start"]
+                    )
+                    if previous_tokens != self._identity.chunk_tokens:
+                        raise ValueError("only the final context chunk may be partial")
+
+                descriptor = {
+                    "sha256": chunk_digest,
+                    "bytes": len(encoded),
+                    "logical_start": chunk.logical_start,
+                    "logical_end": chunk.logical_end,
+                }
+                descriptors_by_range[logical_range] = descriptor
+                pending_descriptors.append(descriptor)
+                pending_objects.append(
+                    (
+                        self._store.root / "chunks" / f"{chunk_digest}.spcc",
+                        encoded,
+                    )
+                )
+                expected_start = chunk.logical_end
+                previous = descriptor
+
+            _publish_immutable_batch(pending_objects)
+            self._descriptors.extend(pending_descriptors)
+            self._expected_start = expected_start
+            return tuple(receipts)
+
+    def commit_manifest(self) -> CommitReceipt:
+        """Publish the visibility point after every referenced chunk is durable."""
+
+        with self._lock:
+            if self._state == "committed":
+                assert self._receipt is not None
+                return self._receipt
+            self._require_open()
+            if not self._descriptors:
+                raise ValueError("at least one context chunk is required")
+            if (
+                self._span_tokens is not None
+                and self._expected_start != self._span_tokens
+            ):
+                raise IncompleteEntry(
+                    "transaction does not cover the declared context span"
+                )
+            manifest = {
+                "format_abi": FORMAT_ABI,
+                "identity": self._identity.to_wire(),
+                "context_digest": self._context_digest,
+                "committed_tokens": self._expected_start,
+                "chunks": list(self._descriptors),
+            }
+            encoded_manifest = _canonical_json(manifest)
+            receipt = CommitReceipt(
+                manifest_digest=_sha256(encoded_manifest),
+                committed_tokens=self._expected_start,
+                encoded_bytes=(
+                    len(encoded_manifest)
+                    + sum(int(item["bytes"]) for item in self._descriptors)
+                ),
+                allocated_bytes_upper_bound=sum(
+                    (size + 4095) // 4096 * 4096
+                    for size in (
+                        len(encoded_manifest),
+                        *(int(item["bytes"]) for item in self._descriptors),
+                    )
+                ),
+            )
+            _publish_immutable(
+                self._store._manifest_path(
+                    self._identity,
+                    self._context_digest,
+                ),
+                encoded_manifest,
+            )
+            self._receipt = receipt
+            self._state = "committed"
+            self._release_root_guard()
+            return receipt
+
+    def abort(self) -> None:
+        """Make the transaction terminal without publishing a manifest."""
+
+        with self._lock:
+            if self._state == "committed":
+                raise RuntimeError("context transaction is committed")
+            if self._state == "aborted":
+                return
+            self._state = "aborted"
+            self._descriptors.clear()
+            self._release_root_guard()
+
+
+class ManifestStore:
+    """Atomic local-NVMe manifest publisher and fail-closed reader."""
+
+    def __init__(self, root: Path | str) -> None:
+        self.root = Path(root)
+
+    @staticmethod
+    def _capacity_entry(path: Path) -> _CapacityEntry:
+        metadata = path.stat()
+        key = EntryKey(path.parent.name, path.stem)
+        try:
+            _validate_digest(key.storage_key, "storage_key")
+            _validate_digest(key.context_digest, "context_digest")
+            manifest = json.loads(path.read_bytes())
+            if not isinstance(manifest, dict) or not isinstance(
+                manifest.get("identity"), dict
+            ):
+                raise CacheFormatError("capacity manifest is invalid")
+            if (
+                _sha256(_canonical_json(manifest["identity"]))
+                != key.storage_key
+                or manifest.get("context_digest") != key.context_digest
+                or not isinstance(manifest.get("chunks"), list)
+            ):
+                raise CacheFormatError("capacity manifest identity differs")
+            chunks: dict[str, int] = {}
+            for descriptor in manifest["chunks"]:
+                if not isinstance(descriptor, dict):
+                    raise CacheFormatError("capacity chunk descriptor is invalid")
+                digest = descriptor.get("sha256")
+                encoded_bytes = descriptor.get("bytes")
+                _validate_digest(digest, "chunk sha256")
+                if (
+                    type(encoded_bytes) is not int
+                    or encoded_bytes <= 0
+                    or (
+                        digest in chunks
+                        and chunks[digest] != encoded_bytes
+                    )
+                ):
+                    raise CacheFormatError("capacity chunk descriptor differs")
+                chunks[digest] = encoded_bytes
+            if not chunks:
+                raise CacheFormatError("capacity manifest has no chunks")
+            return _CapacityEntry(
+                key=key,
+                path=path,
+                manifest_bytes=_allocated_bytes(metadata),
+                mtime_ns=metadata.st_mtime_ns,
+                chunks=tuple(sorted(chunks.items())),
+                valid=True,
+            )
+        except (CacheFormatError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            return _CapacityEntry(
+                key=key,
+                path=path,
+                manifest_bytes=_allocated_bytes(metadata),
+                mtime_ns=metadata.st_mtime_ns,
+                chunks=(),
+                valid=False,
+            )
+
+    def touch(
+        self,
+        identity: CacheIdentity,
+        context_digest: str,
+        *,
+        now_ns: int | None = None,
+        minimum_interval_seconds: int = 60,
+    ) -> bool:
+        """Best-effort, rate-limited manifest-mtime refresh after verified use."""
+
+        if minimum_interval_seconds < 0:
+            raise ValueError("minimum_interval_seconds must be non-negative")
+        current_ns = time.time_ns() if now_ns is None else now_ns
+        path = self._manifest_path(identity, context_digest)
+        try:
+            with _RootGuard(self.root, shared=True, blocking=False):
+                metadata = path.stat()
+                if (
+                    current_ns - metadata.st_mtime_ns
+                    < minimum_interval_seconds * 10**9
+                ):
+                    return False
+                os.utime(path, ns=(metadata.st_atime_ns, current_ns))
+                return True
+        except (BlockingIOError, OSError):
+            return False
+
+    def expired(
+        self,
+        identity: CacheIdentity,
+        context_digest: str,
+        ttl_seconds: int,
+        *,
+        now_ns: int | None = None,
+    ) -> bool:
+        if ttl_seconds <= 0:
+            return False
+        current_ns = time.time_ns() if now_ns is None else now_ns
+        try:
+            mtime_ns = self._manifest_path(identity, context_digest).stat().st_mtime_ns
+        except OSError:
+            return True
+        return current_ns - mtime_ns >= ttl_seconds * 10**9
+
+    def maintain(
+        self,
+        policy: CapacityPolicy,
+        *,
+        now_ns: int | None = None,
+    ) -> MaintenanceReport:
+        """Apply metadata-only orphan, TTL, and LRU maintenance.
+
+        The exclusive lock is nonblocking. A live transaction therefore makes
+        maintenance skip instead of delaying a store or serving callback.
+        """
+
+        if not policy.enabled:
+            return MaintenanceReport()
+        current_ns = time.time_ns() if now_ns is None else now_ns
+        try:
+            guard = _RootGuard(self.root, shared=False, blocking=False)
+            guard.__enter__()
+        except BlockingIOError:
+            return MaintenanceReport(capacity_satisfied=False, skipped_busy=True)
+        try:
+            manifests_root = self.root / "manifests"
+            manifest_paths = (
+                tuple(sorted(manifests_root.glob("*/*.json")))
+                if manifests_root.is_dir()
+                else ()
+            )
+            entries = [self._capacity_entry(path) for path in manifest_paths]
+            manifest_files = (
+                tuple(
+                    sorted(
+                        path
+                        for directory in manifests_root.iterdir()
+                        if directory.is_dir()
+                        for path in directory.iterdir()
+                        if path.is_file()
+                    )
+                )
+                if manifests_root.is_dir()
+                else ()
+            )
+            manifest_path_set = set(manifest_paths)
+            manifest_debris = tuple(
+                path for path in manifest_files if path not in manifest_path_set
+            )
+            manifest_debris_sizes: dict[Path, int] = {}
+            for path in manifest_debris:
+                try:
+                    manifest_debris_sizes[path] = _allocated_bytes(path.stat())
+                except FileNotFoundError:
+                    continue
+            chunk_directory = self.root / "chunks"
+            chunk_paths = (
+                tuple(
+                    sorted(
+                        path
+                        for path in chunk_directory.iterdir()
+                        if path.is_file()
+                    )
+                )
+                if chunk_directory.is_dir()
+                else ()
+            )
+            chunk_sizes: dict[Path, int] = {}
+            canonical_chunks: dict[str, Path] = {}
+            for path in chunk_paths:
+                try:
+                    chunk_sizes[path] = _allocated_bytes(path.stat())
+                except FileNotFoundError:
+                    continue
+                if path.suffix == ".spcc" and _DIGEST.fullmatch(path.stem):
+                    canonical_chunks[path.stem] = path
+
+            references: Counter[str] = Counter()
+            for entry in entries:
+                references.update(digest for digest, _size in entry.chunks)
+            bytes_before = (
+                sum(entry.manifest_bytes for entry in entries)
+                + sum(manifest_debris_sizes.values())
+                + sum(chunk_sizes.values())
+            )
+            pressure_triggered = (
+                policy.max_bytes > 0 and bytes_before > policy.max_bytes
+            )
+            projected_bytes = bytes_before - sum(manifest_debris_sizes.values()) - sum(
+                size
+                for path, size in chunk_sizes.items()
+                if references.get(path.stem, 0) == 0
+            )
+            projected_references = references.copy()
+            selected: list[_CapacityEntry] = []
+            selected_paths: set[Path] = set()
+
+            def select(entry: _CapacityEntry) -> None:
+                nonlocal projected_bytes
+                if entry.path in selected_paths:
+                    return
+                selected.append(entry)
+                selected_paths.add(entry.path)
+                projected_bytes -= entry.manifest_bytes
+                for digest, _declared_size in entry.chunks:
+                    projected_references[digest] -= 1
+                    if projected_references[digest] == 0:
+                        path = canonical_chunks.get(digest)
+                        if path is not None:
+                            projected_bytes -= chunk_sizes.get(path, 0)
+
+            ordered = sorted(entries, key=lambda entry: (entry.mtime_ns, entry.path))
+            for entry in ordered:
+                expired = policy.ttl_seconds > 0 and (
+                    current_ns - entry.mtime_ns >= policy.ttl_seconds * 10**9
+                )
+                if not entry.valid or expired:
+                    select(entry)
+            if pressure_triggered and projected_bytes > policy.low_watermark_bytes:
+                for entry in ordered:
+                    select(entry)
+                    if projected_bytes <= policy.low_watermark_bytes:
+                        break
+
+            removed: list[_CapacityEntry] = []
+            affected_manifest_directories: set[Path] = set()
+            manifest_debris_deleted = 0
+            for path, size in manifest_debris_sizes.items():
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    affected_manifest_directories.add(path.parent)
+                    manifest_debris_deleted += size
+                except OSError:
+                    continue
+                else:
+                    affected_manifest_directories.add(path.parent)
+                    manifest_debris_deleted += size
+            for entry in selected:
+                try:
+                    entry.path.unlink()
+                except FileNotFoundError:
+                    removed.append(entry)
+                    affected_manifest_directories.add(entry.path.parent)
+                except OSError:
+                    continue
+                else:
+                    removed.append(entry)
+                    affected_manifest_directories.add(entry.path.parent)
+            for directory in sorted(affected_manifest_directories):
+                _fsync_directory(directory)
+
+            remaining_references: Counter[str] = Counter()
+            removed_paths = {entry.path for entry in removed}
+            for entry in entries:
+                if entry.path not in removed_paths:
+                    remaining_references.update(
+                        digest for digest, _size in entry.chunks
+                    )
+            chunks_deleted = 0
+            orphan_chunks_deleted = 0
+            chunk_bytes_deleted = 0
+            initial_orphans = {
+                path for path in chunk_sizes if references.get(path.stem, 0) == 0
+            }
+            for path, size in chunk_sizes.items():
+                if remaining_references.get(path.stem, 0) > 0:
+                    continue
+                try:
+                    path.unlink()
+                except OSError:
+                    continue
+                chunks_deleted += 1
+                chunk_bytes_deleted += size
+                if path in initial_orphans:
+                    orphan_chunks_deleted += 1
+            if chunks_deleted:
+                _fsync_directory(chunk_directory)
+
+            manifest_bytes_deleted = sum(entry.manifest_bytes for entry in removed)
+            bytes_after = max(
+                0,
+                bytes_before
+                - manifest_debris_deleted
+                - manifest_bytes_deleted
+                - chunk_bytes_deleted,
+            )
+            return MaintenanceReport(
+                bytes_before=bytes_before,
+                bytes_after=bytes_after,
+                bytes_reclaimed=bytes_before - bytes_after,
+                manifests_evicted=len(removed),
+                chunks_deleted=chunks_deleted,
+                orphan_chunks_deleted=orphan_chunks_deleted,
+                evicted_entries=tuple(entry.key for entry in removed),
+                capacity_satisfied=(
+                    policy.max_bytes == 0 or bytes_after <= policy.max_bytes
+                ),
+            )
+        finally:
+            guard.__exit__(None, None, None)
+
+    def _manifest_path(self, identity: CacheIdentity, context_digest: str) -> Path:
+        return self.root / "manifests" / identity.storage_key / f"{context_digest}.json"
+
+    def begin(
+        self,
+        *,
+        identity: CacheIdentity,
+        context_digest: str,
+        span_tokens: int | None = None,
+    ) -> ManifestTransaction:
+        """Begin an invisible, incrementally written context transaction."""
+
+        return ManifestTransaction(
+            store=self,
+            identity=identity,
+            context_digest=context_digest,
+            span_tokens=span_tokens,
+        )
+
+    def begin_context(
+        self,
+        *,
+        identity: CacheIdentity,
+        context_digest: str,
+        span_tokens: int | None = None,
+    ) -> ManifestTransaction:
+        """Named alias for callers that manage more than one transaction type."""
+
+        return self.begin(
+            identity=identity,
+            context_digest=context_digest,
+            span_tokens=span_tokens,
+        )
+
+    def commit(
+        self,
+        *,
+        identity: CacheIdentity,
+        context_digest: str,
+        chunks: Sequence[ContextChunk],
+        span_tokens: int | None = None,
+    ) -> CommitReceipt:
+        """Commit chunks as one transaction. When span_tokens is given,
+        commit_manifest additionally requires the chunks to cover exactly
+        that span; a truncated chunk sequence then fails the commit instead
+        of publishing a short manifest that every restore would reject."""
+
+        transaction = self.begin(
+            identity=identity,
+            context_digest=context_digest,
+            span_tokens=span_tokens,
+        )
+        try:
+            for chunk in chunks:
+                transaction.append_chunk(chunk)
+            return transaction.commit_manifest()
+        except BaseException:
+            transaction.abort()
+            raise
+
+    def lookup(
+        self,
+        identity: CacheIdentity,
+        context_digest: str,
+        *,
+        verify_chunks: bool = True,
+        verify_chunk_metadata: bool = False,
+    ) -> LookupResult:
+        """With verify_chunks=False only the manifest itself is validated
+        (existence, identity, descriptor structure). Setting
+        verify_chunk_metadata also requires each referenced chunk file to
+        exist at its declared size, but still does not read payload bytes.
+        Restore always re-reads and re-hashes every chunk, so a probe-mode hit
+        can still degrade to a clean miss at restore."""
+        try:
+            _validate_digest(context_digest, "context_digest")
+            encoded = self._manifest_path(identity, context_digest).read_bytes()
+            manifest = json.loads(encoded)
+            if not isinstance(manifest, dict):
+                raise CacheFormatError("manifest is not an object")
+            _strict_keys(
+                manifest,
+                {
+                    "format_abi",
+                    "identity",
+                    "context_digest",
+                    "committed_tokens",
+                    "chunks",
+                },
+                "manifest",
+            )
+            expected_identity = identity.to_wire()
+            if (
+                type(manifest["format_abi"]) is not int
+                or manifest["format_abi"] != FORMAT_ABI
+                or manifest["identity"] != expected_identity
+                or _canonical_json(manifest["identity"])
+                != _canonical_json(expected_identity)
+                or manifest["context_digest"] != context_digest
+            ):
+                return LookupResult(False, "incompatible")
+            chunks = manifest["chunks"]
+            if not isinstance(chunks, list) or not chunks:
+                raise CacheFormatError("manifest has no chunks")
+            committed_tokens = manifest["committed_tokens"]
+            if type(committed_tokens) is not int or committed_tokens <= 0:
+                raise CacheFormatError("committed_tokens must be a positive integer")
+            expected_start = 0
+            for chunk_index, descriptor in enumerate(chunks):
+                if not isinstance(descriptor, dict):
+                    raise CacheFormatError("chunk descriptor is not an object")
+                _strict_keys(
+                    descriptor,
+                    {
+                        "sha256",
+                        "bytes",
+                        "logical_start",
+                        "logical_end",
+                    },
+                    "chunk descriptor",
+                )
+                digest = descriptor["sha256"]
+                _validate_digest(digest, "chunk sha256")
+                encoded_bytes = descriptor["bytes"]
+                logical_start = descriptor["logical_start"]
+                logical_end = descriptor["logical_end"]
+                if type(encoded_bytes) is not int or encoded_bytes <= 0:
+                    raise CacheFormatError("chunk bytes must be a positive integer")
+                if (
+                    type(logical_start) is not int
+                    or type(logical_end) is not int
+                    or logical_start != expected_start
+                    or logical_end <= expected_start
+                ):
+                    raise CacheFormatError("non-contiguous logical chunk range")
+                token_count = logical_end - logical_start
+                if token_count > identity.chunk_tokens or (
+                    chunk_index != len(chunks) - 1
+                    and token_count != identity.chunk_tokens
+                ):
+                    raise CacheFormatError(
+                        "chunk range disagrees with identity geometry"
+                    )
+                if verify_chunks:
+                    encoded_chunk = (
+                        self.root / "chunks" / f"{digest}.spcc"
+                    ).read_bytes()
+                    if (
+                        len(encoded_chunk) != encoded_bytes
+                        or _sha256(encoded_chunk) != digest
+                    ):
+                        raise CacheFormatError("chunk checksum mismatch")
+                    # The descriptor digest authenticates the complete encoded
+                    # chunk: prefix, header (including record digests and
+                    # offsets), and every payload byte. Re-hashing each record
+                    # after that whole-chunk match is a redundant full-data
+                    # pass. Standalone _decode_chunk callers remain strict by
+                    # default.
+                    chunk = _decode_chunk(encoded_chunk, verify_record_checksums=False)
+                    try:
+                        _require_complete_chunk(chunk, identity.required_records)
+                    except IncompleteEntry as error:
+                        raise CacheFormatError(str(error)) from error
+                    if (
+                        chunk.logical_start != logical_start
+                        or chunk.logical_end != logical_end
+                    ):
+                        raise CacheFormatError("chunk range disagrees with descriptor")
+                elif verify_chunk_metadata:
+                    chunk_path = self.root / "chunks" / f"{digest}.spcc"
+                    if chunk_path.stat().st_size != encoded_bytes:
+                        raise CacheFormatError(
+                            "chunk file size disagrees with descriptor"
+                        )
+                expected_start = logical_end
+            if expected_start != committed_tokens:
+                raise CacheFormatError("committed token count mismatch")
+            return LookupResult(
+                True,
+                "hit",
+                manifest_digest=_sha256(encoded),
+                _manifest=manifest,
+            )
+        except FileNotFoundError:
+            return LookupResult(False, "absent")
+        except (CacheFormatError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            return LookupResult(False, "corrupt")
+
+    def invalidate(
+        self,
+        identity: CacheIdentity,
+        context_digest: str,
+        *,
+        verify_chunk_payloads: bool = True,
+    ) -> bool:
+        """Remove a manifest so a damaged entry can be republished.
+
+        Chunks whose bytes no longer match their content address are also
+        removed: because publication is content-addressed and idempotent,
+        a corrupt file sitting at the correct-hash path would otherwise
+        make every future publish of that content raise CommitConflict,
+        and the entry could never repair itself. Chunks that still verify
+        are left in place - they are valid, shared, and reusable.
+
+        Metadata-only callers may set verify_chunk_payloads=False. That mode
+        removes only the manifest: an unverified descriptor is never
+        sufficient authority to delete a content-addressed chunk that may be
+        shared by another healthy manifest.
+        """
+        manifest_path = self._manifest_path(identity, context_digest)
+        try:
+            _validate_digest(context_digest, "context_digest")
+            raw = manifest_path.read_bytes()
+        except FileNotFoundError:
+            return False
+        except (OSError, ValueError):
+            return False
+        try:
+            manifest = json.loads(raw)
+            descriptors = manifest.get("chunks", [])
+        except (json.JSONDecodeError, AttributeError):
+            descriptors = []
+        for descriptor in descriptors:
+            if not isinstance(descriptor, dict):
+                continue
+            digest = descriptor.get("sha256")
+            if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
+                continue
+            chunk_path = self.root / "chunks" / f"{digest}.spcc"
+            if not verify_chunk_payloads:
+                continue
+            try:
+                healthy = _sha256(chunk_path.read_bytes()) == digest
+            except OSError:
+                healthy = False
+            if not healthy:
+                try:
+                    chunk_path.unlink()
+                except OSError:
+                    pass
+        try:
+            manifest_path.unlink()
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def restore(self, lookup: LookupResult) -> tuple[ContextChunk, ...] | None:
+        if not lookup.is_hit or lookup._manifest is None:
+            raise ValueError("cannot restore a cache miss")
+        required = _required_records_for_identity_wire(
+            lookup._manifest.get("identity", {})
+        )
+
+        def _restore_one(descriptor: Any) -> ContextChunk:
+            if not isinstance(descriptor, dict):
+                raise CacheFormatError("chunk descriptor is not an object")
+            _strict_keys(
+                descriptor,
+                {"sha256", "bytes", "logical_start", "logical_end"},
+                "chunk descriptor",
+            )
+            digest = descriptor["sha256"]
+            _validate_digest(digest, "chunk sha256")
+            encoded = (self.root / "chunks" / f"{digest}.spcc").read_bytes()
+            if len(encoded) != descriptor["bytes"] or _sha256(encoded) != digest:
+                raise CacheFormatError("chunk checksum mismatch")
+            # The outer descriptor digest above already covers the complete
+            # encoded chunk. Avoid hashing the same payload a second time.
+            chunk = _decode_chunk(encoded, verify_record_checksums=False)
+            _require_complete_chunk(chunk, required)
+            if (
+                chunk.logical_start != descriptor["logical_start"]
+                or chunk.logical_end != descriptor["logical_end"]
+            ):
+                raise CacheFormatError("chunk range disagrees with descriptor")
+            return chunk
+
+        try:
+            descriptors = list(lookup._manifest["chunks"])
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                result = list(pool.map(_restore_one, descriptors))
+            return tuple(result)
+        except (
+            CacheFormatError,
+            OSError,
+            TypeError,
+            ValueError,
+        ):
+            return None

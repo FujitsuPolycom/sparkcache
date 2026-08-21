@@ -1,0 +1,43 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+# R7 is based on vLLM e2666d9a6. Apply only the two connector compatibility
+# patches: speculative rollback and the expandable-segments exemption. Each
+# patch accepts its exact preimage or an already-patched postimage.
+COPY patches/vllm-e2666d9a6 /opt/sparkcache-vllm-patches
+RUN set -eu; \
+    root=/opt/venv/lib/python3.12/site-packages; \
+    scheduler="$root/vllm/v1/core/sched/scheduler.py"; \
+    config="$root/vllm/config/vllm.py"; \
+    scheduler_hash="$(sha256sum "$scheduler" | cut -d' ' -f1)"; \
+    case "$scheduler_hash" in \
+      1ea341f4cc28d282452597c25d97eea84be8b5f984d2e1a6b548356c8417fdce) \
+        cd "$root"; \
+        git apply --check /opt/sparkcache-vllm-patches/011-sparkcache-glm52-async-rollback.patch; \
+        git apply /opt/sparkcache-vllm-patches/011-sparkcache-glm52-async-rollback.patch ;; \
+      d4ebec211b027b6c7f64574f79374237de0f5fde0c5c03f20f1cb1596ffadc3a) ;; \
+      *) echo "unsupported R7 scheduler.py SHA-256: $scheduler_hash" >&2; exit 1 ;; \
+    esac; \
+    config_hash="$(sha256sum "$config" | cut -d' ' -f1)"; \
+    case "$config_hash" in \
+      fbc581651521d8f5fb753be7bb9baa24deddac5dcc7cef5da27d6a6b9d99af5f) \
+        cd "$root"; \
+        git apply --check /opt/sparkcache-vllm-patches/020-sparkcache-vmm-exemption.patch; \
+        git apply /opt/sparkcache-vllm-patches/020-sparkcache-vmm-exemption.patch ;; \
+      71c4f9e622dd8b3d665f2a2b5fb932206516ddb82873ff89283c63aa80696005) ;; \
+      *) echo "unsupported R7 vllm.py SHA-256: $config_hash" >&2; exit 1 ;; \
+    esac; \
+    test "$(sha256sum "$scheduler" | cut -d' ' -f1)" = \
+      d4ebec211b027b6c7f64574f79374237de0f5fde0c5c03f20f1cb1596ffadc3a; \
+    test "$(sha256sum "$config" | cut -d' ' -f1)" = \
+      71c4f9e622dd8b3d665f2a2b5fb932206516ddb82873ff89283c63aa80696005
+
+COPY sparkcache /opt/sparkcache-src/sparkcache
+
+ENV PYTHONPATH=/opt/sparkcache-src:/opt/sparkring-r7-tvm-ffi:/opt/spark-vllm
+
+LABEL org.opencontainers.image.source="https://github.com/FujitsuPolycom/sparkcache" \
+      org.sparkcache.deployment-profile="glm52-exl3-r7-3.5bpw"
+
+# The R7 entrypoint is inherited deliberately. It verifies the R7 runtime and
+# applies SPARKRING_EXPLICITLY_UNSET before executing the transformed Cmd.
