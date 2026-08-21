@@ -91,6 +91,10 @@ class CacheFormatError(ValueError):
     """Internal format failure that public lookup converts to a clean miss."""
 
 
+class _IncompatibleManifestError(CacheFormatError):
+    """A structurally valid manifest belongs to another runtime contract."""
+
+
 class CommitConflict(RuntimeError):
     """A different immutable object already owns the cache key."""
 
@@ -599,6 +603,107 @@ def _strict_keys(value: Mapping[str, Any], expected: set[str], label: str) -> No
         )
 
 
+def _validate_manifest_metadata(
+    manifest: Any,
+    key: EntryKey,
+    *,
+    expected_identity: CacheIdentity | None = None,
+) -> tuple[Mapping[str, Any], ...]:
+    """Validate every manifest field without reading referenced chunk payloads."""
+
+    if not isinstance(manifest, dict):
+        raise CacheFormatError("manifest is not an object")
+    _strict_keys(
+        manifest,
+        {
+            "format_abi",
+            "identity",
+            "context_digest",
+            "committed_tokens",
+            "chunks",
+        },
+        "manifest",
+    )
+    identity_wire = manifest["identity"]
+    if not isinstance(identity_wire, dict):
+        raise CacheFormatError("manifest identity is not an object")
+    try:
+        identity = CacheIdentity(**identity_wire)
+    except (TypeError, ValueError) as error:
+        raise CacheFormatError("manifest identity is invalid") from error
+    for field in (
+        "tp_degree",
+        "dcp_degree",
+        "chunk_tokens",
+        "dcp_shard_rank",
+        "tp_shard_rank",
+    ):
+        if type(getattr(identity, field)) is not int:
+            raise CacheFormatError(f"manifest identity {field} is not an integer")
+    if identity.to_wire() != identity_wire:
+        raise CacheFormatError("manifest identity fields differ")
+
+    incompatible = (
+        type(manifest["format_abi"]) is not int
+        or manifest["format_abi"] != FORMAT_ABI
+        or identity.storage_key != key.storage_key
+        or manifest["context_digest"] != key.context_digest
+    )
+    if expected_identity is not None:
+        expected_wire = expected_identity.to_wire()
+        incompatible = incompatible or (
+            identity_wire != expected_wire
+            or _canonical_json(identity_wire) != _canonical_json(expected_wire)
+        )
+    if incompatible:
+        error_type = (
+            _IncompatibleManifestError
+            if expected_identity is not None
+            else CacheFormatError
+        )
+        raise error_type("manifest identity differs")
+
+    committed_tokens = manifest["committed_tokens"]
+    if type(committed_tokens) is not int or committed_tokens <= 0:
+        raise CacheFormatError("committed_tokens must be a positive integer")
+    chunks = manifest["chunks"]
+    if not isinstance(chunks, list) or not chunks:
+        raise CacheFormatError("manifest has no chunks")
+
+    expected_start = 0
+    for chunk_index, descriptor in enumerate(chunks):
+        if not isinstance(descriptor, dict):
+            raise CacheFormatError("chunk descriptor is not an object")
+        _strict_keys(
+            descriptor,
+            {"sha256", "bytes", "logical_start", "logical_end"},
+            "chunk descriptor",
+        )
+        _validate_digest(descriptor["sha256"], "chunk sha256")
+        encoded_bytes = descriptor["bytes"]
+        logical_start = descriptor["logical_start"]
+        logical_end = descriptor["logical_end"]
+        if type(encoded_bytes) is not int or encoded_bytes <= 0:
+            raise CacheFormatError("chunk bytes must be a positive integer")
+        if (
+            type(logical_start) is not int
+            or type(logical_end) is not int
+            or logical_start != expected_start
+            or logical_end <= expected_start
+        ):
+            raise CacheFormatError("non-contiguous logical chunk range")
+        token_count = logical_end - logical_start
+        if token_count > identity.chunk_tokens or (
+            chunk_index != len(chunks) - 1
+            and token_count != identity.chunk_tokens
+        ):
+            raise CacheFormatError("chunk range disagrees with identity geometry")
+        expected_start = logical_end
+    if expected_start != committed_tokens:
+        raise CacheFormatError("committed token count mismatch")
+    return tuple(chunks)
+
+
 def _decode_chunk(
     encoded: bytes,
     *,
@@ -890,36 +995,14 @@ class ManifestStore:
             _validate_digest(key.storage_key, "storage_key")
             _validate_digest(key.context_digest, "context_digest")
             manifest = json.loads(path.read_bytes())
-            if not isinstance(manifest, dict) or not isinstance(
-                manifest.get("identity"), dict
-            ):
-                raise CacheFormatError("capacity manifest is invalid")
-            if (
-                _sha256(_canonical_json(manifest["identity"]))
-                != key.storage_key
-                or manifest.get("context_digest") != key.context_digest
-                or not isinstance(manifest.get("chunks"), list)
-            ):
-                raise CacheFormatError("capacity manifest identity differs")
+            descriptors = _validate_manifest_metadata(manifest, key)
             chunks: dict[str, int] = {}
-            for descriptor in manifest["chunks"]:
-                if not isinstance(descriptor, dict):
-                    raise CacheFormatError("capacity chunk descriptor is invalid")
-                digest = descriptor.get("sha256")
-                encoded_bytes = descriptor.get("bytes")
-                _validate_digest(digest, "chunk sha256")
-                if (
-                    type(encoded_bytes) is not int
-                    or encoded_bytes <= 0
-                    or (
-                        digest in chunks
-                        and chunks[digest] != encoded_bytes
-                    )
-                ):
+            for descriptor in descriptors:
+                digest = descriptor["sha256"]
+                encoded_bytes = descriptor["bytes"]
+                if digest in chunks and chunks[digest] != encoded_bytes:
                     raise CacheFormatError("capacity chunk descriptor differs")
                 chunks[digest] = encoded_bytes
-            if not chunks:
-                raise CacheFormatError("capacity manifest has no chunks")
             return _CapacityEntry(
                 key=key,
                 path=path,
@@ -1258,71 +1341,16 @@ class ManifestStore:
             _validate_digest(context_digest, "context_digest")
             encoded = self._manifest_path(identity, context_digest).read_bytes()
             manifest = json.loads(encoded)
-            if not isinstance(manifest, dict):
-                raise CacheFormatError("manifest is not an object")
-            _strict_keys(
+            chunks = _validate_manifest_metadata(
                 manifest,
-                {
-                    "format_abi",
-                    "identity",
-                    "context_digest",
-                    "committed_tokens",
-                    "chunks",
-                },
-                "manifest",
+                EntryKey(identity.storage_key, context_digest),
+                expected_identity=identity,
             )
-            expected_identity = identity.to_wire()
-            if (
-                type(manifest["format_abi"]) is not int
-                or manifest["format_abi"] != FORMAT_ABI
-                or manifest["identity"] != expected_identity
-                or _canonical_json(manifest["identity"])
-                != _canonical_json(expected_identity)
-                or manifest["context_digest"] != context_digest
-            ):
-                return LookupResult(False, "incompatible")
-            chunks = manifest["chunks"]
-            if not isinstance(chunks, list) or not chunks:
-                raise CacheFormatError("manifest has no chunks")
-            committed_tokens = manifest["committed_tokens"]
-            if type(committed_tokens) is not int or committed_tokens <= 0:
-                raise CacheFormatError("committed_tokens must be a positive integer")
-            expected_start = 0
-            for chunk_index, descriptor in enumerate(chunks):
-                if not isinstance(descriptor, dict):
-                    raise CacheFormatError("chunk descriptor is not an object")
-                _strict_keys(
-                    descriptor,
-                    {
-                        "sha256",
-                        "bytes",
-                        "logical_start",
-                        "logical_end",
-                    },
-                    "chunk descriptor",
-                )
+            for descriptor in chunks:
                 digest = descriptor["sha256"]
-                _validate_digest(digest, "chunk sha256")
                 encoded_bytes = descriptor["bytes"]
                 logical_start = descriptor["logical_start"]
                 logical_end = descriptor["logical_end"]
-                if type(encoded_bytes) is not int or encoded_bytes <= 0:
-                    raise CacheFormatError("chunk bytes must be a positive integer")
-                if (
-                    type(logical_start) is not int
-                    or type(logical_end) is not int
-                    or logical_start != expected_start
-                    or logical_end <= expected_start
-                ):
-                    raise CacheFormatError("non-contiguous logical chunk range")
-                token_count = logical_end - logical_start
-                if token_count > identity.chunk_tokens or (
-                    chunk_index != len(chunks) - 1
-                    and token_count != identity.chunk_tokens
-                ):
-                    raise CacheFormatError(
-                        "chunk range disagrees with identity geometry"
-                    )
                 if verify_chunks:
                     encoded_chunk = (
                         self.root / "chunks" / f"{digest}.spcc"
@@ -1354,15 +1382,14 @@ class ManifestStore:
                         raise CacheFormatError(
                             "chunk file size disagrees with descriptor"
                         )
-                expected_start = logical_end
-            if expected_start != committed_tokens:
-                raise CacheFormatError("committed token count mismatch")
             return LookupResult(
                 True,
                 "hit",
                 manifest_digest=_sha256(encoded),
                 _manifest=manifest,
             )
+        except _IncompatibleManifestError:
+            return LookupResult(False, "incompatible")
         except FileNotFoundError:
             return LookupResult(False, "absent")
         except (CacheFormatError, OSError, TypeError, ValueError, json.JSONDecodeError):

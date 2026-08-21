@@ -6,6 +6,8 @@ shared with test_spark_context_cache_connector, which installs them at import.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import tempfile
 import types
 import unittest
@@ -449,6 +451,59 @@ class StoreSpanCompletenessTests(unittest.TestCase):
                     snapshot.identity, plan.digest, verify_chunks=False
                 ).is_hit
             )
+
+
+class InvalidManifestMaintenanceTests(unittest.TestCase):
+    """D-13: maintenance removes manifests that restore must reject."""
+
+    def test_restore_invalid_manifest_and_its_unshared_chunk_are_removed(self) -> None:
+        identity = package_store.CacheIdentity(
+            target_checkpoint="1" * 64,
+            draft_checkpoint="2" * 64,
+            quantization_layout="nvfp4-ds-mla-v1",
+            rope_layout="glm52-bf16-rope-v1",
+            tp_degree=1,
+            dcp_degree=1,
+        )
+        chunk = package_store.ContextChunk(
+            logical_start=0,
+            logical_end=256,
+            records={
+                record: record.value.encode()
+                for record in package_store.StateRecord
+            },
+        )
+        context_digest = hashlib.sha256(b"D-13-invalid-manifest").hexdigest()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = package_store.ManifestStore(root)
+            store.commit(
+                identity=identity,
+                context_digest=context_digest,
+                chunks=[chunk],
+            )
+            manifest_path = (
+                root
+                / "manifests"
+                / identity.storage_key
+                / f"{context_digest}.json"
+            )
+            manifest = json.loads(manifest_path.read_bytes())
+            manifest["committed_tokens"] = 0
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            chunk_path = next((root / "chunks").glob("*.spcc"))
+
+            lookup = store.lookup(identity, context_digest, verify_chunks=False)
+            self.assertFalse(lookup.is_hit)
+            self.assertEqual(lookup.reason, "corrupt")
+
+            report = store.maintain(package_store.CapacityPolicy(ttl_seconds=3600))
+
+            self.assertEqual(report.manifests_evicted, 1)
+            self.assertEqual(report.chunks_deleted, 1)
+            self.assertFalse(manifest_path.exists())
+            self.assertFalse(chunk_path.exists())
 
 
 class FailureInvalidationTests(unittest.TestCase):

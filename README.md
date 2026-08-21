@@ -14,26 +14,45 @@ that table.
 
 ## Installation
 
-After version `0.1.0a1` is published, install it from PyPI:
+After version `0.1.0a1` is published, install the dependency-free storage
+engine and verification tooling from PyPI:
 
 ```bash
 python -m pip install sparkcache==0.1.0a1
 ```
 
-The base package contains the dependency-free storage engine and tooling. A
-vLLM serving environment already provides its compatible CUDA build, PyTorch,
-and the exact vLLM revision required by the selected deployment profile. The
-optional `connector` extra installs PyTorch for CPU-side development but does
-not install or select vLLM:
+The wheel and Python source distribution contain the importable `sparkcache`
+package and exact-hash vLLM lease contracts. They intentionally omit the
+repository-level `patches/` and `deploy/` trees and the optional native
+C++/CUDA sources. A PyPI-only installation therefore does not construct a
+supported vLLM serving runtime.
+
+The optional `connector` extra installs PyTorch for CPU-side development. It
+does not install vLLM, select a CUDA build, or patch a serving environment:
 
 ```bash
 python -m pip install 'sparkcache[connector]==0.1.0a1'
 ```
 
-Configure vLLM with the installed connector module path
-`sparkcache.spark_context_cache_connector`. Source deployments likewise add
-the directory containing the `sparkcache` package to `PYTHONPATH`; they do not
-add the package directory itself.
+Qualified serving deployments require the repository tag whose version
+matches the installed package. The checkout supplies the model-specific
+deployment transformers, vLLM patches, native sources, and evidence records:
+
+```bash
+git clone --branch v0.1.0a1 --depth 1 \
+  https://github.com/FujitsuPolycom/sparkcache.git
+cd sparkcache
+python -m pip install '.[connector]'
+```
+
+Use [`deploy/deepseek_v4/`](deploy/deepseek_v4/README.md) for the qualified
+DeepSeek-V4 profiles or
+[`deploy/glm52_35bpw/`](deploy/glm52_35bpw/README.md) for the qualified
+GLM-5.2 profile. Those builders attest the accepted serving-image sources and
+produce source-bound overlay receipts. Configure vLLM with connector module
+path `sparkcache.spark_context_cache_connector`. A source deployment adds the
+directory containing the `sparkcache` package to `PYTHONPATH`; it does not add
+the package directory itself.
 
 ## System contract
 
@@ -119,16 +138,13 @@ See [the live evidence record](GLM52_DCP4_HISTORICAL_VALIDATION.md) and
 
 ## vLLM compatibility
 
-SparkCache supports two exact-hash vLLM source contracts:
+| Source contract | Status | Construction boundary |
+|---|---|---|
+| `vllm-project/vllm@fcc614141e5e9ab18cb304c476f7feed2a9552e3` with `patches/vllm/` | **implemented** | Patch sources and exact preimage hashes are published. A standalone public runtime builder is **unsupported**; a PyPI installation does not construct or attest this runtime. |
+| vLLM build `e2666d9a6` with `patches/vllm-e2666d9a6/` and `sparkcache/runtime_patches/vllm-kv-block-lease-contract-e2666d9a6.json` | **qualified** | The DeepSeek-V4 and GLM-5.2 deployment builders apply exact lineage-specific patch chains, verify postimages, and bind the results to the SparkCache source tree. |
 
-- `vllm-project/vllm@fcc614141e5e9ab18cb304c476f7feed2a9552e3` with the
-  patches in `patches/vllm/`;
-- vLLM build `e2666d9a6` with the lineage-specific patches in
-  `patches/vllm-e2666d9a6/` and the lease contract
-  `sparkcache/runtime_patches/vllm-kv-block-lease-contract-e2666d9a6.json`.
-
-Any other whole-file hash is rejected until its ownership contract is derived
-and tested.
+Any other whole-file hash is **unsupported** until its ownership contract is
+derived and tested.
 
 ## Validation
 
