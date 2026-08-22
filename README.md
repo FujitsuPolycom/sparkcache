@@ -5,23 +5,19 @@ KV-Connector-V1 interface. Each tensor-parallel worker stores the KV state it
 owns and restores that state from its own disk after an engine restart. Cache
 traffic does not cross the network.
 
-Distribution status for version `0.1.0a1`: **qualified**. Its immutable
-package artifacts are available from
-[PyPI](https://pypi.org/project/sparkcache/0.1.0a1/) and are identified by
-[`MULTI_MODEL_LIVE_VALIDATION.md`](MULTI_MODEL_LIVE_VALIDATION.md). The wheel
-and source distribution match the artifacts built by the protected release
-workflow, and that exact wheel passed the DeepSeek-V4 and GLM-5.2
-store/restart/restore matrix in the support table. Qualification does not
-transfer to another package version, model, topology, or vLLM source contract.
-Other combinations are implemented, research-only, or unsupported as stated
-in that table.
+## Published release status
 
-Version `0.1.0a2` is **qualified** for the GLM-5.2 TP4/DCP4 persistent
-store/restart/external-restore lane recorded in
-[`GLM52_A2_LIVE_VALIDATION.md`](GLM52_A2_LIVE_VALIDATION.md). Its DeepSeek
-profiles remain **implemented** and have not inherited `0.1.0a1`'s live
-qualification. Release notes and qualification records identify the status of
-each immutable artifact.
+| Package artifact | Qualified deployment lanes | Evidence |
+|---|---|---|
+| [`0.1.0a2`](https://pypi.org/project/sparkcache/0.1.0a2/) | GLM-5.2 EXL3 3.5-bpw TP4/DCP4 | [`GLM52_A2_LIVE_VALIDATION.md`](GLM52_A2_LIVE_VALIDATION.md) |
+| [`0.1.0a1`](https://pypi.org/project/sparkcache/0.1.0a1/) | DeepSeek-V4-Flash-0731 TP2/DCP1, DeepSeek-V4-Flash-0731 TP4/DCP1, and GLM-5.2 EXL3 3.5-bpw TP4/DCP4 | [`MULTI_MODEL_LIVE_VALIDATION.md`](MULTI_MODEL_LIVE_VALIDATION.md) |
+
+The `0.1.0a2` DeepSeek profiles are **implemented** but have not inherited
+`0.1.0a1`'s live qualification. Qualification does not transfer to another
+package version, model, topology, or vLLM source contract. Other combinations
+are implemented, research-only, or unsupported as stated in the support table.
+The wheel and source distribution for each published version match the
+artifacts built by the protected release workflow.
 
 ## Installation
 
@@ -32,9 +28,13 @@ from PyPI:
 python -m pip install sparkcache
 ```
 
-Reproducing the qualified release-wheel matrix requires the exact artifact:
+Select the exact artifact whose recorded lane matches the deployment:
 
 ```bash
+# GLM-5.2 TP4/DCP4
+python -m pip install sparkcache==0.1.0a2
+
+# DeepSeek-V4 TP2/DCP1 or TP4/DCP1
 python -m pip install sparkcache==0.1.0a1
 ```
 
@@ -56,7 +56,9 @@ matches the installed package. The checkout supplies the model-specific
 deployment transformers, vLLM patches, native sources, and evidence records:
 
 ```bash
-git clone --branch v0.1.0a1 --depth 1 \
+# Use v0.1.0a2 for GLM-5.2 or v0.1.0a1 for DeepSeek-V4.
+SPARKCACHE_TAG=v0.1.0a2
+git clone --branch "$SPARKCACHE_TAG" --depth 1 \
   https://github.com/FujitsuPolycom/sparkcache.git
 cd sparkcache
 python -m pip install '.[connector]'
@@ -115,10 +117,10 @@ SparkCache provides these invariants:
 | Capability | Status | Evidence or limitation |
 |---|---|---|
 | Per-token row storage at TP1/TP2/TP4 and DCP1/DCP2/DCP4 | **implemented** | GPU-free topology and round-trip matrix; DCP must divide TP and profile chunk geometry |
-| DeepSeek-V4 opaque HMA pages at TP2/DCP1 | **qualified** | `MULTI_MODEL_LIVE_VALIDATION.md`; the release wheel restored 73,728 tokens in 459.8–517.0 ms per rank |
-| DeepSeek-V4-Flash-0731 opaque HMA pages at TP4/DCP1 | **qualified** | `MULTI_MODEL_LIVE_VALIDATION.md`; the release wheel restored 73,728 tokens in 413.9–494.6 ms per rank |
+| DeepSeek-V4 opaque HMA pages at TP2/DCP1 | **qualified** | `0.1.0a1`; `MULTI_MODEL_LIVE_VALIDATION.md`; 73,728 restored tokens in 459.8–517.0 ms per rank |
+| DeepSeek-V4-Flash-0731 opaque HMA pages at TP4/DCP1 | **qualified** | `0.1.0a1`; `MULTI_MODEL_LIVE_VALIDATION.md`; 73,728 restored tokens in 413.9–494.6 ms per rank |
 | DeepSeek-V4 HMA pages at DCP2/DCP4 | **unsupported** | opaque page ownership and DSpark rolling-state sharding are undefined; see `deploy/deepseek_v4/DCP_SUPPORT.md` |
-| GLM-5.2 EXL3 3.5-bpw per-token rows at TP4/DCP4 | **qualified** | SparkRing serving recipe `R7`; `MULTI_MODEL_LIVE_VALIDATION.md`; the release wheel restored 225,536 tokens in 3.39–3.95 seconds per rank |
+| GLM-5.2 EXL3 3.5-bpw per-token rows at TP4/DCP4 | **qualified** | `0.1.0a1`: `MULTI_MODEL_LIVE_VALIDATION.md`, 3.39–3.95 seconds per rank; `0.1.0a2`: `GLM52_A2_LIVE_VALIDATION.md`, 3.17–4.17 seconds per rank; 225,536 restored tokens |
 | Native direct restore | **implemented** | checksum-attested adapter and CPU-testable ABI/layout gates; disabled in qualified DeepSeek profiles |
 | Streaming snapshots | **research-only** | GLM-5.2 DCP4 inventory only; not profile-general and disabled for opaque block pages |
 | Buddy replication | **research-only** | protocol/state machines implemented; network carrier absent |
@@ -130,8 +132,10 @@ SparkCache provides these invariants:
 The exact `0.1.0a1` wheel passed cold store, coordinated engine restart,
 all-rank manifest discovery, external restore, exact semantic output, and a
 fresh post-restore canary in three serving profiles. Every profile used
-`--max-num-batched-tokens 4096`; a value of `8192` is unsupported until the
-exact profile passes a separate smoke at that value.
+`--max-num-batched-tokens 4096`. That value is the scheduler budget covered by
+the published receipts, not a configuration ceiling. Operators may change the
+value, and `8192` is known to work. Performance and capacity behavior at other
+values are outside the published qualification evidence.
 
 | Profile | Prompt / restored tokens | Restore time by rank |
 |---|---:|---:|

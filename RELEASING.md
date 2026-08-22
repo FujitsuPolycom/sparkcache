@@ -96,14 +96,16 @@ even when their source trees are equivalent.
 ## Verification
 
 After publication, install from PyPI in a clean virtual environment and verify
-the installed package rather than the checkout:
+the installed package rather than the checkout. The isolated-mode probe omits
+the checkout and user site from Python's import path, so source files or stale
+local package metadata cannot satisfy the check:
 
 ```bash
 python -m venv sparkcache-release-check
 sparkcache-release-check/bin/python -m pip install --upgrade pip
 version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
 sparkcache-release-check/bin/python -m pip install "sparkcache==${version}"
-sparkcache-release-check/bin/python -c "import sparkcache; print(sparkcache.__version__, sparkcache.__file__)"
+sparkcache-release-check/bin/python -I -c "import sparkcache; print(sparkcache.__version__, sparkcache.__file__)"
 ```
 
 On Windows, replace `sparkcache-release-check/bin/python` with
