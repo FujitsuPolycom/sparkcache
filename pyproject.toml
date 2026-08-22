@@ -38,8 +38,8 @@ sparkcache-verify-vllm = "sparkcache.runtime_patches.verify_lease_contract:main"
 [project.optional-dependencies]
 connector = ["torch"]
 test = ["numpy>=1.26", "pytest>=8", "torch"]
-lint = ["ruff==0.15.17"]
-release = ["build>=1.2", "ruff==0.15.17", "twine>=6"]
+lint = ["ruff==0.16.3"]
+release = ["build>=1.2", "ruff==0.16.3", "twine>=6"]
 
 [tool.setuptools]
 include-package-data = false
