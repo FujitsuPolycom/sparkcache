@@ -34,6 +34,9 @@ FORMAT_ABI = 1
 _CHUNK_MAGIC = b"SPCKV001"
 _CHUNK_PREFIX = struct.Struct("<8sII")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
+_COMMIT_CHUNK_BATCH_SIZE = 8
+
+
 class _ProcessRootLock:
     def __init__(self) -> None:
         self._condition = threading.Condition()
@@ -1316,8 +1319,14 @@ class ManifestStore:
             span_tokens=span_tokens,
         )
         try:
-            for chunk in chunks:
-                transaction.append_chunk(chunk)
+            # The transaction's batch path fsyncs file data concurrently and
+            # uses one chunk-directory metadata barrier for the complete
+            # batch. Keep the batch bounded because each encoded chunk remains
+            # live until that barrier completes.
+            for start in range(0, len(chunks), _COMMIT_CHUNK_BATCH_SIZE):
+                transaction.append_chunks(
+                    chunks[start : start + _COMMIT_CHUNK_BATCH_SIZE]
+                )
             return transaction.commit_manifest()
         except BaseException:
             transaction.abort()
