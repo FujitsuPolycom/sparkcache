@@ -10,7 +10,8 @@ owns and restores that state from its own disk after an engine restart. Cache
 traffic does not cross the network.
 
 Version `0.1.0a3` is **implemented**. GPU-free validation covers bounded
-macro-batch chunk publication; it has no live-qualified deployment lane.
+macro-batch chunk publication and post-commit manifest-read avoidance; it has
+no live-qualified deployment lane.
 
 ## Published release status
 
