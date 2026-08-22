@@ -63,7 +63,7 @@ from sparkcache.spark_context_cache_codec import (
     build_layer_plans,
     chunk_count,
     classify_layer,
-    context_digest,
+    context_prefix_digest,
     local_slots_for_positions,
     owned_positions,
     pack_positions,
@@ -508,6 +508,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._native_arena_bytes = config.native_arena_bytes
         self._native_io_workers = config.native_io_workers
         self._identity_base = config.identity_base
+        self._context_digest_salt = config.build_identity(0, 0).storage_key
         self._scheduler_probe = config.scheduler_probe
         self._shard_rank = 0
         self._store = ManifestStore(self._root)
@@ -733,10 +734,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     def _digest(self, token_ids: list[int], span: int) -> str:
         # The salt must be identical on every role and rank: it names the
         # shared context, not this process's shard. Pin both shard fields to
-        # zero rather than letting the worker role substitute its physical
-        # rank, which would fork the digest namespace per worker.
-        salt = self._identity(0, tp_shard_rank=0).storage_key
-        return context_digest(token_ids[:span], salt)
+        # zero at construction rather than letting the worker role substitute
+        # its physical rank, which would fork the namespace per worker.
+        return context_prefix_digest(
+            token_ids,
+            self._context_digest_salt,
+            token_count=span,
+        )
 
     def _aligned_span(self, prompt_len: int) -> int:
         span = (prompt_len - 1) // self._block_size * self._block_size
