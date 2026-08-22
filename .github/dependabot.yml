@@ -7,6 +7,8 @@ updates:
     groups:
       python-development-dependencies:
         dependency-type: development
+    ignore:
+      - dependency-name: ruff
 
   - package-ecosystem: github-actions
     directory: /
