@@ -7,14 +7,15 @@ import json
 from pathlib import Path
 
 from deploy.deployment_contract import (
-    assistant_content as _content,
+    SemanticGateInconclusive,
+    assistant_completion as _completion,
     request_chat as _request,
     run_semantic_hit as run_hit,
     run_semantic_miss as run_miss,
 )
 
 
-LONG_MAX_TOKENS = 256
+LONG_MAX_TOKENS = 512
 SHORT_MAX_TOKENS = 128
 
 
@@ -33,7 +34,11 @@ def run_hit_after_quorum(
         "What is 1 + 1? Respond with only the integer.",
         SHORT_MAX_TOKENS,
     )
-    if _content(prime) != "2":
+    prime_completion = _completion(prime)
+    prime_completion.require_conclusive(
+        "four-rank manifest-inventory publication request"
+    )
+    if prime_completion.content != "2":
         raise RuntimeError(
             "four-rank manifest-inventory publication request failed"
         )
@@ -60,22 +65,26 @@ def main() -> None:
         help="archive records; miss defaults to 384 and hit reads the reference",
     )
     args = parser.parse_args()
-    result = (
-        run_miss(
-            args.endpoint,
-            args.model,
-            args.reference,
-            long_max_tokens=LONG_MAX_TOKENS,
-            records=args.records or 384,
+    try:
+        result = (
+            run_miss(
+                args.endpoint,
+                args.model,
+                args.reference,
+                long_max_tokens=LONG_MAX_TOKENS,
+                records=args.records or 384,
+            )
+            if args.phase == "miss"
+            else run_hit_after_quorum(
+                args.endpoint,
+                args.model,
+                args.reference,
+                records=args.records,
+            )
         )
-        if args.phase == "miss"
-        else run_hit_after_quorum(
-            args.endpoint,
-            args.model,
-            args.reference,
-            records=args.records,
-        )
-    )
+    except SemanticGateInconclusive as error:
+        print(json.dumps(error.as_result(), sort_keys=True))
+        raise SystemExit(2) from None
     print(json.dumps(result, sort_keys=True))
 
 

@@ -1404,10 +1404,9 @@ class StartupDiscoveryTests(unittest.TestCase):
             )
             self.assertNotIn(plan.digest, restarted._held)
             report = restarted.get_kv_connector_stats().data["reports"][0]
-            self.assertEqual({"rank": report["rank"], "held": report["held"]}, {
-                "rank": 1,
-                "held": [],
-            })
+            self.assertEqual(report["rank"], 1)
+            self.assertEqual(report["held_count"], 0)
+            self.assertEqual(report["checkpoint"]["held"], [])
             self.assertRegex(report["generation"], r"[0-9a-f]{32}")
             for tensor in pool.values():
                 self.assertTrue((tensor == 0).all())
@@ -2240,10 +2239,9 @@ class AsyncStoreTests(unittest.TestCase):
                 )
                 self.assertNotIn(digest, connector._held)
                 report = connector.get_kv_connector_stats().data["reports"][0]
-                self.assertEqual(
-                    {"rank": report["rank"], "held": report["held"]},
-                    {"rank": 0, "held": []},
-                )
+                self.assertEqual(report["rank"], 0)
+                self.assertEqual(report["held_count"], 0)
+                self.assertEqual(report["checkpoint"]["held"], [])
                 self.assertRegex(report["generation"], r"[0-9a-f]{32}")
             finally:
                 release_commit.set()
@@ -2494,10 +2492,9 @@ class AsyncStoreTests(unittest.TestCase):
             self.assertEqual(connector.counters["store_failed"], 1)
             self.assertNotIn(failed.digest, connector._held)
             report = connector.get_kv_connector_stats().data["reports"][0]
-            self.assertEqual(
-                {"rank": report["rank"], "held": report["held"]},
-                {"rank": 0, "held": []},
-            )
+            self.assertEqual(report["rank"], 0)
+            self.assertEqual(report["held_count"], 0)
+            self.assertEqual(report["checkpoint"]["held"], [])
             self.assertRegex(report["generation"], r"[0-9a-f]{32}")
 
             connector._store.commit = original_commit
@@ -2838,10 +2835,9 @@ class QuorumAdmissionTests(unittest.TestCase):
             stats = c.get_kv_connector_stats()
             self.assertIsNotNone(stats)
             report = stats.data["reports"][0]
-            self.assertEqual(
-                {"rank": report["rank"], "held": report["held"]},
-                {"rank": 1, "held": []},
-            )
+            self.assertEqual(report["rank"], 1)
+            self.assertEqual(report["held_count"], 0)
+            self.assertEqual(report["checkpoint"]["held"], [])
             self.assertRegex(report["generation"], r"[0-9a-f]{32}")
             c._quorum[digest] = {0, 1, 2, 3}
             c._absorb_quorum(types.SimpleNamespace(kv_connector_stats=stats))
@@ -3903,7 +3899,9 @@ class StreamingSnapshotModelServingBoundaryTests(unittest.TestCase):
             self.assertTrue(connector._store.lookup(identity, digest).is_hit)
             stats = connector.get_kv_connector_stats()
             self.assertIsNotNone(stats)
-            self.assertEqual(stats.data["reports"][0]["held"], [digest])
+            report = stats.data["reports"][0]
+            self.assertEqual(report["held_count"], 1)
+            self.assertEqual(report["checkpoint"]["held"], [digest])
             streaming = stats.data["reports"][0]["streaming"]
             self.assertTrue(streaming["bound"])
             self.assertEqual(streaming["arena_mode"], "mapped_host")
@@ -4004,10 +4002,10 @@ class DCP2RoundTripTests(unittest.TestCase):
     ) -> SparkContextCacheConnector:
         """Build a DCP2 connector with the TP-rank-to-DCP-rank map [0,1,0,1].
 
-        In a TP4/DCP2 process group, get_dcp_group().rank_in_group
-        returns the DCP rank (0 or 1), not the TP rank (0-3).  We
-        override _worker_rank to return the DCP rank so the store and
-        restore paths use the correct shard identity.
+        In a TP4/DCP2 process group, get_dcp_group().rank_in_group returns the
+        DCP rank (0 or 1), not the TP rank (0-3). The fixture overrides
+        _worker_rank with the DCP rank so the store and restore paths use the
+        correct shard identity.
 
         Each connector gets its own root directory (rank{tp_rank}) so
         stores are independent. This fixture does not model multiple TP ranks

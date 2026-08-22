@@ -21,6 +21,9 @@ from .patches import apply_verified_patch
 from .receipts import validate_overlay_receipt
 from .source import file_sha256, source_tree_sha256
 from .semantic import (
+    AssistantCompletion,
+    SemanticGateInconclusive,
+    assistant_completion,
     assistant_content,
     build_long_prompt,
     request_chat,
@@ -29,8 +32,11 @@ from .semantic import (
 )
 
 __all__ = (
+    "AssistantCompletion",
     "DeploymentContractError",
+    "SemanticGateInconclusive",
     "apply_verified_patch",
+    "assistant_completion",
     "assistant_content",
     "build_long_prompt",
     "build_container_command",

@@ -28,6 +28,19 @@ Compatibility imports remain available from the model-specific modules used
 by existing scripts. Receipt schema identifiers and serialized receipt bytes
 are unchanged.
 
+The semantic response reader records the final `content` answer separately
+from an evidence body that concatenates the assistant message fields
+`reasoning`, `reasoning_content`, and `content` in that order. It also records
+the choice's `finish_reason`. A token-limited response
+(`finish_reason == "length"`) or a response without a non-whitespace assistant
+body raises `SemanticGateInconclusive`; `SemanticGateInconclusive.as_result()`
+provides a JSON-compatible `INCONCLUSIVE` report. Successful miss and hit
+result dictionaries retain their established fields. The miss reference
+stores the combined body so the hit gate can require deterministic evidence.
+Exact expected-answer checks use final `content` and still determine semantic
+success. References written before the optional `assistant_body` field remain
+readable.
+
 ## Validation
 
 ```bash

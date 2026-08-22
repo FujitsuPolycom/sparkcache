@@ -102,6 +102,11 @@ if TYPE_CHECKING:
 logger = init_logger("vllm.spark_context_cache")
 
 _CAPACITY_RETRY_SECONDS = 5.0
+_QUORUM_REPORT_BATCH_SIZE = 64
+_QUORUM_DELTA_HISTORY_SIZE = 64
+_QUORUM_PENDING_DELTA_LIMIT = 64
+_QUORUM_RETIRED_GENERATION_LIMIT = 64
+_QUORUM_DELTA_PROTOCOL = "sparkcache-quorum-delta-v1"
 
 # The runtime is deliberately supplied by the embedding process instead of
 # importing or constructing the optional streaming-snapshot runtime here.
@@ -356,19 +361,12 @@ class SparkCacheStats(KVConnectorStats):
         merged: dict[int, dict[str, Any]] = {}
         for report in mine + theirs:
             if isinstance(report, dict) and isinstance(report.get("rank"), int):
-                normalized: dict[str, Any] = {
-                    "rank": report["rank"],
-                    "held": list(report.get("held", [])),
-                }
-                generation = report.get("generation")
-                if isinstance(generation, str) and generation:
-                    normalized["generation"] = generation
-                streaming = report.get("streaming")
-                if isinstance(streaming, dict):
-                    normalized["streaming"] = dict(streaming)
-                capacity = report.get("capacity")
-                if isinstance(capacity, dict):
-                    normalized["capacity"] = dict(capacity)
+                normalized = dict(report)
+                if isinstance(report.get("held"), list):
+                    normalized["held"] = list(report["held"])
+                for field in ("delta", "checkpoint", "streaming", "capacity"):
+                    if isinstance(report.get(field), dict):
+                        normalized[field] = dict(report[field])
                 merged[report["rank"]] = normalized
         self.data = {"reports": [merged[rank] for rank in sorted(merged)]}
         return self
@@ -377,7 +375,9 @@ class SparkCacheStats(KVConnectorStats):
         reports = self.data.get("reports", [])
         reduced: dict[str, int | float] = {
             "spark_cache_ranks_reporting": len(reports),
-            "spark_cache_digests_held": sum(len(r.get("held", [])) for r in reports),
+            "spark_cache_digests_held": sum(
+                int(r.get("held_count", len(r.get("held", [])))) for r in reports
+            ),
         }
         streaming = [
             report.get("streaming")
@@ -540,9 +540,18 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         # Digests this rank can offer: either discovered from a structurally
         # valid manifest at startup or published by a durable ManifestStore
         # commit. Every restore remains the byte/hash integrity boundary.
-        # Reported to the scheduler each step so admission can require
-        # unanimity.
+        # Reported to the scheduler through bounded deltas and rolling
+        # checkpoints so admission can require unanimity without making
+        # each scheduler step proportional to the retained inventory.
         self._held: set[str] = set()
+        self._stats_observed_held: set[str] = set()
+        self._stats_sequence = 0
+        self._stats_delta_history: list[dict[str, Any]] = []
+        self._stats_delta_cursor = 0
+        self._stats_checkpoint_items: tuple[str, ...] = ()
+        self._stats_checkpoint_sequence = 0
+        self._stats_checkpoint_cycle = 1
+        self._stats_checkpoint_index = 0
         self._pending_saves: dict[str, dict[str, torch.Tensor]] = {}
         self._load_errors: set[int] = set()
         self._load_lock = threading.Lock()
@@ -594,7 +603,18 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         # confirmations before accepting a report from a different generation,
         # so an isolated worker restart cannot inherit stale quorum state.
         self._stats_generation = uuid.uuid4().hex
+        # This process-local value detects inconsistent reuse of one UUID. It
+        # never orders generations because a host reboot resets its clock.
+        self._stats_generation_epoch = time.monotonic_ns()
         self._worker_generations: dict[int, str] = {}
+        self._worker_generation_epochs: dict[int, int] = {}
+        self._worker_retired_generations: dict[int, list[str]] = {}
+        self._worker_report_sequences: dict[int, int] = {}
+        self._worker_held: dict[int, set[str]] = {}
+        self._worker_pending_deltas: dict[int, dict[int, dict[str, Any]]] = {}
+        self._worker_checkpoints: dict[int, dict[str, Any]] = {}
+        self._worker_desynchronized: set[int] = set()
+        self._worker_requires_checkpoint: set[int] = set()
         self._store_progress: dict[str, tuple[str, int, int, list[list[int]]]] = {}
         self.counters: dict[str, int] = {
             "store_committed": 0,
@@ -2599,6 +2619,271 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             receipt.manifest_digest[:12],
         )
 
+    def _withdraw_worker_quorum(self, rank: int) -> None:
+        for digest, ranks in list(self._quorum.items()):
+            ranks.discard(rank)
+            if not ranks:
+                self._quorum.pop(digest, None)
+
+    def _publish_worker_quorum(self, rank: int) -> None:
+        for digest in self._worker_held.get(rank, ()):
+            self._quorum.setdefault(digest, set()).add(rank)
+
+    def _mark_worker_desynchronized(self, rank: int) -> None:
+        if rank not in self._worker_desynchronized:
+            self._withdraw_worker_quorum(rank)
+            self._worker_desynchronized.add(rank)
+
+    def _replace_worker_held(self, rank: int, held: set[str]) -> None:
+        self._withdraw_worker_quorum(rank)
+        self._worker_held[rank] = held
+        if rank not in self._worker_desynchronized:
+            self._publish_worker_quorum(rank)
+
+    def _begin_worker_generation(
+        self, rank: int, generation: str, generation_epoch: int | None
+    ) -> None:
+        self._withdraw_worker_quorum(rank)
+        self._worker_generations[rank] = generation
+        if generation_epoch is None:
+            self._worker_generation_epochs.pop(rank, None)
+        else:
+            self._worker_generation_epochs[rank] = generation_epoch
+        self._worker_report_sequences[rank] = 0
+        self._worker_held[rank] = set()
+        self._worker_pending_deltas.pop(rank, None)
+        self._worker_checkpoints.pop(rank, None)
+        self._worker_desynchronized.discard(rank)
+        self._worker_requires_checkpoint.discard(rank)
+
+    def _accept_worker_generation(
+        self, rank: int, generation: str, generation_epoch: int | None
+    ) -> bool:
+        previous = self._worker_generations.get(rank)
+        if previous == generation:
+            expected_epoch = self._worker_generation_epochs.get(rank)
+            return expected_epoch is None or generation_epoch == expected_epoch
+        # Generation UUIDs have no cross-reboot ordering. Remember a bounded
+        # set of retired UUIDs so delayed reports cannot replace the serving
+        # process generation after one or more worker restarts.
+        retired = self._worker_retired_generations.setdefault(rank, [])
+        if generation in retired:
+            return False
+        if generation == "missing-generation-field" and previous is not None:
+            return False
+        if previous is not None:
+            retired.append(previous)
+            if len(retired) > _QUORUM_RETIRED_GENERATION_LIMIT:
+                del retired[:-_QUORUM_RETIRED_GENERATION_LIMIT]
+            self.counters["quorum_generation_resets"] += 1
+        self._begin_worker_generation(rank, generation, generation_epoch)
+        return True
+
+    def _apply_worker_delta(
+        self, rank: int, added: set[str], removed: set[str]
+    ) -> None:
+        held = self._worker_held.setdefault(rank, set())
+        held.difference_update(removed)
+        held.update(added)
+        if rank in self._worker_desynchronized:
+            return
+        for digest in removed:
+            ranks = self._quorum.get(digest)
+            if ranks is None:
+                continue
+            ranks.discard(rank)
+            if not ranks:
+                self._quorum.pop(digest, None)
+        for digest in added:
+            self._quorum.setdefault(digest, set()).add(rank)
+
+    def _drain_worker_deltas(self, rank: int) -> None:
+        pending = self._worker_pending_deltas.setdefault(rank, {})
+        sequence = self._worker_report_sequences.get(rank, 0)
+        while True:
+            delta = pending.get(sequence + 1)
+            if delta is None or delta["base_sequence"] != sequence:
+                break
+            pending.pop(sequence + 1)
+            self._apply_worker_delta(
+                rank,
+                set(delta["added"]),
+                set(delta["removed"]),
+            )
+            sequence += 1
+            self._worker_report_sequences[rank] = sequence
+        if pending:
+            self._mark_worker_desynchronized(rank)
+            return
+        if rank in self._worker_requires_checkpoint:
+            self._mark_worker_desynchronized(rank)
+            return
+        if rank in self._worker_desynchronized:
+            self._worker_desynchronized.discard(rank)
+            self._publish_worker_quorum(rank)
+
+    def _absorb_worker_delta(self, rank: int, delta: Any) -> None:
+        if not isinstance(delta, dict):
+            return
+        sequence = delta.get("sequence")
+        base_sequence = delta.get("base_sequence")
+        added = delta.get("added")
+        removed = delta.get("removed")
+        if (
+            type(sequence) is not int
+            or type(base_sequence) is not int
+            or sequence != base_sequence + 1
+            or base_sequence < 0
+            or not isinstance(added, list)
+            or not isinstance(removed, list)
+            or len(added) + len(removed) > _QUORUM_REPORT_BATCH_SIZE
+        ):
+            return
+        added_set = {
+            digest
+            for digest in added
+            if isinstance(digest, str) and SHA256_RE.fullmatch(digest) is not None
+        }
+        removed_set = {
+            digest
+            for digest in removed
+            if isinstance(digest, str) and SHA256_RE.fullmatch(digest) is not None
+        }
+        if (
+            len(added_set) != len(added)
+            or len(removed_set) != len(removed)
+            or added_set & removed_set
+        ):
+            return
+        accepted = self._worker_report_sequences.get(rank, 0)
+        if sequence <= accepted:
+            return
+        normalized = {
+            "sequence": sequence,
+            "base_sequence": base_sequence,
+            "added": tuple(sorted(added_set)),
+            "removed": tuple(sorted(removed_set)),
+        }
+        pending = self._worker_pending_deltas.setdefault(rank, {})
+        duplicate = pending.get(sequence)
+        if duplicate is not None:
+            if duplicate != normalized:
+                self._worker_requires_checkpoint.add(rank)
+                self._mark_worker_desynchronized(rank)
+            return
+        if len(pending) >= _QUORUM_PENDING_DELTA_LIMIT:
+            self._worker_requires_checkpoint.add(rank)
+            self._mark_worker_desynchronized(rank)
+            if sequence >= max(pending):
+                return
+            pending.pop(max(pending))
+        pending[sequence] = normalized
+        if base_sequence != accepted:
+            self._mark_worker_desynchronized(rank)
+        self._drain_worker_deltas(rank)
+
+    def _absorb_worker_checkpoint(self, rank: int, checkpoint: Any) -> None:
+        if not isinstance(checkpoint, dict):
+            return
+        state_sequence = checkpoint.get("state_sequence")
+        cycle = checkpoint.get("cycle")
+        index = checkpoint.get("index")
+        count = checkpoint.get("count")
+        held_count = checkpoint.get("held_count")
+        held = checkpoint.get("held")
+        if (
+            type(state_sequence) is not int
+            or type(cycle) is not int
+            or type(index) is not int
+            or type(count) is not int
+            or type(held_count) is not int
+            or state_sequence < 0
+            or cycle < 1
+            or count < 1
+            or not 0 <= index < count
+            or held_count < 0
+            or not isinstance(held, list)
+            or len(held) > _QUORUM_REPORT_BATCH_SIZE
+        ):
+            return
+        expected_count = max(
+            1, math.ceil(held_count / _QUORUM_REPORT_BATCH_SIZE)
+        )
+        expected_chunk_size = min(
+            _QUORUM_REPORT_BATCH_SIZE,
+            max(0, held_count - index * _QUORUM_REPORT_BATCH_SIZE),
+        )
+        if count != expected_count or len(held) != expected_chunk_size:
+            return
+        held_chunk = tuple(
+            digest
+            for digest in held
+            if isinstance(digest, str) and SHA256_RE.fullmatch(digest) is not None
+        )
+        if len(held_chunk) != len(held) or len(set(held_chunk)) != len(held_chunk):
+            return
+        accepted = self._worker_report_sequences.get(rank, 0)
+        if state_sequence < accepted:
+            return
+        if (
+            state_sequence == accepted
+            and rank not in self._worker_desynchronized
+            and rank not in self._worker_requires_checkpoint
+        ):
+            self._worker_checkpoints.pop(rank, None)
+            return
+        if state_sequence > accepted:
+            self._mark_worker_desynchronized(rank)
+        candidate_key = (state_sequence, cycle)
+        active = self._worker_checkpoints.get(rank)
+        if active is not None:
+            active_key = (active["state_sequence"], active["cycle"])
+            if candidate_key < active_key:
+                return
+            if candidate_key > active_key:
+                active = None
+        if active is None:
+            active = {
+                "state_sequence": state_sequence,
+                "cycle": cycle,
+                "count": count,
+                "held_count": held_count,
+                "chunks": {},
+            }
+            self._worker_checkpoints[rank] = active
+        elif active["count"] != count or active["held_count"] != held_count:
+            self._worker_requires_checkpoint.add(rank)
+            self._mark_worker_desynchronized(rank)
+            return
+        chunks = active["chunks"]
+        prior_chunk = chunks.get(index)
+        if prior_chunk is not None and prior_chunk != held_chunk:
+            self._worker_requires_checkpoint.add(rank)
+            self._mark_worker_desynchronized(rank)
+            return
+        chunks[index] = held_chunk
+        if len(chunks) != count:
+            return
+        reconstructed = {
+            digest
+            for chunk_index in range(count)
+            for digest in chunks[chunk_index]
+        }
+        if len(reconstructed) != held_count:
+            self._worker_requires_checkpoint.add(rank)
+            self._mark_worker_desynchronized(rank)
+            return
+        self._worker_desynchronized.add(rank)
+        self._replace_worker_held(rank, reconstructed)
+        self._worker_report_sequences[rank] = state_sequence
+        pending = self._worker_pending_deltas.setdefault(rank, {})
+        for delta_sequence in tuple(pending):
+            if delta_sequence <= state_sequence:
+                pending.pop(delta_sequence, None)
+        self._worker_requires_checkpoint.discard(rank)
+        self._worker_checkpoints.pop(rank, None)
+        self._drain_worker_deltas(rank)
+
     def _absorb_quorum(self, connector_output: Any) -> None:
         stats = getattr(connector_output, "kv_connector_stats", None)
         data = getattr(stats, "data", None)
@@ -2610,36 +2895,41 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             if not isinstance(report, dict):
                 continue
             rank = report.get("rank")
-            held = report.get("held")
             generation = report.get("generation")
-            if (
-                type(rank) is not int
-                or not 0 <= rank < self._tp_degree
-                or not isinstance(held, list)
-            ):
+            if type(rank) is not int or not 0 <= rank < self._tp_degree:
                 continue
             if not isinstance(generation, str) or not generation:
                 # Reports without a generation field share one inert sentinel.
                 # Connectors from this source always send a UUID generation, so
                 # an unversioned report cannot reset a worker's UUID state.
                 generation = "missing-generation-field"
-            previous = self._worker_generations.get(rank)
-            if previous is not None and previous != generation:
-                for digest, ranks in list(self._quorum.items()):
-                    ranks.discard(rank)
-                    if not ranks:
-                        self._quorum.pop(digest, None)
-                self.counters["quorum_generation_resets"] += 1
-            self._worker_generations[rank] = generation
-            held_set = {d for d in held if isinstance(d, str)}
-            for digest in held_set:
-                self._quorum.setdefault(digest, set()).add(rank)
-            # a digest this rank no longer holds loses its confirmation
-            for digest, ranks in list(self._quorum.items()):
-                if digest not in held_set and rank in ranks:
-                    ranks.discard(rank)
-                    if not ranks:
-                        self._quorum.pop(digest, None)
+            generation_epoch = report.get("generation_epoch")
+            if type(generation_epoch) is not int or generation_epoch < 0:
+                generation_epoch = None
+            protocol = report.get("protocol")
+            if protocol == _QUORUM_DELTA_PROTOCOL:
+                if generation == "missing-generation-field" or generation_epoch is None:
+                    continue
+                if not self._accept_worker_generation(
+                    rank, generation, generation_epoch
+                ):
+                    continue
+                self._absorb_worker_delta(rank, report.get("delta"))
+                self._absorb_worker_checkpoint(rank, report.get("checkpoint"))
+                continue
+            held = report.get("held")
+            if not isinstance(held, list):
+                continue
+            if not self._accept_worker_generation(
+                rank, generation, generation_epoch
+            ):
+                continue
+            held_set = {digest for digest in held if isinstance(digest, str)}
+            self._worker_pending_deltas.pop(rank, None)
+            self._worker_checkpoints.pop(rank, None)
+            self._worker_desynchronized.discard(rank)
+            self._worker_requires_checkpoint.discard(rank)
+            self._replace_worker_held(rank, held_set)
 
     def update_connector_output(self, connector_output: Any) -> None:
         self._absorb_quorum(connector_output)
@@ -2678,6 +2968,80 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     def build_kv_connector_stats(cls, data=None):
         return SparkCacheStats(data=data if data is not None else {})
 
+    def _build_quorum_report_locked(self) -> dict[str, Any]:
+        held = set(self._held)
+        if held != self._stats_observed_held:
+            added = sorted(held - self._stats_observed_held)
+            removed = sorted(self._stats_observed_held - held)
+            base_sequence = self._stats_sequence
+            self._stats_sequence += 1
+            if len(added) + len(removed) <= _QUORUM_REPORT_BATCH_SIZE:
+                self._stats_delta_history.append(
+                    {
+                        "sequence": self._stats_sequence,
+                        "base_sequence": base_sequence,
+                        "added": added,
+                        "removed": removed,
+                    }
+                )
+                if len(self._stats_delta_history) > _QUORUM_DELTA_HISTORY_SIZE:
+                    self._stats_delta_history = self._stats_delta_history[
+                        -_QUORUM_DELTA_HISTORY_SIZE:
+                    ]
+                self._stats_delta_cursor %= len(self._stats_delta_history)
+            self._stats_observed_held = held
+            self._stats_checkpoint_items = tuple(sorted(held))
+            self._stats_checkpoint_sequence = self._stats_sequence
+            self._stats_checkpoint_cycle += 1
+            self._stats_checkpoint_index = 0
+
+        checkpoint_count = max(
+            1,
+            math.ceil(
+                len(self._stats_checkpoint_items) / _QUORUM_REPORT_BATCH_SIZE
+            ),
+        )
+        checkpoint_index = self._stats_checkpoint_index
+        checkpoint_start = checkpoint_index * _QUORUM_REPORT_BATCH_SIZE
+        checkpoint_held = list(
+            self._stats_checkpoint_items[
+                checkpoint_start : checkpoint_start + _QUORUM_REPORT_BATCH_SIZE
+            ]
+        )
+        checkpoint = {
+            "state_sequence": self._stats_checkpoint_sequence,
+            "cycle": self._stats_checkpoint_cycle,
+            "index": checkpoint_index,
+            "count": checkpoint_count,
+            "held_count": len(self._stats_checkpoint_items),
+            "held": checkpoint_held,
+        }
+        self._stats_checkpoint_index += 1
+        if self._stats_checkpoint_index >= checkpoint_count:
+            self._stats_checkpoint_index = 0
+            self._stats_checkpoint_cycle += 1
+
+        report: dict[str, Any] = {
+            "rank": self._physical_rank(),
+            "protocol": _QUORUM_DELTA_PROTOCOL,
+            "generation": self._stats_generation,
+            "generation_epoch": self._stats_generation_epoch,
+            "held_count": len(held),
+            # A scheduler without delta-protocol support interprets this as a
+            # withdrawal instead of retaining stale full-set confirmations.
+            "held": [],
+            "checkpoint": checkpoint,
+        }
+        if self._stats_delta_history:
+            delta_index = self._stats_delta_cursor % len(
+                self._stats_delta_history
+            )
+            report["delta"] = dict(self._stats_delta_history[delta_index])
+            self._stats_delta_cursor = (
+                delta_index + 1
+            ) % len(self._stats_delta_history)
+        return report
+
     def get_kv_connector_stats(self):
         """Report this rank's manifest-offered digests to the scheduler.
 
@@ -2690,16 +3054,15 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         The report uses the physical TP rank (unique across all workers),
         not the DCP-local rank, so TP0 and TP2 are not deduplicated
         despite sharing DCP-local rank 0 under TP4/DCP2.
+
+        Each report carries at most one bounded state delta and one bounded
+        checkpoint chunk. Sequence gaps withdraw the rank's confirmations;
+        replayed deltas or a complete rolling checkpoint restore them.
         """
         if self._role is not KVConnectorRole.WORKER:
             return None
         with self._load_lock:
-            held = sorted(self._held)
-        report: dict[str, Any] = {
-            "rank": self._physical_rank(),
-            "held": held,
-            "generation": self._stats_generation,
-        }
+            report = self._build_quorum_report_locked()
         runtime = self._streaming_runtime
         status = getattr(runtime, "status", None)
         if self._streaming_snapshots_enabled and callable(status):

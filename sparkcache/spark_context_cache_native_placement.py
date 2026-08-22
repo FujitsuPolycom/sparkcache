@@ -77,7 +77,7 @@ class RestoreState(Enum):
 
 
 # Public aliases keep the adapter surface explicit without defining a second
-# ctypes ABI that could drift from the native prototype.
+# ctypes ABI that could drift from the native placement contract.
 SparkCacheDestinationDescriptor = native.DestinationDescriptor
 SparkCacheChunkDescriptor = native.ChunkDescriptor
 SparkCachePlacementStats = native.PlacementStats

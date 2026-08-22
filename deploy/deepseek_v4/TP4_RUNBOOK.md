@@ -195,6 +195,10 @@ python3 -m deploy.deepseek_v4.semantic_gate hit \
   --reference /var/tmp/deepseek0731-reference.json
 ```
 
+A response with an empty assistant body or `finish_reason` equal to `length`
+prints a structured `INCONCLUSIVE` result and exits with status 2. An
+inconclusive result does not satisfy the persistence gate.
+
 Qualification requires all of the following, not merely matching output:
 
 - all four ranks rediscover the same manifest digest after restart;

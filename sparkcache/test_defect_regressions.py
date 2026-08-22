@@ -30,9 +30,282 @@ from sparkcache.test_spark_context_cache_connector import (
     _make_pools,
     KVConnectorRole,
     SparkCacheConnectorMetadata,
+    connector_module,
     _ReqPlan,
 )
 from sparkcache.spark_context_cache_store import IncompleteEntry
+
+
+class DefectD6QuorumDeltaReportingTests(unittest.TestCase):
+    """D-6: quorum control traffic stays bounded as inventories grow."""
+
+    @staticmethod
+    def _output(report: dict[str, object]) -> types.SimpleNamespace:
+        stats = connector_module.SparkCacheStats(data={"reports": [report]})
+        return types.SimpleNamespace(kv_connector_stats=stats)
+
+    @staticmethod
+    def _report(
+        *,
+        generation: str,
+        epoch: int,
+        sequence: int,
+        added: list[str],
+        removed: list[str],
+    ) -> dict[str, object]:
+        return {
+            "rank": 0,
+            "protocol": connector_module._QUORUM_DELTA_PROTOCOL,
+            "generation": generation,
+            "generation_epoch": epoch,
+            "held_count": len(added),
+            "delta": {
+                "sequence": sequence,
+                "base_sequence": sequence - 1,
+                "added": added,
+                "removed": removed,
+            },
+        }
+
+    def test_stable_inventory_reports_do_not_retransmit_complete_held_sets(
+        self,
+    ) -> None:
+        payload_sizes = []
+        compatibility_withdrawals = []
+        for inventory_size in (1, 128, 1024):
+            with tempfile.TemporaryDirectory() as directory:
+                connector = _make_connector(Path(directory), 0, 64)
+                connector._held = {
+                    hashlib.sha256(str(index).encode()).hexdigest()
+                    for index in range(inventory_size)
+                }
+                connector.get_kv_connector_stats()
+                report = connector.get_kv_connector_stats().data["reports"][0]
+                payload_sizes.append(len(json.dumps(report, sort_keys=True)))
+                compatibility_withdrawals.append(report["held"])
+
+        self.assertLessEqual(max(payload_sizes), 20_000)
+        self.assertLessEqual(max(payload_sizes), min(payload_sizes) * 16)
+        self.assertEqual(compatibility_withdrawals, [[], [], []])
+
+    def test_missed_duplicate_and_reordered_checkpoint_chunks_converge(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worker = _make_connector(root / "worker", 0, 64)
+            scheduler = _make_connector(
+                root / "scheduler",
+                0,
+                64,
+                role=KVConnectorRole.SCHEDULER,
+            )
+            initial = {
+                hashlib.sha256(f"initial-{index}".encode()).hexdigest()
+                for index in range(130)
+            }
+            worker._held = set(initial)
+            first_cycle = [
+                worker.get_kv_connector_stats().data["reports"][0]
+                for _ in range(3)
+            ]
+            for report in (
+                first_cycle[2],
+                first_cycle[2],
+                first_cycle[0],
+                first_cycle[1],
+            ):
+                scheduler._absorb_quorum(self._output(report))
+            self.assertEqual(scheduler._worker_held[0], initial)
+            stable_report = worker.get_kv_connector_stats().data["reports"][0]
+            with mock.patch.object(
+                scheduler,
+                "_replace_worker_held",
+                wraps=scheduler._replace_worker_held,
+            ) as replace_worker_held:
+                scheduler._absorb_quorum(self._output(stable_report))
+            replace_worker_held.assert_not_called()
+            self.assertNotIn(0, scheduler._worker_checkpoints)
+
+            removed = min(initial)
+            added = hashlib.sha256(b"replacement").hexdigest()
+            replacement = initial - {removed} | {added}
+            worker._held = set(replacement)
+            worker.get_kv_connector_stats()  # dropped checkpoint chunk zero
+            delivered = [
+                worker.get_kv_connector_stats().data["reports"][0]
+                for _ in range(5)
+            ]
+            complete_cycle = delivered[2:]
+            for report in (
+                complete_cycle[2],
+                complete_cycle[0],
+                complete_cycle[2],
+                complete_cycle[1],
+            ):
+                scheduler._absorb_quorum(self._output(report))
+
+            self.assertEqual(scheduler._worker_held[0], replacement)
+            self.assertNotIn(0, scheduler._worker_desynchronized)
+            self.assertNotIn(removed, scheduler._quorum)
+            self.assertEqual(scheduler._quorum[added], {0})
+
+    def test_reordered_deltas_fail_closed_then_converge(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            scheduler = _make_connector(
+                Path(directory),
+                0,
+                64,
+                role=KVConnectorRole.SCHEDULER,
+            )
+            first = "a" * 64
+            replacement = "b" * 64
+            sequence_one = self._report(
+                generation="generation-a",
+                epoch=100,
+                sequence=1,
+                added=[first],
+                removed=[],
+            )
+            sequence_two = self._report(
+                generation="generation-a",
+                epoch=100,
+                sequence=2,
+                added=[replacement],
+                removed=[first],
+            )
+
+            scheduler._absorb_quorum(self._output(sequence_two))
+            self.assertNotIn(first, scheduler._quorum)
+            self.assertNotIn(replacement, scheduler._quorum)
+            scheduler._absorb_quorum(self._output(sequence_two))
+            scheduler._absorb_quorum(self._output(sequence_one))
+
+            self.assertNotIn(first, scheduler._quorum)
+            self.assertEqual(scheduler._quorum[replacement], {0})
+            self.assertNotIn(0, scheduler._worker_desynchronized)
+
+    def test_post_restart_report_rejects_delayed_process_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            scheduler = _make_connector(
+                Path(directory),
+                0,
+                64,
+                role=KVConnectorRole.SCHEDULER,
+            )
+            stale = "c" * 64
+            serving = "d" * 64
+            replacement = hashlib.sha256(b"second-restart").hexdigest()
+            before_restart = self._report(
+                generation="generation-before-restart",
+                epoch=100,
+                sequence=1,
+                added=[stale],
+                removed=[],
+            )
+            after_restart = self._report(
+                generation="generation-after-restart",
+                epoch=50,
+                sequence=1,
+                added=[serving],
+                removed=[],
+            )
+            second_restart = self._report(
+                generation="generation-after-second-restart",
+                epoch=25,
+                sequence=1,
+                added=[replacement],
+                removed=[],
+            )
+            scheduler._absorb_quorum(self._output(before_restart))
+            scheduler._absorb_quorum(self._output(after_restart))
+            scheduler._absorb_quorum(self._output(second_restart))
+            scheduler._absorb_quorum(self._output(before_restart))
+            scheduler._absorb_quorum(self._output(after_restart))
+
+            self.assertNotIn(stale, scheduler._quorum)
+            self.assertNotIn(serving, scheduler._quorum)
+            self.assertEqual(scheduler._quorum[replacement], {0})
+            self.assertEqual(
+                scheduler._worker_generations[0],
+                "generation-after-second-restart",
+            )
+            self.assertEqual(
+                scheduler._worker_retired_generations[0],
+                ["generation-before-restart", "generation-after-restart"],
+            )
+
+    def test_retired_generation_memory_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            scheduler = _make_connector(
+                Path(directory),
+                0,
+                64,
+                role=KVConnectorRole.SCHEDULER,
+            )
+            report_count = connector_module._QUORUM_RETIRED_GENERATION_LIMIT + 5
+            reports = []
+            for index in range(report_count):
+                digest = hashlib.sha256(f"restart-{index}".encode()).hexdigest()
+                report = self._report(
+                    generation=f"generation-{index}",
+                    epoch=report_count - index,
+                    sequence=1,
+                    added=[digest],
+                    removed=[],
+                )
+                reports.append(report)
+                scheduler._absorb_quorum(self._output(report))
+
+            retired = scheduler._worker_retired_generations[0]
+            self.assertEqual(
+                len(retired), connector_module._QUORUM_RETIRED_GENERATION_LIMIT
+            )
+            serving_generation = scheduler._worker_generations[0]
+            scheduler._absorb_quorum(self._output(reports[-2]))
+            self.assertEqual(scheduler._worker_generations[0], serving_generation)
+
+    def test_same_rank_aggregation_loss_recovers_from_replayed_delta(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            scheduler = _make_connector(
+                Path(directory),
+                0,
+                64,
+                role=KVConnectorRole.SCHEDULER,
+            )
+            first = "e" * 64
+            replacement = "f" * 64
+            sequence_one = self._report(
+                generation="generation-a",
+                epoch=100,
+                sequence=1,
+                added=[first],
+                removed=[],
+            )
+            sequence_two = self._report(
+                generation="generation-a",
+                epoch=100,
+                sequence=2,
+                added=[replacement],
+                removed=[first],
+            )
+            merged = connector_module.SparkCacheStats(
+                data={"reports": [sequence_one]}
+            ).aggregate(
+                connector_module.SparkCacheStats(
+                    data={"reports": [sequence_two]}
+                )
+            )
+            self.assertEqual(
+                merged.data["reports"][0]["delta"]["sequence"], 2
+            )
+
+            scheduler._absorb_quorum(
+                types.SimpleNamespace(kv_connector_stats=merged)
+            )
+            self.assertNotIn(replacement, scheduler._quorum)
+            scheduler._absorb_quorum(self._output(sequence_one))
+            self.assertEqual(scheduler._quorum[replacement], {0})
 
 
 class DeadInterfaceRemovalTests(unittest.TestCase):

@@ -1,4 +1,4 @@
-# Native streaming-snapshot ring prototype
+# Native streaming-snapshot ring state model
 
 Status: **research-only**. CPU contract and state-machine gates pass. The CUDA
 source compiled for SM121 with CUDA 13.0.88 and 13.2.86, and both builds passed
@@ -153,8 +153,8 @@ From `sparkcache`:
 ```powershell
 python -m pytest -q native/tests
 python -m ruff check native/python/spark_cache_snapshot_native.py `
-  native/python/snapshot_ring_state_prototype.py `
-  native/app/spark_cache_snapshot_ring_prototype.py `
+  native/python/snapshot_ring_state_model.py `
+  native/app/spark_cache_snapshot_ring_lab.py `
   native/tests/test_snapshot_ring_contract.py
 ```
 
@@ -168,10 +168,10 @@ wsl.exe bash -lc "g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror \
   /tmp/snapshot_ring_test"
 ```
 
-Drive the throwaway state-model TUI:
+Run the interactive state-model lab:
 
 ```powershell
-python native/app/spark_cache_snapshot_ring_prototype.py
+python native/app/spark_cache_snapshot_ring_lab.py
 ```
 
 Useful sequence: submit three contexts, submit a fourth to observe

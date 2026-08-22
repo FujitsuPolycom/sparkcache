@@ -36,7 +36,7 @@ workflow.
    python -m build
    python -m twine check dist/*
    version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
-   python tools/verify_distribution.py "dist/sparkcache-${version}-py3-none-any.whl" --version "$version"
+   python tools/verify_distribution.py dist/*.whl dist/*.tar.gz --version "$version"
    ```
 
 4. Commit the version and documentation changes. The commit message must state

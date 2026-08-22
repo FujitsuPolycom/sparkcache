@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sparkcache"
-version = "0.1.0a1"
+version = "0.1.0a2"
 description = "Fail-closed, DCP-shard-local persistent KV context cache for vLLM (KV-Connector-V1)"
 readme = "README.md"
 license = "Apache-2.0"

@@ -7,7 +7,7 @@ compilation, standalone mapped-host placement, ctypes ABI validation, and a
 checksum-bound four-rank integration gate cover this library.
 
 `libspark_cache_snapshot.so` implements the store-side gather ring documented
-in [`SNAPSHOT_RING_PROTOTYPE.md`](SNAPSHOT_RING_PROTOTYPE.md). It is
+in [`SNAPSHOT_RING_STATE_MODEL.md`](SNAPSHOT_RING_STATE_MODEL.md). It is
 **research-only** and uses a separate fail-open ABI so optional snapshot
 publication cannot weaken fail-closed restore placement.
 

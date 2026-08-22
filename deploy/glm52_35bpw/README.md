@@ -222,6 +222,13 @@ exact long answer
 show the same digest offered by all four physical ranks and an external-cache
 restore rather than a fresh store.
 
+The GLM-5.2 semantic gate allows 512 output tokens for each long semantic
+request. The gate combines the OpenAI-compatible `reasoning`,
+`reasoning_content`, and `content` assistant fields for deterministic evidence
+while checking the exact answer against final `content`. A token-limit finish
+or an empty combined body prints a structured `INCONCLUSIVE` result and exits
+with status 2; neither condition satisfies the persistence gate.
+
 ## Offline validation
 
 ```bash
