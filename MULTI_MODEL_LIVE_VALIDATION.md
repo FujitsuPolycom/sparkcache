@@ -1,133 +1,146 @@
-# Multi-model SparkCache live validation
+# SparkCache 0.1.0a1 release qualification
 
-Status: **qualified** for the exact configurations recorded below.
+Status: **qualified** for the exact artifacts and serving configurations in
+this record.
 
-## Scope
+## Release artifact
 
-On 2026-08-21, SparkCache source tree
-`33fbe426045a64b4c46a957c39ebad7cfc85db35be0925ef77a017bf3e53adec`
-from commit `82b35b3c345501bd3275029d7656facebe55ef23` was validated on two-
-and four-Spark DeepSeek-V4-Flash-0731 services and on the four-Spark GLM-5.2
-EXL3 3.5-bpw fixed-MTP4 service. The GLM deployment recipe's durable
-identifier is `R7`.
+The protected GitHub Actions release run
+[`32535319768`](https://github.com/FujitsuPolycom/sparkcache/actions/runs/32535319768)
+built the distributions from tag `v0.1.0a1` at commit
+`5344192526d328b5cda3417c857b7ffb048fca8a`.
 
-The source implements immutable connector configuration in
-`spark_context_cache_config.py` and explicit removal of inherited Docker image
-environment values in `deploy/deployment_contract/container.py`. The GPU-free
-repository gate passed 647 tests with 5 skipped, plus Ruff and Python
-compilation.
+| Artifact | SHA-256 |
+|---|---|
+| `sparkcache-0.1.0a1-py3-none-any.whl` | `87c17d8dab5052f5a7833349dc9b99b76a3b6531ca6f0d3deff812f724fecdcc` |
+| `sparkcache-0.1.0a1.tar.gz` | `8a463a64c55d03d4084d9e364767c510c43b109b78f4de6f99ac9131eef6bee6` |
+
+The exact wheel was installed on every physical rank before live validation.
+Publication promoted the stored workflow artifact without rebuilding it. A
+clean download from PyPI reproduced both hashes, and a fresh virtual
+environment imported package version `0.1.0a1` from its `site-packages`
+directory.
+
+The common serving scheduler budget was
+`--max-num-batched-tokens 4096`. A value of `8192` is **unsupported** until the
+exact model profile passes its own cold-store, coordinated-restart,
+external-hit, and post-restore canary smoke.
+
+## Common storage and failure gates
+
+Before model serving, every rank passed GPU-free import, physical-capacity,
+invalid-manifest, and corruption gates with the release wheel:
+
+- capacity maintenance reduced an 8,417,280-byte fixture to 2,105,344 bytes,
+  reclaimed 6,311,936 bytes, evicted two manifests, deleted three chunks, and
+  collected one orphan;
+- an invalid manifest was removed during capacity maintenance and its
+  unreferenced chunk was deleted, covering defect `D-13`;
+- a bit-flipped disposable entry was reported as `corrupt` and invalidated,
+  while the source entry remained unchanged.
+
+These gates require a state that cannot be proven correct to become a cache
+miss. They do not authorize serving unverified bytes.
 
 ## DeepSeek-V4-Flash-0731 TP2/DCP1
 
-| Attribute | Value |
-| --- | --- |
-| Hardware | Two NVIDIA DGX Sparks |
-| Image | `sha256:d316c96d7e1b77ea5459e778c869289c59f7d8a55f3ce274a2082ba48c1be9f6` |
+| Attribute | Qualified value |
+|---|---|
+| Hardware | Two directly cabled NVIDIA DGX Sparks |
+| Runtime image | `sha256:50036224411e5ef04d651730c56d794111991b37981ec76ca81b66ea7d35dae7` |
+| Checkpoint identity | `bd6b0117ca28997acc9f22022814bb6bc50b5c3e1bc466d148b1d45067fe714f` |
 | Model limit | 131,072 tokens |
-| Checkpoint identity | `6c8f3d2d3b48707541b88f32f22ef3f0f8a6b57d8523281e2b8d3cdb0ae9a023` |
-| Cache root | `/cache/sparkcache-dsv4` |
+| Scheduler budget | 4,096 tokens |
+| Sequence limit | 6 |
+| KV allocation | 17,179,869,184 bytes/rank, `fp8_ds_mla` HMA pages |
+| Parallelism | TP2/DCP1, DSpark K5 greedy speculation |
 | Capacity policy | 200 GiB high, 180 GiB low, TTL disabled |
 
-The connector source identified above discovered 19 manifests. A deterministic
-73,774-token prompt committed a 73,728-token entry on both ranks. After a
-coordinated engine restart, both ranks restored the entry asynchronously in
-570.5 ms and 549.4 ms. The response was exactly `SPARKCACHE_OK:9540`; the
-post-restore canary was exactly `SPARKCACHE_CANARY_OK`.
+A cold 73,774-token deterministic prompt returned exactly
+`SPARKCACHE_OK:9540`. Both ranks snapshotted and committed 73,728 reusable
+tokens with digest
+`1b2a4d1b6faf7685d1641e298f16c5ef97ad40a279c0a451ab4c0438d2922925`,
+288 chunks, and 300,904,448 stored bytes per rank.
 
-A fresh non-cached semantic probe correctly returned:
-
-```json
-{"action":"recompute","product":1517,"sum":9540}
-```
-
-The qualification-time Docker environments also confirmed that inherited
-`SPARKRING_MODEL_CONFIG_SHA256`, `SPARKRING_MODEL_REPOSITORY`, and
-`SPARKRING_MODEL_REVISION` values were explicitly empty.
+After a coordinated restart, both ranks reported
+`checked=1 offered=1 rejected=0`. They restored the entry asynchronously in
+459.8 ms and 517.0 ms. vLLM reported 73,814 external-cache queried tokens and
+73,728 external-cache hit tokens. The response remained exact and the fresh
+post-restore canary returned `SPARKCACHE_CANARY_OK`.
 
 ## DeepSeek-V4-Flash-0731 TP4/DCP1
 
-| Attribute | Value |
-| --- | --- |
+| Attribute | Qualified value |
+|---|---|
 | Hardware | Four directly cabled NVIDIA DGX Sparks |
-| Image | `sha256:50036224411e5ef04d651730c56d794111991b37981ec76ca81b66ea7d35dae7` |
-| Model limit | 524,288 tokens |
+| Runtime image | `sha256:50036224411e5ef04d651730c56d794111991b37981ec76ca81b66ea7d35dae7` |
 | Checkpoint identity | `bd6b0117ca28997acc9f22022814bb6bc50b5c3e1bc466d148b1d45067fe714f` |
-| Cache root | `/cache/sparkcache-deepseek0731-tp4-dcp1` |
+| Model limit | 524,288 tokens |
+| Scheduler budget | 4,096 tokens |
+| Sequence limit | 32 |
+| KV allocation | 34,359,738,368 bytes/rank, `fp8_ds_mla` HMA pages |
+| Parallelism | TP4/DCP1, DSpark K5 greedy speculation |
 | Capacity policy | 200 GiB high, 180 GiB low, TTL disabled |
 
-A 294,958-token deterministic prompt snapshotted 294,912 reusable tokens
-on all four ranks in 1.51-1.88 seconds. Durable background commits completed
-in 10.32-11.81 seconds. After a coordinated restart, the qualified connector
-restored the entry in:
+A cold 73,774-token deterministic prompt returned exactly
+`SPARKCACHE_OK:9540`. All ranks snapshotted and committed 73,728 reusable
+tokens with digest
+`c17e6fbaefea740b4a83890f20d0e72e792cf9db9429633340e3c48d41d02d1c`,
+288 chunks, and 300,908,544 stored bytes per rank.
 
-| Physical rank | Restore time |
-| ---: | ---: |
-| 0 | 1,999.4 ms |
-| 1 | 1,882.3 ms |
-| 2 | 2,093.7 ms |
-| 3 | 2,303.1 ms |
+After a coordinated restart, all ranks reported
+`checked=1 offered=1 rejected=0`. Physical ranks 0 through 3 restored the entry
+asynchronously in 483.9 ms, 413.9 ms, 443.0 ms, and 494.6 ms. vLLM reported
+73,814 external-cache queried tokens and 73,728 external-cache hit tokens. The
+response remained exact and the fresh post-restore canary returned
+`SPARKCACHE_CANARY_OK`.
 
-The external-cache response was exactly `SPARKCACHE_OK:9540`, the canary was
-exact, and a fresh arithmetic/checksum semantic probe passed. All four
-qualification-time environments showed the inherited GLM model variables
-explicitly empty.
+## GLM-5.2 EXL3 3.5-bpw TP4/DCP4
 
-## GLM-5.2 EXL3 3.5-bpw fixed-MTP4 TP4/DCP4 (`R7`)
-
-| Attribute | Value |
-| --- | --- |
+| Attribute | Qualified value |
+|---|---|
 | Hardware | Four directly cabled NVIDIA DGX Sparks |
-| Image | `sha256:02881d5229d4f4d1cbba0cf40537492a2a505b9d4e43bbfe9a0b2a7bd0584513` |
+| Runtime image | `sha256:02881d5229d4f4d1cbba0cf40537492a2a505b9d4e43bbfe9a0b2a7bd0584513` |
 | Model revision | `9ab9579774cc432df91567a36f6e9e863e0d4c9f` |
 | Checkpoint identity | `9fd852f69ed64442e31dce1cbc5fe7acd0a76bfb848e945d272fe98d00d0c9cd` |
-| Parallelism | TP4/DCP4, all-gather/reduce-scatter backend (`ag_rs`), interleave one |
-| Speculation | Fixed MTP4, greedy draft sampling |
-| KV representation | Dynamic `nvfp4_ds_mla`, FP8 RoPE |
-| KV allocation | 9,250,000,000 bytes/rank |
 | Model limit | 262,144 tokens |
-| Graphs | `FULL_AND_PIECEWISE`, CUDA graph capture sizes of 1 through 40 query rows (`Q1` through `Q40`) |
-| Cache root | `/cache/sparkcache-glm52-r7` |
+| Scheduler budget | 4,096 tokens |
+| Sequence limit | 8 |
+| KV allocation | 9,250,000,000 bytes/rank, dynamic `nvfp4_ds_mla` rows |
+| Parallelism | TP4/DCP4, `ag_rs`, interleave one, fixed MTP4 |
+| Graphs | `FULL_AND_PIECEWISE`, query rows 1 through 40 |
+| Capacity policy | 200 GiB high, 180 GiB low, TTL disabled |
 
-Startup registered 101 persistent layers: 79 target-KV layers and 22 sparse-
-indexer layers. It discovered 10 compatible manifests before the store gate
-and 11 after restart.
+Startup registered 101 persistent layers: 79 target-KV layers and 22
+sparse-indexer layers. The Q40 runtime refuses to replace an existing exact-
+state receipt. Before each coordinated restart, all four containers were
+stopped, every receipt hash was recorded, and each receipt was moved to a
+unique hash-preserving backup name. Every launch generated and attested a
+fresh Q40 receipt before serving health was accepted.
 
-The qualification's initial GLM start failed closed because receipts for the
-40-query-row exact graph (`Q40`) already existed in the shared JIT roots.
-Those four files were moved to hash-preserving backup names. The restarted
-profile generated and attested fresh receipts and captured every graph size
-from 1 through 40 query rows (`Q1` through `Q40`).
+A cold 225,555-token deterministic prompt returned exactly
+`SPARKCACHE_OK:9540`. Every rank snapshotted and committed 225,536 reusable
+tokens with digest
+`fd441fa9535cd5eba7a261b0ef908cebe278d1667fd676d12a3e016c65d4d31a`,
+881 chunks, and 1,803,702,724 stored bytes per rank.
 
-A 225,555-token deterministic prompt committed 225,536 reusable tokens on
-every rank. After a coordinated restart and fresh 40-query-row exact-graph
-receipt generation,
-SparkCache restored the entry in:
+After a coordinated restart, all ranks reported
+`checked=1 offered=1 rejected=0`. DCP ranks 0 through 3 restored the entry
+asynchronously in 3,954.2 ms, 3,385.0 ms, 3,649.6 ms, and 3,722.4 ms. vLLM
+reported 225,633 external-cache queried tokens, 225,536 external-cache hit
+tokens, and zero local-prefix hit tokens. The all-rank inventory prime returned
+`2`, the long response remained exact, and the fresh post-restore canary
+returned `SPARKCACHE_CANARY_OK`.
 
-| DCP rank | Restore time |
-| ---: | ---: |
-| 0 | 4,358.8 ms |
-| 1 | 3,180.1 ms |
-| 2 | 3,386.2 ms |
-| 3 | 3,694.6 ms |
+## Conclusion and limitations
 
-The scheduler reported an external hit for all 225,536 reusable tokens.
-The model returned exactly `SPARKCACHE_OK:9540`. A short request that published
-all-rank cache inventory to the scheduler (the quorum prime) returned `2`, and
-the post-restore canary returned `SPARKCACHE_CANARY_OK`. A fresh semantic probe correctly
-computed both arithmetic results and selected `recompute` for a checksum
-mismatch. GLM's default high-reasoning mode required a 1,024-token completion
-budget for that short structured probe; 256 tokens ended before assistant
-content was emitted.
+The exact `0.1.0a1` wheel is qualified for durable store, coordinated engine
+restart, all-rank manifest discovery, external restore, exact semantic output,
+continued generation, capacity maintenance, and corruption handling in the
+three recorded profiles.
 
-## Conclusion and limits
-
-The connector-configuration and Docker environment-removal implementations are
-qualified for these exact DeepSeek and GLM deployments. The evidence proves
-durable store, engine-restart discovery, all-rank external restore, exact
-semantic output, continued generation, bounded capacity reporting, and clean
-handling of inherited image environment state.
-
-This record does not qualify DeepSeek opaque pages exposed through vLLM's
-hybrid-memory-allocator (HMA)
-API at DCP2/DCP4, another checkpoint or vLLM source contract, streaming
-snapshots, native restore, or a GLM image rebuilt from different inputs.
+This record does not qualify another wheel, source tree, runtime image,
+checkpoint, scheduler budget, topology, cache geometry, or vLLM source
+contract. DeepSeek DCP2 and DCP4, streaming snapshots, native restore in these
+profiles, buddy replication, and longest-stored-prefix reuse for a growing
+conversation remain unsupported or research-only as stated in `README.md`.

@@ -5,17 +5,18 @@ KV-Connector-V1 interface. Each tensor-parallel worker stores the KV state it
 owns and restores that state from its own disk after an engine restart. Cache
 traffic does not cross the network.
 
-Distribution workflow: **implemented**. Version `0.1.0a1` builds as a checked
-wheel and source distribution; publication to PyPI has not been performed. The
-exact DeepSeek-V4 and GLM-5.2 configurations in the support table are
-**qualified** on DGX Spark development systems. Other model, topology, and
+Distribution status: **qualified**. Version `0.1.0a1` is published on
+[PyPI](https://pypi.org/project/sparkcache/0.1.0a1/). The published wheel and
+source distribution match the artifacts built by the protected release
+workflow, and that exact wheel passed the DeepSeek-V4 and GLM-5.2
+store/restart/restore matrix in the support table. Other model, topology, and
 vLLM combinations are implemented, research-only, or unsupported as stated in
 that table.
 
 ## Installation
 
-After version `0.1.0a1` is published, install the dependency-free storage
-engine and verification tooling from PyPI:
+Install the dependency-free storage engine and verification tooling from
+PyPI:
 
 ```bash
 python -m pip install sparkcache==0.1.0a1
@@ -98,43 +99,32 @@ SparkCache provides these invariants:
 | Capability | Status | Evidence or limitation |
 |---|---|---|
 | Per-token row storage at TP1/TP2/TP4 and DCP1/DCP2/DCP4 | **implemented** | GPU-free topology and round-trip matrix; DCP must divide TP and profile chunk geometry |
-| DeepSeek-V4 opaque HMA pages at TP2/DCP1 | **qualified** | `MULTI_MODEL_LIVE_VALIDATION.md`; 73,728-token restore completed in 549–571 ms per rank |
-| DeepSeek-V4-Flash-0731 opaque HMA pages at TP4/DCP1 | **qualified** | `MULTI_MODEL_LIVE_VALIDATION.md`; 294,912-token restore completed in 1.88–2.30 seconds per rank |
+| DeepSeek-V4 opaque HMA pages at TP2/DCP1 | **qualified** | `MULTI_MODEL_LIVE_VALIDATION.md`; the release wheel restored 73,728 tokens in 459.8–517.0 ms per rank |
+| DeepSeek-V4-Flash-0731 opaque HMA pages at TP4/DCP1 | **qualified** | `MULTI_MODEL_LIVE_VALIDATION.md`; the release wheel restored 73,728 tokens in 413.9–494.6 ms per rank |
 | DeepSeek-V4 HMA pages at DCP2/DCP4 | **unsupported** | opaque page ownership and DSpark rolling-state sharding are undefined; see `deploy/deepseek_v4/DCP_SUPPORT.md` |
-| GLM-5.2 EXL3 3.5-bpw per-token rows at TP4/DCP4 | **qualified** | SparkRing serving recipe `R7`; `MULTI_MODEL_LIVE_VALIDATION.md`; 225,536-token restore completed in 3.18–4.36 seconds per rank |
+| GLM-5.2 EXL3 3.5-bpw per-token rows at TP4/DCP4 | **qualified** | SparkRing serving recipe `R7`; `MULTI_MODEL_LIVE_VALIDATION.md`; the release wheel restored 225,536 tokens in 3.39–3.95 seconds per rank |
 | Native direct restore | **implemented** | checksum-attested adapter and CPU-testable ABI/layout gates; disabled in qualified DeepSeek profiles |
 | Streaming snapshots | **research-only** | GLM-5.2 DCP4 inventory only; not profile-general and disabled for opaque block pages |
 | Buddy replication | **research-only** | protocol/state machines implemented; network carrier absent |
 | Qwen recurrent-state persistence | **unsupported** | no profile, record schema, or live qualification |
 | Longest-stored-prefix restore for grown conversations | **unsupported** | exact full-span digests only; design work is tracked in `ROADMAP.md` |
 
-## Qualified DeepSeek-V4 TP4 result
+## Qualified release matrix
 
-The 2026-08-21 four-Spark qualification used
-`deepseek-ai/DeepSeek-V4-Flash-0731`, vLLM
-`0.1.dev1+ge2666d9a6.d20260810`, TP4/DCP1, DSpark speculation with five
-draft tokens per step (`K5`), and
-`fp8_ds_mla` KV pages.
+The exact `0.1.0a1` wheel passed cold store, coordinated engine restart,
+all-rank manifest discovery, external restore, exact semantic output, and a
+fresh post-restore canary in three serving profiles. Every profile used
+`--max-num-batched-tokens 4096`; a value of `8192` is unsupported until the
+exact profile passes a separate smoke at that value.
 
-| Prompt tokens | Restored tokens | Restore time per rank | End-to-end gate |
-|---:|---:|---:|---:|
-| 36,910 | 36,864 | 207–298 ms | 1.56 s |
-| 73,774 | 73,728 | 335–412 ms | 1.64 s |
-| 147,502 | 147,456 | 734–888 ms | 2.45 s |
+| Profile | Prompt / restored tokens | Restore time by rank |
+|---|---:|---:|
+| DeepSeek-V4-Flash-0731 TP2/DCP1 | 73,774 / 73,728 | 459.8, 517.0 ms |
+| DeepSeek-V4-Flash-0731 TP4/DCP1 | 73,774 / 73,728 | 483.9, 413.9, 443.0, 494.6 ms |
+| GLM-5.2 EXL3 3.5-bpw TP4/DCP4 | 225,555 / 225,536 | 3,954.2, 3,385.0, 3,649.6, 3,722.4 ms |
 
-The gate required four-rank manifest discovery, current-generation quorum,
-nonzero external-prefix hit metrics, byte-identical semantic output, and an
-immediate exact sentinel. Capacity and disposable-copy corruption gates also
-passed. See [the complete evidence record](DEEPSEEK_V4_TP4_LIVE_VALIDATION.md).
-
-## Qualified GLM-5.2 3.5-bpw result
-
-The GLM-5.2 EXL3 3.5-bpw SparkCache composition, identified by SparkRing as
-serving recipe `R7`, is qualified on four Sparks at TP4/DCP4. The recorded gate
-covered durable store, coordinated runtime restart, four-rank restore, and
-mixed cached/uncached concurrency.
-See [the live evidence record](GLM52_DCP4_HISTORICAL_VALIDATION.md) and
-[the deployment instructions](deploy/glm52_35bpw/README.md).
+See [the complete release-wheel evidence](MULTI_MODEL_LIVE_VALIDATION.md) and
+the model-specific deployment instructions under `deploy/`.
 
 ## vLLM compatibility
 
