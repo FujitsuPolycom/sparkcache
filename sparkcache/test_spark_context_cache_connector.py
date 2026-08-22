@@ -1413,6 +1413,54 @@ class StartupDiscoveryTests(unittest.TestCase):
 
 
 class CapacityPolicyConnectorTests(unittest.TestCase):
+    def test_capacity_worker_waits_for_events_when_ttl_is_disabled(self) -> None:
+        timeouts: list[float | None] = []
+        connector = object.__new__(SparkContextCacheConnector)
+        connector._capacity_policy = CapacityPolicy(
+            max_bytes=1 << 20,
+            low_watermark_bytes=900 << 10,
+            ttl_seconds=0,
+        )
+        connector._capacity_stop = threading.Event()
+
+        class StopAfterWait:
+            def wait(self, timeout: float | None = None) -> bool:
+                timeouts.append(timeout)
+                connector._capacity_stop.set()
+                return False
+
+            def clear(self) -> None:
+                return
+
+        connector._capacity_wakeup = StopAfterWait()
+        connector._capacity_worker_main()
+
+        self.assertEqual(timeouts, [None])
+
+    def test_capacity_worker_keeps_periodic_ttl_passes(self) -> None:
+        timeouts: list[float | None] = []
+        connector = object.__new__(SparkContextCacheConnector)
+        connector._capacity_policy = CapacityPolicy(
+            max_bytes=1 << 20,
+            low_watermark_bytes=900 << 10,
+            ttl_seconds=120,
+        )
+        connector._capacity_stop = threading.Event()
+
+        class StopAfterWait:
+            def wait(self, timeout: float | None = None) -> bool:
+                timeouts.append(timeout)
+                connector._capacity_stop.set()
+                return False
+
+            def clear(self) -> None:
+                return
+
+        connector._capacity_wakeup = StopAfterWait()
+        connector._capacity_worker_main()
+
+        self.assertEqual(timeouts, [60])
+
     def test_capacity_config_is_strict_and_defaults_low_watermark(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(

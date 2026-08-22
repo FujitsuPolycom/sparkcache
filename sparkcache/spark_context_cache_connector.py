@@ -1689,10 +1689,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
 
     def _capacity_worker_main(self) -> None:
         ttl_seconds = self._capacity_policy.ttl_seconds
+        # TTL expiry needs a clock-driven pass. With TTL disabled, startup
+        # performs one exact scan and commit accounting wakes this worker on
+        # pressure or retry; an idle timer would only rescan an unchanged tree.
         interval = (
             min(60, max(1, ttl_seconds // 2))
             if ttl_seconds
-            else 300
+            else None
         )
         pending: dict[str, _PendingStreamingCommit] = {}
         retry_unsatisfied = False
