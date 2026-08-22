@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PROTOTYPE TUI for the fail-open snapshot-ring state model.
+"""Interactive lab for the fail-open snapshot-ring state model.
 
 Question: can two or three staging slots remain safe when GPU completion,
 writer ownership, ring saturation, and context cancellation race?
@@ -14,7 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
 
-from snapshot_ring_state_prototype import SnapshotRing  # noqa: E402
+from snapshot_ring_state_model import SnapshotRing  # noqa: E402
 
 
 BOLD = "\x1b[1m"
@@ -24,7 +24,7 @@ RESET = "\x1b[0m"
 
 def render(ring: SnapshotRing, message: str) -> None:
     print("\x1b[2J\x1b[H", end="")
-    print(f"{BOLD}SparkCache snapshot-ring prototype{RESET}")
+    print(f"{BOLD}SparkCache snapshot-ring state-model lab{RESET}")
     print(
         f"{DIM}Question: can saturation/cancellation remain fail-open "
         f"without reusing owned bytes?{RESET}\n"

@@ -1,4 +1,4 @@
-"""PROTOTYPE: portable state oracle for the SparkCache snapshot ring."""
+"""Portable state model for the SparkCache snapshot ring."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ class SnapshotRing:
 
     def __post_init__(self) -> None:
         if self.slot_count not in (2, 3):
-            raise ValueError("prototype ring requires two or three slots")
+            raise ValueError("snapshot ring requires two or three slots")
         self.slots = [Slot() for _ in range(self.slot_count)]
 
     def submit(self, context: int) -> str:

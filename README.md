@@ -5,18 +5,32 @@ KV-Connector-V1 interface. Each tensor-parallel worker stores the KV state it
 owns and restores that state from its own disk after an engine restart. Cache
 traffic does not cross the network.
 
-Distribution status: **qualified**. Version `0.1.0a1` is published on
-[PyPI](https://pypi.org/project/sparkcache/0.1.0a1/). The published wheel and
-source distribution match the artifacts built by the protected release
+Distribution status for version `0.1.0a1`: **qualified**. Its immutable
+package artifacts are available from
+[PyPI](https://pypi.org/project/sparkcache/0.1.0a1/) and are identified by
+[`MULTI_MODEL_LIVE_VALIDATION.md`](MULTI_MODEL_LIVE_VALIDATION.md). The wheel
+and source distribution match the artifacts built by the protected release
 workflow, and that exact wheel passed the DeepSeek-V4 and GLM-5.2
-store/restart/restore matrix in the support table. Other model, topology, and
-vLLM combinations are implemented, research-only, or unsupported as stated in
-that table.
+store/restart/restore matrix in the support table. Qualification does not
+transfer to another package version, model, topology, or vLLM source contract.
+Other combinations are implemented, research-only, or unsupported as stated
+in that table.
+
+Source version `0.1.0a2` is **implemented** and passed GPU-free, packaging,
+four-host capacity, invalid-manifest, corruption, and runtime-import gates. It
+has not inherited `0.1.0a1`'s live model qualification. Release notes and
+qualification records identify the status of each immutable artifact.
 
 ## Installation
 
-Install the dependency-free storage engine and verification tooling from
-PyPI:
+Install the available dependency-free storage engine and verification tooling
+from PyPI:
+
+```bash
+python -m pip install sparkcache
+```
+
+Reproducing the qualified release-wheel matrix requires the exact artifact:
 
 ```bash
 python -m pip install sparkcache==0.1.0a1
@@ -32,7 +46,7 @@ The optional `connector` extra installs PyTorch for CPU-side development. It
 does not install vLLM, select a CUDA build, or patch a serving environment:
 
 ```bash
-python -m pip install 'sparkcache[connector]==0.1.0a1'
+python -m pip install 'sparkcache[connector]'
 ```
 
 Qualified serving deployments require the repository tag whose version

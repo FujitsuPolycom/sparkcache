@@ -3,7 +3,7 @@
 This document records work that is not part of SparkCache's implemented
 interface. Status labels have these meanings:
 
-- **research-only** — prototype or evidence exists, but deployment support is
+- **research-only** — a design or evidence exists, but deployment support is
   not qualified; accepted design directions without implementation also use
   this status and state their prerequisites;
 - **unsupported** — no safe interface exists; configuration fails closed;
@@ -14,17 +14,6 @@ Open correctness and scaling defects are listed in `DEFECTS.md` and take
 priority over feature work.
 
 ## Research-only design work
-
-### Generation-scoped quorum deltas
-
-**Status: research-only.** Defect D-6 requires replacing complete held-manifest sets
-with generation-scoped deltas. The protocol must carry a monotonically ordered
-sequence, tolerate duplicate/reordered delivery, reset after worker restart,
-and converge to the same scheduler quorum state after a missed report.
-
-This work is a prerequisite for prefix aliases because one stored context can
-otherwise multiply control-plane report size by its number of reusable
-prefixes.
 
 ### Longest-stored-prefix restore
 
@@ -38,6 +27,10 @@ new turns extend it. A prefix-aware interface requires:
 - descending-span admission bounded by the configured maximum context;
 - tail-only publication after the longest verified prefix; and
 - identity changes that make pre-alias manifests miss safely.
+
+The implemented bounded quorum-delta protocol must carry alias additions and
+withdrawals without making each scheduler report proportional to the complete
+stored-prefix inventory.
 
 ### Per-entry retention controls
 

@@ -26,7 +26,7 @@ def test_hit_gate_passes_an_explicit_record_count(monkeypatch, tmp_path: Path) -
         records=12000,
     )
     assert options == {
-        "long_max_tokens": 256,
+        "long_max_tokens": 512,
         "short_max_tokens": 128,
         "records": 12000,
     }

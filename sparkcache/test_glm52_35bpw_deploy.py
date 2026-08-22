@@ -264,7 +264,7 @@ def test_glm_hit_gate_primes_worker_quorum(monkeypatch, tmp_path: Path) -> None:
 
     assert result["quorum_prime"] == "2"
     assert budgets == [128]
-    assert hit_options == {"long_max_tokens": 256, "short_max_tokens": 128}
+    assert hit_options == {"long_max_tokens": 512, "short_max_tokens": 128}
 
 
 def test_launch_reader_accepts_bom_prefixed_docker_inspection(tmp_path: Path) -> None:

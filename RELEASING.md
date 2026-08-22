@@ -13,8 +13,9 @@ the repository does not store a PyPI token.
    environment name to `pypi`.
 3. Create a GitHub Actions environment named `pypi` with a required reviewer.
    The environment gate must hold the publish job until that reviewer has
-   qualified the exact workflow artifact. A single-maintainer repository must
-   allow the configured reviewer to approve their own deployment.
+   reviewed the exact workflow artifact and the release's declared evidence
+   class. A single-maintainer repository must allow the configured reviewer to
+   approve their own deployment.
 
 The trusted-publisher owner and repository values must match the public GitHub
 location exactly. No password, API token, or signing key is required by the
@@ -36,7 +37,7 @@ workflow.
    python -m build
    python -m twine check dist/*
    version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
-   python tools/verify_distribution.py "dist/sparkcache-${version}-py3-none-any.whl" --version "$version"
+   python tools/verify_distribution.py dist/*.whl dist/*.tar.gz --version "$version"
    ```
 
 4. Commit the version and documentation changes. The commit message must state
@@ -63,20 +64,34 @@ workflow.
      ../release-artifact-identity/release-artifact-sha256.txt)
    ```
 
-7. Install the downloaded wheel on the qualification systems and run the
-   store, coordinated-restart, restore, semantic-canary, capacity, and
-   corruption gates required by the release's support table. Record the tag,
-   workflow run, wheel SHA-256, deployment conditions, measurements, and
-   result. A failing or interrupted gate rejects the deployment; it does not
-   authorize publication.
+7. Assign the release an evidence class from the changed behavior:
 
-8. Approve the waiting `pypi` environment deployment only after qualification
-   passes. The publish job downloads the same two workflow artifacts and
+   - documentation, metadata, packaging, and qualification-harness-only
+     changes require the GPU-free suite, archive verification, and isolated
+     installation;
+   - model-neutral connector control-plane changes require the GPU-free TP/DCP
+     matrix and one representative four-rank live gate before that artifact is
+     described as qualified;
+   - model-profile changes require live gates for the affected profiles;
+   - cache-identity, on-disk format, restore-placement, CUDA-ownership, or vLLM
+     runtime-patch changes require the complete qualified profile matrix.
+
+   A pre-release may be published with **implemented** status after its
+   offline and package gates pass when live systems are unavailable. Its
+   README and release notes must state that live qualification is absent, and
+   it must not inherit a qualification claim from another artifact.
+
+8. Approve the waiting `pypi` environment deployment only after the gates for
+   the declared publication status pass. The approval comment must identify
+   the artifact hashes, evidence class, resulting status, and any omitted live
+   gates. The publish job downloads the same two workflow artifacts and
    verifies their SHA-256 values immediately before uploading the distributions
    to PyPI.
 
-The publish workflow rejects a tag that does not match `project.version`. Never
-approve a different workflow run from the one whose artifacts were qualified.
+The publish workflow rejects a tag that does not match `project.version`. A
+qualification claim must name the exact published artifact hash evaluated by
+its required gates. Never transfer a qualification result between artifacts,
+even when their source trees are equivalent.
 
 ## Verification
 

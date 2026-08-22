@@ -1,12 +1,16 @@
-# SparkCache 0.1.0a1 distribution validation
+# Historical validation: SparkCache 0.1.0a1 candidate wheel 8e111d42
 
 Date: 2026-08-21.
 
-The installable distribution is **qualified** for the exact two-rank
-DeepSeek-V4 configuration below. The wheel-backed four-rank GLM-5.2
-configuration is **research-only**: package installation and model startup
-passed, but a two-host outage prevented the store/restart/restore gate from
-completing.
+Document role: historical evidence. This record identifies a pre-release
+candidate whose wheel SHA-256 begins with `8e111d42`. The candidate is
+**qualified** only for the bounded DeepSeek-V4 conditions below; its GLM-5.2
+store/restore result is **research-only**. This record does not describe the
+published SparkCache 0.1.0a1 distributions.
+
+[`MULTI_MODEL_LIVE_VALIDATION.md`](MULTI_MODEL_LIVE_VALIDATION.md) is the
+canonical qualification record for the published SparkCache 0.1.0a1 wheel,
+whose SHA-256 begins with `87c17d8d`.
 
 ## Distribution identity
 
@@ -51,9 +55,10 @@ native research probes.
   tokens. The restored response was exactly `SPARKCACHE_OK:9540`; the canary
   was exactly `SPARKCACHE_CANARY_OK`.
 
-Conclusion: SparkCache 0.1.0a1 is qualified for this exact DeepSeek-V4
-TP2/DCP1 deployment. The evidence does not qualify another model, checkpoint,
-runtime image, or topology.
+Conclusion: candidate wheel
+`8e111d42f53e823f10179fbad96235aa0bad6ca8791d729494c12fadb1acedaf` is
+qualified for this exact DeepSeek-V4 TP2/DCP1 deployment. The evidence does
+not qualify another wheel, model, checkpoint, runtime image, or topology.
 
 ## GLM-5.2 TP4/DCP4 bounded result
 
@@ -78,7 +83,8 @@ returned HTTP 500 after repeated 60-second shared-memory broadcast warnings.
 No semantic reference, manifest, or completed cache entry was produced.
 
 Conclusion: package installation, canonical connector loading, GLM-5.2 model
-startup, exact-state attestation, and graph capture passed. Persistent store
-and restore remain research-only for the wheel-backed GLM-5.2 TP4/DCP4
+startup, exact-state attestation, and graph capture passed for candidate wheel
+`8e111d42f53e823f10179fbad96235aa0bad6ca8791d729494c12fadb1acedaf`.
+Persistent store and restore are **research-only** for that artifact and
 deployment because host loss interrupted the required gate. The observation
 does not identify a wheel, connector, cache, or model-startup defect.

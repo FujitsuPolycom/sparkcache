@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from deploy.deployment_contract import (
+    SemanticGateInconclusive,
     assistant_content as _content,
     build_long_prompt,
     request_chat as _request,
@@ -74,21 +75,25 @@ def main() -> None:
         help="archive records; miss defaults to 384 and hit reads the reference",
     )
     args = parser.parse_args()
-    result = (
-        run_miss(
-            args.endpoint,
-            args.model,
-            args.reference,
-            records=args.records or 384,
+    try:
+        result = (
+            run_miss(
+                args.endpoint,
+                args.model,
+                args.reference,
+                records=args.records or 384,
+            )
+            if args.phase == "miss"
+            else run_hit(
+                args.endpoint,
+                args.model,
+                args.reference,
+                records=args.records,
+            )
         )
-        if args.phase == "miss"
-        else run_hit(
-            args.endpoint,
-            args.model,
-            args.reference,
-            records=args.records,
-        )
-    )
+    except SemanticGateInconclusive as error:
+        print(json.dumps(error.as_result(), sort_keys=True))
+        raise SystemExit(2) from None
     print(json.dumps(result, sort_keys=True))
 
 
