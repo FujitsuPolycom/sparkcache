@@ -435,6 +435,38 @@ class ManifestStoreTests(unittest.TestCase):
                 ),
             )
 
+    def test_compatibility_commit_publishes_bounded_macro_batches(self) -> None:
+        context_digest = hashlib.sha256(b"compatibility-macro-batch").hexdigest()
+        chunks = tuple(
+            _chunk(index * 256, (index + 1) * 256) for index in range(17)
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = ManifestStore(directory)
+            batch_sizes: list[int] = []
+            original_publish = cache_manifest._publish_immutable_batch
+
+            def record_batch(objects: list[tuple[Path, bytes]]) -> None:
+                batch_sizes.append(len(objects))
+                original_publish(objects)
+
+            with mock.patch.object(
+                cache_manifest,
+                "_publish_immutable_batch",
+                side_effect=record_batch,
+            ):
+                store.commit(
+                    identity=_identity(),
+                    context_digest=context_digest,
+                    chunks=chunks,
+                    span_tokens=17 * 256,
+                )
+
+            self.assertEqual(batch_sizes, [8, 8, 1])
+            lookup = store.lookup(_identity(), context_digest)
+            self.assertTrue(lookup.is_hit, lookup.reason)
+            self.assertEqual(store.restore(lookup), chunks)
+
     def test_streaming_macro_batch_retry_is_idempotent(self) -> None:
         context_digest = hashlib.sha256(b"macro-batch-retry").hexdigest()
         chunks = (_chunk(0, 256), _chunk(256, 512), _chunk(512, 768))

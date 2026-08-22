@@ -9,6 +9,9 @@ KV-Connector-V1 interface. Each tensor-parallel worker stores the KV state it
 owns and restores that state from its own disk after an engine restart. Cache
 traffic does not cross the network.
 
+Version `0.1.0a3` is **implemented**. GPU-free validation covers bounded
+macro-batch chunk publication; it has no live-qualified deployment lane.
+
 ## Published release status
 
 | Package artifact | Qualified deployment lanes | Evidence |

@@ -77,7 +77,7 @@ def test_package_metadata_is_publication_neutral_for_its_own_version() -> None:
     readme = README.read_text(encoding="utf-8")
     metadata = f"Metadata-Version: 2.4\nVersion: {version}\n\n{readme}"
 
-    assert version == "0.1.0a2"
+    assert version == "0.1.0a3"
     verify_archive_contract(
         {"sparkcache/native/python/snapshot_ring_state_model.py"},
         metadata,
@@ -121,13 +121,13 @@ def test_snapshot_artifact_paths_use_semantic_names() -> None:
     ("artifact", "member"),
     [
         (
-            Path("sparkcache-0.1.0a2-py3-none-any.whl"),
+            Path("sparkcache-0.1.0a3-py3-none-any.whl"),
             "sparkcache/native/python/"
             f"snapshot_ring_state_{LIFECYCLE_LABEL_EXAMPLE}.py",
         ),
         (
-            Path("sparkcache-0.1.0a2.tar.gz"),
-            "sparkcache-0.1.0a2/sparkcache/native/"
+            Path("sparkcache-0.1.0a3.tar.gz"),
+            "sparkcache-0.1.0a3/sparkcache/native/"
             f"SNAPSHOT_RING_{LIFECYCLE_LABEL_EXAMPLE.upper()}.md",
         ),
     ],
@@ -136,27 +136,27 @@ def test_release_verifier_rejects_lifecycle_labeled_snapshot_paths(
     artifact: Path,
     member: str,
 ) -> None:
-    metadata = "Metadata-Version: 2.4\nVersion: 0.1.0a2\n"
+    metadata = "Metadata-Version: 2.4\nVersion: 0.1.0a3\n"
 
     with pytest.raises(RuntimeError, match="lifecycle-labeled snapshot paths"):
-        verify_archive_contract({member}, metadata, "0.1.0a2", artifact)
+        verify_archive_contract({member}, metadata, "0.1.0a3", artifact)
 
 
 @pytest.mark.parametrize(
     "claim",
     [
         "Publication has not been performed.",
-        "After version `0.1.0a2` is published, install it from PyPI.",
-        "Version `0.1.0a2` is published on PyPI.",
+        "After version `0.1.0a3` is published, install it from PyPI.",
+        "Version `0.1.0a3` is published on PyPI.",
     ],
 )
 def test_release_verifier_rejects_publication_timing_claims(claim: str) -> None:
-    metadata = f"Metadata-Version: 2.4\nVersion: 0.1.0a2\n\n{claim}\n"
+    metadata = f"Metadata-Version: 2.4\nVersion: 0.1.0a3\n\n{claim}\n"
 
     with pytest.raises(RuntimeError, match="publication|published"):
         verify_archive_contract(
             set(),
             metadata,
-            "0.1.0a2",
-            Path("sparkcache-0.1.0a2.tar.gz"),
+            "0.1.0a3",
+            Path("sparkcache-0.1.0a3.tar.gz"),
         )
