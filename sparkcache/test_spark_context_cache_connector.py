@@ -187,6 +187,21 @@ class CodecTests(unittest.TestCase):
             codec.context_digest(tokens, "salt-b"),
         )
 
+    def test_prefix_digest_matches_explicit_token_slice(self) -> None:
+        tokens = list(range(300))
+        self.assertEqual(
+            codec.context_prefix_digest(tokens, "identity", token_count=256),
+            codec.context_digest(tokens[:256], "identity"),
+        )
+        for invalid in (True, -1, 301):
+            with self.subTest(token_count=invalid):
+                with self.assertRaises(codec.CodecError):
+                    codec.context_prefix_digest(
+                        tokens,
+                        "identity",
+                        token_count=invalid,
+                    )
+
     def test_vectorized_integer_codec_matches_v1_wire_bytes(self) -> None:
         tokens = [0, 1, 255, 65535, 2**32 - 1]
         v1_reference_bytes = b"".join(
@@ -465,6 +480,28 @@ def _deepseek_tp4_group_tables(
 
 
 class CheckpointIdentityTests(unittest.TestCase):
+    def test_prompt_digest_reuses_identity_salt_without_slicing_tokens(self) -> None:
+        class UnsliceableTokens(list[int]):
+            def __getitem__(self, index):
+                if isinstance(index, slice):
+                    raise AssertionError("prompt digest must not copy a token prefix")
+                return super().__getitem__(index)
+
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(Path(directory), 0)
+            salt = connector._identity(0, tp_shard_rank=0).storage_key
+            tokens = UnsliceableTokens(range(1100))
+            expected = codec.context_digest(range(1024), salt)
+            connector._identity = mock.Mock(
+                side_effect=AssertionError(
+                    "prompt digest must reuse its immutable identity salt"
+                )
+            )
+
+            actual = connector._digest(tokens, 1024)
+
+        self.assertEqual(actual, expected)
+
     def test_mutable_target_identity_is_rejected_at_startup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(

@@ -22,7 +22,7 @@ import struct
 import sys
 from array import array
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import Iterable, Mapping, Sequence
 
 CHUNK_TOKENS = 256
 _POSITION_STRUCT = struct.Struct("<I")
@@ -33,11 +33,11 @@ class CodecError(ValueError):
     fail-closed cache miss; it must never crash a serving process."""
 
 
-def _pack_u32(values: Sequence[int], label: str) -> bytes:
-    """Pack unsigned 32-bit integers in the frozen little-endian ABI.
+def _u32_array(values: Iterable[int], label: str) -> array:
+    """Collect unsigned 32-bit integers in the frozen little-endian ABI.
 
-    ``array`` performs the conversion in C, avoiding one Python ``bytes``
-    allocation per token/position on large contexts.
+    ``array`` performs the conversion in C, avoiding one Python object per
+    token or position on large contexts.
     """
     try:
         packed = array("I", values)
@@ -47,7 +47,13 @@ def _pack_u32(values: Sequence[int], label: str) -> bytes:
         raise CodecError("platform unsigned-int width does not match cache ABI")
     if sys.byteorder != "little":
         packed.byteswap()
-    return packed.tobytes()
+    return packed
+
+
+def _pack_u32(values: Iterable[int], label: str) -> bytes:
+    """Pack unsigned 32-bit integers as immutable bytes."""
+
+    return _u32_array(values, label).tobytes()
 
 
 def owned_positions(
@@ -83,14 +89,34 @@ def local_slots_for_positions(
     return tuple(slots)
 
 
-def context_digest(token_ids: Sequence[int], identity_salt: str) -> str:
+def context_digest(token_ids: Iterable[int], identity_salt: str) -> str:
     """Content digest for a block-aligned prompt span. The identity salt
     binds the digest to the cache identity so distinct configurations can
     never alias to the same key even inside one store root."""
+    return context_prefix_digest(token_ids, identity_salt, token_count=None)
+
+
+def context_prefix_digest(
+    token_ids: Iterable[int],
+    identity_salt: str,
+    *,
+    token_count: int | None,
+) -> str:
+    """Digest a packed token prefix without allocating a Python list slice."""
+
+    packed = _u32_array(token_ids, "token_ids")
+    if token_count is None:
+        token_count = len(packed)
+    if (
+        isinstance(token_count, bool)
+        or not isinstance(token_count, int)
+        or not 0 <= token_count <= len(packed)
+    ):
+        raise CodecError("token_count must identify a prefix of token_ids")
     digest = hashlib.sha256()
     digest.update(identity_salt.encode("ascii"))
     digest.update(b"\x00")
-    digest.update(_pack_u32(token_ids, "token_ids"))
+    digest.update(memoryview(packed).cast("B")[: token_count * packed.itemsize])
     return digest.hexdigest()
 
 
