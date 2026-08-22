@@ -1,5 +1,9 @@
 # SparkCache
 
+> [!WARNING]
+> **Alpha research software.** Use for evaluation; APIs, cache formats, and
+> supported profiles may change.
+
 SparkCache is a persistent, rank-local NVMe context cache for vLLM's
 KV-Connector-V1 interface. Each tensor-parallel worker stores the KV state it
 owns and restores that state from its own disk after an engine restart. Cache
