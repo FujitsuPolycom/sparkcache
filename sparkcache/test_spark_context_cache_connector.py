@@ -2132,6 +2132,77 @@ class SweepTests(unittest.TestCase):
 
 
 class AsyncStoreTests(unittest.TestCase):
+    def test_under_limit_commit_does_not_reread_its_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                64,
+                extra_config={
+                    "spark_cache_max_bytes": str(1 << 30),
+                    "spark_cache_low_watermark_bytes": str(900 << 20),
+                },
+            )
+            connector.register_kv_caches(_make_pools(8, 64))
+            plan = _ReqPlan("fast-path", "2" * 64, 1024, (3, 0, 5, 1), True)
+            original_lookup = connector._store.lookup
+            connector._store.lookup = mock.Mock(
+                side_effect=AssertionError(
+                    "an under-limit commit must not reread its published manifest"
+                )
+            )
+            connector.bind_connector_metadata(
+                SparkCacheConnectorMetadata(plans=[plan])
+            )
+
+            connector.wait_for_save()
+            self.assertTrue(connector.wait_for_pending_stores(timeout=5))
+            connector._store.lookup = original_lookup
+
+            self.assertIn(plan.digest, connector._held)
+            self.assertEqual(connector.counters["store_committed"], 1)
+            self.assertTrue(
+                original_lookup(connector._identity(0), plan.digest).is_hit
+            )
+            connector.shutdown()
+
+    def test_successful_maintenance_report_identifies_evicted_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                64,
+                extra_config={
+                    "spark_cache_max_bytes": "1",
+                    "spark_cache_low_watermark_bytes": "1",
+                },
+            )
+            connector.register_kv_caches(_make_pools(8, 64))
+            plan = _ReqPlan("reported-eviction", "6" * 64, 1024, (3, 0, 5, 1), True)
+            entry = EntryKey(connector._identity(0).storage_key, plan.digest)
+            connector._store.maintain = mock.Mock(
+                return_value=MaintenanceReport(
+                    manifests_evicted=1,
+                    evicted_entries=(entry,),
+                )
+            )
+            connector._store.lookup = mock.Mock(
+                side_effect=AssertionError(
+                    "a successful maintenance report is authoritative"
+                )
+            )
+            connector.bind_connector_metadata(
+                SparkCacheConnectorMetadata(plans=[plan])
+            )
+
+            connector.wait_for_save()
+            self.assertTrue(connector.wait_for_pending_stores(timeout=5))
+            connector.shutdown()
+
+        self.assertNotIn(plan.digest, connector._held)
+        self.assertEqual(connector.counters["store_evicted"], 1)
+        self.assertEqual(connector.counters["store_failed"], 0)
+
     def test_partial_maintenance_failure_never_advertises_removed_manifest(
         self,
     ) -> None:
