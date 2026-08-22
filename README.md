@@ -16,10 +16,12 @@ transfer to another package version, model, topology, or vLLM source contract.
 Other combinations are implemented, research-only, or unsupported as stated
 in that table.
 
-Source version `0.1.0a2` is **implemented** and passed GPU-free, packaging,
-four-host capacity, invalid-manifest, corruption, and runtime-import gates. It
-has not inherited `0.1.0a1`'s live model qualification. Release notes and
-qualification records identify the status of each immutable artifact.
+Version `0.1.0a2` is **qualified** for the GLM-5.2 TP4/DCP4 persistent
+store/restart/external-restore lane recorded in
+[`GLM52_A2_LIVE_VALIDATION.md`](GLM52_A2_LIVE_VALIDATION.md). Its DeepSeek
+profiles remain **implemented** and have not inherited `0.1.0a1`'s live
+qualification. Release notes and qualification records identify the status of
+each immutable artifact.
 
 ## Installation
 
