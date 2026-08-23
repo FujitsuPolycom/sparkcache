@@ -63,7 +63,7 @@ from sparkcache.spark_context_cache_codec import (
     build_layer_plans,
     chunk_count,
     classify_layer,
-    context_digest,
+    context_prefix_digest,
     local_slots_for_positions,
     owned_positions,
     pack_positions,
@@ -87,6 +87,7 @@ from sparkcache.spark_context_cache_hybrid import (
 from sparkcache.spark_context_cache_store import (
     CacheIdentity,
     ContextChunk,
+    EntryKey,
     MaintenanceReport,
     ManifestStore,
     StateRecord,
@@ -508,6 +509,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._native_arena_bytes = config.native_arena_bytes
         self._native_io_workers = config.native_io_workers
         self._identity_base = config.identity_base
+        self._context_digest_salt = config.build_identity(0, 0).storage_key
         self._scheduler_probe = config.scheduler_probe
         self._shard_rank = 0
         self._store = ManifestStore(self._root)
@@ -733,10 +735,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     def _digest(self, token_ids: list[int], span: int) -> str:
         # The salt must be identical on every role and rank: it names the
         # shared context, not this process's shard. Pin both shard fields to
-        # zero rather than letting the worker role substitute its physical
-        # rank, which would fork the digest namespace per worker.
-        salt = self._identity(0, tp_shard_rank=0).storage_key
-        return context_digest(token_ids[:span], salt)
+        # zero at construction rather than letting the worker role substitute
+        # its physical rank, which would fork the namespace per worker.
+        return context_prefix_digest(
+            token_ids,
+            self._context_digest_salt,
+            token_count=span,
+        )
 
     def _aligned_span(self, prompt_len: int) -> int:
         span = (prompt_len - 1) // self._block_size * self._block_size
@@ -1420,6 +1425,36 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             )
         return report
 
+    def _post_commit_was_evicted_locked(
+        self,
+        identity: CacheIdentity,
+        context_digest: str,
+    ) -> bool:
+        """Maintain capacity; read back only when the outcome is ambiguous."""
+
+        policy = self._capacity_policy
+        maintenance_required = (
+            policy.enabled
+            and policy.max_bytes > 0
+            and self._capacity_estimated_bytes > policy.max_bytes
+        )
+        report = self._maintain_capacity_locked(wake_worker_on_unsatisfied=True)
+        if report is not None and not report.skipped_busy:
+            return EntryKey(identity.storage_key, context_digest) in (
+                report.evicted_entries
+            )
+        if not maintenance_required:
+            return False
+
+        # A failed or concurrently skipped pass cannot prove which manifests
+        # survived. Retain fail-closed readback only for that ambiguous path.
+        return not self._store.lookup(
+            identity,
+            context_digest,
+            verify_chunks=False,
+            verify_chunk_metadata=True,
+        ).is_hit
+
     def _note_capacity_commit(self, encoded_bytes: int) -> None:
         with self._capacity_lock:
             self._note_capacity_commit_locked(encoded_bytes)
@@ -1689,10 +1724,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
 
     def _capacity_worker_main(self) -> None:
         ttl_seconds = self._capacity_policy.ttl_seconds
+        # TTL expiry needs a clock-driven pass. With TTL disabled, startup
+        # performs one exact scan and commit accounting wakes this worker on
+        # pressure or retry; an idle timer would only rescan an unchanged tree.
         interval = (
             min(60, max(1, ttl_seconds // 2))
             if ttl_seconds
-            else 300
+            else None
         )
         pending: dict[str, _PendingStreamingCommit] = {}
         retry_unsatisfied = False
@@ -2515,15 +2553,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     self._note_capacity_commit_locked(
                         receipt.allocated_bytes_upper_bound
                     )
-                    self._maintain_capacity_locked(
-                        wake_worker_on_unsatisfied=True
-                    )
-                    evicted = not self._store.lookup(
+                    evicted = self._post_commit_was_evicted_locked(
                         snapshot.identity,
                         snapshot.plan.digest,
-                        verify_chunks=False,
-                        verify_chunk_metadata=True,
-                    ).is_hit
+                    )
                     logger.info(
                         "spark-context-cache: rank %d committed %d tokens"
                         " digest=%s manifest=%s in %.1f ms",
@@ -2599,15 +2632,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self._note_capacity_commit_locked(
                 receipt.allocated_bytes_upper_bound
             )
-            self._maintain_capacity_locked(
-                wake_worker_on_unsatisfied=True
-            )
-            evicted = not self._store.lookup(
+            evicted = self._post_commit_was_evicted_locked(
                 snapshot.identity,
                 plan.digest,
-                verify_chunks=False,
-                verify_chunk_metadata=True,
-            ).is_hit
+            )
             if evicted:
                 with self._store_cv:
                     self._held.discard(plan.digest)

@@ -187,6 +187,21 @@ class CodecTests(unittest.TestCase):
             codec.context_digest(tokens, "salt-b"),
         )
 
+    def test_prefix_digest_matches_explicit_token_slice(self) -> None:
+        tokens = list(range(300))
+        self.assertEqual(
+            codec.context_prefix_digest(tokens, "identity", token_count=256),
+            codec.context_digest(tokens[:256], "identity"),
+        )
+        for invalid in (True, -1, 301):
+            with self.subTest(token_count=invalid):
+                with self.assertRaises(codec.CodecError):
+                    codec.context_prefix_digest(
+                        tokens,
+                        "identity",
+                        token_count=invalid,
+                    )
+
     def test_vectorized_integer_codec_matches_v1_wire_bytes(self) -> None:
         tokens = [0, 1, 255, 65535, 2**32 - 1]
         v1_reference_bytes = b"".join(
@@ -465,6 +480,28 @@ def _deepseek_tp4_group_tables(
 
 
 class CheckpointIdentityTests(unittest.TestCase):
+    def test_prompt_digest_reuses_identity_salt_without_slicing_tokens(self) -> None:
+        class UnsliceableTokens(list[int]):
+            def __getitem__(self, index):
+                if isinstance(index, slice):
+                    raise AssertionError("prompt digest must not copy a token prefix")
+                return super().__getitem__(index)
+
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(Path(directory), 0)
+            salt = connector._identity(0, tp_shard_rank=0).storage_key
+            tokens = UnsliceableTokens(range(1100))
+            expected = codec.context_digest(range(1024), salt)
+            connector._identity = mock.Mock(
+                side_effect=AssertionError(
+                    "prompt digest must reuse its immutable identity salt"
+                )
+            )
+
+            actual = connector._digest(tokens, 1024)
+
+        self.assertEqual(actual, expected)
+
     def test_mutable_target_identity_is_rejected_at_startup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(
@@ -1413,6 +1450,54 @@ class StartupDiscoveryTests(unittest.TestCase):
 
 
 class CapacityPolicyConnectorTests(unittest.TestCase):
+    def test_capacity_worker_waits_for_events_when_ttl_is_disabled(self) -> None:
+        timeouts: list[float | None] = []
+        connector = object.__new__(SparkContextCacheConnector)
+        connector._capacity_policy = CapacityPolicy(
+            max_bytes=1 << 20,
+            low_watermark_bytes=900 << 10,
+            ttl_seconds=0,
+        )
+        connector._capacity_stop = threading.Event()
+
+        class StopAfterWait:
+            def wait(self, timeout: float | None = None) -> bool:
+                timeouts.append(timeout)
+                connector._capacity_stop.set()
+                return False
+
+            def clear(self) -> None:
+                return
+
+        connector._capacity_wakeup = StopAfterWait()
+        connector._capacity_worker_main()
+
+        self.assertEqual(timeouts, [None])
+
+    def test_capacity_worker_keeps_periodic_ttl_passes(self) -> None:
+        timeouts: list[float | None] = []
+        connector = object.__new__(SparkContextCacheConnector)
+        connector._capacity_policy = CapacityPolicy(
+            max_bytes=1 << 20,
+            low_watermark_bytes=900 << 10,
+            ttl_seconds=120,
+        )
+        connector._capacity_stop = threading.Event()
+
+        class StopAfterWait:
+            def wait(self, timeout: float | None = None) -> bool:
+                timeouts.append(timeout)
+                connector._capacity_stop.set()
+                return False
+
+            def clear(self) -> None:
+                return
+
+        connector._capacity_wakeup = StopAfterWait()
+        connector._capacity_worker_main()
+
+        self.assertEqual(timeouts, [60])
+
     def test_capacity_config_is_strict_and_defaults_low_watermark(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(
@@ -2084,6 +2169,77 @@ class SweepTests(unittest.TestCase):
 
 
 class AsyncStoreTests(unittest.TestCase):
+    def test_under_limit_commit_does_not_reread_its_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                64,
+                extra_config={
+                    "spark_cache_max_bytes": str(1 << 30),
+                    "spark_cache_low_watermark_bytes": str(900 << 20),
+                },
+            )
+            connector.register_kv_caches(_make_pools(8, 64))
+            plan = _ReqPlan("fast-path", "2" * 64, 1024, (3, 0, 5, 1), True)
+            original_lookup = connector._store.lookup
+            connector._store.lookup = mock.Mock(
+                side_effect=AssertionError(
+                    "an under-limit commit must not reread its published manifest"
+                )
+            )
+            connector.bind_connector_metadata(
+                SparkCacheConnectorMetadata(plans=[plan])
+            )
+
+            connector.wait_for_save()
+            self.assertTrue(connector.wait_for_pending_stores(timeout=5))
+            connector._store.lookup = original_lookup
+
+            self.assertIn(plan.digest, connector._held)
+            self.assertEqual(connector.counters["store_committed"], 1)
+            self.assertTrue(
+                original_lookup(connector._identity(0), plan.digest).is_hit
+            )
+            connector.shutdown()
+
+    def test_successful_maintenance_report_identifies_evicted_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                64,
+                extra_config={
+                    "spark_cache_max_bytes": "1",
+                    "spark_cache_low_watermark_bytes": "1",
+                },
+            )
+            connector.register_kv_caches(_make_pools(8, 64))
+            plan = _ReqPlan("reported-eviction", "6" * 64, 1024, (3, 0, 5, 1), True)
+            entry = EntryKey(connector._identity(0).storage_key, plan.digest)
+            connector._store.maintain = mock.Mock(
+                return_value=MaintenanceReport(
+                    manifests_evicted=1,
+                    evicted_entries=(entry,),
+                )
+            )
+            connector._store.lookup = mock.Mock(
+                side_effect=AssertionError(
+                    "a successful maintenance report is authoritative"
+                )
+            )
+            connector.bind_connector_metadata(
+                SparkCacheConnectorMetadata(plans=[plan])
+            )
+
+            connector.wait_for_save()
+            self.assertTrue(connector.wait_for_pending_stores(timeout=5))
+            connector.shutdown()
+
+        self.assertNotIn(plan.digest, connector._held)
+        self.assertEqual(connector.counters["store_evicted"], 1)
+        self.assertEqual(connector.counters["store_failed"], 0)
+
     def test_partial_maintenance_failure_never_advertises_removed_manifest(
         self,
     ) -> None:
