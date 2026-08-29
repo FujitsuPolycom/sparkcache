@@ -23,6 +23,7 @@ from sparkcache.persistent_context_cache.cache_manifest import (
     ContextChunk,
     IncompleteEntry,
     ManifestStore,
+    PageDeltaDepthExceeded,
     StateRecord,
 )
 
@@ -36,6 +37,14 @@ def _identity() -> CacheIdentity:
         tp_degree=4,
         dcp_degree=1,
         chunk_tokens=256,
+    )
+
+
+def _tail_identity(**changes: Any) -> CacheIdentity:
+    return dataclasses.replace(
+        _identity(),
+        publication_schema="tail-cow-v1",
+        **changes,
     )
 
 
@@ -89,6 +98,405 @@ def _clear_once_in_subprocess(
 
 
 class ManifestStoreTests(unittest.TestCase):
+    def test_page_extension_materializes_full_snapshot_after_base_root_removal(
+        self,
+    ) -> None:
+        from sparkcache.spark_context_cache_codec import (
+            context_prefix_digest,
+            pack_positions,
+        )
+        from sparkcache.spark_context_cache_hybrid import (
+            PageGroup,
+            PageLayer,
+            PageLayout,
+            encode_page_snapshot,
+            split_snapshot,
+        )
+
+        identity = dataclasses.replace(
+            _identity(),
+            record_schema=("target_ckv", "logical_positions"),
+            publication_schema="page-tail-cow-v1",
+        )
+        layout = PageLayout(
+            (PageGroup(256, (PageLayer("page", "u8", (1024,), 1024),)),)
+        )
+        tokens = tuple(range(1024))
+        salt = "page-tail-store-test"
+        base_digest = context_prefix_digest(tokens, salt, token_count=256)
+        result_digest = context_prefix_digest(tokens, salt, token_count=512)
+        third_digest = context_prefix_digest(tokens, salt, token_count=768)
+        base_snapshot = encode_page_snapshot(layout, (1,), {"page": b"A" * 1024})
+        result_snapshot = encode_page_snapshot(
+            layout,
+            (2,),
+            {"page": b"A" * 1024 + b"B" * 1024},
+        )
+        third_snapshot = encode_page_snapshot(
+            layout,
+            (3,),
+            {"page": b"A" * 1024 + b"B" * 1024 + b"C" * 1024},
+        )
+        fourth_snapshot = encode_page_snapshot(
+            layout,
+            (4,),
+            {"page": (b"A" * 1024 + b"B" * 1024 + b"C" * 1024 + b"D" * 1024)},
+        )
+        base_chunks = tuple(
+            ContextChunk(
+                index * 256,
+                (index + 1) * 256,
+                {
+                    StateRecord.LOGICAL_POSITIONS: pack_positions(
+                        range(index * 256, (index + 1) * 256)
+                    ),
+                    StateRecord.TARGET_CKV: payload,
+                },
+            )
+            for index, payload in enumerate(split_snapshot(base_snapshot, 1))
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ManifestStore(root)
+            store.commit(
+                identity=identity,
+                context_digest=base_digest,
+                chunks=base_chunks,
+                span_tokens=256,
+            )
+
+            page_receipt = store.commit_page_extension(
+                identity=identity,
+                base_context_digest=base_digest,
+                token_ids=tokens,
+                identity_salt=salt,
+                layout=layout,
+                base_block_counts=(1,),
+                result_block_counts=(2,),
+                base_boundary_tokens=256,
+                result_boundary_tokens=512,
+                result_snapshot=result_snapshot,
+            )
+            page_root_path = (
+                root / "manifests" / identity.storage_key / f"{result_digest}.json"
+            )
+            page_root = json.loads(page_root_path.read_bytes())
+            page_objects = [
+                page_root_path,
+                *(
+                    root / "chunks" / f"{item['sha256']}.spcc"
+                    for item in page_root["delta_chunks"]
+                ),
+            ]
+            self.assertGreaterEqual(
+                page_receipt.allocated_bytes_upper_bound,
+                sum(
+                    cache_manifest._allocated_bytes(path.stat())
+                    for path in page_objects
+                ),
+            )
+            chained_receipt = store.commit_page_extension(
+                identity=identity,
+                base_context_digest=result_digest,
+                token_ids=tokens,
+                identity_salt=salt,
+                layout=layout,
+                base_block_counts=(2,),
+                result_block_counts=(3,),
+                base_boundary_tokens=512,
+                result_boundary_tokens=768,
+                result_snapshot=third_snapshot,
+            )
+            chained_root_path = (
+                root / "manifests" / identity.storage_key / f"{third_digest}.json"
+            )
+            chained_root = json.loads(chained_root_path.read_bytes())
+            chained_objects = [
+                chained_root_path,
+                *(
+                    root / "chunks" / f"{item['sha256']}.spcc"
+                    for item in chained_root["delta_chunks"]
+                ),
+            ]
+            self.assertGreaterEqual(
+                chained_receipt.allocated_bytes_upper_bound,
+                sum(
+                    cache_manifest._allocated_bytes(path.stat())
+                    for path in chained_objects
+                ),
+            )
+            with self.assertRaises(PageDeltaDepthExceeded):
+                store.commit_page_extension(
+                    identity=identity,
+                    base_context_digest=third_digest,
+                    token_ids=tokens,
+                    identity_salt=salt,
+                    layout=layout,
+                    base_block_counts=(3,),
+                    result_block_counts=(4,),
+                    base_boundary_tokens=768,
+                    result_boundary_tokens=1024,
+                    result_snapshot=fourth_snapshot,
+                )
+            (root / "manifests" / identity.storage_key / f"{base_digest}.json").unlink()
+            (
+                root / "manifests" / identity.storage_key / f"{result_digest}.json"
+            ).unlink()
+            store.maintain(CapacityPolicy(max_bytes=10**9, low_watermark_bytes=10**9))
+
+            lookup = store.lookup(identity, third_digest)
+            self.assertTrue(lookup.is_hit, lookup.reason)
+            self.assertEqual(lookup.root_kind, "page_delta")
+            with self.assertRaisesRegex(ValueError, "restore_page_snapshot"):
+                store.restore(lookup)
+            self.assertEqual(
+                store.restore_page_snapshot(
+                    lookup,
+                    layout=layout,
+                    result_block_counts=(3,),
+                    result_boundary_tokens=768,
+                ),
+                third_snapshot,
+            )
+
+    def test_tail_publication_uses_a_distinct_cache_namespace(self) -> None:
+        snapshot_identity = _identity()
+        tail_identity = _tail_identity()
+
+        self.assertNotEqual(snapshot_identity.storage_key, tail_identity.storage_key)
+        self.assertNotIn("publication_schema", snapshot_identity.to_wire())
+        self.assertEqual(
+            tail_identity.to_wire()["publication_schema"],
+            "tail-cow-v1",
+        )
+
+    def test_extension_publishes_only_tail_payload_and_restores_full_context(
+        self,
+    ) -> None:
+        from sparkcache.spark_context_cache_codec import context_prefix_digest
+
+        identity = _tail_identity()
+        token_ids = tuple(range(512))
+        salt = "tail-publication-test"
+        base_digest = context_prefix_digest(token_ids, salt, token_count=256)
+        result_digest = context_prefix_digest(token_ids, salt, token_count=512)
+        base = _variant_chunk(b"base")
+        tail = ContextChunk(
+            256,
+            512,
+            dict(_variant_chunk(b"tail").records),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ManifestStore(root)
+            store.commit(
+                identity=identity,
+                context_digest=base_digest,
+                chunks=[base],
+                span_tokens=256,
+            )
+            base_chunk = next((root / "chunks").glob("*.spcc"))
+
+            receipt = store.commit_extension(
+                identity=identity,
+                base_context_digest=base_digest,
+                token_ids=token_ids,
+                identity_salt=salt,
+                tail_chunks=[tail],
+            )
+
+            self.assertEqual(receipt.committed_tokens, 512)
+            self.assertEqual(len(tuple((root / "chunks").glob("*.spcc"))), 2)
+            self.assertTrue(base_chunk.exists())
+            encoded = (
+                root / "manifests" / identity.storage_key / f"{result_digest}.json"
+            ).read_bytes()
+            manifest = json.loads(encoded)
+            self.assertEqual(manifest["schema"], "sparkcache-tail-manifest/v1")
+            self.assertEqual(len(manifest["tail_chunks"]), 1)
+            committed_paths = [
+                root / "chunks" / f"{manifest['tail_chunks'][0]['sha256']}.spcc",
+                root / "manifests" / identity.storage_key / f"{result_digest}.json",
+                *(root / "prefix-index" / identity.storage_key).glob("*.spix"),
+            ]
+            self.assertGreaterEqual(
+                receipt.allocated_bytes_upper_bound,
+                sum(
+                    cache_manifest._allocated_bytes(path.stat())
+                    for path in committed_paths
+                ),
+            )
+            lookup = store.lookup(identity, result_digest)
+            self.assertTrue(lookup.is_hit, lookup.reason)
+            self.assertEqual(store.restore(lookup), (base, tail))
+
+    def test_extension_replaces_partial_terminal_without_mutating_base(self) -> None:
+        from sparkcache.spark_context_cache_codec import context_prefix_digest
+
+        identity = _tail_identity()
+        token_ids = tuple(range(512))
+        salt = "partial-terminal-test"
+        base_digest = context_prefix_digest(token_ids, salt, token_count=300)
+        result_digest = context_prefix_digest(token_ids, salt, token_count=512)
+        first = _variant_chunk(b"first")
+        partial = ContextChunk(256, 300, dict(_variant_chunk(b"partial").records))
+        replacement = ContextChunk(
+            256,
+            512,
+            dict(_variant_chunk(b"replacement").records),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            store = ManifestStore(directory)
+            store.commit(
+                identity=identity,
+                context_digest=base_digest,
+                chunks=[first, partial],
+                span_tokens=300,
+            )
+
+            store.commit_extension(
+                identity=identity,
+                base_context_digest=base_digest,
+                token_ids=token_ids,
+                identity_salt=salt,
+                tail_chunks=[replacement],
+            )
+
+            base = store.lookup(identity, base_digest)
+            extended = store.lookup(identity, result_digest)
+            self.assertEqual(store.restore(base), (first, partial))
+            self.assertEqual(store.restore(extended), (first, replacement))
+
+    def test_extension_gc_preserves_old_alias_and_shared_base_chunks(self) -> None:
+        from sparkcache.spark_context_cache_codec import context_prefix_digest
+
+        identity = _tail_identity()
+        token_ids = tuple(range(768))
+        salt = "tail-reference-gc-test"
+        base_digest = context_prefix_digest(token_ids, salt, token_count=512)
+        alias_digest = context_prefix_digest(token_ids, salt, token_count=256)
+        result_digest = context_prefix_digest(token_ids, salt, token_count=768)
+        chunks = (
+            _variant_chunk(b"base-zero"),
+            ContextChunk(256, 512, dict(_variant_chunk(b"base-one").records)),
+        )
+        tail = ContextChunk(512, 768, dict(_variant_chunk(b"tail-two").records))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ManifestStore(root)
+            store.commit(
+                identity=identity,
+                context_digest=base_digest,
+                chunks=chunks,
+                span_tokens=512,
+            )
+            store.publish_prefix_aliases(
+                identity=identity,
+                source_context_digest=base_digest,
+                token_ids=token_ids,
+                identity_salt=salt,
+                prefix_tokens=(256,),
+                storage_mode="per_token_rows",
+            )
+            store.commit_extension(
+                identity=identity,
+                base_context_digest=base_digest,
+                token_ids=token_ids,
+                identity_salt=salt,
+                tail_chunks=(tail,),
+            )
+            (root / "manifests" / identity.storage_key / f"{base_digest}.json").unlink()
+
+            report = store.maintain(
+                CapacityPolicy(max_bytes=10**9, low_watermark_bytes=10**9)
+            )
+
+            self.assertEqual(report.orphan_chunks_deleted, 0)
+            alias = store.lookup(
+                identity,
+                alias_digest,
+                storage_mode="per_token_rows",
+            )
+            extension = store.lookup(identity, result_digest)
+            self.assertEqual(store.restore(alias), (chunks[0],))
+            self.assertEqual(store.restore(extension), (*chunks, tail))
+
+    def test_extension_rejects_corrupt_descriptor_chain_and_wrong_rank(self) -> None:
+        from sparkcache.spark_context_cache_codec import context_prefix_digest
+
+        identity = _tail_identity(tp_shard_rank=0)
+        other_rank = dataclasses.replace(identity, tp_shard_rank=1)
+        token_ids = tuple(range(512))
+        salt = "tail-integrity-test"
+        base_digest = context_prefix_digest(token_ids, salt, token_count=256)
+        result_digest = context_prefix_digest(token_ids, salt, token_count=512)
+        tail = ContextChunk(256, 512, dict(_variant_chunk(b"tail").records))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ManifestStore(root)
+            store.commit(
+                identity=identity,
+                context_digest=base_digest,
+                chunks=[_variant_chunk(b"base")],
+            )
+            store.commit_extension(
+                identity=identity,
+                base_context_digest=base_digest,
+                token_ids=token_ids,
+                identity_salt=salt,
+                tail_chunks=(tail,),
+            )
+            manifest_path = (
+                root / "manifests" / identity.storage_key / f"{result_digest}.json"
+            )
+            manifest = json.loads(manifest_path.read_bytes())
+            segment = (
+                root
+                / "prefix-index"
+                / identity.storage_key
+                / f"{manifest['base_tail_segment_sha256']}.spix"
+            )
+            segment.write_bytes(segment.read_bytes() + b"corrupt")
+
+            damaged = store.lookup(identity, result_digest)
+            self.assertFalse(damaged.is_hit)
+            self.assertEqual(damaged.reason, "corrupt")
+
+            wrong_root = (
+                root / "manifests" / other_rank.storage_key / manifest_path.name
+            )
+            wrong_root.parent.mkdir(parents=True)
+            wrong_root.write_bytes(manifest_path.read_bytes())
+            wrong_rank = store.lookup(other_rank, result_digest)
+            self.assertFalse(wrong_rank.is_hit)
+            self.assertEqual(wrong_rank.reason, "incompatible")
+
+    def test_extension_derives_and_checks_token_commitments_internally(self) -> None:
+        from sparkcache.spark_context_cache_codec import context_prefix_digest
+
+        identity = _tail_identity()
+        original = tuple(range(512))
+        changed = (*original[:255], 9999, *original[256:])
+        salt = "tail-token-commitment-test"
+        base_digest = context_prefix_digest(original, salt, token_count=256)
+        tail = ContextChunk(256, 512, dict(_variant_chunk(b"tail").records))
+        with tempfile.TemporaryDirectory() as directory:
+            store = ManifestStore(directory)
+            store.commit(
+                identity=identity,
+                context_digest=base_digest,
+                chunks=[_variant_chunk(b"base")],
+            )
+
+            with self.assertRaisesRegex(CommitConflict, "token sequence"):
+                store.commit_extension(
+                    identity=identity,
+                    base_context_digest=base_digest,
+                    token_ids=changed,
+                    identity_salt=salt,
+                    tail_chunks=(tail,),
+                )
+
     def test_clear_once_preserves_markers_and_non_cache_siblings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory)
@@ -340,7 +748,9 @@ class ManifestStoreTests(unittest.TestCase):
         self,
     ) -> None:
         identity = _identity()
-        digests = [hashlib.sha256(f"entry-{index}".encode()).hexdigest() for index in range(3)]
+        digests = [
+            hashlib.sha256(f"entry-{index}".encode()).hexdigest() for index in range(3)
+        ]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             store = ManifestStore(root)
@@ -431,9 +841,7 @@ class ManifestStoreTests(unittest.TestCase):
                     context_digest=digest,
                     chunks=[_variant_chunk(f"live-{index}".encode())],
                 )
-                manifest = (
-                    root / "manifests" / identity.storage_key / f"{digest}.json"
-                )
+                manifest = root / "manifests" / identity.storage_key / f"{digest}.json"
                 mtime_ns = (index + 1) * 10**9
                 os.utime(manifest, ns=(mtime_ns, mtime_ns))
 
@@ -540,9 +948,7 @@ class ManifestStoreTests(unittest.TestCase):
             transaction.append_chunk(_chunk())
             chunk_path = next((root / "chunks").glob("*.spcc"))
 
-            busy = store.maintain(
-                CapacityPolicy(max_bytes=1, low_watermark_bytes=1)
-            )
+            busy = store.maintain(CapacityPolicy(max_bytes=1, low_watermark_bytes=1))
             self.assertTrue(busy.skipped_busy)
             self.assertTrue(chunk_path.exists())
 
@@ -635,9 +1041,7 @@ class ManifestStoreTests(unittest.TestCase):
                 store.maintain(CapacityPolicy(max_bytes=1, low_watermark_bytes=1))
 
             self.assertTrue(chunk_path.exists())
-            retry = store.maintain(
-                CapacityPolicy(max_bytes=1, low_watermark_bytes=1)
-            )
+            retry = store.maintain(CapacityPolicy(max_bytes=1, low_watermark_bytes=1))
             self.assertEqual(retry.orphan_chunks_deleted, 1)
             self.assertFalse(chunk_path.exists())
 
@@ -686,9 +1090,7 @@ class ManifestStoreTests(unittest.TestCase):
 
     def test_compatibility_commit_publishes_bounded_macro_batches(self) -> None:
         context_digest = hashlib.sha256(b"compatibility-macro-batch").hexdigest()
-        chunks = tuple(
-            _chunk(index * 256, (index + 1) * 256) for index in range(17)
-        )
+        chunks = tuple(_chunk(index * 256, (index + 1) * 256) for index in range(17))
 
         with tempfile.TemporaryDirectory() as directory:
             store = ManifestStore(directory)
@@ -811,7 +1213,10 @@ class ManifestStoreTests(unittest.TestCase):
             lookup = store.lookup(_identity(), context_digest)
             self.assertTrue(lookup.is_hit, lookup.reason)
             self.assertEqual(
-                [(chunk.logical_start, chunk.logical_end) for chunk in store.restore(lookup)],
+                [
+                    (chunk.logical_start, chunk.logical_end)
+                    for chunk in store.restore(lookup)
+                ],
                 [(0, 256), (256, 384)],
             )
 

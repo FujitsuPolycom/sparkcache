@@ -22,6 +22,7 @@ def build_command(
     sparkcache_revision: str,
     base_image_licenses: str,
     output_image: str,
+    containerfile: str = "deploy/glm53_flash/Containerfile",
 ) -> list[str]:
     if SHA256_ID.fullmatch(base_image_id) is None:
         raise ValueError("base_image_id must be sha256 followed by 64 lowercase hex")
@@ -31,6 +32,13 @@ def build_command(
         raise ValueError("sparkcache_revision must be a 40-character Git commit")
     if not base_image_licenses.strip():
         raise ValueError("base_image_licenses must identify the parent image terms")
+    recipe = (repository / containerfile).resolve()
+    try:
+        recipe.relative_to(repository.resolve())
+    except ValueError as exc:
+        raise ValueError("containerfile must remain inside the repository") from exc
+    if repository.exists() and not recipe.is_file():
+        raise ValueError(f"containerfile is absent: {containerfile}")
     inspected = subprocess.run(
         ["docker", "image", "inspect", "--format", "{{.Id}}", base_image],
         check=True,
@@ -45,7 +53,7 @@ def build_command(
         "docker",
         "build",
         "-f",
-        str(repository / "deploy/glm53_flash/Containerfile"),
+        str(recipe),
         "--build-arg",
         f"BASE_IMAGE={base_image}",
         "--build-arg",
@@ -77,6 +85,11 @@ def main() -> int:
         ),
     )
     parser.add_argument("--output-image", required=True)
+    parser.add_argument(
+        "--containerfile",
+        default="deploy/glm53_flash/Containerfile",
+        help="repository-relative SparkCache overlay recipe",
+    )
     args = parser.parse_args()
     repository = args.repository.resolve()
     sparkcache_revision = args.sparkcache_revision
@@ -95,6 +108,7 @@ def main() -> int:
         sparkcache_revision=sparkcache_revision,
         base_image_licenses=args.base_image_licenses,
         output_image=args.output_image,
+        containerfile=args.containerfile,
     )
     subprocess.run(command, check=True)
     return 0

@@ -12,6 +12,7 @@ from sparkcache.persistent_context_cache.cache_manifest import (
     LookupResult,
     MaintenanceReport,
     ManifestStore,
+    PageDeltaDepthExceeded,
     StateRecord,
     validate_clear_once_request,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "LookupResult",
     "MaintenanceReport",
     "ManifestStore",
+    "PageDeltaDepthExceeded",
     "StateRecord",
     "validate_clear_once_request",
 ]

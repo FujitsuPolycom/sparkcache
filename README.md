@@ -285,13 +285,26 @@ CUDA execution requires a CUDA 13 build from
 
 ## Limitations and research work
 
-Tail-only publication is **unsupported**. Publishing a grown context can write
-another complete snapshot. Row-prefix aliases reduce lookup metadata and reuse
-payload objects; they do not make publication incremental.
+Tail-only publication for `per_token_rows` is **implemented** with GPU-free
+regression coverage and no live model-serving qualification.
+The opt-in `tail-cow-v1` publication schema writes only immutable replacement
+and extension chunks after an all-rank reusable boundary. It uses a distinct
+cache namespace. Default `snapshot-v1` deployments retain their existing wire
+identity and full-snapshot publication behavior.
 
-Opaque HMA snapshots cannot be shortened by truncating chunk lists. Tail-only
-GLM storage requires a page-semantic physical format, byte-exact restore tests,
-and a distinct cache namespace.
+Tail-only publication for `block_pages_v1` is also **implemented** with
+GPU-free regression coverage and no live model-serving qualification. The
+page-semantic `sparkcache-hybrid-page-delta/v1` codec binds
+the exact base snapshot and recurrent/sliding boundary and reuses only
+byte-identical opaque pages. Restore reconstructs and verifies the complete
+snapshot before Python or native page placement. Arbitrary earlier-prefix
+aliases cannot be derived from opaque page snapshots.
+
+Opaque HMA snapshots cannot be shortened by truncating chunk lists. SparkCache
+therefore uses the page-semantic format and distinct namespace described above.
+At most two page deltas may form one graph; the following publication compacts
+the context into a fresh flat snapshot. Live GLM latency and write-volume
+qualification for this path remains outstanding.
 
 Sparse row-prefix aliases are **implemented** but have no live model-serving
 qualification. Their behavior is covered by GPU-free publication, discovery,

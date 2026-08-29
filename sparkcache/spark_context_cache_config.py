@@ -52,7 +52,9 @@ def _nonnegative_config_int(value: Any, label: str) -> int:
             raise ValueError("Boolean and floating values are not integer limits")
         parsed = int(value)
     except (OverflowError, TypeError, ValueError) as error:
-        raise RuntimeError(f"spark-context-cache: {label} must be an integer") from error
+        raise RuntimeError(
+            f"spark-context-cache: {label} must be an integer"
+        ) from error
     if parsed < 0:
         raise RuntimeError(f"spark-context-cache: {label} must be non-negative")
     return parsed
@@ -132,9 +134,7 @@ def _recurrent_state_identity(
 
     per_layer = getattr(spec, "kv_cache_specs", None)
     layer_specs = tuple(
-        per_layer[name]
-        if isinstance(per_layer, dict) and name in per_layer
-        else spec
+        per_layer[name] if isinstance(per_layer, dict) and name in per_layer else spec
         for name in layer_names
     )
     recurrent = tuple(
@@ -215,6 +215,7 @@ class ConnectorConfig:
     block_size: int
     profile: Any
     storage_mode: str
+    publication_schema: str
     group_topology: tuple[Mapping[str, Any], ...]
     chunk_tokens: int
     root: str
@@ -291,6 +292,25 @@ def parse_connector_config(
     except ProfileError as error:
         raise RuntimeError(f"spark-context-cache: {error}") from error
     storage_mode = profile.storage_mode
+    publication_schema_raw = str(
+        extra(
+            "spark_cache_publication_schema",
+            os.environ.get(
+                "SPARK_CONTEXT_CACHE_PUBLICATION_SCHEMA",
+                "snapshot-v1",
+            ),
+        )
+    )
+    if publication_schema_raw not in ("snapshot-v1", "tail-cow-v1"):
+        raise RuntimeError(
+            "spark-context-cache: spark_cache_publication_schema must be"
+            " 'snapshot-v1' or 'tail-cow-v1'"
+        )
+    publication_schema = ""
+    if publication_schema_raw == "tail-cow-v1":
+        publication_schema = (
+            "page-tail-cow-v1" if storage_mode == "block_pages_v1" else "tail-cow-v1"
+        )
     group_topology = kv_group_topology(kv_cache_config)
     if storage_mode == "block_pages_v1" and not group_topology:
         raise RuntimeError(
@@ -395,6 +415,11 @@ def parse_connector_config(
     if storage_mode == "block_pages_v1" and streaming_snapshots_enabled:
         raise RuntimeError(
             "spark-context-cache: block-page storage does not support"
+            " streaming snapshots"
+        )
+    if publication_schema and streaming_snapshots_enabled:
+        raise RuntimeError(
+            "spark-context-cache: tail-cow-v1 publication does not support"
             " streaming snapshots"
         )
     native_restore_enabled = extra(
@@ -511,9 +536,7 @@ def parse_connector_config(
     if storage_mode == "block_pages_v1":
         quantization_layout += ":" + kv_group_topology_digest(kv_cache_config)
     record_schema = (
-        ("target_ckv", "logical_positions")
-        if storage_mode == "block_pages_v1"
-        else ()
+        ("target_ckv", "logical_positions") if storage_mode == "block_pages_v1" else ()
     )
     identity_base: dict[str, Any] = dict(
         target_checkpoint=target_id,
@@ -528,6 +551,8 @@ def parse_connector_config(
     )
     if record_schema:
         identity_base["record_schema"] = record_schema
+    if publication_schema:
+        identity_base["publication_schema"] = publication_schema
     try:
         profile.validate_for_deployment(
             dcp_degree=dcp_degree,
@@ -575,13 +600,11 @@ def parse_connector_config(
         max_pending_restores = int(max_pending_restores_raw)
     except (TypeError, ValueError) as error:
         raise RuntimeError(
-            "spark-context-cache: spark_cache_max_pending_restores"
-            " must be an integer"
+            "spark-context-cache: spark_cache_max_pending_restores must be an integer"
         ) from error
     if max_pending_restores < 1:
         raise RuntimeError(
-            "spark-context-cache: spark_cache_max_pending_restores"
-            " must be at least 1"
+            "spark-context-cache: spark_cache_max_pending_restores must be at least 1"
         )
     return ConnectorConfig(
         tp_degree=tp_degree,
@@ -589,6 +612,7 @@ def parse_connector_config(
         block_size=block_size,
         profile=profile,
         storage_mode=storage_mode,
+        publication_schema=publication_schema,
         group_topology=tuple(_freeze_config_value(group) for group in group_topology),
         chunk_tokens=chunk_tokens,
         root=root,

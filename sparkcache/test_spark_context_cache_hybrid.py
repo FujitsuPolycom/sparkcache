@@ -8,6 +8,8 @@ from sparkcache.spark_context_cache_hybrid import (
     PageLayer,
     PageLayout,
     decode_page_snapshot,
+    apply_page_delta,
+    encode_page_delta,
     encode_page_snapshot,
     plan_page_snapshot,
     split_snapshot,
@@ -33,6 +35,162 @@ def _layout() -> PageLayout:
 
 
 class HybridPageCodecTests(unittest.TestCase):
+    def test_page_delta_reuses_byte_identical_pages_and_round_trips(self) -> None:
+        layout = PageLayout(
+            (
+                PageGroup(256, (PageLayer("full", "u8", (1024,), 1024),)),
+                PageGroup(
+                    256,
+                    (PageLayer("recurrent", "u8", (512,), 512),),
+                    reuse_policy="recurrent_align",
+                ),
+                PageGroup(
+                    64,
+                    (PageLayer("sliding", "u8", (256,), 256),),
+                    reuse_policy="sliding",
+                    reuse_window_tokens=512,
+                ),
+            )
+        )
+        base_payloads = {
+            "full": b"A" * 2048,
+            "recurrent": b"B" * 1024,
+            "sliding": b"C" * 512,
+        }
+        result_payloads = {
+            "full": base_payloads["full"] + b"D" * 2048,
+            "recurrent": base_payloads["recurrent"] + b"E" * 512,
+            "sliding": base_payloads["sliding"] + b"F" * 256,
+        }
+        base = encode_page_snapshot(layout, (2, 2, 2), base_payloads)
+        result = encode_page_snapshot(layout, (4, 3, 3), result_payloads)
+
+        delta = encode_page_delta(
+            layout,
+            base,
+            result,
+            base_block_counts=(2, 2, 2),
+            result_block_counts=(4, 3, 3),
+            base_boundary_tokens=512,
+            result_boundary_tokens=768,
+        )
+
+        self.assertLess(len(delta), len(result))
+        self.assertEqual(
+            apply_page_delta(
+                layout,
+                base,
+                delta,
+                base_block_counts=(2, 2, 2),
+                result_block_counts=(4, 3, 3),
+                base_boundary_tokens=512,
+                result_boundary_tokens=768,
+            ),
+            result,
+        )
+
+    def test_page_delta_rejects_wrong_base_corruption_and_unproven_boundary(
+        self,
+    ) -> None:
+        layout = _layout()
+        base_payloads = {
+            "compressed": b"a" * 16,
+            "full": b"b" * 512,
+            "state": b"c" * 256,
+        }
+        result_payloads = {
+            "compressed": base_payloads["compressed"] + b"d" * 16,
+            "full": base_payloads["full"] + b"e" * 512,
+            "state": base_payloads["state"] + b"f" * 256,
+        }
+        base = encode_page_snapshot(layout, (1, 1), base_payloads)
+        result = encode_page_snapshot(layout, (2, 2), result_payloads)
+        delta = encode_page_delta(
+            layout,
+            base,
+            result,
+            base_block_counts=(1, 1),
+            result_block_counts=(2, 2),
+            base_boundary_tokens=256,
+            result_boundary_tokens=512,
+        )
+
+        wrong_base_payloads = dict(base_payloads)
+        wrong_base_payloads["state"] = b"z" * 256
+        wrong_base = encode_page_snapshot(layout, (1, 1), wrong_base_payloads)
+        with self.assertRaisesRegex(HybridCodecError, "base differs"):
+            apply_page_delta(
+                layout,
+                wrong_base,
+                delta,
+                base_block_counts=(1, 1),
+                result_block_counts=(2, 2),
+                base_boundary_tokens=256,
+                result_boundary_tokens=512,
+            )
+        damaged = bytearray(delta)
+        damaged[-1] ^= 1
+        with self.assertRaisesRegex(HybridCodecError, "checksum mismatch"):
+            apply_page_delta(
+                layout,
+                base,
+                bytes(damaged),
+                base_block_counts=(1, 1),
+                result_block_counts=(2, 2),
+                base_boundary_tokens=256,
+                result_boundary_tokens=512,
+            )
+        with self.assertRaisesRegex(HybridCodecError, "group geometry"):
+            encode_page_delta(
+                layout,
+                base,
+                result,
+                base_block_counts=(1, 1),
+                result_block_counts=(2, 2),
+                base_boundary_tokens=257,
+                result_boundary_tokens=512,
+            )
+
+    def test_page_delta_does_not_reuse_changed_recurrent_prefix_pages(self) -> None:
+        layout = PageLayout(
+            (
+                PageGroup(
+                    256,
+                    (PageLayer("state", "u8", (128,), 128),),
+                    reuse_policy="recurrent_align",
+                ),
+            )
+        )
+        base = encode_page_snapshot(layout, (2,), {"state": b"A" * 256})
+        result = encode_page_snapshot(
+            layout,
+            (3,),
+            {"state": b"Z" * 128 + b"A" * 128 + b"B" * 128},
+        )
+
+        delta = encode_page_delta(
+            layout,
+            base,
+            result,
+            base_block_counts=(2,),
+            result_block_counts=(3,),
+            base_boundary_tokens=512,
+            result_boundary_tokens=768,
+        )
+
+        self.assertEqual(
+            apply_page_delta(
+                layout,
+                base,
+                delta,
+                base_block_counts=(2,),
+                result_block_counts=(3,),
+                base_boundary_tokens=512,
+                result_boundary_tokens=768,
+            ),
+            result,
+        )
+
     def test_page_plan_describes_payloads_without_slicing_them(self) -> None:
         layout = _layout()
         payloads = {
@@ -47,7 +205,10 @@ class HybridPageCodecTests(unittest.TestCase):
         self.assertEqual(plan.total_bytes, len(encoded))
         self.assertEqual(plan.block_counts, (2, 3))
         self.assertEqual(
-            [(span.layer_name, span.group_index, span.page_count) for span in plan.spans],
+            [
+                (span.layer_name, span.group_index, span.page_count)
+                for span in plan.spans
+            ],
             [
                 ("compressed", 0, 2),
                 ("full", 0, 2),

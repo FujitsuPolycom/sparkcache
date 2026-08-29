@@ -123,6 +123,37 @@ The builder rejects a parent whose resolved image ID differs from
 `--base-image-id`. The container build verifies the SparkCache source digest,
 patch inputs and outputs, and the ten-file vLLM contract.
 
+### Source-built e10536a candidates
+
+`Containerfile.e10536a` overlays SparkCache on a parent built from
+`local-inference-lab/vllm@e10536aadf02a18fccddda7ec939c33147e8b0b3`.
+Its four exact-input patches and ten-file contract are implemented but not
+qualified. The existing public OCI image and its 8,192-token evidence remain
+separate.
+
+Build the overlay only after verifying that the local parent carries the exact
+vLLM commit in its OCI labels:
+
+```bash
+python deploy/glm53_flash/build_image.py \
+  --containerfile deploy/glm53_flash/Containerfile.e10536a \
+  --base-image sparkring-glm53-runtime:e10536a-source-arm64 \
+  --base-image-id sha256:<64-lowercase-hex> \
+  --source-sha256 <64-lowercase-hex> \
+  --output-image sparkring-glm53-sparkcache:e10536a-source-arm64
+```
+
+The external-draft configuration retains the BF16 DFlash2 checkpoint at depth
+five, isolating the vLLM revision from a speculative-model change. The
+embedded-draft configuration uses the target checkpoint's MTP layer with a
+maximum depth of five. Acceptance-length adaptation is opt-in and uses an
+initial depth of three with a 32-step window when enabled.
+
+External DFlash, static embedded MTP, and adaptive embedded MTP use distinct
+`draft_checkpoint` identity values. Switching between them therefore selects
+a different cache namespace and recomputes instead of reusing entries from an
+incompatible speculative policy.
+
 The connector must use role `kv_both`, load-failure policy `recompute`, model
 profile `glm53-flash-hybrid`, and exact lowercase SHA-256 identities for both
 checkpoints. `build_kv_transfer_config` validates configuration syntax and

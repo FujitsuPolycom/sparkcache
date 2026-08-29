@@ -15,22 +15,20 @@ priority over feature work.
 
 ## Research-only design work
 
-### Longest-stored-prefix restore
+### Tail-publication performance qualification
 
-**Status: research-only.** Exact full-span digests do not match a conversation after
-new turns extend it. A prefix-aware interface requires:
+**Status: research-only qualification work.** Longest exact-boundary search,
+authenticated row-prefix aliases, immutable row tails, and authenticated
+block-page deltas are implemented. Tail publication is opt-in through
+`spark_cache_publication_schema=tail-cow-v1`, which selects distinct row and
+page cache identities while leaving the default snapshot identity unchanged.
 
-- chained per-chunk token digests so each 256-token prefix is available while
-  hashing the full prompt;
-- alias manifests that reference existing immutable chunks without copying
-  payloads;
-- descending-span admission bounded by the configured maximum context;
-- tail-only publication after the longest verified prefix; and
-- identity changes that make pre-alias manifests miss safely.
-
-The implemented bounded quorum-delta protocol must carry alias additions and
-withdrawals without making each scheduler report proportional to the complete
-stored-prefix inventory.
+GPU-free coverage proves copy-on-write extension, bounded page-delta
+compaction, recurrent/sliding boundary geometry, corruption removal,
+reference-aware maintenance, and verified reconstruction. Live GLM-5.3
+qualification must still measure publication bytes, cold restore latency,
+native-placement latency after page reconstruction, SSD writes, and continued
+generation across repeated conversation extensions.
 
 ### Per-entry retention controls
 
@@ -42,9 +40,12 @@ bounds.
 
 ### Trunk-aware eviction
 
-**Status: research-only.** Prefix aliases are a prerequisite. Manifest-recency LRU treats every
-entry independently. Alias reference counts would allow eviction to prefer
+**Status: research-only.** Prefix aliases and cross-root row-trunk sharing are
+implemented. Manifest-recency LRU still treats every root independently.
+Frequency and reference-value metadata could allow eviction to prefer
 unshared suffixes and preserve chunks referenced by many conversation trunks.
+Such metadata must remain outside authenticated restore state and cannot make
+an entry eligible for restoration.
 
 ### Restore prefetch
 
@@ -53,13 +54,17 @@ verification before vLLM schedules the request. It must reuse the bounded
 asynchronous-load machinery without claiming an external hit until all ranks
 confirm completion.
 
-### Hybrid-memory-allocator native restore
+### Native restore expansion
 
-**Status: research-only.** DeepSeek-V4 opaque hybrid-memory-allocator (HMA)
-pages use the verified Python
-restore path. A native path must describe all five page groups, preserve each
-group's semantic reuse window, and prove byte identity before changing the
-qualified profile.
+**Status: research-only qualification work.** Native multi-group page restore
+is implemented and source-runtime-qualified for the recorded GLM-5.3 TP4/DCP1
+profile. Tail page deltas reconstruct a fully verified snapshot before Python
+or native placement, but that path has no live performance qualification.
+
+DeepSeek-V4 opaque HMA pages retain their verified Python restore path. Native
+support for that profile must describe all five page groups, preserve each
+group's semantic reuse window, and prove byte identity before changing its
+qualified deployment contract.
 
 ## Research-only
 
