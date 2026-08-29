@@ -57,7 +57,7 @@ diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
          if required_blocks > available_blocks:
              # Cannot allocate new blocks
              return None
-@@ -707,6 +728,209 @@ class KVCacheManager:
+@@ -707,6 +728,265 @@ class KVCacheManager:
          """Get the blocks of a request."""
          return self.create_kv_cache_blocks(self.coordinator.get_blocks(request_id))
  
@@ -116,12 +116,17 @@ diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
 +                return True
 +
 +        source_blocks = self.coordinator.get_blocks(source_request_id)
-+        if len(source_blocks) != self.num_kv_cache_groups or not any(source_blocks):
++        managers = self.coordinator.single_type_managers
++        if (
++            len(source_blocks) != self.num_kv_cache_groups
++            or len(managers) != self.num_kv_cache_groups
++            or not any(source_blocks)
++        ):
 +            return False
 +
 +        partial_page_count = sum(
 +            num_computed_tokens % manager.block_size != 0
-+            for manager in self.coordinator.single_type_managers
++            for manager in managers
 +        )
 +        required_free_blocks = reserved_blocks + partial_page_count
 +        self.evict_shared_prefix_leases_until_free(required_free_blocks, now=now)
@@ -141,9 +146,60 @@ diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
 +            # different prefixes.  Refuse the optimization and recompute.
 +            return False
 +        try:
++            normalized_blocks: list[Sequence[KVCacheBlock]] = []
++            for manager, group_blocks in zip(managers, source_blocks):
++                skipped_blocks = (
++                    manager.get_num_skipped_tokens(num_computed_tokens)
++                    // manager.block_size
++                )
++                required_blocks = cdiv(num_computed_tokens, manager.block_size)
++                if (
++                    skipped_blocks < 0
++                    or skipped_blocks > required_blocks
++                    or required_blocks > len(group_blocks)
++                ):
++                    raise RuntimeError(
++                        "shared prefix lease source table is incomplete"
++                    )
++                selected = list(group_blocks[skipped_blocks:required_blocks])
++                if len(selected) != required_blocks - skipped_blocks:
++                    raise RuntimeError(
++                        "shared prefix lease logical source slice is incomplete"
++                    )
++                if num_computed_tokens % manager.block_size != 0:
++                    if not selected:
++                        raise RuntimeError(
++                            "shared prefix lease lacks its physical partial page"
++                        )
++                    logical_boundary_idx = required_blocks - 1
++                    partial = manager._partial_hit_reqs.get(source_request_id)
++                    if partial is None:
++                        source_block = selected[-1]
++                    else:
++                        partial_idx, source_block = partial
++                        source_occurrences = sum(
++                            block is source_block for block in group_blocks
++                        )
++                        if (
++                            partial_idx != logical_boundary_idx
++                            or source_occurrences != 1
++                        ):
++                            raise RuntimeError(
++                                "shared prefix lease source metadata is invalid"
++                            )
++                        selected[-1] = source_block
++                    if source_block.is_null or sum(
++                        block is source_block for block in selected
++                    ) != 1:
++                        raise RuntimeError(
++                            "shared prefix lease source boundary is null or duplicated"
++                        )
++                normalized_blocks.append(
++                    [manager._null_block] * skipped_blocks + selected
++                )
 +            self.coordinator.allocate_new_computed_blocks(
 +                request_id=lease_request_id,
-+                new_computed_blocks=source_blocks,
++                new_computed_blocks=tuple(normalized_blocks),
 +                num_local_computed_tokens=num_computed_tokens,
 +                num_external_computed_tokens=0,
 +            )
@@ -151,7 +207,7 @@ diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
 +            # on the leader's mutable page.  Move every such lease tail to a
 +            # dedicated block through vLLM's existing CoW copy pipeline.  The
 +            # scheduler marks the lease ready only after the copy step fences.
-+            for manager in self.coordinator.single_type_managers:
++            for manager in managers:
 +                if num_computed_tokens % manager.block_size == 0:
 +                    continue
 +                lease_blocks = manager.req_to_blocks[lease_request_id]

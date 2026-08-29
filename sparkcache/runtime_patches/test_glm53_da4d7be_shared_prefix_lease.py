@@ -27,12 +27,18 @@ from typing import Literal, overload
 
 KVCacheBlock = object
 
+
+def cdiv(a, b):
+    return (a + b - 1) // b
+
 class _Logger:
+    last_warning = None
+
     def exception(self, *args):
         pass
 
     def warning(self, *args):
-        pass
+        self.last_warning = args
 
 logger = _Logger()
 
@@ -132,6 +138,7 @@ class _Manager:
         self.coordinator = coordinator
         self.group_index = group_index
         self.block_size = 300
+        self._null_block = coordinator.null
         self._partial_hit_reqs: dict[str, tuple[int, _Block]] = {}
         self.new_block_ids: list[int] = []
         self.pending_copies: list[tuple[_Block, _Block]] = []
@@ -151,6 +158,9 @@ class _Manager:
         groups[self.group_index][block_idx] = destination
         destination.ref_cnt += 1
         self.pending_copies.append((source, destination))
+
+    def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
+        return 0 if self.group_index == 0 else num_computed_tokens - 1
 
 
 class _Coordinator:
@@ -370,21 +380,30 @@ def test_null_partial_page_refuses_lease_and_pressure_drops_only_pin() -> None:
 
 
 def test_authoritative_checkpoint_slot_can_differ_from_arithmetic_boundary() -> None:
-    manager, coordinator, _, mamba = _manager()
-    coordinator.authoritative_partial_slot = 2
+    manager, coordinator, _, _ = _manager()
+    checkpoint = _Block("mamba-checkpoint")
+    leader_mamba = coordinator.tables["leader"][1]
+    leader_mamba.append(checkpoint)
+    coordinator.single_type_managers[1]._partial_hit_reqs["leader"] = (
+        3,
+        checkpoint,
+    )
 
-    assert manager.publish_shared_prefix_lease(
+    published = manager.publish_shared_prefix_lease(
         "checkpoint", "leader", 1024, 15.0, now=10.0
     )
+    assert published, manager.publish_shared_prefix_lease.__globals__[
+        "logger"
+    ].last_warning
 
     mamba_source, mamba_hot = (
         coordinator.single_type_managers[1].pending_copies.pop()
     )
-    assert mamba_source is mamba[2]
+    assert mamba_source is checkpoint
     assert mamba_hot is not mamba_source
     lease = manager._shared_prefix_leases["checkpoint"]
     lease_table = coordinator.get_blocks(lease.request_id)[1]
-    assert lease_table[2] is mamba_hot
+    assert lease_table[3] is mamba_hot
 
 
 def test_scheduler_patch_orders_publish_and_attach_after_verification() -> None:
