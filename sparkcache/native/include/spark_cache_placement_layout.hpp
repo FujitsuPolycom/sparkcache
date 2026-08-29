@@ -496,6 +496,11 @@ inline bool validate_page_completion(
       destination_covered.size() != destination_count) {
     return fail("page restore completion state is invalid");
   }
+  if (static_cast<std::uint64_t>(destinations[destination_count - 1].group_index) +
+          1 !=
+      group_count) {
+    return fail("every page group must have at least one destination");
+  }
   if (submitted_snapshot_bytes != snapshot_bytes) {
     return fail("page slabs do not cover the complete snapshot");
   }

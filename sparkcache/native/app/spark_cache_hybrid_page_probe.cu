@@ -54,6 +54,16 @@ int main() {
       "cudaMalloc(destination)");
   ok = ok && cuda_ok(cudaMemset(destination, 0xEE, 16), "cudaMemset(destination)");
 
+  const SparkCachePageDestinationDescriptor overflow_destination{
+      UINT64_MAX - 1, 4, 4, 4, 0, 0};
+  const auto overflow_status =
+      spark_cache_placement_configure_page_destinations(
+          placement, &overflow_destination, 1);
+  ok = ok && overflow_status == SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT &&
+       std::strstr(
+           spark_cache_placement_last_error(placement),
+           "address range overflows") != nullptr;
+
   const SparkCachePageDestinationDescriptor page_destination{
       reinterpret_cast<std::uintptr_t>(destination), 4, 4, 4, 0, 0};
   const SparkCachePageGroupDescriptor group{0, 2, 0, 0};
@@ -63,6 +73,23 @@ int main() {
           placement, &page_destination, 1),
       placement,
       "configure page destinations");
+
+  const std::array<SparkCachePageGroupDescriptor, 2> extra_group{{
+      {0, 2, 0, 0},
+      {2, 1, 0, 0},
+  }};
+  const std::array<std::uint32_t, 3> extra_slots{2, 0, 1};
+  const auto extra_group_status = spark_cache_placement_begin_page_restore(
+      placement,
+      extra_group.data(),
+      extra_group.size(),
+      extra_slots.data(),
+      extra_slots.size(),
+      8);
+  ok = ok && extra_group_status == SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT &&
+       std::strstr(
+           spark_cache_placement_last_error(placement),
+           "every page group must have at least one destination") != nullptr;
 
   // A partially submitted page transaction must remain unavailable to its
   // parked request. This exercises the production finish edge, not only the

@@ -16,6 +16,8 @@
 namespace {
 
 using spark_cache::placement::validate_config;
+using spark_cache::placement::checked_add;
+using spark_cache::placement::checked_mul;
 using spark_cache::placement::validate_destinations;
 using spark_cache::placement::validate_direct_slab;
 using spark_cache::placement::validate_page_completion;
@@ -757,6 +759,20 @@ spark_cache_placement_configure_page_destinations(
       set_error(placement, "page destination geometry or group order is invalid");
       return SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT;
     }
+    std::uint64_t destination_end = 0;
+    if (!checked_mul(
+            destination.destination_pages - 1,
+            destination.destination_page_stride_bytes,
+            &destination_end) ||
+        !checked_add(
+            destination.destination_base, destination_end, &destination_end) ||
+        !checked_add(
+            destination_end,
+            destination.bytes_per_page,
+            &destination_end)) {
+      set_error(placement, "page destination address range overflows");
+      return SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT;
+    }
     last_group = destination.group_index;
   }
   const cudaError_t result = cudaMemcpy(
@@ -879,6 +895,13 @@ spark_cache_placement_begin_page_restore(
   }
   if (expected_first != slot_count) {
     set_error(placement, "page groups do not cover every slot");
+    return SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT;
+  }
+  if (static_cast<std::uint64_t>(
+          placement->page_destinations.back().group_index) +
+          1 !=
+      group_count) {
+    set_error(placement, "every page group must have at least one destination");
     return SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT;
   }
   for (const auto& destination : placement->page_destinations) {

@@ -412,6 +412,21 @@ void test_page_completion_requires_every_snapshot_and_destination_byte() {
       &error));
   assert(error == "page slabs do not cover every destination");
 
+  const std::array<SparkCachePageGroupDescriptor, 2> extra_group{{
+      {0, 2, 0, 0},
+      {2, 1, 0, 0},
+  }};
+  assert(!spark_cache::placement::validate_page_completion(
+      12,
+      12,
+      destinations.data(),
+      destinations.size(),
+      extra_group.data(),
+      extra_group.size(),
+      {8, 4},
+      &error));
+  assert(error == "every page group must have at least one destination");
+
   assert(spark_cache::placement::validate_page_completion(
       12,
       12,

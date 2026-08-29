@@ -243,3 +243,8 @@ def test_page_finish_proves_complete_coverage_and_modes_cannot_mix() -> None:
     finish_body = text[finish:abort]
     assert "placement->restore_mode == RestoreMode::kPages" in finish_body
     assert "validate_page_completion(" in finish_body
+    assert "every page group must have at least one destination" in text
+    configure = text.index("spark_cache_placement_configure_page_destinations")
+    row_begin = text.index("spark_cache_placement_begin_restore")
+    configure_body = text[configure:row_begin]
+    assert "page destination address range overflows" in configure_body
