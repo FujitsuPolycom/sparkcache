@@ -3193,6 +3193,196 @@ class AsyncRestoreTests(unittest.TestCase):
         table = list(block_ids or self.BLOCKS)
         return types.SimpleNamespace(get_block_ids=lambda: (table,))
 
+    def _cohort_connector(self, root: Path, *, max_pending: int = 2):
+        connector = _make_connector(
+            root,
+            0,
+            64,
+            extra_config={"spark_cache_max_pending_restores": str(max_pending)},
+        )
+        connector._scheduler_probe = "none"
+        return connector
+
+    @staticmethod
+    def _offer(connector, tokens):
+        digest = connector._digest(tokens, 1024)
+        connector._quorum[digest] = {0, 1, 2, 3}
+        return digest
+
+    def test_identical_requests_share_one_restore_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            tokens = list(range(1100))
+            digest = self._offer(connector, tokens)
+            leader = types.SimpleNamespace(
+                request_id="leader", prompt_token_ids=tokens
+            )
+            follower = types.SimpleNamespace(
+                request_id="follower", prompt_token_ids=tokens
+            )
+
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(leader, 0),
+                (self.SPAN, True),
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(follower, 0),
+                (None, False),
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(follower, 0),
+                (None, False),
+            )
+            connector.update_state_after_alloc(
+                leader, self._blocks_stub(), self.SPAN
+            )
+            metadata = connector.build_connector_meta(_empty_scheduler_output())
+
+            self.assertEqual([plan.request_id for plan in metadata.plans], ["leader"])
+            self.assertEqual(connector.counters["restore_flights_started"], 1)
+            self.assertEqual(connector.counters["restore_flights_joined"], 1)
+            connector.update_connector_output(
+                types.SimpleNamespace(
+                    invalid_block_ids=set(), finished_recving={"leader"}
+                )
+            )
+            self.assertNotIn(digest, connector._restore_flights)
+            # vLLM supplies the newly published local-prefix length on the
+            # follower's next lookup; no second external restore is planned.
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(follower, self.SPAN),
+                (0, False),
+            )
+
+    def test_unique_flights_are_bounded_but_identical_follower_can_join(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory), max_pending=2)
+            requests = []
+            for index in range(3):
+                tokens = [index * 10_000 + value for value in range(1100)]
+                self._offer(connector, tokens)
+                requests.append(
+                    types.SimpleNamespace(
+                        request_id=f"request-{index}", prompt_token_ids=tokens
+                    )
+                )
+
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(requests[0], 0),
+                (self.SPAN, True),
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(requests[1], 0),
+                (self.SPAN, True),
+            )
+            same_digest = types.SimpleNamespace(
+                request_id="same-digest",
+                prompt_token_ids=requests[0].prompt_token_ids,
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(same_digest, 0),
+                (None, False),
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(requests[2], 0),
+                (0, False),
+            )
+            self.assertEqual(len(connector._restore_flights), 2)
+            self.assertEqual(connector.counters["restore_skip_backlog"], 1)
+
+    def test_failed_leader_releases_followers_to_recompute(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            tokens = list(range(1100))
+            digest = self._offer(connector, tokens)
+            leader = types.SimpleNamespace(
+                request_id="bad-leader", prompt_token_ids=tokens
+            )
+            follower = types.SimpleNamespace(
+                request_id="waiting-follower", prompt_token_ids=tokens
+            )
+            connector.get_num_new_matched_tokens(leader, 0)
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(follower, 0),
+                (None, False),
+            )
+            connector.update_state_after_alloc(
+                leader, self._blocks_stub(), self.SPAN
+            )
+            connector.build_connector_meta(_empty_scheduler_output())
+            connector.update_connector_output(
+                types.SimpleNamespace(
+                    invalid_block_ids={self.BLOCKS[0]},
+                    finished_recving={"bad-leader"},
+                )
+            )
+
+            self.assertNotIn(digest, connector._quorum)
+            self.assertEqual(connector.counters["restore_flights_failed"], 1)
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(follower, 0),
+                (0, False),
+            )
+
+    def test_aborted_dispatched_leader_drains_before_flight_retires(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            tokens = list(range(1100))
+            digest = self._offer(connector, tokens)
+            leader = types.SimpleNamespace(
+                request_id="aborted-leader", prompt_token_ids=tokens
+            )
+            follower = types.SimpleNamespace(
+                request_id="patient-follower", prompt_token_ids=tokens
+            )
+            connector.get_num_new_matched_tokens(leader, 0)
+            connector.get_num_new_matched_tokens(follower, 0)
+            connector.update_state_after_alloc(
+                leader, self._blocks_stub(), self.SPAN
+            )
+            connector.build_connector_meta(_empty_scheduler_output())
+
+            connector.request_finished(leader, list(self.BLOCKS))
+            self.assertIn(digest, connector._restore_flights)
+            self.assertTrue(connector._restore_flights[digest].leader_finished)
+            newcomer = types.SimpleNamespace(
+                request_id="newcomer", prompt_token_ids=tokens
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(newcomer, 0),
+                (None, False),
+            )
+
+            connector.update_connector_output(
+                types.SimpleNamespace(
+                    invalid_block_ids=set(), finished_recving={"aborted-leader"}
+                )
+            )
+            self.assertNotIn(digest, connector._restore_flights)
+            self.assertEqual(connector.counters["restore_flight_leader_aborted"], 1)
+
+    def test_finished_follower_leaves_the_cohort_without_affecting_leader(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            tokens = list(range(1100))
+            digest = self._offer(connector, tokens)
+            leader = types.SimpleNamespace(
+                request_id="live-leader", prompt_token_ids=tokens
+            )
+            follower = types.SimpleNamespace(
+                request_id="gone-follower", prompt_token_ids=tokens
+            )
+            connector.get_num_new_matched_tokens(leader, 0)
+            connector.get_num_new_matched_tokens(follower, 0)
+
+            connector.request_finished(follower, [])
+
+            self.assertIn(digest, connector._restore_flights)
+            self.assertNotIn("gone-follower", connector._restore_flight_followers)
+            self.assertNotIn(
+                "gone-follower", connector._restore_flights[digest].followers
+            )
+
     def test_full_quorum_parks_only_the_restoring_request(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(Path(directory), 0, 64)

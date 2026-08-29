@@ -111,6 +111,7 @@ _QUORUM_DELTA_HISTORY_SIZE = 64
 _QUORUM_PENDING_DELTA_LIMIT = 64
 _QUORUM_RETIRED_GENERATION_LIMIT = 64
 _QUORUM_DELTA_PROTOCOL = "sparkcache-quorum-delta-v1"
+_MAX_RESTORE_FLIGHT_FOLLOWERS = 16
 
 # The runtime is deliberately supplied by the embedding process instead of
 # importing or constructing the optional streaming-snapshot runtime here.
@@ -180,6 +181,19 @@ class _ReqPlan:
     @property
     def group_block_ids(self) -> tuple[tuple[int, ...], ...]:
         return self.block_ids_by_group or (self.block_ids,)
+
+
+@dataclass
+class _RestoreFlight:
+    """One scheduler-owned restore whose result may satisfy peer requests."""
+
+    digest: str
+    span_tokens: int
+    leader_request_id: str
+    followers: set[str] = field(default_factory=set)
+    restored_block_ids: frozenset[int] = frozenset()
+    dispatched: bool = False
+    leader_finished: bool = False
 
 
 @dataclass(frozen=True)
@@ -604,6 +618,15 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         # update_state_after_alloc / build_connector_meta and cleared by
         # request_finished, so the map cannot grow past in-flight requests.
         self._max_pending_restores = config.max_pending_restores
+        # Coalesce requests selecting the same persistent digest around one
+        # restore. Followers own no restore blocks: they remain ordinary
+        # waiting requests until vLLM publishes the leader's verified blocks
+        # into its local prefix cache. Unique flights are bounded by the same
+        # admission limit as native load lanes; excess unrelated work
+        # recomputes immediately instead of joining a cache-side queue.
+        self._restore_flights: dict[str, _RestoreFlight] = {}
+        self._restore_flight_leaders: dict[str, str] = {}
+        self._restore_flight_followers: dict[str, str] = {}
         # Async loads are parked after block allocation, so they do not
         # appear in the next SchedulerOutput. Carry their allocated blocks
         # across that boundary explicitly.
@@ -649,6 +672,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             "restore_miss_absent": 0,
             "restore_miss_corrupt": 0,
             "restore_miss_incompatible": 0,
+            "restore_flights_started": 0,
+            "restore_flights_joined": 0,
+            "restore_flights_completed": 0,
+            "restore_flights_failed": 0,
+            "restore_flight_follower_overflow": 0,
+            "restore_flight_leader_aborted": 0,
             "quorum_generation_resets": 0,
             "load_verified": 0,
             "load_failed": 0,
@@ -848,19 +877,53 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     # scheduler side
     # ------------------------------------------------------------------
 
+    def _retire_restore_flight(self, digest: str, *, outcome: str) -> None:
+        flight = self._restore_flights.pop(digest, None)
+        if flight is None:
+            return
+        self._restore_flight_leaders.pop(flight.leader_request_id, None)
+        for request_id in flight.followers:
+            self._restore_flight_followers.pop(request_id, None)
+        counter = {
+            "completed": "restore_flights_completed",
+            "failed": "restore_flights_failed",
+        }.get(outcome)
+        if counter is not None:
+            self.counters[counter] += 1
+
+    def _remove_restore_follower(self, request_id: str) -> None:
+        digest = self._restore_flight_followers.pop(request_id, None)
+        if digest is None:
+            return
+        flight = self._restore_flights.get(digest)
+        if flight is not None:
+            flight.followers.discard(request_id)
+
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int | None, bool]:
         if not self._restore_enabled:
             return 0, False
-        if (
-            request.request_id not in self._need_load
-            and len(self._need_load) >= self._max_pending_restores
-        ):
-            self.counters["restore_skip_backlog"] = (
-                self.counters.get("restore_skip_backlog", 0) + 1
-            )
-            return 0, False
+        request_id = request.request_id
+        follower_digest = self._restore_flight_followers.get(request_id)
+        if follower_digest is not None:
+            flight = self._restore_flights.get(follower_digest)
+            if flight is not None and num_computed_tokens < flight.span_tokens:
+                return None, False
+            self._remove_restore_follower(request_id)
+        leader_digest = self._restore_flight_leaders.get(request_id)
+        if leader_digest is not None:
+            flight = self._restore_flights.get(leader_digest)
+            if flight is not None:
+                if flight.dispatched:
+                    # The leader cannot legitimately re-enter lookup before
+                    # worker completion, but waiting is safer than creating a
+                    # second writer into its private blocks.
+                    return None, False
+                if self._has_full_quorum(leader_digest):
+                    return flight.span_tokens - num_computed_tokens, True
+                self._need_load.pop(request_id, None)
+                self._retire_restore_flight(leader_digest, outcome="cancelled")
         token_ids = list(request.prompt_token_ids or [])
         aligned_span = self._aligned_span(len(token_ids))
         span_ceiling = min(
@@ -911,6 +974,26 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             )
             return 0, False
         span, digest = selected
+        flight = self._restore_flights.get(digest)
+        if flight is not None:
+            if len(flight.followers) >= _MAX_RESTORE_FLIGHT_FOLLOWERS:
+                self.counters["restore_flight_follower_overflow"] += 1
+                return 0, False
+            flight.followers.add(request_id)
+            self._restore_flight_followers[request_id] = digest
+            self.counters["restore_flights_joined"] += 1
+            return None, False
+        if (
+            len(self._restore_flights) >= self._max_pending_restores
+            or (
+                request_id not in self._need_load
+                and len(self._need_load) >= self._max_pending_restores
+            )
+        ):
+            self.counters["restore_skip_backlog"] = (
+                self.counters.get("restore_skip_backlog", 0) + 1
+            )
+            return 0, False
         if self._scheduler_probe == "tp0":
             lookup = self._store.lookup(
                 self._identity(self._shard_rank), digest, verify_chunks=False
@@ -929,7 +1012,14 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             digest[:12],
             span,
         )
-        self._need_load[request.request_id] = (digest, span)
+        self._restore_flights[digest] = _RestoreFlight(
+            digest=digest,
+            span_tokens=span,
+            leader_request_id=request_id,
+        )
+        self._restore_flight_leaders[request_id] = digest
+        self.counters["restore_flights_started"] += 1
+        self._need_load[request_id] = (digest, span)
         return span - num_computed_tokens, True
 
     def update_state_after_alloc(
@@ -940,7 +1030,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> None:
         request_id = request.request_id
         if num_external_tokens <= 0:
-            self._need_load.pop(request_id, None)
+            entry = self._need_load.pop(request_id, None)
+            if entry is not None:
+                self._retire_restore_flight(entry[0], outcome="cancelled")
             return
         entry = self._need_load.pop(request_id, None)
         if entry is None:
@@ -993,6 +1085,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         ) in self._pending_async_loads.items():
             all_blocks = frozenset(block for group in group_blocks for block in group)
             self._admitted[request_id] = (digest, all_blocks)
+            flight = self._restore_flights.get(digest)
+            if flight is not None and flight.leader_request_id == request_id:
+                flight.restored_block_ids = all_blocks
+                flight.dispatched = True
             meta.plans.append(
                 _ReqPlan(
                     request_id,
@@ -2597,6 +2693,22 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         # state is dropped here. This is what keeps _need_load, _admitted,
         # and _store_progress bounded without evicting live entries.
         request_id = request.request_id
+        follower_digest = self._restore_flight_followers.get(request_id)
+        if follower_digest is not None:
+            self._remove_restore_follower(request_id)
+        leader_digest = self._restore_flight_leaders.get(request_id)
+        if leader_digest is not None:
+            flight = self._restore_flights.get(leader_digest)
+            if flight is not None:
+                if flight.dispatched:
+                    # Worker completion owns the drain edge. Keep the flight
+                    # reserved until that signal arrives so an abort cannot
+                    # start a second restore into blocks that may still be
+                    # receiving writes.
+                    flight.leader_finished = True
+                    self.counters["restore_flight_leader_aborted"] += 1
+                else:
+                    self._retire_restore_flight(leader_digest, outcome="cancelled")
         self._need_load.pop(request_id, None)
         self._pending_async_loads.pop(request_id, None)
         self._admitted.pop(request_id, None)
@@ -3325,15 +3437,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     def update_connector_output(self, connector_output: Any) -> None:
         self._absorb_quorum(connector_output)
         invalid = getattr(connector_output, "invalid_block_ids", None)
-        if not invalid or not self._admitted:
-            return
+        invalid_blocks = set(invalid or ())
         # Async failure output reaches this callback before the parked
         # request is rescheduled, so retire the admission before its clean
         # recompute can republish the entry. Only admissions whose restored
         # blocks intersect the reported invalid blocks are retired: the
         # report carries no request id, and retiring every admission would
         # destroy unrelated healthy entries.
-        invalid_blocks = set(invalid)
         for request_id, (digest, block_ids) in list(self._admitted.items()):
             if not (block_ids & invalid_blocks):
                 continue
@@ -3354,6 +3464,33 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 )
             self._quorum.pop(digest, None)
             self._admitted.pop(request_id, None)
+            self._retire_restore_flight(digest, outcome="failed")
+
+        # A client may abort a leader after its plan is dispatched. Its
+        # ordinary admission bookkeeping is already gone, but the flight
+        # retains the block set until worker completion so a failed write can
+        # still withdraw quorum and release followers to recompute.
+        for digest, flight in list(self._restore_flights.items()):
+            if flight.restored_block_ids & invalid_blocks:
+                if self._scheduler_probe == "tp0" and self._store.invalidate(
+                    self._identity(self._shard_rank), digest
+                ):
+                    self.counters["scheduler_retired"] = (
+                        self.counters.get("scheduler_retired", 0) + 1
+                    )
+                    logger.warning(
+                        "spark-context-cache: retired entry %s after aborted"
+                        " leader %s reported load errors",
+                        digest[:12],
+                        flight.leader_request_id,
+                    )
+                self._quorum.pop(digest, None)
+                self._retire_restore_flight(digest, outcome="failed")
+
+        for request_id in getattr(connector_output, "finished_recving", None) or ():
+            digest = self._restore_flight_leaders.get(request_id)
+            if digest is not None:
+                self._retire_restore_flight(digest, outcome="completed")
 
     @classmethod
     def build_kv_connector_stats(cls, data=None):
