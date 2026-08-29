@@ -81,6 +81,12 @@ The qualified overlay is
 Another build remains implemented until its own immutable digest passes the
 same qualification.
 
+Before posting a custom-image announcement in a model channel, create one
+dedicated Discord support thread and replace the
+`UNKNOWN — needs verification` thread field in `IMAGE_ANNOUNCEMENT.md` with
+its URL. The announcement labels the artifact as an experimental community
+derivative and does not identify it as the recommended community image.
+
 ## Required public record
 
 A public announcement names:
