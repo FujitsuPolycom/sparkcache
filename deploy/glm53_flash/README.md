@@ -11,12 +11,7 @@ topologies, scheduler budgets, or span lengths.
 The `glm53-flash-hybrid` profile stores opaque target-model cache pages for
 GLM-5.3 Flash. The stored transaction includes sparse-MLA pages, C4 selector
 tail bytes, and the KDA/GDN recurrent checkpoint at the aligned persistent
-boundary. The profile requires vLLM `--mamba-cache-mode align` and
-`--prefix-cache-retention-interval 18432`. The positive, 2,304-token-aligned
-retention interval preserves every eighth recurrent replay boundary; vLLM's
-zero default retains only the newest boundary and prevents a restored prefix
-from becoming a later all-group local hit after DFlash/EAGLE computes its
-tail. The profile rejects
+boundary. The profile requires vLLM `--mamba-cache-mode align` and rejects
 other recurrent-cache modes.
 
 External speculative-draft state is recomputed after a target-prefix restore.

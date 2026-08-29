@@ -111,23 +111,27 @@ the maximum was 8.252 seconds. The run was correct but slower than the baseline
 and is not a qualification result.
 
 vLLM metrics showed zero local-prefix hit tokens and 100% external-prefix hits.
-A CPU differential probe isolated the cause to the GLM hybrid-cache retention
-policy. With Mamba `align`, EAGLE/DFlash, and
-`prefix_cache_retention_interval=0`, computing the leader's tail discards the
-restored recurrent replay boundary, so the all-group local hit collapses to
-zero. The same external allocation and publication with a positive aligned
-retention interval remains locally reusable.
+A CPU differential probe initially implicated the GLM hybrid-cache retention
+policy: a minimal Mamba+EAGLE fixture with retention zero lost its common hit,
+while a positive aligned interval retained it. That result did not generalize
+to the full GLM topology. A live run with
+`--prefix-cache-retention-interval 18432` still recorded zero local-prefix hit
+tokens and sixteen external restores. The retention setting is therefore not
+part of the profile contract.
 
-The qualified candidate uses `--prefix-cache-retention-interval 18432`, eight
-times the resolved 2,304-token hybrid page. This retains the 129,024-token
-cacheable boundary underlying the recorded 128K entry with bounded recurrent
-metadata. The source-level CPU probe is
-`deploy/glm53_flash/probe_hma_external_reuse.py`.
+The remaining boundary is explicit HMA block ownership: at least one live
+cache group is not rediscoverable through the common hash lookup after the
+leader advances. The next implementation attaches followers directly to the
+verified leader's rank-local block table through vLLM's existing block-pool
+reference accounting. It must occur only after all-worker restore completion
+and before leader reclamation.
 
 Diagnostic receipts:
 
 - `evidence/glm53-flash-dflash7-bf16/singleflight-128k-c16-830a117.json`;
-- `evidence/glm53-flash-dflash7-bf16/post-singleflight-semantic-830a117.json`.
+- `evidence/glm53-flash-dflash7-bf16/post-singleflight-semantic-830a117.json`;
+- `evidence/glm53-flash-dflash7-bf16/singleflight-retention18432-128k-c16.json`;
+- `evidence/glm53-flash-dflash7-bf16/post-retention18432-semantic.json`.
 
 ## Repository validation
 

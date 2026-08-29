@@ -11,27 +11,10 @@ from typing import Any
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 DEFAULT_MAX_BYTES = 200 * 1024**3
 DEFAULT_LOW_WATERMARK_BYTES = 180 * 1024**3
-# GLM-5.3 resolves each hybrid attention/Mamba page to 2,304 tokens. Retaining
-# every eighth boundary preserves useful conversation checkpoints while
-# avoiding dense recurrent-state retention. Zero keeps only the newest replay
-# boundary and makes an externally restored prefix undiscoverable after its
-# leader computes a tail under DFlash/EAGLE.
-PREFIX_CACHE_RETENTION_INTERVAL = 8 * 2304
 
 
 class ProfileError(ValueError):
     """The GLM-5.3 deployment configuration is incomplete or unsafe."""
-
-
-def required_hybrid_prefix_arguments() -> tuple[str, ...]:
-    """vLLM arguments required for reusable GLM hybrid prefix boundaries."""
-
-    return (
-        "--mamba-cache-mode",
-        "align",
-        "--prefix-cache-retention-interval",
-        str(PREFIX_CACHE_RETENTION_INTERVAL),
-    )
 
 
 def immutable_revision_identity(repository: str, revision: str) -> str:
