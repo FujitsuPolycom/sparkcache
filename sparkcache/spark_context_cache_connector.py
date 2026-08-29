@@ -1135,6 +1135,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         request_id = request.request_id
         follower_digest = self._restore_flight_followers.get(request_id)
         if follower_digest is not None:
+            # Shared-prefix leases can only adopt an empty request block table.
+            # A request with locally computed tokens already owns allocator
+            # state and must continue from that state instead of waiting for a
+            # lease it cannot attach.
+            if num_computed_tokens > 0:
+                self._remove_restore_follower(request_id)
+                return 0, False
             flight = self._restore_flights.get(follower_digest)
             if flight is not None and num_computed_tokens < flight.span_tokens:
                 return None, False
@@ -1215,6 +1222,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         span, digest = selected
         flight = self._restore_flights.get(digest)
         if flight is not None:
+            if num_computed_tokens > 0:
+                return 0, False
             if len(flight.followers) >= _MAX_RESTORE_FLIGHT_FOLLOWERS:
                 self.counters["restore_flight_follower_overflow"] += 1
                 return 0, False

@@ -3464,6 +3464,49 @@ class AsyncRestoreTests(unittest.TestCase):
                 (0, False),
             )
 
+    def test_partially_computed_request_does_not_wait_for_zero_token_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            tokens = list(range(1100))
+            digest = self._offer(connector, tokens)
+            leader = types.SimpleNamespace(
+                request_id="partial-prefix-leader", prompt_token_ids=tokens
+            )
+            partial = types.SimpleNamespace(
+                request_id="partial-prefix-follower", prompt_token_ids=tokens
+            )
+            joined_then_local = types.SimpleNamespace(
+                request_id="joined-then-local", prompt_token_ids=tokens
+            )
+
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(leader, 0),
+                (self.SPAN, True),
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(partial, 256),
+                (0, False),
+            )
+            self.assertNotIn(
+                partial.request_id, connector._restore_flight_followers
+            )
+
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(joined_then_local, 0),
+                (None, False),
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(joined_then_local, 256),
+                (0, False),
+            )
+            self.assertNotIn(
+                joined_then_local.request_id, connector._restore_flight_followers
+            )
+            self.assertNotIn(
+                joined_then_local.request_id,
+                connector._restore_flights[digest].followers,
+            )
+
     def test_verified_flight_publishes_lease_for_joined_and_late_followers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = self._cohort_connector(Path(directory))
