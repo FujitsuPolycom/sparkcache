@@ -1,11 +1,15 @@
 ARG BASE_IMAGE=invalid.invalid/supply-an-immutable-base-image
 FROM ${BASE_IMAGE}
 
+ARG BASE_IMAGE
 ARG SPARKCACHE_SOURCE_SHA256
 ARG BASE_IMAGE_ID
+ARG BASE_IMAGE_LICENSES
+ARG SPARKCACHE_REVISION
 COPY sparkcache /opt/sparkcache-src/sparkcache
 COPY patches/vllm-da4d7be /opt/sparkcache-vllm-patches
 COPY deploy/deployment_contract/source.py /opt/sparkcache-source-identity.py
+COPY LICENSE /usr/share/licenses/SparkCache/LICENSE
 
 RUN set -eu; \
     case "$BASE_IMAGE_ID" in sha256:[0-9a-f][0-9a-f]*) ;; \
@@ -31,6 +35,10 @@ RUN set -eu; \
 
 ENV PYTHONPATH=/opt/sparkcache-src
 LABEL org.opencontainers.image.source="https://github.com/FujitsuPolycom/sparkcache" \
+      org.opencontainers.image.revision="${SPARKCACHE_REVISION}" \
+      org.opencontainers.image.base.name="${BASE_IMAGE}" \
+      org.opencontainers.image.licenses="${BASE_IMAGE_LICENSES}" \
       org.sparkcache.deployment-profile="glm53-flash-hybrid" \
       org.sparkcache.parent-image-id="${BASE_IMAGE_ID}" \
-      org.sparkcache.source-sha256="${SPARKCACHE_SOURCE_SHA256}"
+      org.sparkcache.source-sha256="${SPARKCACHE_SOURCE_SHA256}" \
+      org.sparkcache.source-revision="${SPARKCACHE_REVISION}"

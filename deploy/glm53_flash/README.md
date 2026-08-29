@@ -80,9 +80,13 @@ python deploy/glm53_flash/build_image.py \
 ```
 
 The builder resolves `--base-image` with `docker image inspect` and rejects an
-identity different from `--base-image-id`. The image is not published by
-SparkCache, so this recipe does not provide a standalone public vLLM runtime
-builder.
+identity different from `--base-image-id`. The qualified image is not a
+standalone public vLLM runtime.
+
+[`PUBLISHING.md`](PUBLISHING.md) defines the source-bound public image path. It
+builds the SparkCache overlay from an immutable SparkRing runtime digest,
+records the parent and output identities, requires an SPDX SBOM, and keeps the
+registry package private until one digest passes four-rank qualification.
 
 The serving command must use `SparkContextCacheConnector`, role `kv_both`,
 load-failure policy `recompute`, model profile `glm53-flash-hybrid`, and exact
