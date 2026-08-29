@@ -1442,7 +1442,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     arena_bytes=self._native_arena_bytes,
                     max_destinations=destination_count,
                     max_slots=max_slots,
-                    max_chunks_per_slab=max(64, destination_count),
+                    max_chunks_per_slab=4096,
                     device_ordinal=device_ordinal,
                 )
                 adapters.append(adapter)
