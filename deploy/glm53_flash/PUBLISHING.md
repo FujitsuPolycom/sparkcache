@@ -97,7 +97,8 @@ A public announcement names:
 - SparkRing, SparkCache, vLLM, B12X, NCCL, and InstantTensor revisions;
 - every applied patch and Git tree;
 - combined licenses and third-party notices;
-- build command, build receipt, SPDX SBOM, and provenance attestation;
+- build command, build receipt, SPDX SBOM, and either a provenance attestation
+  or an explicit statement that no standalone attestation was generated;
 - four-Spark hardware, TP/DCP, checkpoints, DFlash depth, KV mode and size,
   scheduler settings, graph mode, and limits;
 - store, restart, restore, semantic, DFlash, health, RDMA, and fatal-log results;

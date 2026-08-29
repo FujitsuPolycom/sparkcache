@@ -19,7 +19,7 @@ DFlash2 using seven draft tokens
 recorded in
 [`GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md`](GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md).
 
-The qualified community image is
+The qualified experimental community derivative is
 `ghcr.io/fujitsupolycom/sparkring-glm53-sparkcache@sha256:cd4045bba2a0f3dc55361560f8c3a3f171939854db28d48dfdae58eed9c44943`.
 [`deploy/glm53_flash/README.md`](deploy/glm53_flash/README.md) provides pull,
 source-build, TP4 launch, and validation directions.
@@ -141,7 +141,7 @@ SparkCache provides these invariants:
 | DeepSeek-V4-Flash-0731 opaque HMA pages at TP4/DCP1 | **qualified** | `0.1.0a1`; `MULTI_MODEL_LIVE_VALIDATION.md`; 73,728 restored tokens in 413.9–494.6 ms per rank |
 | DeepSeek-V4 HMA pages at DCP2/DCP4 | **unsupported** | opaque page ownership and DSpark rolling-state sharding are undefined; see `deploy/deepseek_v4/DCP_SUPPORT.md` |
 | GLM-5.2 EXL3 3.5-bpw per-token rows at TP4/DCP4 | **qualified** | `0.1.0a1`: `MULTI_MODEL_LIVE_VALIDATION.md`, 3.39–3.95 seconds per rank; `0.1.0a2`: `GLM52_A2_LIVE_VALIDATION.md`, 3.17–4.17 seconds per rank; 225,536 restored tokens |
-| GLM-5.3 Flash hybrid pages with BF16 DFlash2 using seven draft tokens at TP4/DCP1 | **qualified** | Source-tree deployment only; `GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md`; 8,192 restored tokens in 142.1–165.1 ms per rank |
+| GLM-5.3 Flash hybrid pages with BF16 DFlash2 using seven draft tokens at TP4/DCP1 | **qualified** | Immutable OCI image `cd4045...`; `GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md`; 8,192 restored tokens in 156.8–171.8 ms per rank; restored request 1.902 s |
 | Native direct restore | **implemented** | checksum-attested adapter and CPU-testable ABI/layout gates; disabled in qualified DeepSeek profiles |
 | Streaming snapshots | **research-only** | GLM-5.2 DCP4 inventory only; not profile-general and disabled for opaque block pages |
 | Buddy replication | **research-only** | protocol/state machines implemented; network carrier absent |
@@ -173,7 +173,7 @@ the model-specific deployment instructions under `deploy/`.
 |---|---|---|
 | `vllm-project/vllm@fcc614141e5e9ab18cb304c476f7feed2a9552e3` with `patches/vllm/` | **implemented** | Patch sources and exact preimage hashes are published. A standalone public runtime builder is **unsupported**; a PyPI installation does not construct or attest this runtime. |
 | vLLM build `e2666d9a6` with `patches/vllm-e2666d9a6/` and `sparkcache/runtime_patches/vllm-kv-block-lease-contract-e2666d9a6.json` | **qualified** | The DeepSeek-V4 and GLM-5.2 deployment builders apply exact lineage-specific patch chains, verify postimages, and bind the results to the SparkCache source tree. |
-| `local-inference-lab/vllm@da4d7be6c97434f6942292ed8abbf4b32dc44355` with `sparkcache/runtime_patches/vllm-kv-block-lease-contract-da4d7be.json` | **qualified** | The GLM-5.3 Flash source deployment verifies coherent repository and installed-runtime hashes, applies the exact VMM exemption, and passes TP4/DCP1 store/restart/restore with BF16 DFlash2 using seven draft tokens. |
+| `local-inference-lab/vllm@da4d7be6c97434f6942292ed8abbf4b32dc44355` with `sparkcache/runtime_patches/vllm-kv-block-lease-contract-da4d7be.json` | **qualified** | The source-bound GLM-5.3 Flash OCI image verifies coherent repository and installed-runtime hashes, applies the exact VMM exemption, and passes TP4/DCP1 store/restart/restore with BF16 DFlash2 using seven draft tokens. |
 
 Any other whole-file hash is **unsupported** until its ownership contract is
 derived and tested.

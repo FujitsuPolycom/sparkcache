@@ -20,6 +20,16 @@ The Linux/ARM64 image ID observed on every qualified rank was
 `sha256:7c007cf673c35f5818da7fea8faa343304baed00f489efdcbd027d6616b8a290`.
 The image does not contain target-model or draft-model weights.
 
+Recorded publication artifacts:
+
+- runtime SPDX SBOM SHA-256
+  `f5261dbed089a52923d4b2e2d5204aa889f0031ff57e324022b16c584068cd43`;
+- SparkCache overlay SPDX SBOM SHA-256
+  `14450bf58a8b08fd1997706de4fefc9ae4681ebe990176b6c195e296b32c9d27`;
+- runtime source receipt SHA-256
+  `afec2f37aa0adfea8c330f0a8e25c393c6276c3e8b8e0f855932f7f2d4ba45df`;
+- standalone SLSA/Sigstore provenance attestation: `Not generated`.
+
 ## Based on
 
 Exact parent:
