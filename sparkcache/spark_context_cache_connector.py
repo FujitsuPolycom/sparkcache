@@ -750,9 +750,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     @staticmethod
     def _normalize_group_blocks(
         block_ids: Sequence[Sequence[int]],
+        *,
+        allow_empty_groups: bool = False,
     ) -> tuple[tuple[int, ...], ...]:
         groups = tuple(tuple(int(block) for block in group) for group in block_ids)
-        if not groups or any(not group for group in groups):
+        if not groups or (not allow_empty_groups and any(not group for group in groups)):
             raise RuntimeError("spark-context-cache: KV-cache block table is empty")
         return groups
 
@@ -783,6 +785,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     required,
                     (int(window) - 1 + block_size - 1) // block_size,
                 )
+            elif policy == "recurrent_align":
+                # Align mode retains a single recurrent checkpoint at the
+                # persistent boundary. Earlier position-indexed table entries
+                # are null after vLLM removes skipped state blocks.
+                selected = 1
             elif policy != "full":
                 raise HybridCodecError(f"unsupported page reuse policy {policy!r}")
             # The table can include a live tail beyond the persistent span.
@@ -1021,7 +1028,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             digest, span, done, blocks_by_group = self._store_progress[req_id]
             new_block_ids = cached.new_block_ids[index]
             appended = (
-                [list(group) for group in self._normalize_group_blocks(new_block_ids)]
+                [
+                    list(group)
+                    for group in self._normalize_group_blocks(
+                        new_block_ids,
+                        allow_empty_groups=True,
+                    )
+                ]
                 if new_block_ids is not None
                 else [[] for _ in blocks_by_group]
             )

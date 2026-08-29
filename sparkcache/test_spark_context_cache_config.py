@@ -501,6 +501,69 @@ class KvGroupTopologyTests(unittest.TestCase):
         self.assertEqual(topology[0]["reuse_window_tokens"], 512)
         self.assertTrue(topology[0]["eagle"])
 
+    def test_mamba_align_policy_records_recurrent_identity(self) -> None:
+        class MambaSpec:
+            block_size = 256
+            storage_block_size = 256
+            page_size_bytes = 4096
+            mamba_cache_mode = "align"
+            tokens_per_state = 256
+            num_speculative_blocks = 7
+            num_prefill_checkpoint_blocks = 1
+
+        kv_cache_config = types.SimpleNamespace(
+            kv_cache_groups=(
+                types.SimpleNamespace(
+                    kv_cache_spec=MambaSpec(),
+                    is_eagle_group=False,
+                    layer_names=("recurrent",),
+                ),
+            )
+        )
+        topology = cfg.kv_group_topology(kv_cache_config)
+        self.assertEqual(topology[0]["reuse_policy"], "recurrent_align")
+        self.assertIsNone(topology[0]["reuse_window_tokens"])
+        self.assertEqual(
+            topology[0]["recurrent_state"],
+            {
+                "mamba_cache_mode": "align",
+                "tokens_per_state": 256,
+                "num_speculative_blocks": 7,
+                "num_prefill_checkpoint_blocks": 1,
+            },
+        )
+
+        vllm, _ = _make_vllm_config(
+            {"spark_cache_model_profile": "glm53-flash-hybrid"},
+            dcp=1,
+            tp=4,
+            block_size=256,
+        )
+        connector_config = cfg.parse_connector_config(
+            vllm, vllm.kv_transfer_config, kv_cache_config
+        )
+        with self.assertRaises(TypeError):
+            connector_config.group_topology[0]["recurrent_state"][
+                "tokens_per_state"
+            ] = 512
+
+    def test_mamba_non_align_policy_fails_closed(self) -> None:
+        class MambaSpec:
+            block_size = 256
+            mamba_cache_mode = "all"
+
+        kv_cache_config = types.SimpleNamespace(
+            kv_cache_groups=(
+                types.SimpleNamespace(
+                    kv_cache_spec=MambaSpec(),
+                    is_eagle_group=False,
+                    layer_names=("recurrent",),
+                ),
+            )
+        )
+        with self.assertRaisesRegex(RuntimeError, "requires mamba_cache_mode 'align'"):
+            cfg.kv_group_topology(kv_cache_config)
+
     def test_digest_is_stable_sha256(self) -> None:
         class FullAttentionSpec:
             block_size = 256

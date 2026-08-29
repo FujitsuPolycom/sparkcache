@@ -174,11 +174,13 @@ class ModelProfile:
                 f" divisible by dcp_degree {dcp_degree}; per-rank chunk rows"
                 " would silently drop owned positions"
             )
-        if block_size <= 0 or self.chunk_tokens % block_size:
+        if block_size <= 0 or (
+            self.chunk_tokens % block_size and block_size % self.chunk_tokens
+        ):
             raise ProfileError(
-                f"profile {self.name}: chunk_tokens {self.chunk_tokens} is not"
-                f" divisible by block_size {block_size}; span alignment would"
-                " disagree with the block table"
+                f"profile {self.name}: chunk_tokens {self.chunk_tokens} and"
+                f" block_size {block_size} are not mutually divisible; span"
+                " alignment would disagree with the block table"
             )
         if min_span_tokens < self.chunk_tokens:
             raise ProfileError(
@@ -233,6 +235,23 @@ PROFILES: Mapping[str, ModelProfile] = {
             {"target_ckv", "sparse_indexer", "mtp_draft_kv"}
         ),
         chunk_tokens=256,
+        kv_replicated_across_tp=True,
+    ),
+    "glm53-flash-hybrid": ModelProfile(
+        name="glm53-flash-hybrid",
+        description=(
+            "GLM-5.3 Flash hybrid sparse-MLA/C4 pages and KDA/GDN recurrent"
+            " checkpoints. External speculative-draft state is recomputed;"
+            " its checkpoint identity remains namespace-bound."
+        ),
+        quantization_layout="glm53-flash-hybrid-block-pages-v1",
+        rope_layout="glm53-flash-rope-v1",
+        boundary_hidden_policy="live_forward",
+        default_draft_kv_policy="separate",
+        classification_rules=(),
+        required_families=frozenset({"target_ckv"}),
+        chunk_tokens=256,
+        storage_mode="block_pages_v1",
         kv_replicated_across_tp=True,
     ),
     "deepseek-v4-fp8-hma": ModelProfile(

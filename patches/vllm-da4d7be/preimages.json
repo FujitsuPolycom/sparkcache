@@ -1,0 +1,13 @@
+{
+  "020-sparkcache-vmm-exemption.patch": {
+    "target_path": "vllm/config/vllm.py",
+    "accepted_preimage_sha256": {
+      "source_checkout": "262728a3d60195bd22ea9ec749a32293b027c529e2599ef666c86f4bb7f4a2c3",
+      "jovian_glm53_runtime": "e6a6e4087331b897bb3116720f608cc23b43dcdbca9c65187aa54dbbd5c0e16e"
+    },
+    "accepted_postimage_sha256": {
+      "source_checkout": "1169e49ff4199d24261fbeff8195335514da38f98a636b9c3fbed1897da5c20e",
+      "jovian_glm53_runtime": "b97316bf3c8ba7ba575cc8d4d2ded62bc3ae24f160e6e2aee4cabe34f9444671"
+    }
+  }
+}

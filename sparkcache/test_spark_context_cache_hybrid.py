@@ -86,6 +86,31 @@ class HybridPageCodecTests(unittest.TestCase):
         with self.assertRaises(HybridCodecError):
             decode_page_snapshot(layout, encoded + b"x", (1, 1))
 
+    def test_recurrent_align_policy_is_part_of_layout_identity(self) -> None:
+        recurrent = PageLayout(
+            (
+                PageGroup(
+                    256,
+                    (PageLayer("state", "torch.float32", (4, 16), 256),),
+                    reuse_policy="recurrent_align",
+                ),
+            )
+        )
+        full = PageLayout(
+            (
+                PageGroup(
+                    256,
+                    (PageLayer("state", "torch.float32", (4, 16), 256),),
+                ),
+            )
+        )
+        self.assertNotEqual(recurrent.digest, full.digest)
+        payloads = {"state": bytes(256)}
+        encoded = encode_page_snapshot(recurrent, (1,), payloads)
+        self.assertEqual(decode_page_snapshot(recurrent, encoded, (1,)), payloads)
+        with self.assertRaises(HybridCodecError):
+            decode_page_snapshot(full, encoded, (1,))
+
 
 if __name__ == "__main__":
     unittest.main()

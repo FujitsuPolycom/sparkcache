@@ -23,6 +23,7 @@ import sparkcache.spark_context_cache_store as flat_store
 from sparkcache.spark_context_cache_native_placement import ParkedRestore
 
 from sparkcache.spark_context_cache_hybrid import HybridCodecError
+from sparkcache.spark_context_cache_profiles import resolve_profile
 from sparkcache.test_spark_context_cache_connector import (
     _drain_store,
     _hybrid_kv_cache_config,
@@ -593,14 +594,14 @@ class HybridReuseWindowTests(unittest.TestCase):
                         256,
                     )
 
-    def test_unknown_and_mamba_specs_are_rejected_at_startup(self) -> None:
+    def test_unknown_and_non_align_mamba_specs_are_rejected_at_startup(self) -> None:
         class MambaSpec:
             block_size = 4
             mamba_cache_mode = "all"
 
         for bad_spec, message in (
             (types.SimpleNamespace(block_size=4), "unsupported block-page"),
-            (MambaSpec(), "does not support Mamba"),
+            (MambaSpec(), "requires mamba_cache_mode 'align'"),
         ):
             config = self._windowed_config(128)
             config.kv_cache_groups[2].kv_cache_spec.kv_cache_specs["state"] = bad_spec
@@ -617,6 +618,127 @@ class HybridReuseWindowTests(unittest.TestCase):
                             dcp=1,
                             kv_cache_config=config,
                         )
+
+    def test_mamba_align_selects_only_the_boundary_state(self) -> None:
+        class MambaSpec:
+            block_size = 4
+            storage_block_size = 4
+            page_size_bytes = 32
+            mamba_cache_mode = "align"
+            tokens_per_state = 4
+            num_speculative_blocks = 0
+            num_prefill_checkpoint_blocks = 0
+
+        config = self._windowed_config(128)
+        config.kv_cache_groups[2].kv_cache_spec.kv_cache_specs["state"] = MambaSpec()
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                extra_config={
+                    "spark_cache_model_profile": "glm53-flash-hybrid",
+                    "spark_cache_draft_checkpoint_sha256": "2" * 64,
+                },
+                tp=2,
+                dcp=1,
+                kv_cache_config=config,
+            )
+
+        groups = (
+            (1,),
+            (10, 11, 12, 13),
+            tuple([0] * 63 + [163]),
+            tuple(range(200, 232)),
+        )
+        self.assertEqual(
+            connector._select_group_blocks_for_span(groups, 256)[2],
+            (163,),
+        )
+
+        unsafe = list(groups)
+        unsafe[2] = tuple([0] * 64)
+        with self.assertRaisesRegex(HybridCodecError, "null block"):
+            connector._select_group_blocks_for_span(tuple(unsafe), 256)
+
+    def test_mamba_align_checkpoint_round_trips_with_attention_pages(self) -> None:
+        class MambaSpec:
+            block_size = 4
+            storage_block_size = 4
+            page_size_bytes = 32
+            mamba_cache_mode = "align"
+            tokens_per_state = 4
+            num_speculative_blocks = 0
+            num_prefill_checkpoint_blocks = 0
+
+        config = self._windowed_config(128)
+        config.kv_cache_groups[2].kv_cache_spec.kv_cache_specs["state"] = MambaSpec()
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                extra_config={
+                    "spark_cache_model_profile": "glm53-flash-hybrid",
+                    "spark_cache_draft_checkpoint_sha256": "2" * 64,
+                },
+                tp=2,
+                dcp=1,
+                kv_cache_config=config,
+            )
+            pools = {
+                "full": torch.arange(8 * 64, dtype=torch.uint8).reshape(8, 1, 64),
+                "swa": torch.arange(16 * 64, dtype=torch.uint8).reshape(16, 1, 64),
+                "state": torch.arange(100 * 8, dtype=torch.float32).reshape(100, 1, 8),
+                "state128": torch.arange(80 * 8, dtype=torch.float32).reshape(80, 1, 8),
+            }
+            connector.register_kv_caches(pools)
+            source_groups = (
+                (3,),
+                (5, 6, 7, 8),
+                tuple([0] * 63 + [63]),
+                tuple(range(1, 33)),
+            )
+            destination_groups = (
+                (4,),
+                (9, 10, 11, 12),
+                tuple([0] * 63 + [79]),
+                tuple(range(33, 65)),
+            )
+            source_selected = connector._select_group_blocks_for_span(
+                source_groups, 256
+            )
+            expected = {}
+            for group, selected in zip(config.kv_cache_groups, source_selected):
+                for name in group.layer_names:
+                    expected[name] = pools[name][list(selected)].clone()
+            store = _ReqPlan(
+                "store",
+                "d" * 64,
+                256,
+                source_groups[0],
+                True,
+                block_ids_by_group=source_groups,
+            )
+            connector._store_one(store)
+            for tensor in pools.values():
+                tensor.zero_()
+            load = _ReqPlan(
+                "load",
+                store.digest,
+                store.span_tokens,
+                destination_groups[0],
+                False,
+                block_ids_by_group=destination_groups,
+            )
+            self.assertTrue(connector._load_one(load))
+            destination_selected = connector._select_group_blocks_for_span(
+                destination_groups, 256
+            )
+            for group, selected in zip(config.kv_cache_groups, destination_selected):
+                for name in group.layer_names:
+                    self.assertTrue(
+                        torch.equal(pools[name][list(selected)], expected[name]),
+                        name,
+                    )
 
     def test_sliding_and_recurrent_groups_select_their_declared_windows(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -681,6 +803,50 @@ class HybridReuseWindowTests(unittest.TestCase):
                 verify_chunks=False,
             )
             self.assertFalse(lookup.is_hit)
+
+
+class DefectD14HybridSchedulerGeometryTests(unittest.TestCase):
+    """D-14: a scheduler block may contain multiple storage chunks."""
+
+    def test_resolved_scheduler_block_size_accepts_exact_chunk_multiple(self) -> None:
+        resolve_profile("glm53-flash-hybrid").validate_for_deployment(
+            dcp_degree=1,
+            block_size=2304,
+            min_span_tokens=4096,
+            native_restore=False,
+        )
+
+
+class DefectD15HybridBlockDeltaTests(unittest.TestCase):
+    """D-15: a hybrid allocation delta may be empty for one cache group."""
+
+    def test_empty_group_delta_preserves_the_complete_request_table(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(Path(directory), 0, block_size=64)
+            connector._store_progress["hybrid"] = (
+                "a" * 64,
+                1024,
+                256,
+                [[10], [20], [30]],
+            )
+            step = types.SimpleNamespace(
+                scheduled_new_reqs=[],
+                num_scheduled_tokens={"hybrid": 256},
+                scheduled_cached_reqs=types.SimpleNamespace(
+                    req_ids=["hybrid"],
+                    resumed_req_ids=set(),
+                    num_computed_tokens=[256],
+                    new_block_ids=[([11], [], [31])],
+                ),
+            )
+
+            metadata = connector.build_connector_meta(step)
+
+            self.assertEqual(metadata.plans, [])
+            self.assertEqual(
+                connector._store_progress["hybrid"][3],
+                [[10, 11], [20], [30, 31]],
+            )
 
 
 class DigestNamespaceTests(unittest.TestCase):

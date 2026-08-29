@@ -23,6 +23,24 @@ python -m sparkcache.runtime_patches.verify_lease_contract \
   --vllm-root /path/to/vllm/source
 ```
 
+The GLM-5.3 Flash integration pins the seven-file serving safety contract
+`vllm-kv-block-lease-contract-da4d7be.json` to
+`local-inference-lab/vllm@da4d7be6c97434f6942292ed8abbf4b32dc44355`.
+The accepted hashes cover both the repository checkout and
+the Python sources installed by the GLM-5.3 serving image, and named-state
+coherence prevents a mixed source/runtime tree from passing. The contract
+includes the Mamba manager and cache-spec files that define recurrent
+block-table semantics. That fork includes
+deferred block reclamation for overlapping consumer batches and preserves the
+connector completion interfaces. Verify it explicitly; the default contract
+names a different upstream lineage:
+
+```bash
+python -m sparkcache.runtime_patches.verify_lease_contract \
+  --vllm-root /opt/spark-vllm \
+  --contract sparkcache/runtime_patches/vllm-kv-block-lease-contract-da4d7be.json
+```
+
 ## Narrow integration
 
 Use `sparkcache.streaming.BlockLeaseRegistry` in the worker connector:
