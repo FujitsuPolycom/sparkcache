@@ -18,11 +18,15 @@ topology, settings, and immutable artifacts named in those records. It does
 not transfer to another vLLM tree, target or draft checkpoint, TP/DCP geometry,
 scheduler configuration, or registry image.
 
-Standalone public reproduction is **unsupported** because the qualified ARM64
-parent images and exact patched NCCL build are not published. The source-bound
-image tools are **implemented** for use with an eligible immutable parent;
-[`PUBLISHING.md`](PUBLISHING.md) keeps a registry package private until one
-registry digest completes four-rank qualification.
+The qualified 8,192-token Python-placement artifact is public at digest
+`sha256:cd4045bba2a0f3dc55361560f8c3a3f171939854db28d48dfdae58eed9c44943`.
+Its immutable parent and build provenance are recorded in
+[`IMAGE_ANNOUNCEMENT.md`](IMAGE_ANNOUNCEMENT.md).
+
+Native 131,072-token restore and shared GPU-prefix reuse are qualified only for
+the source-bound runtime named in the native validation record. No public OCI
+digest carries that runtime. [`PUBLISHING.md`](PUBLISHING.md) requires every
+rebuilt digest to complete its own four-rank qualification.
 
 ## Stored state and prefix behavior
 
@@ -92,6 +96,17 @@ whole-file hashes and required symbols against installed vLLM source. An
 unrecognized hash is unsupported.
 
 ## Image construction
+
+Pull the qualified public Python-placement artifact by immutable digest:
+
+```bash
+docker pull ghcr.io/fujitsupolycom/sparkring-glm53-sparkcache@sha256:cd4045bba2a0f3dc55361560f8c3a3f171939854db28d48dfdae58eed9c44943
+```
+
+Its parent is
+`ghcr.io/fujitsupolycom/sparkring-glm53-runtime@sha256:864adfe68f458223e186a19844ac80c7adc7365e5db1f25e109b85fc19850dcd`.
+The public artifact remains bound to SparkCache revision `3860a2250193a6679ac6bac857af53e0757841f8`;
+it does not contain the later native/shared-prefix source described above.
 
 Build from the repository root after recording the exact local parent image
 ID and SparkCache source-tree digest:

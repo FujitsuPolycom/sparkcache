@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from unittest import mock
 
@@ -122,3 +123,41 @@ def test_publish_refuses_to_overwrite_an_existing_sbom(tmp_path: Path) -> None:
                 sbom_path=sbom,
             )
     run.assert_not_called()
+
+
+def test_community_announcement_has_the_required_support_contract() -> None:
+    announcement = Path(__file__).with_name("IMAGE_ANNOUNCEMENT.md").read_text(
+        encoding="utf-8"
+    )
+    for heading in (
+        "## Status",
+        "## Image and digest",
+        "## Based on",
+        "## Build recipe",
+        "## Source commits, pull requests, patches, and overlays",
+        "## Changes from the base image",
+        "## Tested configuration",
+        "## Validation commands",
+        "## Validation results",
+        "## Performance claims",
+        "## Known limitations",
+        "## Support contact or issue tracker",
+        "## Upstream useful work",
+    ):
+        assert heading in announcement
+    assert "Experimental community derivative" in announcement
+    assert "not the recommended community image" in announcement
+    assert "UNKNOWN — needs verification" in announcement
+    assert "Not tested" in announcement
+    assert "@sha256:" in announcement
+    assert "Support owner: `FujitsuPolycom`" in announcement
+    assert "Dedicated Discord support thread:" in announcement
+    assert re.search(
+        r"\b(?:10\.|192\.168\.|172\.(?:1[6-9]|2[0-9]|3[01])\.)",
+        announcement,
+    ) is None
+    assert re.search(r"(?i)\b[A-Z]:\\(?:Users|home)\\", announcement) is None
+    assert not any(
+        secret in announcement
+        for secret in ("HF_TOKEN=", "GH_TOKEN=", "PASSWORD=", "PRIVATE_KEY=")
+    )

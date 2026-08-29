@@ -5,6 +5,12 @@ An exact registry digest remains unqualified until all four TP4/DCP1 ranks pull
 that digest and pass persistent store, coordinated restart, verified restore,
 exact semantic output, cache-disabled serving, health, and fatal-log checks.
 
+The qualified public artifact is
+`ghcr.io/fujitsupolycom/sparkring-glm53-sparkcache@sha256:cd4045bba2a0f3dc55361560f8c3a3f171939854db28d48dfdae58eed9c44943`.
+Its recorded parent is
+`ghcr.io/fujitsupolycom/sparkring-glm53-runtime@sha256:864adfe68f458223e186a19844ac80c7adc7365e5db1f25e109b85fc19850dcd`.
+Another build remains implemented until its own digest passes the named checks.
+
 The published artifact is a FujitsuPolycom community derivative. It is not an
 official NVIDIA, vLLM, local-inference-lab, B12X, Inco AI, Z.AI, or SparkCache
 release artifact. The image does not contain either model checkpoint.

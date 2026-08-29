@@ -21,12 +21,16 @@ PyPI version `0.1.0a3` is **implemented** and GPU-free tested. Its package
 artifact has no live serving qualification. Qualification belongs to an exact
 artifact, model, topology, and vLLM source contract.
 
-The GLM-5.3 source deployment is qualified under the exact conditions recorded
-in [the GLM-5.3 validation](GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md) and
+The public GLM-5.3 OCI artifact is qualified for its recorded 8,192-token
+Python-placement restore. The source deployment separately qualifies native
+131,072-token restore and bounded shared-prefix reuse. See
+[the public image record](deploy/glm53_flash/IMAGE_ANNOUNCEMENT.md),
+[the GLM-5.3 validation](GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md), and
 [the native restore record](GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md).
 
-Standalone public reproduction of the GLM-5.3 results is **unsupported**. The
-qualified ARM64 parent images and exact patched NCCL build are not public.
+The public image does not contain the model checkpoints. Native restore and
+shared GPU-prefix qualification belong to a later source-bound runtime that has
+no published OCI digest.
 
 ## Implemented capabilities
 
@@ -99,6 +103,12 @@ cd sparkcache
 python -m pip install '.[connector]'
 ```
 
+The qualified 8,192-token public image is available by immutable digest:
+
+```bash
+docker pull ghcr.io/fujitsupolycom/sparkring-glm53-sparkcache@sha256:cd4045bba2a0f3dc55361560f8c3a3f171939854db28d48dfdae58eed9c44943
+```
+
 The matching SparkRing procedure is pinned at
 [`FujitsuPolycom/sparkring@6e9e3ace`](https://github.com/FujitsuPolycom/sparkring/blob/6e9e3acef62886a71531310673463972944b2b84/docs/GLM53_FLASH_DFLASH2_BF16_SPARKCACHE_TP4_QUICKSTART.md).
 
@@ -126,7 +136,8 @@ the package qualification.
 | `0.1.0a1`, DeepSeek-V4-Flash-0731 TP4/DCP1 | 73,728 | 413.9–494.6 ms | [release-wheel validation](MULTI_MODEL_LIVE_VALIDATION.md) |
 | `0.1.0a1`, GLM-5.2 EXL3 3.5-bpw TP4/DCP4 | 225,536 | 3.39–3.95 s | [release-wheel validation](MULTI_MODEL_LIVE_VALIDATION.md) |
 | `0.1.0a2`, GLM-5.2 EXL3 3.5-bpw TP4/DCP4 | 225,536 | 3.17–4.17 s | [package validation](GLM52_A2_LIVE_VALIDATION.md) |
-| GLM-5.3 Flash TP4/DCP1, BF16 DFlash2 with seven draft tokens | 8,192 | 147.2–194.0 ms | [GLM-5.3 validation](GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md) |
+| Public GLM-5.3 OCI image, TP4/DCP1 | 8,192 | 156.8–171.8 ms | [public image record](deploy/glm53_flash/IMAGE_ANNOUNCEMENT.md) |
+| GLM-5.3 source deployment, TP4/DCP1 | 8,192 | 147.2–194.0 ms | [GLM-5.3 validation](GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md) |
 
 The native GLM-5.3 work changes practical restore cost across prefix sizes and
 concurrency. C1, C8, and C16 mean one, eight, and sixteen concurrent requests.
