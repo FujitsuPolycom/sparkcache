@@ -1,0 +1,103 @@
+{
+  "schema": "sparkcache-glm53-concurrency-benchmark/v1",
+  "model": "glm-5.3-flash-nvfp4-dflash7-bf16-tp4",
+  "scenario": "identical-prefix",
+  "cache_state": "hot",
+  "concurrency": 8,
+  "prefix_header": "Native 128K restore test.\n",
+  "prefix_repetitions": 131072,
+  "tail_repetitions": 32,
+  "max_tokens": 1,
+  "requests": [
+    {
+      "request_index": 0,
+      "request_id": "request-00",
+      "prompt_sha256": "a2e0c04fb8effeb85f267e8d735a78a4be758725e817ef51354a12fae7949ad2",
+      "elapsed_seconds": 2.356145,
+      "http_status": 200,
+      "response_valid": true,
+      "ok": true,
+      "error_type": null
+    },
+    {
+      "request_index": 1,
+      "request_id": "request-01",
+      "prompt_sha256": "a2e0c04fb8effeb85f267e8d735a78a4be758725e817ef51354a12fae7949ad2",
+      "elapsed_seconds": 3.129369,
+      "http_status": 200,
+      "response_valid": true,
+      "ok": true,
+      "error_type": null
+    },
+    {
+      "request_index": 2,
+      "request_id": "request-02",
+      "prompt_sha256": "a2e0c04fb8effeb85f267e8d735a78a4be758725e817ef51354a12fae7949ad2",
+      "elapsed_seconds": 1.350953,
+      "http_status": 200,
+      "response_valid": true,
+      "ok": true,
+      "error_type": null
+    },
+    {
+      "request_index": 3,
+      "request_id": "request-03",
+      "prompt_sha256": "a2e0c04fb8effeb85f267e8d735a78a4be758725e817ef51354a12fae7949ad2",
+      "elapsed_seconds": 3.036287,
+      "http_status": 200,
+      "response_valid": true,
+      "ok": true,
+      "error_type": null
+    },
+    {
+      "request_index": 4,
+      "request_id": "request-04",
+      "prompt_sha256": "a2e0c04fb8effeb85f267e8d735a78a4be758725e817ef51354a12fae7949ad2",
+      "elapsed_seconds": 0.94711,
+      "http_status": 200,
+      "response_valid": true,
+      "ok": true,
+      "error_type": null
+    },
+    {
+      "request_index": 5,
+      "request_id": "request-05",
+      "prompt_sha256": "a2e0c04fb8effeb85f267e8d735a78a4be758725e817ef51354a12fae7949ad2",
+      "elapsed_seconds": 1.692025,
+      "http_status": 200,
+      "response_valid": true,
+      "ok": true,
+      "error_type": null
+    },
+    {
+      "request_index": 6,
+      "request_id": "request-06",
+      "prompt_sha256": "a2e0c04fb8effeb85f267e8d735a78a4be758725e817ef51354a12fae7949ad2",
+      "elapsed_seconds": 2.017127,
+      "http_status": 200,
+      "response_valid": true,
+      "ok": true,
+      "error_type": null
+    },
+    {
+      "request_index": 7,
+      "request_id": "request-07",
+      "prompt_sha256": "a2e0c04fb8effeb85f267e8d735a78a4be758725e817ef51354a12fae7949ad2",
+      "elapsed_seconds": 2.781146,
+      "http_status": 200,
+      "response_valid": true,
+      "ok": true,
+      "error_type": null
+    }
+  ],
+  "aggregate": {
+    "request_count": 8,
+    "succeeded": 8,
+    "failed": 0,
+    "min_seconds": 0.94711,
+    "p50_seconds": 2.017127,
+    "p95_seconds": 3.129369,
+    "max_seconds": 3.129369
+  },
+  "validation_passed": true
+}

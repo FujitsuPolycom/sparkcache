@@ -73,6 +73,34 @@ completed in approximately 1.2--2.1 seconds. This is strong evidence that the
 Python/Torch page-placement section caused the earlier serialized stall, but
 it is not a completed C16 qualification.
 
+## 128K concurrency baseline
+
+After rolling the scheduler recovery correction in `b00c6d4`, a synchronized
+fixture reproduced persisted digest `53d5e0f5fe6b...`. Every request restored
+131,072 tokens and 813,068,464 bytes per rank. The baseline predates
+single-flight cohort sharing, so logs record one complete restore per request:
+2 for C2, 8 for C8, and 16 for C16 on every rank.
+
+| Cohort | Cache state | Client min | Client p50 | Client p95/max |
+|---:|---|---:|---:|---:|
+| C2 | first read after restart | 1.282 s | 1.282 s | 1.377 s |
+| C8 | host/filesystem warm | 0.947 s | 2.017 s | 3.129 s |
+| C16 | host/filesystem warm | 1.063 s | 3.363 s | 5.335 s |
+
+All 26 requests succeeded. No load failure, placement failure, engine death,
+container exit, or semantic-canary failure was observed. C2 per-rank cache
+service ranged from 283.9 to 564.7 ms, with queue wait below 0.4 ms. This
+baseline demonstrates that native placement removed the earlier Python submit
+stall, while also quantifying the remaining duplication: C16 still reads,
+verifies, and places the same snapshot sixteen times per rank.
+
+Committed receipts:
+
+- `evidence/glm53-flash-dflash7-bf16/native-128k-c2-b00c6d4.json`;
+- `evidence/glm53-flash-dflash7-bf16/native-128k-c8-hot-b00c6d4.json`;
+- `evidence/glm53-flash-dflash7-bf16/native-128k-c16-hot-b00c6d4.json`;
+- `evidence/glm53-flash-dflash7-bf16/post-b00c6d4-semantic.json`.
+
 ## Repository validation
 
 The exact source tree above passed:
