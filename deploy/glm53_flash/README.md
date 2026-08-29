@@ -95,7 +95,7 @@ supplied checkpoint identities; it does not inspect model mounts. A launcher
 must verify the target artifact manifest and the DFlash config and weight
 SHA-256 values before starting vLLM. The qualified SparkRing TP4 launcher owns
 that artifact-verification boundary at
-[`FujitsuPolycom/sparkring@d45572d`](https://github.com/FujitsuPolycom/sparkring/blob/d45572dbd2adc7afa1d3208fb801c8ad9eac7864/docs/GLM53_FLASH_DFLASH2_BF16_SPARKCACHE_TP4_QUICKSTART.md).
+[`FujitsuPolycom/sparkring@6e9e3ac`](https://github.com/FujitsuPolycom/sparkring/blob/6e9e3acef62886a71531310673463972944b2b84/docs/GLM53_FLASH_DFLASH2_BF16_SPARKCACHE_TP4_QUICKSTART.md).
 Supplying an unverified digest is unsupported.
 
 ## Compatibility

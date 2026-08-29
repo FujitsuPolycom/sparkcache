@@ -21,7 +21,9 @@ recorded in
 Build and connector configuration are documented in
 [`deploy/glm53_flash/README.md`](deploy/glm53_flash/README.md); the corresponding
 four-Spark cached and cache-disabled quickstarts are pinned through the
-SparkRing commit linked from that guide.
+SparkRing commit linked from that guide. Standalone public reproduction is
+**unsupported** because the qualified ARM64 parent images and exact patched
+NCCL build are not published.
 
 ## Published release status
 
