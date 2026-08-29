@@ -309,6 +309,10 @@ class LookupResult:
 class EntryKey:
     storage_key: str
     context_digest: str
+    # The default preserves the two-argument exact-manifest API and equality
+    # used by existing callers. Prefix aliases occupy a distinct root kind so
+    # an alias eviction cannot be mistaken for eviction of an exact entry.
+    root_kind: str = "manifest"
 
 
 @dataclass(frozen=True)
@@ -347,6 +351,9 @@ class MaintenanceReport:
     evicted_entries: tuple[EntryKey, ...] = ()
     capacity_satisfied: bool = True
     skipped_busy: bool = False
+    aliases_evicted: int = 0
+    segments_deleted: int = 0
+    orphan_segments_deleted: int = 0
 
 
 @dataclass(frozen=True)
@@ -357,6 +364,7 @@ class _CapacityEntry:
     mtime_ns: int
     chunks: tuple[tuple[str, int], ...]
     valid: bool
+    segments: tuple[str, ...] = ()
 
 
 def _process_root_lock(root: Path) -> _ProcessRootLock:
@@ -1141,6 +1149,132 @@ class ManifestStore:
                 valid=False,
             )
 
+    def _capacity_alias_entry(self, path: Path) -> _CapacityEntry:
+        """Describe one alias root only when its complete graph authenticates.
+
+        Maintenance may remove malformed metadata, but it must never use an
+        unverified alias or segment descriptor as authority to retain or delete
+        shared content-addressed chunks.
+        """
+
+        metadata = path.stat()
+        key = EntryKey(path.parent.name, path.stem, "prefix_alias")
+        try:
+            _validate_digest(key.storage_key, "storage_key")
+            _validate_digest(key.context_digest, "context_digest")
+            alias = json.loads(path.read_bytes())
+            if not isinstance(alias, dict) or not isinstance(alias.get("identity"), dict):
+                raise CacheFormatError("prefix alias identity is invalid")
+            identity_wire = dict(alias["identity"])
+            if "record_schema" in identity_wire:
+                schema = identity_wire["record_schema"]
+                if not isinstance(schema, list):
+                    raise CacheFormatError("prefix alias record schema is invalid")
+                identity_wire["record_schema"] = tuple(schema)
+            try:
+                identity = CacheIdentity(**identity_wire)
+            except (TypeError, ValueError) as error:
+                raise CacheFormatError("prefix alias identity is invalid") from error
+            if identity.storage_key != key.storage_key:
+                raise _IncompatibleManifestError("prefix alias storage key differs")
+            committed_tokens, chunk_count, segment_digest = _validate_prefix_alias(
+                alias,
+                identity=identity,
+                context_digest=key.context_digest,
+            )
+            segment_count = (
+                chunk_count + _PREFIX_SEGMENT_DESCRIPTORS - 1
+            ) // _PREFIX_SEGMENT_DESCRIPTORS
+            visited: set[str] = set()
+            reversed_segments: list[tuple[Mapping[str, Any], ...]] = []
+            for segment_index in range(segment_count - 1, -1, -1):
+                if segment_digest in visited:
+                    raise CacheFormatError("prefix descriptor chain contains a cycle")
+                visited.add(segment_digest)
+                segment_path = (
+                    self.root
+                    / "prefix-index"
+                    / key.storage_key
+                    / f"{segment_digest}.spix"
+                )
+                encoded_segment = segment_path.read_bytes()
+                if _sha256(encoded_segment) != segment_digest:
+                    raise CacheFormatError(
+                        "prefix descriptor segment checksum mismatch"
+                    )
+                segment = json.loads(encoded_segment)
+                descriptors = _validate_prefix_segment(
+                    segment,
+                    storage_key=key.storage_key,
+                    expected_first_chunk=(
+                        segment_index * _PREFIX_SEGMENT_DESCRIPTORS
+                    ),
+                )
+                if segment_index < segment_count - 1 and (
+                    len(descriptors) != _PREFIX_SEGMENT_DESCRIPTORS
+                ):
+                    raise CacheFormatError("non-tail prefix segment is incomplete")
+                reversed_segments.append(descriptors)
+                parent = segment["parent_sha256"]
+                if segment_index == 0:
+                    if parent is not None:
+                        raise CacheFormatError(
+                            "prefix descriptor chain has extra parent"
+                        )
+                elif parent is None:
+                    raise CacheFormatError("prefix descriptor chain is truncated")
+                else:
+                    segment_digest = parent
+
+            descriptors = [
+                descriptor
+                for segment in reversed(reversed_segments)
+                for descriptor in segment
+            ][:chunk_count]
+            synthetic_manifest = {
+                "format_abi": FORMAT_ABI,
+                "identity": identity.to_wire(),
+                "context_digest": key.context_digest,
+                "committed_tokens": committed_tokens,
+                "chunks": descriptors,
+            }
+            validated = _validate_manifest_metadata(
+                synthetic_manifest,
+                EntryKey(key.storage_key, key.context_digest),
+                expected_identity=identity,
+            )
+            chunks: dict[str, int] = {}
+            for descriptor in validated:
+                digest = descriptor["sha256"]
+                encoded_bytes = descriptor["bytes"]
+                if digest in chunks and chunks[digest] != encoded_bytes:
+                    raise CacheFormatError("capacity chunk descriptor differs")
+                chunks[digest] = encoded_bytes
+            return _CapacityEntry(
+                key=key,
+                path=path,
+                manifest_bytes=_allocated_bytes(metadata),
+                mtime_ns=metadata.st_mtime_ns,
+                chunks=tuple(sorted(chunks.items())),
+                valid=True,
+                segments=tuple(sorted(visited)),
+            )
+        except (
+            CacheFormatError,
+            OSError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            return _CapacityEntry(
+                key=key,
+                path=path,
+                manifest_bytes=_allocated_bytes(metadata),
+                mtime_ns=metadata.st_mtime_ns,
+                chunks=(),
+                valid=False,
+            )
+
     def touch(
         self,
         identity: CacheIdentity,
@@ -1155,6 +1289,8 @@ class ManifestStore:
             raise ValueError("minimum_interval_seconds must be non-negative")
         current_ns = time.time_ns() if now_ns is None else now_ns
         path = self._manifest_path(identity, context_digest)
+        if not path.exists():
+            path = self._prefix_alias_path(identity, context_digest)
         try:
             with _RootGuard(self.root, shared=True, blocking=False):
                 metadata = path.stat()
@@ -1180,7 +1316,10 @@ class ManifestStore:
             return False
         current_ns = time.time_ns() if now_ns is None else now_ns
         try:
-            mtime_ns = self._manifest_path(identity, context_digest).stat().st_mtime_ns
+            path = self._manifest_path(identity, context_digest)
+            if not path.exists():
+                path = self._prefix_alias_path(identity, context_digest)
+            mtime_ns = path.stat().st_mtime_ns
         except OSError:
             return True
         return current_ns - mtime_ns >= ttl_seconds * 10**9
@@ -1207,35 +1346,61 @@ class ManifestStore:
             return MaintenanceReport(capacity_satisfied=False, skipped_busy=True)
         try:
             manifests_root = self.root / "manifests"
+            aliases_root = self.root / "prefix-aliases"
             manifest_paths = (
                 tuple(sorted(manifests_root.glob("*/*.json")))
                 if manifests_root.is_dir()
                 else ()
             )
+            alias_paths = (
+                tuple(sorted(aliases_root.glob("*/*.json")))
+                if aliases_root.is_dir()
+                else ()
+            )
             entries = [self._capacity_entry(path) for path in manifest_paths]
-            manifest_files = (
-                tuple(
+            entries.extend(self._capacity_alias_entry(path) for path in alias_paths)
+
+            def root_files(root: Path) -> tuple[Path, ...]:
+                if not root.is_dir():
+                    return ()
+                return tuple(
                     sorted(
                         path
-                        for directory in manifests_root.iterdir()
+                        for directory in root.iterdir()
                         if directory.is_dir()
                         for path in directory.iterdir()
                         if path.is_file()
                     )
                 )
-                if manifests_root.is_dir()
-                else ()
+
+            root_path_set = set((*manifest_paths, *alias_paths))
+            root_debris = tuple(
+                path
+                for path in (*root_files(manifests_root), *root_files(aliases_root))
+                if path not in root_path_set
             )
-            manifest_path_set = set(manifest_paths)
-            manifest_debris = tuple(
-                path for path in manifest_files if path not in manifest_path_set
-            )
-            manifest_debris_sizes: dict[Path, int] = {}
-            for path in manifest_debris:
+            root_debris_sizes: dict[Path, int] = {}
+            for path in root_debris:
                 try:
-                    manifest_debris_sizes[path] = _allocated_bytes(path.stat())
+                    root_debris_sizes[path] = _allocated_bytes(path.stat())
                 except FileNotFoundError:
                     continue
+
+            segment_root = self.root / "prefix-index"
+            segment_paths = root_files(segment_root)
+            segment_sizes: dict[Path, int] = {}
+            canonical_segments: dict[tuple[str, str], Path] = {}
+            for path in segment_paths:
+                try:
+                    segment_sizes[path] = _allocated_bytes(path.stat())
+                except FileNotFoundError:
+                    continue
+                if (
+                    path.suffix == ".spix"
+                    and _DIGEST.fullmatch(path.stem)
+                    and _DIGEST.fullmatch(path.parent.name)
+                ):
+                    canonical_segments[(path.parent.name, path.stem)] = path
             chunk_directory = self.root / "chunks"
             chunk_paths = (
                 tuple(
@@ -1259,22 +1424,39 @@ class ManifestStore:
                     canonical_chunks[path.stem] = path
 
             references: Counter[str] = Counter()
+            segment_references: Counter[tuple[str, str]] = Counter()
             for entry in entries:
                 references.update(digest for digest, _size in entry.chunks)
+                segment_references.update(
+                    (entry.key.storage_key, digest) for digest in entry.segments
+                )
             bytes_before = (
                 sum(entry.manifest_bytes for entry in entries)
-                + sum(manifest_debris_sizes.values())
+                + sum(root_debris_sizes.values())
+                + sum(segment_sizes.values())
                 + sum(chunk_sizes.values())
             )
             pressure_triggered = (
                 policy.max_bytes > 0 and bytes_before > policy.max_bytes
             )
-            projected_bytes = bytes_before - sum(manifest_debris_sizes.values()) - sum(
-                size
-                for path, size in chunk_sizes.items()
-                if references.get(path.stem, 0) == 0
+            projected_bytes = (
+                bytes_before
+                - sum(root_debris_sizes.values())
+                - sum(
+                    size
+                    for path, size in segment_sizes.items()
+                    if canonical_segments.get((path.parent.name, path.stem)) != path
+                    or segment_references.get((path.parent.name, path.stem), 0) == 0
+                )
+                - sum(
+                    size
+                    for path, size in chunk_sizes.items()
+                    if canonical_chunks.get(path.stem) != path
+                    or references.get(path.stem, 0) == 0
+                )
             )
             projected_references = references.copy()
+            projected_segment_references = segment_references.copy()
             selected: list[_CapacityEntry] = []
             selected_paths: set[Path] = set()
 
@@ -1291,6 +1473,13 @@ class ManifestStore:
                         path = canonical_chunks.get(digest)
                         if path is not None:
                             projected_bytes -= chunk_sizes.get(path, 0)
+                for digest in entry.segments:
+                    reference = (entry.key.storage_key, digest)
+                    projected_segment_references[reference] -= 1
+                    if projected_segment_references[reference] == 0:
+                        path = canonical_segments.get(reference)
+                        if path is not None:
+                            projected_bytes -= segment_sizes.get(path, 0)
 
             ordered = sorted(entries, key=lambda entry: (entry.mtime_ns, entry.path))
             for entry in ordered:
@@ -1306,48 +1495,92 @@ class ManifestStore:
                         break
 
             removed: list[_CapacityEntry] = []
-            affected_manifest_directories: set[Path] = set()
-            manifest_debris_deleted = 0
-            for path, size in manifest_debris_sizes.items():
+            affected_root_directories: set[Path] = set()
+            root_debris_deleted = 0
+            for path, size in root_debris_sizes.items():
                 try:
                     path.unlink()
                 except FileNotFoundError:
-                    affected_manifest_directories.add(path.parent)
-                    manifest_debris_deleted += size
+                    affected_root_directories.add(path.parent)
+                    root_debris_deleted += size
                 except OSError:
                     continue
                 else:
-                    affected_manifest_directories.add(path.parent)
-                    manifest_debris_deleted += size
+                    affected_root_directories.add(path.parent)
+                    root_debris_deleted += size
             for entry in selected:
                 try:
                     entry.path.unlink()
                 except FileNotFoundError:
                     removed.append(entry)
-                    affected_manifest_directories.add(entry.path.parent)
+                    affected_root_directories.add(entry.path.parent)
                 except OSError:
                     continue
                 else:
                     removed.append(entry)
-                    affected_manifest_directories.add(entry.path.parent)
-            for directory in sorted(affected_manifest_directories):
+                    affected_root_directories.add(entry.path.parent)
+            # Root removals are durable before any object they authorized can
+            # be collected. A failed root-directory barrier stops maintenance
+            # with every shared segment and chunk still present.
+            for directory in sorted(affected_root_directories):
                 _fsync_directory(directory)
 
             remaining_references: Counter[str] = Counter()
+            remaining_segment_references: Counter[tuple[str, str]] = Counter()
             removed_paths = {entry.path for entry in removed}
             for entry in entries:
                 if entry.path not in removed_paths:
                     remaining_references.update(
                         digest for digest, _size in entry.chunks
                     )
+                    remaining_segment_references.update(
+                        (entry.key.storage_key, digest)
+                        for digest in entry.segments
+                    )
+
+            segments_deleted = 0
+            orphan_segments_deleted = 0
+            segment_bytes_deleted = 0
+            initial_orphan_segments = {
+                path
+                for path in segment_sizes
+                if canonical_segments.get((path.parent.name, path.stem)) != path
+                or segment_references.get((path.parent.name, path.stem), 0) == 0
+            }
+            affected_segment_directories: set[Path] = set()
+            for path, size in segment_sizes.items():
+                reference = (path.parent.name, path.stem)
+                if (
+                    canonical_segments.get(reference) == path
+                    and remaining_segment_references.get(reference, 0) > 0
+                ):
+                    continue
+                try:
+                    path.unlink()
+                except OSError:
+                    continue
+                segments_deleted += 1
+                segment_bytes_deleted += size
+                affected_segment_directories.add(path.parent)
+                if path in initial_orphan_segments:
+                    orphan_segments_deleted += 1
+            for directory in sorted(affected_segment_directories):
+                _fsync_directory(directory)
+
             chunks_deleted = 0
             orphan_chunks_deleted = 0
             chunk_bytes_deleted = 0
             initial_orphans = {
-                path for path in chunk_sizes if references.get(path.stem, 0) == 0
+                path
+                for path in chunk_sizes
+                if canonical_chunks.get(path.stem) != path
+                or references.get(path.stem, 0) == 0
             }
             for path, size in chunk_sizes.items():
-                if remaining_references.get(path.stem, 0) > 0:
+                if (
+                    canonical_chunks.get(path.stem) == path
+                    and remaining_references.get(path.stem, 0) > 0
+                ):
                     continue
                 try:
                     path.unlink()
@@ -1364,21 +1597,31 @@ class ManifestStore:
             bytes_after = max(
                 0,
                 bytes_before
-                - manifest_debris_deleted
+                - root_debris_deleted
                 - manifest_bytes_deleted
+                - segment_bytes_deleted
                 - chunk_bytes_deleted,
+            )
+            exact_removed = sum(
+                entry.key.root_kind == "manifest" for entry in removed
+            )
+            aliases_removed = sum(
+                entry.key.root_kind == "prefix_alias" for entry in removed
             )
             return MaintenanceReport(
                 bytes_before=bytes_before,
                 bytes_after=bytes_after,
                 bytes_reclaimed=bytes_before - bytes_after,
-                manifests_evicted=len(removed),
+                manifests_evicted=exact_removed,
                 chunks_deleted=chunks_deleted,
                 orphan_chunks_deleted=orphan_chunks_deleted,
                 evicted_entries=tuple(entry.key for entry in removed),
                 capacity_satisfied=(
                     policy.max_bytes == 0 or bytes_after <= policy.max_bytes
                 ),
+                aliases_evicted=aliases_removed,
+                segments_deleted=segments_deleted,
+                orphan_segments_deleted=orphan_segments_deleted,
             )
         finally:
             guard.__exit__(None, None, None)
@@ -1557,7 +1800,9 @@ class ManifestStore:
                 self._prefix_alias_path(identity, context_digest),
                 _canonical_json(alias),
             )
-            alias_keys.append(EntryKey(identity.storage_key, context_digest))
+            alias_keys.append(
+                EntryKey(identity.storage_key, context_digest, "prefix_alias")
+            )
         return PrefixAliasReceipt(
             source_manifest_digest=source_manifest_digest,
             aliases_published=len(alias_keys),

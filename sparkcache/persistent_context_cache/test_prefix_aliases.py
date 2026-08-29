@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
 from sparkcache.persistent_context_cache.cache_manifest import (
     CacheIdentity,
+    CapacityPolicy,
     CommitConflict,
     ContextChunk,
     ManifestStore,
     StateRecord,
 )
+import sparkcache.persistent_context_cache.cache_manifest as cache_manifest
 from sparkcache.spark_context_cache_codec import context_prefix_digest
 
 
@@ -67,6 +71,20 @@ def _publish_source(
         storage_mode="per_token_rows",
     )
     return store, identity, tokens, source_digest, chunks
+
+
+def _allocated_tree_bytes(root: Path) -> int:
+    return sum(
+        cache_manifest._allocated_bytes(path.stat())
+        for directory_name in (
+            "manifests",
+            "prefix-aliases",
+            "prefix-index",
+            "chunks",
+        )
+        for path in (root / directory_name).glob("**/*")
+        if path.is_file()
+    )
 
 
 def test_sparse_aliases_use_bounded_linear_descriptor_segments(tmp_path: Path) -> None:
@@ -310,3 +328,245 @@ def test_invalidated_damaged_alias_can_be_republished(tmp_path: Path) -> None:
         storage_mode="per_token_rows",
     )
     assert repaired.is_hit, repaired.reason
+
+
+def test_capacity_counts_shared_alias_graph_files_once_and_evicts_lru_root(
+    tmp_path: Path,
+) -> None:
+    store, identity, tokens, source_digest, chunks = _publish_source(
+        tmp_path,
+        chunk_count=20,
+        prefix_tokens=(1024, 4096),
+    )
+    short_digest = context_prefix_digest(
+        tokens, identity.storage_key, token_count=1024
+    )
+    long_digest = context_prefix_digest(
+        tokens, identity.storage_key, token_count=4096
+    )
+    short_path = (
+        tmp_path / "prefix-aliases" / identity.storage_key / f"{short_digest}.json"
+    )
+    long_path = (
+        tmp_path / "prefix-aliases" / identity.storage_key / f"{long_digest}.json"
+    )
+    source_path = (
+        tmp_path / "manifests" / identity.storage_key / f"{source_digest}.json"
+    )
+    os_times = ((short_path, 1), (long_path, 2), (source_path, 3))
+    for path, timestamp in os_times:
+        path.touch()
+        path_mtime = timestamp * 10**9
+        os.utime(path, ns=(path_mtime, path_mtime))
+
+    bytes_before = _allocated_tree_bytes(tmp_path)
+    short_bytes = cache_manifest._allocated_bytes(short_path.stat())
+    target = bytes_before - short_bytes
+    report = store.maintain(
+        CapacityPolicy(max_bytes=bytes_before - 1, low_watermark_bytes=target),
+        now_ns=4 * 10**9,
+    )
+
+    assert report.bytes_before == bytes_before
+    assert report.bytes_after == target
+    assert report.aliases_evicted == 1
+    assert report.manifests_evicted == 0
+    assert report.segments_deleted == 0
+    assert report.chunks_deleted == 0
+    assert report.evicted_entries == (
+        cache_manifest.EntryKey(
+            identity.storage_key, short_digest, "prefix_alias"
+        ),
+    )
+    assert not short_path.exists()
+    lookup = store.lookup(identity, long_digest, storage_mode="per_token_rows")
+    assert lookup.is_hit, lookup.reason
+    assert store.restore(lookup) == chunks[:16]
+
+
+def test_last_alias_cleanup_removes_unreferenced_segments_then_chunks(
+    tmp_path: Path,
+) -> None:
+    store, identity, tokens, source_digest, _chunks = _publish_source(
+        tmp_path,
+        chunk_count=20,
+        prefix_tokens=(4096,),
+    )
+    alias_digest = context_prefix_digest(
+        tokens, identity.storage_key, token_count=4096
+    )
+    exact_path = (
+        tmp_path / "manifests" / identity.storage_key / f"{source_digest}.json"
+    )
+    alias_path = (
+        tmp_path / "prefix-aliases" / identity.storage_key / f"{alias_digest}.json"
+    )
+    os.utime(exact_path, ns=(1, 1))
+    os.utime(alias_path, ns=(20 * 10**9, 20 * 10**9))
+
+    first = store.maintain(
+        CapacityPolicy(ttl_seconds=10),
+        now_ns=20 * 10**9,
+    )
+
+    assert first.manifests_evicted == 1
+    assert first.aliases_evicted == 0
+    assert first.segments_deleted == 0
+    assert first.chunks_deleted == 4
+    assert tuple((tmp_path / "prefix-index").glob("*/*.spix"))
+    assert len(tuple((tmp_path / "chunks").glob("*.spcc"))) == 16
+
+    second = store.maintain(
+        CapacityPolicy(ttl_seconds=10),
+        now_ns=31 * 10**9,
+    )
+
+    assert second.aliases_evicted == 1
+    assert second.segments_deleted == 1
+    assert second.chunks_deleted == 16
+    assert not tuple((tmp_path / "prefix-index").glob("*/*.spix"))
+    assert not tuple((tmp_path / "chunks").glob("*.spcc"))
+
+
+def test_corrupt_alias_root_cannot_delete_chunks_held_by_healthy_manifest(
+    tmp_path: Path,
+) -> None:
+    store, identity, tokens, source_digest, chunks = _publish_source(
+        tmp_path,
+        chunk_count=4,
+        prefix_tokens=(1024,),
+    )
+    alias_digest = context_prefix_digest(
+        tokens, identity.storage_key, token_count=1024
+    )
+    alias_path = (
+        tmp_path / "prefix-aliases" / identity.storage_key / f"{alias_digest}.json"
+    )
+    alias_path.write_bytes(b"damaged")
+
+    report = store.maintain(CapacityPolicy(ttl_seconds=1), now_ns=0)
+
+    assert report.aliases_evicted == 1
+    assert report.manifests_evicted == 0
+    assert report.orphan_segments_deleted == 1
+    assert report.chunks_deleted == 0
+    exact = store.lookup(identity, source_digest)
+    assert exact.is_hit, exact.reason
+    assert store.restore(exact) == chunks
+
+
+def test_corrupt_exact_root_cannot_delete_chunks_held_by_healthy_alias(
+    tmp_path: Path,
+) -> None:
+    store, identity, tokens, source_digest, chunks = _publish_source(
+        tmp_path,
+        chunk_count=4,
+        prefix_tokens=(1024,),
+    )
+    alias_digest = context_prefix_digest(
+        tokens, identity.storage_key, token_count=1024
+    )
+    exact_path = (
+        tmp_path / "manifests" / identity.storage_key / f"{source_digest}.json"
+    )
+    exact_path.write_bytes(b"damaged")
+
+    report = store.maintain(CapacityPolicy(ttl_seconds=1), now_ns=0)
+
+    assert report.manifests_evicted == 1
+    assert report.aliases_evicted == 0
+    assert report.segments_deleted == 0
+    assert report.chunks_deleted == 0
+    alias = store.lookup(identity, alias_digest, storage_mode="per_token_rows")
+    assert alias.is_hit, alias.reason
+    assert store.restore(alias) == chunks
+
+
+def test_alias_touch_refreshes_ttl_after_exact_manifest_is_absent(
+    tmp_path: Path,
+) -> None:
+    store, identity, tokens, source_digest, _chunks = _publish_source(
+        tmp_path,
+        chunk_count=4,
+        prefix_tokens=(1024,),
+    )
+    alias_digest = context_prefix_digest(
+        tokens, identity.storage_key, token_count=1024
+    )
+    exact_path = (
+        tmp_path / "manifests" / identity.storage_key / f"{source_digest}.json"
+    )
+    exact_path.unlink()
+    alias_path = (
+        tmp_path / "prefix-aliases" / identity.storage_key / f"{alias_digest}.json"
+    )
+    os.utime(alias_path, ns=(1, 1))
+
+    assert store.touch(
+        identity,
+        alias_digest,
+        now_ns=20 * 10**9,
+        minimum_interval_seconds=0,
+    )
+    report = store.maintain(
+        CapacityPolicy(ttl_seconds=10),
+        now_ns=25 * 10**9,
+    )
+
+    assert report.aliases_evicted == 0
+    assert not store.expired(
+        identity,
+        alias_digest,
+        10,
+        now_ns=25 * 10**9,
+    )
+
+
+def test_alias_root_barrier_failure_preserves_segments_and_chunks(
+    tmp_path: Path,
+) -> None:
+    store, identity, tokens, source_digest, _chunks = _publish_source(
+        tmp_path,
+        chunk_count=4,
+        prefix_tokens=(1024,),
+    )
+    alias_digest = context_prefix_digest(
+        tokens, identity.storage_key, token_count=1024
+    )
+    exact_path = (
+        tmp_path / "manifests" / identity.storage_key / f"{source_digest}.json"
+    )
+    exact_path.unlink()
+    alias_path = (
+        tmp_path / "prefix-aliases" / identity.storage_key / f"{alias_digest}.json"
+    )
+    os.utime(alias_path, ns=(1, 1))
+    alias_directory = alias_path.parent
+    segments = tuple((tmp_path / "prefix-index").glob("*/*.spix"))
+    chunks = tuple((tmp_path / "chunks").glob("*.spcc"))
+
+    def fail_alias_barrier(path: Path) -> None:
+        if path == alias_directory:
+            raise OSError("simulated alias eviction barrier failure")
+
+    with (
+        mock.patch.object(
+            cache_manifest,
+            "_fsync_directory",
+            side_effect=fail_alias_barrier,
+        ),
+        pytest.raises(OSError, match="alias eviction barrier failure"),
+    ):
+        store.maintain(
+            CapacityPolicy(ttl_seconds=1),
+            now_ns=2 * 10**9,
+        )
+
+    assert all(path.exists() for path in segments)
+    assert all(path.exists() for path in chunks)
+    retry = store.maintain(
+        CapacityPolicy(ttl_seconds=1),
+        now_ns=2 * 10**9,
+    )
+    assert retry.orphan_segments_deleted == len(segments)
+    assert retry.orphan_chunks_deleted == len(chunks)
