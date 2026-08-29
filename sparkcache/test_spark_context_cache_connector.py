@@ -308,6 +308,171 @@ class HybridAllocatorContractTests(unittest.TestCase):
 
 
 class HybridPageRoundTripTests(unittest.TestCase):
+    def test_page_tail_uses_geometry_when_historical_recurrent_slot_is_null(
+        self,
+    ) -> None:
+        class FullAttentionSpec:
+            block_size = 256
+            storage_block_size = 256
+            page_size_bytes = 8
+
+        class MambaSpec:
+            block_size = 256
+            storage_block_size = 256
+            page_size_bytes = 8
+            mamba_cache_mode = "align"
+            tokens_per_state = 256
+            num_speculative_blocks = 0
+            num_prefill_checkpoint_blocks = 1
+
+        config = types.SimpleNamespace(
+            kv_cache_groups=(
+                types.SimpleNamespace(
+                    kv_cache_spec=FullAttentionSpec(),
+                    is_eagle_group=False,
+                    layer_names=("full",),
+                ),
+                types.SimpleNamespace(
+                    kv_cache_spec=MambaSpec(),
+                    is_eagle_group=False,
+                    layer_names=("state",),
+                ),
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                extra_config={
+                    "spark_cache_model_profile": "deepseek-v4-fp8-hma",
+                    "spark_cache_publication_schema": "tail-cow-v1",
+                },
+                tp=1,
+                dcp=1,
+                kv_cache_config=config,
+            )
+            connector.register_kv_caches(
+                {
+                    "full": torch.arange(80, dtype=torch.uint8).reshape(10, 1, 8),
+                    "state": torch.arange(80, dtype=torch.uint8).reshape(10, 1, 8),
+                }
+            )
+            tokens = tuple(range(512))
+            base_digest = connector._digest(list(tokens), 256)
+            result_digest = connector._digest(list(tokens), 512)
+            connector._store_one(
+                _ReqPlan(
+                    "recurrent-base",
+                    base_digest,
+                    256,
+                    (3,),
+                    True,
+                    block_ids_by_group=((3,), (4,)),
+                    token_ids=tokens[:256],
+                )
+            )
+
+            connector._store_one(
+                _ReqPlan(
+                    "recurrent-tail",
+                    result_digest,
+                    512,
+                    (3, 5),
+                    True,
+                    block_ids_by_group=((3, 5), (0, 7)),
+                    token_ids=tokens,
+                    base_context_digest=base_digest,
+                    base_span_tokens=256,
+                )
+            )
+
+            lookup = connector._store.lookup(connector._identity(0), result_digest)
+            self.assertTrue(lookup.is_hit, lookup.reason)
+            self.assertEqual(lookup.root_kind, "page_delta")
+
+    def test_page_tail_compacts_at_depth_limit_and_rejects_wrong_plan_digest(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connector = _make_connector(
+                root,
+                0,
+                extra_config={
+                    "spark_cache_model_profile": "deepseek-v4-fp8-hma",
+                    "spark_cache_publication_schema": "tail-cow-v1",
+                },
+                tp=2,
+                dcp=1,
+                kv_cache_config=_hybrid_kv_cache_config(),
+            )
+            connector.register_kv_caches(
+                {
+                    "full": torch.zeros((10, 64, 8), dtype=torch.uint8),
+                    "compressed": torch.zeros((10, 2, 8), dtype=torch.uint8),
+                    "state": torch.zeros((10, 4, 16), dtype=torch.float32),
+                }
+            )
+            tokens = tuple(range(1024))
+            base_digest = connector._digest(list(tokens), 512)
+            connector._store_one(
+                _ReqPlan(
+                    "compact-base",
+                    base_digest,
+                    512,
+                    (3,),
+                    True,
+                    block_ids_by_group=((3,), (4,)),
+                    token_ids=tokens[:512],
+                )
+            )
+            plan = _ReqPlan(
+                "compact-tail",
+                connector._digest(list(tokens), 1024),
+                1024,
+                (3, 5),
+                True,
+                block_ids_by_group=((3, 5), (4, 2)),
+                token_ids=tokens,
+                base_context_digest=base_digest,
+                base_span_tokens=512,
+            )
+            with mock.patch.object(
+                connector._store,
+                "commit_page_extension",
+                side_effect=connector_module.PageDeltaDepthExceeded(
+                    "synthetic depth limit"
+                ),
+            ):
+                connector._store_one(plan)
+
+            root_manifest = json.loads(
+                (
+                    root
+                    / "manifests"
+                    / connector._identity(0).storage_key
+                    / f"{plan.digest}.json"
+                ).read_bytes()
+            )
+            self.assertNotIn("schema", root_manifest)
+            self.assertEqual(connector.counters["page_delta_compactions"], 1)
+            with self.assertRaisesRegex(RuntimeError, "digest differs"):
+                connector._store_one(
+                    dataclasses.replace(
+                        plan,
+                        request_id="wrong-digest",
+                        digest="f" * 64,
+                    )
+                )
+            self.assertFalse(
+                (
+                    root
+                    / "manifests"
+                    / connector._identity(0).storage_key
+                    / f"{'f' * 64}.json"
+                ).exists()
+            )
+
     def test_page_tail_publication_restores_changed_sliding_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

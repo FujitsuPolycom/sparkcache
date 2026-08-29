@@ -300,9 +300,11 @@ byte-identical opaque pages. Restore reconstructs and verifies the complete
 snapshot before Python or native page placement. Arbitrary earlier-prefix
 aliases cannot be derived from opaque page snapshots.
 
-Opaque HMA snapshots cannot be shortened by truncating chunk lists. Tail-only
-GLM storage requires a page-semantic physical format, byte-exact restore tests,
-and a distinct cache namespace.
+Opaque HMA snapshots cannot be shortened by truncating chunk lists. SparkCache
+therefore uses the page-semantic format and distinct namespace described above.
+At most two page deltas may form one graph; the following publication compacts
+the context into a fresh flat snapshot. Live GLM latency and write-volume
+qualification for this path remains outstanding.
 
 Sparse row-prefix aliases are **implemented** but have no live model-serving
 qualification. Their behavior is covered by GPU-free publication, discovery,

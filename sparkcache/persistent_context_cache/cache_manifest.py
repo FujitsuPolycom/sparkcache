@@ -42,7 +42,9 @@ _PREFIX_SEGMENT_SCHEMA = "sparkcache-prefix-descriptor-segment/v1"
 _PREFIX_ALIAS_SCHEMA = "sparkcache-prefix-alias/v1"
 _TAIL_MANIFEST_SCHEMA = "sparkcache-tail-manifest/v1"
 _PAGE_DELTA_MANIFEST_SCHEMA = "sparkcache-page-delta-manifest/v1"
-_MAX_PAGE_DELTA_DEPTH = 64
+# Two delta roots cap reconstruction at two full-snapshot applications. A
+# following extension is compacted by the connector into a fresh flat root.
+_MAX_PAGE_DELTA_DEPTH = 2
 _CLEAR_ONCE_SCHEMA = "sparkcache-clear-once/v1"
 _CLEAR_ONCE_MARKER_DIRECTORY = ".sparkcache-clear-once"
 _CLEAR_ONCE_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}\Z")
@@ -132,6 +134,10 @@ class CommitConflict(RuntimeError):
 
 class IncompleteEntry(ValueError):
     """Required target, indexer, draft, or boundary state is absent."""
+
+
+class PageDeltaDepthExceeded(ValueError):
+    """Another page delta would exceed the bounded reconstruction depth."""
 
 
 @dataclass(frozen=True)
@@ -2144,9 +2150,9 @@ class ManifestStore:
         self,
         identity: CacheIdentity,
         descriptors: Sequence[Mapping[str, Any]],
-    ) -> tuple[str | None, int]:
+    ) -> tuple[str | None, int, int]:
         if not descriptors:
-            return None, 0
+            return None, 0, 0
         objects: list[tuple[Path, bytes]] = []
         parent_digest: str | None = None
         for first in range(0, len(descriptors), _PREFIX_SEGMENT_DESCRIPTORS):
@@ -2165,7 +2171,10 @@ class ManifestStore:
                 (self._prefix_segment_path(identity, parent_digest), encoded)
             )
         _publish_immutable_batch(objects)
-        return parent_digest, len(objects)
+        allocated_bytes = sum(
+            (len(encoded) + 4095) // 4096 * 4096 for _path, encoded in objects
+        )
+        return parent_digest, len(objects), allocated_bytes
 
     def _resolve_tail_manifest(
         self,
@@ -2236,6 +2245,18 @@ class ManifestStore:
         if base_root.get("committed_tokens") != manifest["base_committed_tokens"]:
             raise CacheFormatError("page delta base boundary differs")
         return (*base_chunks, *delta_chunks)
+
+    @staticmethod
+    def _page_delta_root_count(manifest: Mapping[str, Any]) -> int:
+        count = 0
+        root: Any = manifest
+        while (
+            isinstance(root, Mapping)
+            and root.get("schema") == _PAGE_DELTA_MANIFEST_SCHEMA
+        ):
+            count += 1
+            root = root.get("base_root")
+        return count
 
     def _read_context_chunks(
         self,
@@ -2529,10 +2550,11 @@ class ManifestStore:
             ):
                 raise ValueError("tail chunks do not extend the base context")
 
-            segment_digest, _segment_count = self._publish_descriptor_chain(
-                identity,
-                base_descriptors,
-            )
+            (
+                segment_digest,
+                _segment_count,
+                segment_allocated_bytes,
+            ) = self._publish_descriptor_chain(identity, base_descriptors)
             _publish_immutable_batch(tail_objects)
             root = {
                 "schema": _TAIL_MANIFEST_SCHEMA,
@@ -2561,11 +2583,14 @@ class ManifestStore:
                     len(encoded_root)
                     + sum(int(item["bytes"]) for item in tail_descriptors)
                 ),
-                allocated_bytes_upper_bound=sum(
-                    (size + 4095) // 4096 * 4096
-                    for size in (
-                        len(encoded_root),
-                        *(int(item["bytes"]) for item in tail_descriptors),
+                allocated_bytes_upper_bound=(
+                    segment_allocated_bytes
+                    + sum(
+                        (size + 4095) // 4096 * 4096
+                        for size in (
+                            len(encoded_root),
+                            *(int(item["bytes"]) for item in tail_descriptors),
+                        )
                     )
                 ),
             )
@@ -2605,6 +2630,10 @@ class ManifestStore:
                 raise CacheFormatError(f"base context is not reusable: {base.reason}")
             if int(base._manifest["committed_tokens"]) != base_boundary_tokens:
                 raise CacheFormatError("base context boundary differs")
+            if self._page_delta_root_count(base._manifest) >= _MAX_PAGE_DELTA_DEPTH:
+                raise PageDeltaDepthExceeded(
+                    "page delta depth requires a fresh full snapshot"
+                )
             if (
                 context_prefix_digest(
                     token_ids,
@@ -2726,14 +2755,14 @@ class ManifestStore:
 
         if not lookup.is_hit or lookup._manifest is None:
             raise ValueError("cannot restore a cache miss")
-        if _depth >= _MAX_PAGE_DELTA_DEPTH:
-            raise CacheFormatError("page delta graph exceeds the depth limit")
         manifest = lookup._manifest
         if manifest.get("schema") != _PAGE_DELTA_MANIFEST_SCHEMA:
             chunks = self.restore(lookup)
             if chunks is None:
                 raise CacheFormatError("page snapshot restore failed")
             return b"".join(chunk.records[StateRecord.TARGET_CKV] for chunk in chunks)
+        if _depth >= _MAX_PAGE_DELTA_DEPTH:
+            raise CacheFormatError("page delta graph exceeds the depth limit")
         identity_wire = dict(manifest["identity"])
         if "record_schema" in identity_wire:
             identity_wire["record_schema"] = tuple(identity_wire["record_schema"])
@@ -3183,6 +3212,8 @@ class ManifestStore:
     def restore(self, lookup: LookupResult) -> tuple[ContextChunk, ...] | None:
         if not lookup.is_hit or lookup._manifest is None:
             raise ValueError("cannot restore a cache miss")
+        if lookup.root_kind == "page_delta":
+            raise ValueError("page delta restore requires restore_page_snapshot")
         required = _required_records_for_identity_wire(
             lookup._manifest.get("identity", {})
         )

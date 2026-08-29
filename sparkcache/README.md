@@ -213,7 +213,9 @@ when placement completes and intentionally excludes that bookkeeping.
   authenticated base graph, allowing capacity maintenance to retain shared
   objects after older roots are removed. Restore reconstructs the verified
   full snapshot before Python or native page placement. GPU-free regression
-  coverage exists; live model-serving qualification does not.
+  coverage exists; live model-serving qualification does not. A graph contains
+  at most two deltas. The following extension publishes a fresh flat snapshot,
+  bounding reconstruction work and metadata ancestry.
 - **Concurrent shared GPU prefix — implemented.** One leader restores a
   persistent digest. After every rank succeeds, up to sixteen waiting followers
   attach through vLLM block references. Two leases may remain reusable for

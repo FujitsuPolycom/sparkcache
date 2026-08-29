@@ -23,6 +23,7 @@ from sparkcache.persistent_context_cache.cache_manifest import (
     ContextChunk,
     IncompleteEntry,
     ManifestStore,
+    PageDeltaDepthExceeded,
     StateRecord,
 )
 
@@ -120,7 +121,7 @@ class ManifestStoreTests(unittest.TestCase):
         layout = PageLayout(
             (PageGroup(256, (PageLayer("page", "u8", (1024,), 1024),)),)
         )
-        tokens = tuple(range(768))
+        tokens = tuple(range(1024))
         salt = "page-tail-store-test"
         base_digest = context_prefix_digest(tokens, salt, token_count=256)
         result_digest = context_prefix_digest(tokens, salt, token_count=512)
@@ -135,6 +136,11 @@ class ManifestStoreTests(unittest.TestCase):
             layout,
             (3,),
             {"page": b"A" * 1024 + b"B" * 1024 + b"C" * 1024},
+        )
+        fourth_snapshot = encode_page_snapshot(
+            layout,
+            (4,),
+            {"page": (b"A" * 1024 + b"B" * 1024 + b"C" * 1024 + b"D" * 1024)},
         )
         base_chunks = tuple(
             ContextChunk(
@@ -159,7 +165,7 @@ class ManifestStoreTests(unittest.TestCase):
                 span_tokens=256,
             )
 
-            store.commit_page_extension(
+            page_receipt = store.commit_page_extension(
                 identity=identity,
                 base_context_digest=base_digest,
                 token_ids=tokens,
@@ -171,7 +177,25 @@ class ManifestStoreTests(unittest.TestCase):
                 result_boundary_tokens=512,
                 result_snapshot=result_snapshot,
             )
-            store.commit_page_extension(
+            page_root_path = (
+                root / "manifests" / identity.storage_key / f"{result_digest}.json"
+            )
+            page_root = json.loads(page_root_path.read_bytes())
+            page_objects = [
+                page_root_path,
+                *(
+                    root / "chunks" / f"{item['sha256']}.spcc"
+                    for item in page_root["delta_chunks"]
+                ),
+            ]
+            self.assertGreaterEqual(
+                page_receipt.allocated_bytes_upper_bound,
+                sum(
+                    cache_manifest._allocated_bytes(path.stat())
+                    for path in page_objects
+                ),
+            )
+            chained_receipt = store.commit_page_extension(
                 identity=identity,
                 base_context_digest=result_digest,
                 token_ids=tokens,
@@ -183,6 +207,37 @@ class ManifestStoreTests(unittest.TestCase):
                 result_boundary_tokens=768,
                 result_snapshot=third_snapshot,
             )
+            chained_root_path = (
+                root / "manifests" / identity.storage_key / f"{third_digest}.json"
+            )
+            chained_root = json.loads(chained_root_path.read_bytes())
+            chained_objects = [
+                chained_root_path,
+                *(
+                    root / "chunks" / f"{item['sha256']}.spcc"
+                    for item in chained_root["delta_chunks"]
+                ),
+            ]
+            self.assertGreaterEqual(
+                chained_receipt.allocated_bytes_upper_bound,
+                sum(
+                    cache_manifest._allocated_bytes(path.stat())
+                    for path in chained_objects
+                ),
+            )
+            with self.assertRaises(PageDeltaDepthExceeded):
+                store.commit_page_extension(
+                    identity=identity,
+                    base_context_digest=third_digest,
+                    token_ids=tokens,
+                    identity_salt=salt,
+                    layout=layout,
+                    base_block_counts=(3,),
+                    result_block_counts=(4,),
+                    base_boundary_tokens=768,
+                    result_boundary_tokens=1024,
+                    result_snapshot=fourth_snapshot,
+                )
             (root / "manifests" / identity.storage_key / f"{base_digest}.json").unlink()
             (
                 root / "manifests" / identity.storage_key / f"{result_digest}.json"
@@ -192,6 +247,8 @@ class ManifestStoreTests(unittest.TestCase):
             lookup = store.lookup(identity, third_digest)
             self.assertTrue(lookup.is_hit, lookup.reason)
             self.assertEqual(lookup.root_kind, "page_delta")
+            with self.assertRaisesRegex(ValueError, "restore_page_snapshot"):
+                store.restore(lookup)
             self.assertEqual(
                 store.restore_page_snapshot(
                     lookup,
@@ -257,6 +314,18 @@ class ManifestStoreTests(unittest.TestCase):
             manifest = json.loads(encoded)
             self.assertEqual(manifest["schema"], "sparkcache-tail-manifest/v1")
             self.assertEqual(len(manifest["tail_chunks"]), 1)
+            committed_paths = [
+                root / "chunks" / f"{manifest['tail_chunks'][0]['sha256']}.spcc",
+                root / "manifests" / identity.storage_key / f"{result_digest}.json",
+                *(root / "prefix-index" / identity.storage_key).glob("*.spix"),
+            ]
+            self.assertGreaterEqual(
+                receipt.allocated_bytes_upper_bound,
+                sum(
+                    cache_manifest._allocated_bytes(path.stat())
+                    for path in committed_paths
+                ),
+            )
             lookup = store.lookup(identity, result_digest)
             self.assertTrue(lookup.is_hit, lookup.reason)
             self.assertEqual(store.restore(lookup), (base, tail))

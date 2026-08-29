@@ -94,6 +94,7 @@ from sparkcache.spark_context_cache_store import (
     LookupResult,
     MaintenanceReport,
     ManifestStore,
+    PageDeltaDepthExceeded,
     StateRecord,
 )
 
@@ -745,6 +746,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             "store_skipped_busy": 0,
             "store_skipped_present": 0,
             "store_skipped_quorum": 0,
+            "page_delta_compactions": 0,
             "prefix_alias_publication_attempted": 0,
             "prefix_alias_publication_failed": 0,
             "prefix_aliases_published": 0,
@@ -1044,6 +1046,29 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 )
             trimmed.append(chosen)
         return tuple(trimmed)
+
+    def _group_block_counts_for_span(self, span_tokens: int) -> tuple[int, ...]:
+        """Return page counts without consulting disposable physical IDs."""
+
+        counts = []
+        for topology in self._group_topology:
+            block_size = int(topology["block_size"])
+            required = (span_tokens + block_size - 1) // block_size
+            policy = topology["reuse_policy"]
+            if policy == "sliding":
+                window = topology["reuse_window_tokens"]
+                if window is None:
+                    raise HybridCodecError("sliding page group has no reuse window")
+                required = min(
+                    required,
+                    (int(window) - 1 + block_size - 1) // block_size,
+                )
+            elif policy == "recurrent_align":
+                required = 1
+            elif policy != "full":
+                raise HybridCodecError(f"unsupported page reuse policy {policy!r}")
+            counts.append(required)
+        return tuple(counts)
 
     def _has_full_quorum(self, digest: str) -> bool:
         """Return whether every physical TP worker already offers this cache entry.
@@ -3761,6 +3786,16 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     chunks = _SnapshotChunks(
                         snapshot, self._dcp_degree, self._chunk_tokens
                     )
+                if snapshot.plan.base_context_digest and (
+                    snapshot.plan.digest
+                    != self._digest(
+                        list(snapshot.plan.token_ids),
+                        snapshot.plan.span_tokens,
+                    )
+                ):
+                    raise RuntimeError(
+                        "tail publication result digest differs from request"
+                    )
                 if (
                     isinstance(snapshot, _HybridStoreSnapshot)
                     and snapshot.plan.base_context_digest
@@ -3768,22 +3803,29 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     layout = self._page_layout
                     if layout is None:
                         raise RuntimeError("block-page layout was not registered")
-                    base_groups = self._select_group_blocks_for_span(
-                        snapshot.plan.group_block_ids,
-                        snapshot.plan.base_span_tokens,
-                    )
-                    receipt = self._store.commit_page_extension(
-                        identity=snapshot.identity,
-                        base_context_digest=snapshot.plan.base_context_digest,
-                        token_ids=snapshot.plan.token_ids,
-                        identity_salt=self._context_digest_salt,
-                        layout=layout,
-                        base_block_counts=tuple(len(group) for group in base_groups),
-                        result_block_counts=snapshot.block_counts,
-                        base_boundary_tokens=snapshot.plan.base_span_tokens,
-                        result_boundary_tokens=snapshot.plan.span_tokens,
-                        result_snapshot=snapshot.encoded_pages,
-                    )
+                    try:
+                        receipt = self._store.commit_page_extension(
+                            identity=snapshot.identity,
+                            base_context_digest=snapshot.plan.base_context_digest,
+                            token_ids=snapshot.plan.token_ids,
+                            identity_salt=self._context_digest_salt,
+                            layout=layout,
+                            base_block_counts=self._group_block_counts_for_span(
+                                snapshot.plan.base_span_tokens
+                            ),
+                            result_block_counts=snapshot.block_counts,
+                            base_boundary_tokens=snapshot.plan.base_span_tokens,
+                            result_boundary_tokens=snapshot.plan.span_tokens,
+                            result_snapshot=snapshot.encoded_pages,
+                        )
+                    except PageDeltaDepthExceeded:
+                        receipt = self._store.commit(
+                            identity=snapshot.identity,
+                            context_digest=snapshot.plan.digest,
+                            chunks=chunks,
+                            span_tokens=snapshot.plan.span_tokens,
+                        )
+                        self.counters["page_delta_compactions"] += 1
                 elif snapshot.plan.base_context_digest:
                     receipt = self._store.commit_extension(
                         identity=snapshot.identity,
@@ -3792,16 +3834,6 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         identity_salt=self._context_digest_salt,
                         tail_chunks=chunks,
                     )
-                    if receipt.manifest_digest and (
-                        snapshot.plan.digest
-                        != self._digest(
-                            list(snapshot.plan.token_ids),
-                            snapshot.plan.span_tokens,
-                        )
-                    ):
-                        raise RuntimeError(
-                            "tail publication result digest differs from request"
-                        )
                 else:
                     receipt = self._store.commit(
                         identity=snapshot.identity,
@@ -3967,26 +3999,37 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             chunks = _HybridSnapshotChunks(snapshot, self._chunk_tokens)
         else:
             chunks = _SnapshotChunks(snapshot, self._dcp_degree, self._chunk_tokens)
+        if plan.base_context_digest and (
+            plan.digest != self._digest(list(plan.token_ids), plan.span_tokens)
+        ):
+            raise RuntimeError("tail publication result digest differs from request")
         if isinstance(snapshot, _HybridStoreSnapshot) and plan.base_context_digest:
             layout = self._page_layout
             if layout is None:
                 raise RuntimeError("block-page layout was not registered")
-            base_groups = self._select_group_blocks_for_span(
-                plan.group_block_ids,
-                plan.base_span_tokens,
-            )
-            receipt = self._store.commit_page_extension(
-                identity=snapshot.identity,
-                base_context_digest=plan.base_context_digest,
-                token_ids=plan.token_ids,
-                identity_salt=self._context_digest_salt,
-                layout=layout,
-                base_block_counts=tuple(len(group) for group in base_groups),
-                result_block_counts=snapshot.block_counts,
-                base_boundary_tokens=plan.base_span_tokens,
-                result_boundary_tokens=plan.span_tokens,
-                result_snapshot=snapshot.encoded_pages,
-            )
+            try:
+                receipt = self._store.commit_page_extension(
+                    identity=snapshot.identity,
+                    base_context_digest=plan.base_context_digest,
+                    token_ids=plan.token_ids,
+                    identity_salt=self._context_digest_salt,
+                    layout=layout,
+                    base_block_counts=self._group_block_counts_for_span(
+                        plan.base_span_tokens
+                    ),
+                    result_block_counts=snapshot.block_counts,
+                    base_boundary_tokens=plan.base_span_tokens,
+                    result_boundary_tokens=plan.span_tokens,
+                    result_snapshot=snapshot.encoded_pages,
+                )
+            except PageDeltaDepthExceeded:
+                receipt = self._store.commit(
+                    identity=snapshot.identity,
+                    context_digest=plan.digest,
+                    chunks=chunks,
+                    span_tokens=plan.span_tokens,
+                )
+                self.counters["page_delta_compactions"] += 1
         elif plan.base_context_digest:
             receipt = self._store.commit_extension(
                 identity=snapshot.identity,
