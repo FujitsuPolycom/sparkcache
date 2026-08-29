@@ -113,6 +113,8 @@ _QUORUM_PENDING_DELTA_LIMIT = 64
 _QUORUM_RETIRED_GENERATION_LIMIT = 64
 _QUORUM_DELTA_PROTOCOL = "sparkcache-quorum-delta-v1"
 _MAX_RESTORE_FLIGHT_FOLLOWERS = 16
+_MAX_SHARED_PREFIX_LEASES = 2
+_SHARED_PREFIX_LEASE_TTL_SECONDS = 15.0
 
 # The runtime is deliberately supplied by the embedding process instead of
 # importing or constructing the optional streaming-snapshot runtime here.
@@ -201,6 +203,12 @@ class _RestoreFlight:
     dispatched: bool = False
     workers_finished: bool = False
     leader_finished: bool = False
+    lease_published_at: float | None = None
+    lease_expires_at: float | None = None
+
+    @property
+    def lease_published(self) -> bool:
+        return self.lease_expires_at is not None
 
 
 @dataclass(frozen=True)
@@ -698,6 +706,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             "restore_flights_failed": 0,
             "restore_flight_follower_overflow": 0,
             "restore_flight_leader_aborted": 0,
+            "shared_prefix_leases_published": 0,
+            "shared_prefix_leases_attached": 0,
+            "shared_prefix_leases_expired": 0,
+            "shared_prefix_leases_evicted": 0,
+            "shared_prefix_lease_rejected": 0,
             "quorum_generation_resets": 0,
             "load_verified": 0,
             "load_failed": 0,
@@ -988,6 +1001,132 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         if flight is not None:
             flight.followers.discard(request_id)
 
+    def _expire_shared_prefix_flights(self, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        for digest, flight in tuple(self._restore_flights.items()):
+            expires_at = flight.lease_expires_at
+            if expires_at is not None and expires_at <= now:
+                self.counters["shared_prefix_leases_expired"] += 1
+                self._retire_restore_flight(digest, outcome="completed")
+
+    def get_shared_prefix_lease_to_publish(
+        self, request: "Request"
+    ) -> tuple[str, int, float] | None:
+        """Name a restore only after every worker has verified and finished it."""
+        request_id = request.request_id
+        digest = self._restore_flight_leaders.get(request_id)
+        if digest is None:
+            return None
+        flight = self._restore_flights.get(digest)
+        if (
+            flight is None
+            or not flight.workers_finished
+            or flight.leader_finished
+            or flight.lease_published
+        ):
+            return None
+        return digest, flight.span_tokens, _SHARED_PREFIX_LEASE_TTL_SECONDS
+
+    def shared_prefix_lease_published(self, request_id: str, lease_key: str) -> bool:
+        """Acknowledge that vLLM pinned the verified multi-group block table."""
+        digest = self._restore_flight_leaders.get(request_id)
+        flight = self._restore_flights.get(lease_key)
+        if digest != lease_key or flight is None or not flight.workers_finished:
+            return False
+        now = time.monotonic()
+        flight.lease_published_at = now
+        flight.lease_expires_at = now + _SHARED_PREFIX_LEASE_TTL_SECONDS
+        self.counters["shared_prefix_leases_published"] += 1
+
+        published = sorted(
+            (
+                item
+                for item in self._restore_flights.values()
+                if item.lease_published_at is not None
+            ),
+            key=lambda item: item.lease_published_at or 0.0,
+        )
+        for stale in published[:-_MAX_SHARED_PREFIX_LEASES]:
+            self.counters["shared_prefix_leases_evicted"] += 1
+            self._retire_restore_flight(stale.digest, outcome="completed")
+        return True
+
+    def get_shared_prefix_lease_candidate(
+        self, request: "Request"
+    ) -> tuple[str, int] | None:
+        """Return the longest live verified lease matching this request prefix."""
+        if not self._restore_enabled:
+            return None
+        self._expire_shared_prefix_flights()
+        request_id = request.request_id
+
+        follower_digest = self._restore_flight_followers.get(request_id)
+        if follower_digest is not None:
+            flight = self._restore_flights.get(follower_digest)
+            if flight is not None and flight.lease_published:
+                return flight.digest, flight.span_tokens
+            return None
+
+        token_ids = list(request.prompt_token_ids or [])
+        aligned_span = self._aligned_span(len(token_ids))
+        span_ceiling = min(
+            aligned_span,
+            self._max_span // self._chunk_tokens * self._chunk_tokens,
+        )
+        if span_ceiling < self._min_span:
+            return None
+        candidates = chunk_prefix_digests(
+            token_ids,
+            self._context_digest_salt,
+            boundaries=range(
+                (
+                    (self._min_span + self._chunk_tokens - 1)
+                    // self._chunk_tokens
+                    * self._chunk_tokens
+                ),
+                span_ceiling + 1,
+                self._chunk_tokens,
+            ),
+        )
+        flight = next(
+            (
+                self._restore_flights.get(candidate_digest)
+                for _, candidate_digest in reversed(candidates)
+                if (
+                    self._restore_flights.get(candidate_digest) is not None
+                    and self._restore_flights[candidate_digest].lease_published
+                )
+            ),
+            None,
+        )
+        if flight is None or request_id == flight.leader_request_id:
+            return None
+        if len(flight.followers) >= _MAX_RESTORE_FLIGHT_FOLLOWERS:
+            self.counters["restore_flight_follower_overflow"] += 1
+            return None
+        flight.followers.add(request_id)
+        self._restore_flight_followers[request_id] = flight.digest
+        self.counters["restore_flights_joined"] += 1
+        return flight.digest, flight.span_tokens
+
+    def shared_prefix_lease_attached(self, request_id: str, lease_key: str) -> None:
+        if self._restore_flight_followers.get(request_id) == lease_key:
+            self.counters["shared_prefix_leases_attached"] += 1
+
+    def shared_prefix_lease_rejected(self, request_id: str, lease_key: str) -> None:
+        self.counters["shared_prefix_lease_rejected"] += 1
+        if self._restore_flight_followers.get(request_id) == lease_key:
+            self._remove_restore_follower(request_id)
+        flight = self._restore_flights.get(lease_key)
+        publish_rejected = self._restore_flight_leaders.get(request_id) == lease_key
+        if flight is not None and (flight.lease_published or publish_rejected):
+            # The scheduler no longer owns the matching block-table pin.  Drop
+            # the hot flight so this request can start a fresh verified restore.
+            self._retire_restore_flight(
+                lease_key,
+                outcome="completed" if flight.lease_published else "cancelled",
+            )
+
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int | None, bool]:
@@ -1083,8 +1222,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self._restore_flight_followers[request_id] = digest
             self.counters["restore_flights_joined"] += 1
             return None, False
+        active_restore_flights = sum(
+            not existing.lease_published
+            for existing in self._restore_flights.values()
+        )
         if (
-            len(self._restore_flights) >= self._max_pending_restores
+            active_restore_flights >= self._max_pending_restores
             or (
                 request_id not in self._need_load
                 and len(self._need_load) >= self._max_pending_restores
@@ -2947,12 +3090,25 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         "FINISHED_LENGTH_CAPPED",
                         "FINISHED_REPETITION",
                     }
-                    if flight.workers_finished and completed_normally:
+                    if flight.lease_published:
+                        # The scheduler-owned lease, not the leader request,
+                        # now retains the verified table. Keep the digest hot
+                        # for late arrivals until its bounded expiry.
+                        self._restore_flight_leaders.pop(request_id, None)
+                        flight.leader_finished = True
+                    elif flight.workers_finished and completed_normally:
                         # The leader could only generate after vLLM published
                         # its verified external blocks. Retiring here also
                         # wakes an otherwise all-deferred follower cohort.
                         self._retire_restore_flight(
                             leader_digest, outcome="completed"
+                        )
+                    elif flight.workers_finished:
+                        # The worker writes have already drained, so an abort
+                        # needs no later completion edge to release followers.
+                        self.counters["restore_flight_leader_aborted"] += 1
+                        self._retire_restore_flight(
+                            leader_digest, outcome="cancelled"
                         )
                     else:
                         # Worker completion owns the drain edge. Keep aborted

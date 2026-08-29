@@ -1,0 +1,262 @@
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import itertools
++import time
+ from collections.abc import Sequence
+ from dataclasses import dataclass
+ from typing import Literal, overload
+@@ -115,6 +116,16 @@ class KVCacheBlocks:
+         return KVCacheBlocks(tuple(() for _ in range(len(self.blocks))))
+ 
+ 
++@dataclass(frozen=True)
++class _SharedPrefixLease:
++    """Scheduler-owned reference to one verified multi-group prefix."""
++
++    request_id: str
++    num_computed_tokens: int
++    expires_at: float
++    ready: bool = False
++
++
+ class KVCacheManager:
+     def __init__(
+         self,
+@@ -188,6 +199,11 @@ class KVCacheManager:
+         self.empty_kv_cache_blocks = KVCacheBlocks(
+             tuple(() for _ in range(self.num_kv_cache_groups))
+         )
++        # Short-lived leases let a KV connector hand a verified external
++        # prefix to requests that arrive after the original loader.  The
++        # lease is represented as an ordinary hidden request in every
++        # single-type manager, so BlockPool remains the sole refcount owner.
++        self._shared_prefix_leases: dict[str, _SharedPrefixLease] = {}
+ 
+         # Off-table cow blocks handed to a KV connector for partial-tail
+         # offload; pinned until the request's blocks are freed.
+@@ -487,6 +503,7 @@ class KVCacheManager:
+                 apply_admission_cap=True,
+             )
+             required_blocks = num_blocks_to_allocate + watermark_blocks
++            self.evict_shared_prefix_leases_until_free(required_blocks)
+             if required_blocks > self.block_pool.get_num_free_blocks():
+                 return None
+ 
+@@ -525,6 +542,10 @@ class KVCacheManager:
+         # additional watermark of headroom for waiting/preempted admissions.
+         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
+         required_blocks = num_blocks_to_allocate + watermark_blocks
++        self.evict_shared_prefix_leases_until_free(
++            required_blocks + reserved_blocks
++        )
++        available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
+         if required_blocks > available_blocks:
+             # Cannot allocate new blocks
+             return None
+@@ -707,6 +728,202 @@ class KVCacheManager:
+         """Get the blocks of a request."""
+         return self.create_kv_cache_blocks(self.coordinator.get_blocks(request_id))
+ 
++    def _release_shared_prefix_lease(self, lease_key: str) -> None:
++        lease = self._shared_prefix_leases.pop(lease_key, None)
++        if lease is not None:
++            # The hidden request owns exactly one ordinary BlockPool reference
++            # to every live block in the leased prefix.  Coordinator.free()
++            # releases those references through the same path as any request.
++            self.coordinator.free(lease.request_id)
++
++    def expire_shared_prefix_leases(self, now: float | None = None) -> None:
++        """Release connector prefix leases whose bounded grace period elapsed."""
++        now = time.monotonic() if now is None else now
++        for lease_key, lease in tuple(self._shared_prefix_leases.items()):
++            if lease.expires_at <= now:
++                self._release_shared_prefix_lease(lease_key)
++
++    def publish_shared_prefix_lease(
++        self,
++        lease_key: str,
++        source_request_id: str,
++        num_computed_tokens: int,
++        ttl_seconds: float,
++        *,
++        max_entries: int = 2,
++        reserved_blocks: int = 0,
++        now: float | None = None,
++    ) -> bool:
++        """Pin a verified request prefix for bounded by-reference attachment.
++
++        This must be called only after the connector reports every worker's
++        receive complete and ``cache_blocks`` has published the source.  A
++        hidden request uses the existing per-group allocation bookkeeping and
++        BlockPool refcounts; no parallel ownership system is introduced.
++        """
++        if not lease_key or num_computed_tokens <= 0 or ttl_seconds <= 0:
++            return False
++        if max_entries <= 0 or max_entries > 2:
++            raise ValueError("shared prefix leases are bounded to at most two entries")
++
++        now = time.monotonic() if now is None else now
++        self.expire_shared_prefix_leases(now)
++        expires_at = now + ttl_seconds
++        existing = self._shared_prefix_leases.get(lease_key)
++        if existing is not None:
++            if existing.num_computed_tokens != num_computed_tokens:
++                self._release_shared_prefix_lease(lease_key)
++            else:
++                self._shared_prefix_leases[lease_key] = _SharedPrefixLease(
++                    existing.request_id,
++                    existing.num_computed_tokens,
++                    expires_at,
++                    existing.ready,
++                )
++                return True
++
++        source_blocks = self.coordinator.get_blocks(source_request_id)
++        if len(source_blocks) != self.num_kv_cache_groups or not any(source_blocks):
++            return False
++
++        partial_page_count = sum(
++            num_computed_tokens % manager.block_size != 0
++            for manager in self.coordinator.single_type_managers
++        )
++        required_free_blocks = reserved_blocks + partial_page_count
++        self.evict_shared_prefix_leases_until_free(required_free_blocks, now=now)
++        if self.block_pool.get_num_free_blocks() < required_free_blocks:
++            return False
++
++        while len(self._shared_prefix_leases) >= max_entries:
++            oldest_key = min(
++                self._shared_prefix_leases,
++                key=lambda key: self._shared_prefix_leases[key].expires_at,
++            )
++            self._release_shared_prefix_lease(oldest_key)
++
++        lease_request_id = f"\x00sparkcache-shared-prefix:{lease_key}"
++        if any(self.coordinator.get_blocks(lease_request_id)):
++            # A request ID collision or stale bookkeeping must never alias two
++            # different prefixes.  Refuse the optimization and recompute.
++            return False
++        try:
++            self.coordinator.allocate_new_computed_blocks(
++                request_id=lease_request_id,
++                new_computed_blocks=source_blocks,
++                num_local_computed_tokens=num_computed_tokens,
++                num_external_computed_tokens=0,
++            )
++            # A prefix ending inside any group's physical page cannot remain
++            # on the leader's mutable page.  Move every such lease tail to a
++            # dedicated block through vLLM's existing CoW copy pipeline.  The
++            # scheduler marks the lease ready only after the copy step fences.
++            for manager in self.coordinator.single_type_managers:
++                if num_computed_tokens % manager.block_size == 0:
++                    continue
++                block_idx = num_computed_tokens // manager.block_size
++                lease_blocks = manager.req_to_blocks[lease_request_id]
++                if block_idx >= len(lease_blocks):
++                    raise RuntimeError(
++                        "shared prefix lease lacks its physical partial page"
++                    )
++                source_block = lease_blocks[block_idx]
++                if source_block.is_null:
++                    raise RuntimeError(
++                        "shared prefix lease partial page is a null placeholder"
++                    )
++                partial = manager._partial_hit_reqs.pop(lease_request_id, None)
++                if partial is not None and partial != (block_idx, source_block):
++                    raise RuntimeError(
++                        "shared prefix lease partial-page bookkeeping disagrees"
++                    )
++                hot_block = self.block_pool.get_new_blocks(1)[0]
++                manager._apply_cow(
++                    lease_request_id, block_idx, source_block, hot_block
++                )
++                manager.new_block_ids.append(hot_block.block_id)
++        except Exception:
++            self.coordinator.free(lease_request_id)
++            logger.exception("Failed to pin shared prefix lease %s", lease_key)
++            return False
++
++        self._shared_prefix_leases[lease_key] = _SharedPrefixLease(
++            lease_request_id,
++            num_computed_tokens,
++            expires_at,
++            False,
++        )
++        return True
++
++    def mark_shared_prefix_lease_ready(
++        self, lease_key: str, *, now: float | None = None
++    ) -> bool:
++        """Publish a lease only after its partial-page copies have fenced."""
++        self.expire_shared_prefix_leases(now)
++        lease = self._shared_prefix_leases.get(lease_key)
++        if lease is None:
++            return False
++        self._shared_prefix_leases[lease_key] = _SharedPrefixLease(
++            lease.request_id,
++            lease.num_computed_tokens,
++            lease.expires_at,
++            True,
++        )
++        return True
++
++    def attach_shared_prefix_lease(
++        self,
++        lease_key: str,
++        target_request_id: str,
++        *,
++        now: float | None = None,
++    ) -> int:
++        """Attach a request to a verified leased prefix without copying KV."""
++        now = time.monotonic() if now is None else now
++        self.expire_shared_prefix_leases(now)
++        lease = self._shared_prefix_leases.get(lease_key)
++        if lease is None or not lease.ready:
++            return 0
++        if any(self.coordinator.get_blocks(target_request_id)):
++            return 0
++
++        lease_blocks = self.coordinator.get_blocks(lease.request_id)
++        try:
++            self.coordinator.allocate_new_computed_blocks(
++                request_id=target_request_id,
++                new_computed_blocks=lease_blocks,
++                num_local_computed_tokens=lease.num_computed_tokens,
++                num_external_computed_tokens=0,
++            )
++        except Exception:
++            self.coordinator.free(target_request_id)
++            logger.exception(
++                "Failed to attach request %s to shared prefix lease %s",
++                target_request_id,
++                lease_key,
++            )
++            return 0
++        return lease.num_computed_tokens
++
++    def discard_shared_prefix_lease(self, lease_key: str) -> None:
++        """Release only the lease pin; attached requests retain their refs."""
++        self._release_shared_prefix_lease(lease_key)
++
++    def evict_shared_prefix_leases_until_free(
++        self, min_free_blocks: int, *, now: float | None = None
++    ) -> None:
++        """Drop oldest lease pins under allocation pressure, never request refs."""
++        self.expire_shared_prefix_leases(now)
++        while (
++            self._shared_prefix_leases
++            and self.block_pool.get_num_free_blocks() < min_free_blocks
++        ):
++            oldest_key = min(
++                self._shared_prefix_leases,
++                key=lambda key: self._shared_prefix_leases[key].expires_at,
++            )
++            self._release_shared_prefix_lease(oldest_key)
++
+     def get_block_ids(self, request_id: str) -> tuple[list[int], ...]:
+         """Get the block ids of a request."""
+         return self.get_blocks(request_id).get_block_ids()

@@ -23,6 +23,8 @@ def test_glm53_contract_is_full_commit_bound_and_complete() -> None:
         "vllm/distributed/kv_transfer/kv_connector/utils.py",
         "vllm/v1/core/sched/scheduler.py",
         "vllm/v1/core/kv_cache_manager.py",
+        "vllm/v1/core/block_pool.py",
+        "vllm/v1/core/kv_cache_coordinator.py",
         "vllm/v1/core/sched/output.py",
         "vllm/v1/worker/gpu_model_runner.py",
         "vllm/v1/core/single_type_kv_cache_manager.py",
@@ -71,3 +73,30 @@ def test_glm53_image_applies_exact_hma_load_failure_recovery_patch() -> None:
     assert PATCH_NAME in recipe
     assert receipt["accepted_preimage_sha256"]["jovian_glm53_runtime"] in recipe
     assert receipt["accepted_postimage_sha256"]["jovian_glm53_runtime"] in recipe
+
+
+def test_glm53_shared_prefix_patches_have_exact_two_lineage_receipts() -> None:
+    receipts = json.loads(PREIMAGES.read_text(encoding="utf-8"))
+    expected = {
+        "040-sparkcache-shared-prefix-lease.patch": (
+            "vllm/v1/core/kv_cache_manager.py",
+            "publish_shared_prefix_lease",
+        ),
+        "041-sparkcache-shared-prefix-attach.patch": (
+            "vllm/v1/core/sched/scheduler.py",
+            "get_shared_prefix_lease_to_publish",
+        ),
+    }
+    for patch_name, (target_path, required_text) in expected.items():
+        receipt = receipts[patch_name]
+        assert receipt["target_path"] == target_path
+        assert set(receipt["accepted_preimage_sha256"]) == {
+            "source_checkout",
+            "jovian_glm53_runtime",
+        }
+        assert set(receipt["accepted_postimage_sha256"]) == {
+            "source_checkout",
+            "jovian_glm53_runtime",
+        }
+        patch_text = (PATCH.parent / patch_name).read_text(encoding="utf-8")
+        assert required_text in patch_text

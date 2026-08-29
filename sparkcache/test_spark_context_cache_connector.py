@@ -3464,6 +3464,223 @@ class AsyncRestoreTests(unittest.TestCase):
                 (0, False),
             )
 
+    def test_verified_flight_publishes_lease_for_joined_and_late_followers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            tokens = list(range(1100))
+            digest = self._offer(connector, tokens)
+            leader = types.SimpleNamespace(
+                request_id="lease-leader", prompt_token_ids=tokens
+            )
+            early = types.SimpleNamespace(
+                request_id="early-follower", prompt_token_ids=tokens
+            )
+            late = types.SimpleNamespace(
+                request_id="late-follower", prompt_token_ids=tokens
+            )
+
+            connector.get_num_new_matched_tokens(leader, 0)
+            connector.get_num_new_matched_tokens(early, 0)
+            connector.update_state_after_alloc(
+                leader, self._blocks_stub(), self.SPAN
+            )
+            connector.build_connector_meta(_empty_scheduler_output())
+            self.assertIsNone(connector.get_shared_prefix_lease_to_publish(leader))
+
+            connector.update_connector_output(
+                types.SimpleNamespace(
+                    invalid_block_ids=set(), finished_recving={leader.request_id}
+                )
+            )
+            self.assertEqual(
+                connector.get_shared_prefix_lease_to_publish(leader),
+                (digest, self.SPAN, 15.0),
+            )
+            connector.shared_prefix_lease_published(leader.request_id, digest)
+
+            self.assertEqual(
+                connector.get_shared_prefix_lease_candidate(early),
+                (digest, self.SPAN),
+            )
+            self.assertEqual(
+                connector.get_shared_prefix_lease_candidate(late),
+                (digest, self.SPAN),
+            )
+            connector.shared_prefix_lease_attached(early.request_id, digest)
+            connector.shared_prefix_lease_attached(late.request_id, digest)
+            self.assertEqual(connector.counters["shared_prefix_leases_attached"], 2)
+
+    def test_shared_prefix_lease_expires_and_late_request_can_restore_again(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            tokens = list(range(1100))
+            digest = self._offer(connector, tokens)
+            leader = types.SimpleNamespace(
+                request_id="expiring-leader", prompt_token_ids=tokens
+            )
+            connector.get_num_new_matched_tokens(leader, 0)
+            connector.update_state_after_alloc(
+                leader, self._blocks_stub(), self.SPAN
+            )
+            connector.build_connector_meta(_empty_scheduler_output())
+            connector.update_connector_output(
+                types.SimpleNamespace(
+                    invalid_block_ids=set(), finished_recving={leader.request_id}
+                )
+            )
+            with mock.patch(
+                "sparkcache.spark_context_cache_connector.time.monotonic",
+                return_value=10.0,
+            ):
+                connector.shared_prefix_lease_published(leader.request_id, digest)
+
+            late = types.SimpleNamespace(
+                request_id="after-expiry", prompt_token_ids=tokens
+            )
+            with mock.patch(
+                "sparkcache.spark_context_cache_connector.time.monotonic",
+                return_value=25.001,
+            ):
+                self.assertIsNone(
+                    connector.get_shared_prefix_lease_candidate(late)
+                )
+            self.assertNotIn(digest, connector._restore_flights)
+            self.assertEqual(connector.counters["shared_prefix_leases_expired"], 1)
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(late, 0),
+                (self.SPAN, True),
+            )
+
+    def test_shared_prefix_lease_follower_count_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            tokens = list(range(1100))
+            digest = self._offer(connector, tokens)
+            leader = types.SimpleNamespace(
+                request_id="bounded-leader", prompt_token_ids=tokens
+            )
+            connector.get_num_new_matched_tokens(leader, 0)
+            connector.update_state_after_alloc(
+                leader, self._blocks_stub(), self.SPAN
+            )
+            connector.build_connector_meta(_empty_scheduler_output())
+            connector.update_connector_output(
+                types.SimpleNamespace(
+                    invalid_block_ids=set(), finished_recving={leader.request_id}
+                )
+            )
+            connector.shared_prefix_lease_published(leader.request_id, digest)
+
+            for index in range(16):
+                follower = types.SimpleNamespace(
+                    request_id=f"bounded-follower-{index}",
+                    prompt_token_ids=tokens,
+                )
+                self.assertEqual(
+                    connector.get_shared_prefix_lease_candidate(follower),
+                    (digest, self.SPAN),
+                )
+            overflow = types.SimpleNamespace(
+                request_id="bounded-overflow", prompt_token_ids=tokens
+            )
+            self.assertIsNone(connector.get_shared_prefix_lease_candidate(overflow))
+            self.assertEqual(
+                connector.counters["restore_flight_follower_overflow"], 1
+            )
+
+    def test_shared_prefix_hot_flights_are_bounded_to_two_digests(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            digests = []
+            for index in range(3):
+                tokens = [index * 10_000 + value for value in range(1100)]
+                digest = self._offer(connector, tokens)
+                digests.append(digest)
+                leader = types.SimpleNamespace(
+                    request_id=f"hot-leader-{index}", prompt_token_ids=tokens
+                )
+                self.assertEqual(
+                    connector.get_num_new_matched_tokens(leader, 0),
+                    (self.SPAN, True),
+                )
+                connector.update_state_after_alloc(
+                    leader, self._blocks_stub(), self.SPAN
+                )
+                connector.build_connector_meta(_empty_scheduler_output())
+                connector.update_connector_output(
+                    types.SimpleNamespace(
+                        invalid_block_ids=set(),
+                        finished_recving={leader.request_id},
+                    )
+                )
+                self.assertTrue(
+                    connector.shared_prefix_lease_published(
+                        leader.request_id, digest
+                    )
+                )
+
+            self.assertEqual(set(connector._restore_flights), set(digests[1:]))
+            self.assertEqual(connector.counters["shared_prefix_leases_evicted"], 1)
+
+    def test_rejected_lease_publication_releases_waiting_followers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            tokens = list(range(1100))
+            digest = self._offer(connector, tokens)
+            leader = types.SimpleNamespace(
+                request_id="rejected-publish-leader", prompt_token_ids=tokens
+            )
+            follower = types.SimpleNamespace(
+                request_id="rejected-publish-follower", prompt_token_ids=tokens
+            )
+            connector.get_num_new_matched_tokens(leader, 0)
+            connector.get_num_new_matched_tokens(follower, 0)
+            connector.update_state_after_alloc(
+                leader, self._blocks_stub(), self.SPAN
+            )
+            connector.build_connector_meta(_empty_scheduler_output())
+            connector.update_connector_output(
+                types.SimpleNamespace(
+                    invalid_block_ids=set(), finished_recving={leader.request_id}
+                )
+            )
+
+            connector.shared_prefix_lease_rejected(leader.request_id, digest)
+
+            self.assertNotIn(digest, connector._restore_flights)
+            self.assertNotIn(
+                follower.request_id, connector._restore_flight_followers
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(follower, 0),
+                (self.SPAN, True),
+            )
+
+    def test_aborted_leader_retires_immediately_when_worker_writes_already_drained(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            tokens = list(range(1100))
+            digest = self._offer(connector, tokens)
+            leader = types.SimpleNamespace(
+                request_id="drained-abort", prompt_token_ids=tokens
+            )
+            connector.get_num_new_matched_tokens(leader, 0)
+            connector.update_state_after_alloc(
+                leader, self._blocks_stub(), self.SPAN
+            )
+            connector.build_connector_meta(_empty_scheduler_output())
+            connector.update_connector_output(
+                types.SimpleNamespace(
+                    invalid_block_ids=set(), finished_recving={leader.request_id}
+                )
+            )
+            leader.status = types.SimpleNamespace(name="FINISHED_ABORTED")
+
+            connector.request_finished(leader, list(self.BLOCKS))
+
+            self.assertNotIn(digest, connector._restore_flights)
+            self.assertEqual(connector.counters["restore_flight_leader_aborted"], 1)
+
     def test_unique_flights_are_bounded_but_identical_follower_can_join(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = self._cohort_connector(Path(directory), max_pending=2)

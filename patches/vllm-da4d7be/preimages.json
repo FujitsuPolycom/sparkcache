@@ -20,5 +20,27 @@
       "source_checkout": "4981ca1de8a57c7fe4d258cfeeb103563b1cbe77b02868d210127d891b29140c",
       "jovian_glm53_runtime": "9d2b2d52c2634c3f9b7dffdb631d60e1925f579dc63273df8166e973f04386a9"
     }
+  },
+  "040-sparkcache-shared-prefix-lease.patch": {
+    "target_path": "vllm/v1/core/kv_cache_manager.py",
+    "accepted_preimage_sha256": {
+      "source_checkout": "5cd0c497e7eb11e80d60fcf5690a963137cbc6a29c7ae5efdff18dc4e94b5d1e",
+      "jovian_glm53_runtime": "02c71da26bbac81629248ee42b0a71bd2db817d339894d647d2ff6b66fd5ad19"
+    },
+    "accepted_postimage_sha256": {
+      "source_checkout": "019919c409ad5c75af73b9e506ca8dd66255f30fff8bb90662dde5fb03176209",
+      "jovian_glm53_runtime": "c75ee70b70568fd5002ad78ea6fba2bd20dc4913900586d977ae7ea98dffa416"
+    }
+  },
+  "041-sparkcache-shared-prefix-attach.patch": {
+    "target_path": "vllm/v1/core/sched/scheduler.py",
+    "accepted_preimage_sha256": {
+      "source_checkout": "4981ca1de8a57c7fe4d258cfeeb103563b1cbe77b02868d210127d891b29140c",
+      "jovian_glm53_runtime": "9d2b2d52c2634c3f9b7dffdb631d60e1925f579dc63273df8166e973f04386a9"
+    },
+    "accepted_postimage_sha256": {
+      "source_checkout": "d39e87932cec308bbb3fd4ab9f8f39df39ca7efd6437645dac4cebe33765136b",
+      "jovian_glm53_runtime": "4f8793c4ac4bf356a89c829b6e75b189e6bc4a74c97135208952d0bad1678f15"
+    }
   }
 }
