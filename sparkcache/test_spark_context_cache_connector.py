@@ -144,6 +144,7 @@ from sparkcache.spark_context_cache_hybrid import decode_page_snapshot  # noqa: 
 from sparkcache.spark_context_cache_store import (  # noqa: E402
     CapacityPolicy,
     EntryKey,
+    LookupResult,
     MaintenanceReport,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # noqa: E402
@@ -3815,6 +3816,243 @@ class AsyncRestoreTests(unittest.TestCase):
             connector.shared_prefix_lease_attached(early.request_id, digest)
             connector.shared_prefix_lease_attached(late.request_id, digest)
             self.assertEqual(connector.counters["shared_prefix_leases_attached"], 2)
+
+    def test_c16_distinct_roots_share_one_authenticated_trunk_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            common = list(range(768))
+            leader_tokens = common + list(range(10_000, 10_332))
+            leader_digest = connector._digest(leader_tokens, self.SPAN)
+            trunk_digest = connector._digest(leader_tokens, 768)
+            connector._quorum[leader_digest] = {0, 1, 2, 3}
+            connector._quorum[trunk_digest] = {0, 1, 2, 3}
+            leader = types.SimpleNamespace(
+                request_id="segment-leader", prompt_token_ids=leader_tokens
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(leader, 0),
+                (self.SPAN, True),
+            )
+
+            followers = []
+            for index in range(16):
+                tokens = common + list(
+                    range(20_000 + index * 1_000, 20_332 + index * 1_000)
+                )
+                digest = connector._digest(tokens, self.SPAN)
+                connector._quorum[digest] = {0, 1, 2, 3}
+                follower = types.SimpleNamespace(
+                    request_id=f"segment-follower-{index}",
+                    prompt_token_ids=tokens,
+                )
+                followers.append(follower)
+                self.assertEqual(
+                    connector.get_num_new_matched_tokens(follower, 0),
+                    (None, False),
+                )
+
+            connector.update_state_after_alloc(
+                leader, self._blocks_stub(), self.SPAN
+            )
+            metadata = connector.build_connector_meta(_empty_scheduler_output())
+            self.assertEqual(len(metadata.plans), 1)
+            self.assertEqual(
+                metadata.plans[0].shared_segments, ((trunk_digest, 768),)
+            )
+            connector.update_connector_output(
+                types.SimpleNamespace(
+                    invalid_block_ids=set(), finished_recving={leader.request_id}
+                )
+            )
+            self.assertEqual(
+                connector.get_shared_prefix_lease_to_publish(leader),
+                (trunk_digest, 768, 15.0),
+            )
+            connector.shared_prefix_lease_published(leader.request_id, trunk_digest)
+            for follower in followers:
+                self.assertEqual(
+                    connector.get_shared_prefix_lease_candidate(follower),
+                    (trunk_digest, 768),
+                )
+            self.assertEqual(connector.counters["restore_flights_started"], 1)
+            self.assertEqual(connector.counters["restore_segment_flights_joined"], 16)
+
+    def test_distinct_root_trunk_join_does_not_adopt_partial_local_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            common = list(range(768))
+            leader_tokens = common + list(range(10_000, 10_332))
+            follower_tokens = common + list(range(20_000, 20_332))
+            for tokens, span in (
+                (leader_tokens, self.SPAN),
+                (leader_tokens, 768),
+                (follower_tokens, self.SPAN),
+            ):
+                connector._quorum[connector._digest(tokens, span)] = {0, 1, 2, 3}
+            leader = types.SimpleNamespace(
+                request_id="partial-segment-leader", prompt_token_ids=leader_tokens
+            )
+            partial = types.SimpleNamespace(
+                request_id="partial-segment-follower", prompt_token_ids=follower_tokens
+            )
+
+            connector.get_num_new_matched_tokens(leader, 0)
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(partial, 256), (768, True)
+            )
+            self.assertNotIn(partial.request_id, connector._restore_flight_followers)
+
+    def test_unrelated_cold_request_does_not_wait_behind_segment_flight(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            leader_tokens = list(range(1100))
+            self._offer(connector, leader_tokens)
+            leader = types.SimpleNamespace(
+                request_id="unrelated-leader", prompt_token_ids=leader_tokens
+            )
+            cold = types.SimpleNamespace(
+                request_id="unrelated-cold",
+                prompt_token_ids=list(range(50_000, 51_100)),
+            )
+
+            connector.get_num_new_matched_tokens(leader, 0)
+            self.assertEqual(connector.get_num_new_matched_tokens(cold, 0), (0, False))
+            self.assertNotIn(cold.request_id, connector._restore_flight_followers)
+
+    def test_shareable_descriptor_roots_are_bounded_per_flight(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            tokens = list(range(20_100))
+            span = connector._aligned_span(len(tokens))
+            for boundary, digest in codec.chunk_prefix_digests(
+                tokens,
+                connector._context_digest_salt,
+                boundaries=range(256, span + 1, 256),
+            ):
+                connector._quorum[digest] = {0, 1, 2, 3}
+            request = types.SimpleNamespace(
+                request_id="bounded-segment-roots", prompt_token_ids=tokens
+            )
+
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(request, 0), (span, True)
+            )
+            digest = connector._digest(tokens, span)
+            flight = connector._restore_flights[digest]
+            self.assertEqual(len(flight.shareable_prefixes), 64)
+            self.assertEqual(flight.shareable_prefixes[-1][0], span - 256)
+
+    def test_segment_follower_cancellation_releases_only_its_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            common = list(range(768))
+            leader_tokens = common + list(range(10_000, 10_332))
+            follower_tokens = common + list(range(20_000, 20_332))
+            for tokens, span in (
+                (leader_tokens, self.SPAN),
+                (leader_tokens, 768),
+                (follower_tokens, self.SPAN),
+            ):
+                connector._quorum[connector._digest(tokens, span)] = {0, 1, 2, 3}
+            leader = types.SimpleNamespace(
+                request_id="cancel-segment-leader", prompt_token_ids=leader_tokens
+            )
+            follower = types.SimpleNamespace(
+                request_id="cancel-segment-follower", prompt_token_ids=follower_tokens
+            )
+
+            connector.get_num_new_matched_tokens(leader, 0)
+            connector.get_num_new_matched_tokens(follower, 0)
+            connector.request_finished(follower, [])
+
+            leader_digest = connector._digest(leader_tokens, self.SPAN)
+            self.assertIn(leader_digest, connector._restore_flights)
+            self.assertNotIn(follower.request_id, connector._restore_flight_followers)
+            self.assertEqual(connector._restore_flights[leader_digest].followers, set())
+            self.assertIsNone(connector._restore_flights[leader_digest].segment_digest)
+
+    def test_one_rank_descriptor_disagreement_rejects_shared_trunk(self) -> None:
+        root_chunks = tuple(
+            {
+                "sha256": f"{index:064x}",
+                "bytes": 100 + index,
+                "logical_start": index * 256,
+                "logical_end": (index + 1) * 256,
+            }
+            for index in range(4)
+        )
+        root = LookupResult(True, "hit", _manifest={"chunks": root_chunks})
+        segment_digest = "a" * 64
+        plan = _ReqPlan(
+            "rank-checked-segment",
+            "b" * 64,
+            self.SPAN,
+            self.BLOCKS,
+            False,
+            shared_segments=((segment_digest, 768),),
+        )
+        results = []
+        with tempfile.TemporaryDirectory() as directory:
+            for rank in range(4):
+                connector = self._cohort_connector(Path(directory))
+                segment_chunks = list(root_chunks[:3])
+                if rank == 2:
+                    segment_chunks[1] = {**segment_chunks[1], "sha256": "f" * 64}
+                segment = LookupResult(
+                    True,
+                    "hit",
+                    _manifest={"chunks": tuple(segment_chunks)},
+                    root_kind="prefix_alias",
+                )
+                connector._lookup_reusable = mock.Mock(return_value=(segment, True))
+                connector._invalidate_reusable = mock.Mock(return_value=True)
+                results.append(
+                    connector._verify_shared_segment_roots(
+                        connector._identity(rank), root, plan
+                    )
+                )
+
+        self.assertEqual(results, [True, True, False, True])
+
+    def test_segment_verification_failure_releases_distinct_root_followers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            common = list(range(768))
+            leader_tokens = common + list(range(10_000, 10_332))
+            follower_tokens = common + list(range(20_000, 20_332))
+            leader_digest = connector._digest(leader_tokens, self.SPAN)
+            trunk_digest = connector._digest(leader_tokens, 768)
+            follower_digest = connector._digest(follower_tokens, self.SPAN)
+            for digest in (leader_digest, trunk_digest, follower_digest):
+                connector._quorum[digest] = {0, 1, 2, 3}
+            leader = types.SimpleNamespace(
+                request_id="failed-segment-leader", prompt_token_ids=leader_tokens
+            )
+            follower = types.SimpleNamespace(
+                request_id="released-segment-follower",
+                prompt_token_ids=follower_tokens,
+            )
+            connector.get_num_new_matched_tokens(leader, 0)
+            connector.get_num_new_matched_tokens(follower, 0)
+            connector.update_state_after_alloc(
+                leader, self._blocks_stub(), self.SPAN
+            )
+            connector.build_connector_meta(_empty_scheduler_output())
+
+            connector.update_connector_output(
+                types.SimpleNamespace(
+                    invalid_block_ids={self.BLOCKS[0]},
+                    finished_recving={leader.request_id},
+                )
+            )
+
+            self.assertNotIn(leader_digest, connector._restore_flights)
+            self.assertNotIn(follower.request_id, connector._restore_flight_followers)
+            self.assertNotIn(trunk_digest, connector._quorum)
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(follower, 0),
+                (self.SPAN, True),
+            )
 
     def test_shared_prefix_lease_expires_and_late_request_can_restore_again(
         self,

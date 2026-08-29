@@ -115,6 +115,7 @@ _QUORUM_RETIRED_GENERATION_LIMIT = 64
 _QUORUM_DELTA_PROTOCOL = "sparkcache-quorum-delta-v1"
 _MAX_RESTORE_FLIGHT_FOLLOWERS = 16
 _MAX_SHARED_PREFIX_LEASES = 2
+_MAX_SHAREABLE_PREFIXES_PER_FLIGHT = 64
 _SHARED_PREFIX_LEASE_TTL_SECONDS = 15.0
 
 # The runtime is deliberately supplied by the embedding process instead of
@@ -189,6 +190,10 @@ class _ReqPlan:
     # stored prefix. Empty fields select ordinary full-snapshot publication.
     base_context_digest: str = ""
     base_span_tokens: int = 0
+    # Authenticated row-prefix roots whose descriptors must match the leading
+    # descriptors of this plan.  Workers validate these roots before the
+    # leader's blocks may back a shorter shared-prefix lease.
+    shared_segments: tuple[tuple[str, int], ...] = ()
 
     @property
     def group_block_ids(self) -> tuple[tuple[int, ...], ...]:
@@ -207,12 +212,30 @@ class _RestoreFlight:
     dispatched: bool = False
     workers_finished: bool = False
     leader_finished: bool = False
+    # Every candidate is a full-quorum prefix digest of the leader request.
+    # Row storage can prove that such a root is the leading descriptor graph
+    # of the restored root. Opaque page snapshots deliberately leave this
+    # empty because their recurrent boundary state cannot be truncated.
+    shareable_prefixes: tuple[tuple[int, str], ...] = ()
+    segment_digest: str | None = None
+    segment_span_tokens: int = 0
+    lease_digest: str | None = None
+    lease_span_tokens: int = 0
     lease_published_at: float | None = None
     lease_expires_at: float | None = None
 
     @property
     def lease_published(self) -> bool:
         return self.lease_expires_at is not None
+
+
+@dataclass(frozen=True)
+class _RestoreFollower:
+    """One request waiting to attach a bounded verified prefix lease."""
+
+    flight_digest: str
+    lease_digest: str
+    span_tokens: int
 
 
 @dataclass(frozen=True)
@@ -676,7 +699,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         # recomputes immediately instead of joining a cache-side queue.
         self._restore_flights: dict[str, _RestoreFlight] = {}
         self._restore_flight_leaders: dict[str, str] = {}
-        self._restore_flight_followers: dict[str, str] = {}
+        self._restore_flight_followers: dict[str, _RestoreFollower] = {}
         # Async loads are parked after block allocation, so they do not
         # appear in the next SchedulerOutput. Carry their allocated blocks
         # across that boundary explicitly.
@@ -742,6 +765,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             "restore_flights_failed": 0,
             "restore_flight_follower_overflow": 0,
             "restore_flight_leader_aborted": 0,
+            "restore_segment_flights_joined": 0,
+            "restore_segment_roots_verified": 0,
+            "restore_segment_roots_rejected": 0,
             "shared_prefix_leases_published": 0,
             "shared_prefix_leases_attached": 0,
             "shared_prefix_leases_expired": 0,
@@ -1032,6 +1058,64 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         confirmed = self._quorum.get(digest, ())
         return all(rank in confirmed for rank in range(self._tp_degree))
 
+    def _join_segment_restore_flight(
+        self,
+        request_id: str,
+        candidates: Sequence[tuple[int, str]],
+        *,
+        selected_digest: str,
+    ) -> bool:
+        """Join one different-root flight through a common row-prefix root.
+
+        Only one shorter trunk is retained per flight. It replaces the full
+        root as that flight's hot lease, so divergent tails cannot expand GPU
+        state or scheduler metadata without a fixed bound.
+        """
+        if self._storage_mode != "per_token_rows":
+            return False
+        by_digest = {digest: span for span, digest in candidates}
+        matches: list[tuple[int, _RestoreFlight, str]] = []
+        for flight in self._restore_flights.values():
+            if (
+                flight.digest == selected_digest
+                or flight.leader_finished
+                or flight.dispatched
+            ):
+                continue
+            for span, digest in reversed(flight.shareable_prefixes):
+                if by_digest.get(digest) != span:
+                    continue
+                if flight.segment_digest not in (None, digest):
+                    continue
+                matches.append((span, flight, digest))
+                break
+        if not matches:
+            return False
+        span, flight, digest = max(matches, key=lambda item: item[0])
+        if len(flight.followers) >= _MAX_RESTORE_FLIGHT_FOLLOWERS:
+            self.counters["restore_flight_follower_overflow"] += 1
+            return False
+        if flight.segment_digest is None:
+            flight.segment_digest = digest
+            flight.segment_span_tokens = span
+            # Exact-root followers that arrived first can safely use the
+            # shorter common trunk. Keeping one lease per restore preserves
+            # the existing vLLM callback and the global two-lease bound.
+            for follower_request_id, binding in tuple(
+                self._restore_flight_followers.items()
+            ):
+                if binding.flight_digest == flight.digest:
+                    self._restore_flight_followers[follower_request_id] = (
+                        _RestoreFollower(flight.digest, digest, span)
+                    )
+        flight.followers.add(request_id)
+        self._restore_flight_followers[request_id] = _RestoreFollower(
+            flight.digest, digest, span
+        )
+        self.counters["restore_flights_joined"] += 1
+        self.counters["restore_segment_flights_joined"] += 1
+        return True
+
     # ------------------------------------------------------------------
     # scheduler side
     # ------------------------------------------------------------------
@@ -1051,12 +1135,24 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self.counters[counter] += 1
 
     def _remove_restore_follower(self, request_id: str) -> None:
-        digest = self._restore_flight_followers.pop(request_id, None)
-        if digest is None:
+        follower = self._restore_flight_followers.pop(request_id, None)
+        if follower is None:
             return
-        flight = self._restore_flights.get(digest)
+        flight = self._restore_flights.get(follower.flight_digest)
         if flight is not None:
             flight.followers.discard(request_id)
+            segment_still_needed = any(
+                binding.flight_digest == flight.digest
+                and binding.lease_digest == follower.lease_digest
+                for binding in self._restore_flight_followers.values()
+            )
+            if (
+                follower.lease_digest == flight.segment_digest
+                and not flight.lease_published
+                and not segment_still_needed
+            ):
+                flight.segment_digest = None
+                flight.segment_span_tokens = 0
 
     def _expire_shared_prefix_flights(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
@@ -1065,6 +1161,21 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             if expires_at is not None and expires_at <= now:
                 self.counters["shared_prefix_leases_expired"] += 1
                 self._retire_restore_flight(digest, outcome="completed")
+
+    def _lease_publication_candidates(
+        self, flight: _RestoreFlight
+    ) -> tuple[tuple[str, int, float], ...]:
+        if flight.segment_digest is not None:
+            return (
+                (
+                    flight.segment_digest,
+                    flight.segment_span_tokens,
+                    _SHARED_PREFIX_LEASE_TTL_SECONDS,
+                ),
+            )
+        return (
+            (flight.digest, flight.span_tokens, _SHARED_PREFIX_LEASE_TTL_SECONDS),
+        )
 
     def get_shared_prefix_lease_to_publish(
         self, request: "Request"
@@ -1082,15 +1193,24 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             or flight.lease_published
         ):
             return None
-        return digest, flight.span_tokens, _SHARED_PREFIX_LEASE_TTL_SECONDS
+        return self._lease_publication_candidates(flight)[0]
 
     def shared_prefix_lease_published(self, request_id: str, lease_key: str) -> bool:
         """Acknowledge that vLLM pinned the verified multi-group block table."""
         digest = self._restore_flight_leaders.get(request_id)
-        flight = self._restore_flights.get(lease_key)
-        if digest != lease_key or flight is None or not flight.workers_finished:
+        flight = self._restore_flights.get(digest) if digest is not None else None
+        if flight is None or not flight.workers_finished:
+            return False
+        candidates = {
+            key: span
+            for key, span, _ in self._lease_publication_candidates(flight)
+        }
+        span = candidates.get(lease_key)
+        if span is None:
             return False
         now = time.monotonic()
+        flight.lease_digest = lease_key
+        flight.lease_span_tokens = span
         flight.lease_published_at = now
         flight.lease_expires_at = now + _SHARED_PREFIX_LEASE_TTL_SECONDS
         self.counters["shared_prefix_leases_published"] += 1
@@ -1119,9 +1239,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
 
         follower_digest = self._restore_flight_followers.get(request_id)
         if follower_digest is not None:
-            flight = self._restore_flights.get(follower_digest)
-            if flight is not None and flight.lease_published:
-                return flight.digest, flight.span_tokens
+            flight = self._restore_flights.get(follower_digest.flight_digest)
+            if (
+                flight is not None
+                and flight.lease_published
+                and follower_digest.lease_digest == flight.lease_digest
+            ):
+                return follower_digest.lease_digest, follower_digest.span_tokens
             return None
 
         token_ids = list(request.prompt_token_ids or [])
@@ -1145,44 +1269,69 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self._chunk_tokens,
             ),
         )
-        flight = next(
+        selected = next(
             (
-                self._restore_flights.get(candidate_digest)
+                (self._restore_flights.get(candidate_digest), candidate_digest)
                 for _, candidate_digest in reversed(candidates)
                 if (
                     self._restore_flights.get(candidate_digest) is not None
                     and self._restore_flights[candidate_digest].lease_published
+                    and candidate_digest
+                    == self._restore_flights[candidate_digest].lease_digest
                 )
             ),
             None,
         )
+        if selected is None:
+            for candidate_span, candidate_digest in reversed(candidates):
+                selected = next(
+                    (
+                        (item, candidate_digest)
+                        for item in self._restore_flights.values()
+                        if item.lease_published
+                        and candidate_digest == item.lease_digest
+                    ),
+                    None,
+                )
+                if selected is not None:
+                    break
+        flight, lease_digest = selected if selected is not None else (None, "")
         if flight is None or request_id == flight.leader_request_id:
             return None
         if len(flight.followers) >= _MAX_RESTORE_FLIGHT_FOLLOWERS:
             self.counters["restore_flight_follower_overflow"] += 1
             return None
         flight.followers.add(request_id)
-        self._restore_flight_followers[request_id] = flight.digest
+        lease_span = flight.lease_span_tokens
+        self._restore_flight_followers[request_id] = _RestoreFollower(
+            flight.digest, lease_digest, lease_span
+        )
         self.counters["restore_flights_joined"] += 1
-        return flight.digest, flight.span_tokens
+        if lease_digest != flight.digest:
+            self.counters["restore_segment_flights_joined"] += 1
+        return lease_digest, lease_span
 
     def shared_prefix_lease_attached(self, request_id: str, lease_key: str) -> None:
-        if self._restore_flight_followers.get(request_id) == lease_key:
+        follower = self._restore_flight_followers.get(request_id)
+        if follower is not None and follower.lease_digest == lease_key:
             self.counters["shared_prefix_leases_attached"] += 1
 
     def shared_prefix_lease_rejected(self, request_id: str, lease_key: str) -> None:
         self.counters["shared_prefix_lease_rejected"] += 1
-        if self._restore_flight_followers.get(request_id) == lease_key:
+        follower = self._restore_flight_followers.get(request_id)
+        if follower is not None and follower.lease_digest == lease_key:
             self._remove_restore_follower(request_id)
-        flight = self._restore_flights.get(lease_key)
-        publish_rejected = self._restore_flight_leaders.get(request_id) == lease_key
-        if flight is not None and (flight.lease_published or publish_rejected):
-            # The scheduler no longer owns the matching block-table pin.  Drop
-            # the hot flight so this request can start a fresh verified restore.
-            self._retire_restore_flight(
-                lease_key,
-                outcome="completed" if flight.lease_published else "cancelled",
-            )
+        flight_digest = self._restore_flight_leaders.get(request_id)
+        flight = (
+            self._restore_flights.get(flight_digest)
+            if flight_digest is not None
+            else None
+        )
+        if flight is not None:
+            # Publication failed, so no request may continue waiting for this
+            # scheduler-owned pin. The leader already owns ordinary request
+            # references and can continue; followers resume normal lookup.
+            self._retire_restore_flight(flight.digest, outcome="cancelled")
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
@@ -1199,8 +1348,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             if num_computed_tokens > 0:
                 self._remove_restore_follower(request_id)
                 return 0, False
-            flight = self._restore_flights.get(follower_digest)
-            if flight is not None and num_computed_tokens < flight.span_tokens:
+            flight = self._restore_flights.get(follower_digest.flight_digest)
+            if flight is not None and num_computed_tokens < follower_digest.span_tokens:
                 return None, False
             self._remove_restore_follower(request_id)
         leader_digest = self._restore_flight_leaders.get(request_id)
@@ -1283,8 +1432,16 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self.counters["restore_flight_follower_overflow"] += 1
                 return 0, False
             flight.followers.add(request_id)
-            self._restore_flight_followers[request_id] = digest
+            self._restore_flight_followers[request_id] = _RestoreFollower(
+                digest, digest, span
+            )
             self.counters["restore_flights_joined"] += 1
+            return None, False
+        if num_computed_tokens == 0 and self._join_segment_restore_flight(
+            request_id,
+            candidates,
+            selected_digest=digest,
+        ):
             return None, False
         active_restore_flights = sum(
             not existing.lease_published for existing in self._restore_flights.values()
@@ -1323,6 +1480,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             digest=digest,
             span_tokens=span,
             leader_request_id=request_id,
+            shareable_prefixes=tuple(
+                (candidate_span, candidate_digest)
+                for candidate_span, candidate_digest in candidates
+                if candidate_span < span and self._has_full_quorum(candidate_digest)
+            )[-_MAX_SHAREABLE_PREFIXES_PER_FLIGHT:],
         )
         self._restore_flight_leaders[request_id] = digest
         self.counters["restore_flights_started"] += 1
@@ -1396,6 +1558,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             if flight is not None and flight.leader_request_id == request_id:
                 flight.restored_block_ids = all_blocks
                 flight.dispatched = True
+            shared_segments = (
+                ((flight.segment_digest, flight.segment_span_tokens),)
+                if flight is not None and flight.segment_digest is not None
+                else ()
+            )
             meta.plans.append(
                 _ReqPlan(
                     request_id,
@@ -1404,6 +1571,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     group_blocks[0],
                     is_store=False,
                     block_ids_by_group=group_blocks,
+                    shared_segments=shared_segments,
                 )
             )
         self._pending_async_loads.clear()
@@ -2733,6 +2901,58 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 )
             )
 
+    def _verify_shared_segment_roots(
+        self,
+        identity: CacheIdentity,
+        root_lookup: LookupResult,
+        plan: _ReqPlan,
+    ) -> bool:
+        """Prove each shorter row root is the restored descriptor-graph prefix."""
+        if not plan.shared_segments:
+            return True
+        if self._storage_mode != "per_token_rows" or root_lookup._manifest is None:
+            self.counters["restore_segment_roots_rejected"] += 1
+            return False
+        root_chunks = tuple(root_lookup._manifest.get("chunks", ()))
+        for digest, span_tokens in plan.shared_segments:
+            segment_lookup, is_alias = self._lookup_reusable(
+                identity,
+                digest,
+                verify_chunks=False,
+                verify_chunk_metadata=True,
+            )
+            expected_count = chunk_count(span_tokens, self._chunk_tokens)
+            segment_chunks = (
+                tuple(segment_lookup._manifest.get("chunks", ()))
+                if segment_lookup._manifest is not None
+                else ()
+            )
+            if (
+                not segment_lookup.is_hit
+                or span_tokens >= plan.span_tokens
+                or len(segment_chunks) != expected_count
+                or tuple(root_chunks[:expected_count]) != segment_chunks
+            ):
+                self.counters["restore_segment_roots_rejected"] += 1
+                if segment_lookup.reason == "corrupt" or segment_lookup.is_hit:
+                    self._invalidate_reusable(
+                        identity,
+                        digest,
+                        is_alias=is_alias,
+                        verify_chunk_payloads=False,
+                    )
+                    with self._load_lock:
+                        self._held.discard(digest)
+                logger.warning(
+                    "spark-context-cache: shared trunk rejected digest=%s"
+                    " leader=%s",
+                    digest[:12],
+                    plan.digest[:12],
+                )
+                return False
+            self.counters["restore_segment_roots_verified"] += 1
+        return True
+
     def _load_one(
         self,
         plan: _ReqPlan,
@@ -2789,6 +3009,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 return False
             if is_alias:
                 self.counters["prefix_alias_restore_hit"] += 1
+            if not self._verify_shared_segment_roots(identity, lookup, plan):
+                return False
             if self._storage_mode == "block_pages_v1":
                 return self._load_hybrid_pages(
                     lookup,
@@ -4139,6 +4361,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     request_id,
                 )
             self._quorum.pop(digest, None)
+            flight = self._restore_flights.get(digest)
+            if flight is not None and flight.segment_digest is not None:
+                self._quorum.pop(flight.segment_digest, None)
             self._admitted.pop(request_id, None)
             self._retire_restore_flight(digest, outcome="failed")
 
@@ -4161,6 +4386,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         flight.leader_request_id,
                     )
                 self._quorum.pop(digest, None)
+                if flight.segment_digest is not None:
+                    self._quorum.pop(flight.segment_digest, None)
                 self._retire_restore_flight(digest, outcome="failed")
 
         for request_id in getattr(connector_output, "finished_recving", None) or ():
