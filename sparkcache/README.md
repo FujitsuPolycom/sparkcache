@@ -211,7 +211,7 @@ when placement completes and intentionally excludes that bookkeeping.
   prefixes and binds the base snapshot, layout, block counts, and
   recurrent/sliding boundary. `sparkcache-page-delta-manifest/v1` embeds its
   authenticated base graph, allowing capacity maintenance to retain shared
-  objects after older roots are removed. Restore reconstructs the verified
+  objects after predecessor roots are removed. Restore reconstructs the verified
   full snapshot before Python or native page placement. GPU-free regression
   coverage exists; live model-serving qualification does not. A graph contains
   at most two deltas. The following extension publishes a fresh flat snapshot,

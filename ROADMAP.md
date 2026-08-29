@@ -83,7 +83,7 @@ throughput within 2% of the cache-off profile under the same workload.
 
 The replication package implements transaction framing, credit limits,
 idempotency, stale-generation rejection, expiry, and reconnect state. It has no
-network adapter. Candidate carriers are:
+network adapter. Possible carriers are:
 
 - an asyncio TCP adapter for minimal dependencies and transparent failures;
 - NIXL for UCX/RDMA, POSIX, and storage backends where its dependency cost is

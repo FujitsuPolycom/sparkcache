@@ -41,7 +41,7 @@ python -m sparkcache.runtime_patches.verify_lease_contract \
   --contract sparkcache/runtime_patches/vllm-kv-block-lease-contract-da4d7be.json
 ```
 
-The source-built GLM-5.3 candidate at
+The source-built GLM-5.3 runtime contract for
 `local-inference-lab/vllm@e10536aadf02a18fccddda7ec939c33147e8b0b3`
 uses `vllm-kv-block-lease-contract-e10536a.json` and the exact-input overlays
 under `patches/vllm-e10536a`. The contract covers the same ten SparkCache-owned

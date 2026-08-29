@@ -123,13 +123,14 @@ The builder rejects a parent whose resolved image ID differs from
 `--base-image-id`. The container build verifies the SparkCache source digest,
 patch inputs and outputs, and the ten-file vLLM contract.
 
-### Source-built e10536a candidates
+### Source-built e10536a runtime
 
 `Containerfile.e10536a` overlays SparkCache on a parent built from
 `local-inference-lab/vllm@e10536aadf02a18fccddda7ec939c33147e8b0b3`.
 Its four exact-input patches and ten-file contract are implemented but not
-qualified. The existing public OCI image and its 8,192-token evidence remain
-separate.
+qualified. The public da4d7be OCI artifact at digest
+`sha256:cd4045bba2a0f3dc55361560f8c3a3f171939854db28d48dfdae58eed9c44943`
+and its 8,192-token evidence remain separate.
 
 Build the overlay only after verifying that the local parent carries the exact
 vLLM commit in its OCI labels:
