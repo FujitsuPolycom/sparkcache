@@ -157,6 +157,7 @@ class _Coordinator:
         }
         self.null = null
         self.block_pool = _BlockPool()
+        self.authoritative_partial_slot: int | None = None
         self.single_type_managers = (
             _Manager(self, 0),
             _Manager(self, 1),
@@ -179,8 +180,15 @@ class _Coordinator:
         # table whose historical slots become null and whose boundary state is
         # the only physical block needed by an attached request.
         dense = list(new_computed_blocks[0])
-        mamba = [self.null] * 3 + [new_computed_blocks[1][-1]]
-        for block in dense + [mamba[-1]]:
+        partial_slot = (
+            self.authoritative_partial_slot
+            if request_id.startswith("\x00sparkcache-shared-prefix:")
+            and self.authoritative_partial_slot is not None
+            else 3
+        )
+        mamba = [self.null] * 4
+        mamba[partial_slot] = new_computed_blocks[1][partial_slot]
+        for block in dense + [mamba[partial_slot]]:
             block.ref_cnt += 1
         self.tables[request_id] = (dense, mamba)
         if not request_id.startswith("\x00sparkcache-shared-prefix:"):
@@ -192,8 +200,8 @@ class _Coordinator:
         # boundary. Patch 040 must replace this source page with a dedicated
         # hot destination before the lease can become READY.
         self.single_type_managers[1]._partial_hit_reqs[request_id] = (
-            3,
-            mamba[-1],
+            partial_slot,
+            mamba[partial_slot],
         )
 
     def free(self, request_id: str) -> None:
@@ -356,6 +364,24 @@ def test_null_partial_page_refuses_lease_and_pressure_drops_only_pin() -> None:
 
     assert "pressure" not in manager._shared_prefix_leases
     assert any(coordinator.get_blocks("follower"))
+
+
+def test_authoritative_checkpoint_slot_can_differ_from_arithmetic_boundary() -> None:
+    manager, coordinator, _, mamba = _manager()
+    coordinator.authoritative_partial_slot = 2
+
+    assert manager.publish_shared_prefix_lease(
+        "checkpoint", "leader", 1024, 15.0, now=10.0
+    )
+
+    mamba_source, mamba_hot = (
+        coordinator.single_type_managers[1].pending_copies.pop()
+    )
+    assert mamba_source is mamba[2]
+    assert mamba_hot is not mamba_source
+    lease = manager._shared_prefix_leases["checkpoint"]
+    lease_table = coordinator.get_blocks(lease.request_id)[1]
+    assert lease_table[2] is mamba_hot
 
 
 def test_scheduler_patch_orders_publish_and_attach_after_verification() -> None:

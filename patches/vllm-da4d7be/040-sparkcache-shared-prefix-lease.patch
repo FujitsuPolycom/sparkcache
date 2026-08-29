@@ -57,7 +57,7 @@ diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
          if required_blocks > available_blocks:
              # Cannot allocate new blocks
              return None
-@@ -707,6 +728,202 @@ class KVCacheManager:
+@@ -707,6 +728,208 @@ class KVCacheManager:
          """Get the blocks of a request."""
          return self.create_kv_cache_blocks(self.coordinator.get_blocks(request_id))
  
@@ -154,21 +154,27 @@ diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
 +            for manager in self.coordinator.single_type_managers:
 +                if num_computed_tokens % manager.block_size == 0:
 +                    continue
-+                block_idx = num_computed_tokens // manager.block_size
 +                lease_blocks = manager.req_to_blocks[lease_request_id]
-+                if block_idx >= len(lease_blocks):
-+                    raise RuntimeError(
-+                        "shared prefix lease lacks its physical partial page"
-+                    )
-+                source_block = lease_blocks[block_idx]
++                partial = manager._partial_hit_reqs.pop(lease_request_id, None)
++                if partial is None:
++                    block_idx = num_computed_tokens // manager.block_size
++                    if block_idx >= len(lease_blocks):
++                        raise RuntimeError(
++                            "shared prefix lease lacks its physical partial page"
++                        )
++                    source_block = lease_blocks[block_idx]
++                else:
++                    block_idx, source_block = partial
++                    if (
++                        not 0 <= block_idx < len(lease_blocks)
++                        or lease_blocks[block_idx] is not source_block
++                    ):
++                        raise RuntimeError(
++                            "shared prefix lease partial-page metadata is invalid"
++                        )
 +                if source_block.is_null:
 +                    raise RuntimeError(
 +                        "shared prefix lease partial page is a null placeholder"
-+                    )
-+                partial = manager._partial_hit_reqs.pop(lease_request_id, None)
-+                if partial is not None and partial != (block_idx, source_block):
-+                    raise RuntimeError(
-+                        "shared prefix lease partial-page bookkeeping disagrees"
 +                    )
 +                hot_block = self.block_pool.get_new_blocks(1)[0]
 +                manager._apply_cow(

@@ -28,8 +28,8 @@
       "jovian_glm53_runtime": "02c71da26bbac81629248ee42b0a71bd2db817d339894d647d2ff6b66fd5ad19"
     },
     "accepted_postimage_sha256": {
-      "source_checkout": "019919c409ad5c75af73b9e506ca8dd66255f30fff8bb90662dde5fb03176209",
-      "jovian_glm53_runtime": "c75ee70b70568fd5002ad78ea6fba2bd20dc4913900586d977ae7ea98dffa416"
+      "source_checkout": "11f6d4e4032c2266c10339e934dfb63c42676c0fd80b09a9a6a4030ca01dc7b8",
+      "jovian_glm53_runtime": "07f3d398ab500c6abaaab2fbc9af46626cc1c8dcf2bd12de82532c9288bfbec2"
     }
   },
   "041-sparkcache-shared-prefix-attach.patch": {
