@@ -306,13 +306,10 @@ def parse_connector_config(
             "spark-context-cache: spark_cache_publication_schema must be"
             " 'snapshot-v1' or 'tail-cow-v1'"
         )
-    publication_schema = (
-        "tail-cow-v1" if publication_schema_raw == "tail-cow-v1" else ""
-    )
-    if publication_schema and storage_mode != "per_token_rows":
-        raise RuntimeError(
-            "spark-context-cache: tail-cow-v1 publication requires"
-            " per_token_rows storage"
+    publication_schema = ""
+    if publication_schema_raw == "tail-cow-v1":
+        publication_schema = (
+            "page-tail-cow-v1" if storage_mode == "block_pages_v1" else "tail-cow-v1"
         )
     group_topology = kv_group_topology(kv_cache_config)
     if storage_mode == "block_pages_v1" and not group_topology:

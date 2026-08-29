@@ -97,6 +97,111 @@ def _clear_once_in_subprocess(
 
 
 class ManifestStoreTests(unittest.TestCase):
+    def test_page_extension_materializes_full_snapshot_after_base_root_removal(
+        self,
+    ) -> None:
+        from sparkcache.spark_context_cache_codec import (
+            context_prefix_digest,
+            pack_positions,
+        )
+        from sparkcache.spark_context_cache_hybrid import (
+            PageGroup,
+            PageLayer,
+            PageLayout,
+            encode_page_snapshot,
+            split_snapshot,
+        )
+
+        identity = dataclasses.replace(
+            _identity(),
+            record_schema=("target_ckv", "logical_positions"),
+            publication_schema="page-tail-cow-v1",
+        )
+        layout = PageLayout(
+            (PageGroup(256, (PageLayer("page", "u8", (1024,), 1024),)),)
+        )
+        tokens = tuple(range(768))
+        salt = "page-tail-store-test"
+        base_digest = context_prefix_digest(tokens, salt, token_count=256)
+        result_digest = context_prefix_digest(tokens, salt, token_count=512)
+        third_digest = context_prefix_digest(tokens, salt, token_count=768)
+        base_snapshot = encode_page_snapshot(layout, (1,), {"page": b"A" * 1024})
+        result_snapshot = encode_page_snapshot(
+            layout,
+            (2,),
+            {"page": b"A" * 1024 + b"B" * 1024},
+        )
+        third_snapshot = encode_page_snapshot(
+            layout,
+            (3,),
+            {"page": b"A" * 1024 + b"B" * 1024 + b"C" * 1024},
+        )
+        base_chunks = tuple(
+            ContextChunk(
+                index * 256,
+                (index + 1) * 256,
+                {
+                    StateRecord.LOGICAL_POSITIONS: pack_positions(
+                        range(index * 256, (index + 1) * 256)
+                    ),
+                    StateRecord.TARGET_CKV: payload,
+                },
+            )
+            for index, payload in enumerate(split_snapshot(base_snapshot, 1))
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ManifestStore(root)
+            store.commit(
+                identity=identity,
+                context_digest=base_digest,
+                chunks=base_chunks,
+                span_tokens=256,
+            )
+
+            store.commit_page_extension(
+                identity=identity,
+                base_context_digest=base_digest,
+                token_ids=tokens,
+                identity_salt=salt,
+                layout=layout,
+                base_block_counts=(1,),
+                result_block_counts=(2,),
+                base_boundary_tokens=256,
+                result_boundary_tokens=512,
+                result_snapshot=result_snapshot,
+            )
+            store.commit_page_extension(
+                identity=identity,
+                base_context_digest=result_digest,
+                token_ids=tokens,
+                identity_salt=salt,
+                layout=layout,
+                base_block_counts=(2,),
+                result_block_counts=(3,),
+                base_boundary_tokens=512,
+                result_boundary_tokens=768,
+                result_snapshot=third_snapshot,
+            )
+            (root / "manifests" / identity.storage_key / f"{base_digest}.json").unlink()
+            (
+                root / "manifests" / identity.storage_key / f"{result_digest}.json"
+            ).unlink()
+            store.maintain(CapacityPolicy(max_bytes=10**9, low_watermark_bytes=10**9))
+
+            lookup = store.lookup(identity, third_digest)
+            self.assertTrue(lookup.is_hit, lookup.reason)
+            self.assertEqual(lookup.root_kind, "page_delta")
+            self.assertEqual(
+                store.restore_page_snapshot(
+                    lookup,
+                    layout=layout,
+                    result_block_counts=(3,),
+                    result_boundary_tokens=768,
+                ),
+                third_snapshot,
+            )
+
     def test_tail_publication_uses_a_distinct_cache_namespace(self) -> None:
         snapshot_identity = _identity()
         tail_identity = _tail_identity()

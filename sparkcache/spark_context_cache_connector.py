@@ -284,6 +284,7 @@ class _HybridStoreSnapshot:
     identity: CacheIdentity
     positions: tuple[int, ...]
     encoded_pages: bytes
+    block_counts: tuple[int, ...]
 
 
 class _HybridSnapshotChunks(Sequence[ContextChunk]):
@@ -867,7 +868,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> tuple[str, int]:
         """Select the longest all-rank prefix eligible for tail publication."""
 
-        if self._publication_schema != "tail-cow-v1":
+        if not self._publication_schema:
             return "", 0
         first = (
             (self._min_span + self._chunk_tokens - 1) // self._chunk_tokens
@@ -2528,7 +2529,27 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     digest,
                     verify_chunks=False,
                 )
-                if lookup.is_hit and self._store.restore(lookup) is not None:
+                payload_verified = False
+                if lookup.is_hit:
+                    try:
+                        if lookup.root_kind == "page_delta":
+                            if self._page_layout is None:
+                                raise RuntimeError(
+                                    "block-page layout was not registered"
+                                )
+                            manifest = lookup._manifest or {}
+                            self._store.restore_page_snapshot(
+                                lookup,
+                                layout=self._page_layout,
+                                result_block_counts=manifest["result_block_counts"],
+                                result_boundary_tokens=manifest["committed_tokens"],
+                            )
+                            payload_verified = True
+                        else:
+                            payload_verified = self._store.restore(lookup) is not None
+                    except (KeyError, RuntimeError, ValueError):
+                        payload_verified = False
+                if payload_verified:
                     verified.add(digest)
                     continue
                 with self._load_lock:
@@ -2947,7 +2968,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         )
         if len(groups) != len(layout.groups):
             raise HybridCodecError("request block tables disagree with page groups")
-        if self._native_restore_enabled:
+        if self._native_restore_enabled and lookup.root_kind != "page_delta":
             if not self._native_adapters or not callable(self._native_execute_hybrid):
                 raise RuntimeError(
                     "native hybrid restore selected without a configured adapter"
@@ -3002,32 +3023,42 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             )
             return True
         restore_started = time.perf_counter_ns()
-        chunks = self._store.restore(lookup)
+        if lookup.root_kind == "page_delta":
+            encoded_pages = self._store.restore_page_snapshot(
+                lookup,
+                layout=layout,
+                result_block_counts=tuple(len(group) for group in groups),
+                result_boundary_tokens=plan.span_tokens,
+            )
+            restored_chunk_count = chunk_count(plan.span_tokens, self._chunk_tokens)
+        else:
+            chunks = self._store.restore(lookup)
+            expected_chunks = chunk_count(plan.span_tokens, self._chunk_tokens)
+            if chunks is None or len(chunks) != expected_chunks:
+                raise HybridCodecError("hybrid snapshot chunk count differs")
+            encoded_parts = []
+            for index, chunk in enumerate(chunks):
+                start = index * self._chunk_tokens
+                end = (index + 1) * self._chunk_tokens
+                stored = unpack_positions(chunk.records[StateRecord.LOGICAL_POSITIONS])
+                if stored != tuple(range(start, end)):
+                    raise HybridCodecError("hybrid snapshot positions differ")
+                encoded_parts.append(chunk.records[StateRecord.TARGET_CKV])
+            encoded_pages = b"".join(encoded_parts)
+            restored_chunk_count = len(chunks)
         if timing is not None:
             timing.observe(
                 "restore_read",
                 time.perf_counter_ns() - restore_started,
             )
-        expected_chunks = chunk_count(plan.span_tokens, self._chunk_tokens)
-        if chunks is None or len(chunks) != expected_chunks:
-            raise HybridCodecError("hybrid snapshot chunk count differs")
         reassembly_started = time.perf_counter_ns()
-        encoded_parts = []
-        for index, chunk in enumerate(chunks):
-            start = index * self._chunk_tokens
-            end = (index + 1) * self._chunk_tokens
-            stored = unpack_positions(chunk.records[StateRecord.LOGICAL_POSITIONS])
-            if stored != tuple(range(start, end)):
-                raise HybridCodecError("hybrid snapshot positions differ")
-            encoded_parts.append(chunk.records[StateRecord.TARGET_CKV])
-        encoded_pages = b"".join(encoded_parts)
         page_plan = plan_page_snapshot(
             layout,
             encoded_pages,
             tuple(len(group) for group in groups),
         )
         if timing is not None:
-            timing.chunk_count = len(chunks)
+            timing.chunk_count = restored_chunk_count
             timing.page_bytes = len(encoded_pages)
             timing.observe(
                 "reassembly_decode",
@@ -3471,6 +3502,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             identity=self._identity(rank),
             positions=tuple(range(plan.span_tokens)),
             encoded_pages=encoded,
+            block_counts=tuple(len(group) for group in groups),
         )
 
     def _ensure_store_thread(self) -> None:
@@ -3503,7 +3535,30 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     chunks = _SnapshotChunks(
                         snapshot, self._dcp_degree, self._chunk_tokens
                     )
-                if snapshot.plan.base_context_digest:
+                if (
+                    isinstance(snapshot, _HybridStoreSnapshot)
+                    and snapshot.plan.base_context_digest
+                ):
+                    layout = self._page_layout
+                    if layout is None:
+                        raise RuntimeError("block-page layout was not registered")
+                    base_groups = self._select_group_blocks_for_span(
+                        snapshot.plan.group_block_ids,
+                        snapshot.plan.base_span_tokens,
+                    )
+                    receipt = self._store.commit_page_extension(
+                        identity=snapshot.identity,
+                        base_context_digest=snapshot.plan.base_context_digest,
+                        token_ids=snapshot.plan.token_ids,
+                        identity_salt=self._context_digest_salt,
+                        layout=layout,
+                        base_block_counts=tuple(len(group) for group in base_groups),
+                        result_block_counts=snapshot.block_counts,
+                        base_boundary_tokens=snapshot.plan.base_span_tokens,
+                        result_boundary_tokens=snapshot.plan.span_tokens,
+                        result_snapshot=snapshot.encoded_pages,
+                    )
+                elif snapshot.plan.base_context_digest:
                     receipt = self._store.commit_extension(
                         identity=snapshot.identity,
                         base_context_digest=snapshot.plan.base_context_digest,
@@ -3686,12 +3741,41 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             chunks = _HybridSnapshotChunks(snapshot, self._chunk_tokens)
         else:
             chunks = _SnapshotChunks(snapshot, self._dcp_degree, self._chunk_tokens)
-        receipt = self._store.commit(
-            identity=snapshot.identity,
-            context_digest=plan.digest,
-            chunks=chunks,
-            span_tokens=plan.span_tokens,
-        )
+        if isinstance(snapshot, _HybridStoreSnapshot) and plan.base_context_digest:
+            layout = self._page_layout
+            if layout is None:
+                raise RuntimeError("block-page layout was not registered")
+            base_groups = self._select_group_blocks_for_span(
+                plan.group_block_ids,
+                plan.base_span_tokens,
+            )
+            receipt = self._store.commit_page_extension(
+                identity=snapshot.identity,
+                base_context_digest=plan.base_context_digest,
+                token_ids=plan.token_ids,
+                identity_salt=self._context_digest_salt,
+                layout=layout,
+                base_block_counts=tuple(len(group) for group in base_groups),
+                result_block_counts=snapshot.block_counts,
+                base_boundary_tokens=plan.base_span_tokens,
+                result_boundary_tokens=plan.span_tokens,
+                result_snapshot=snapshot.encoded_pages,
+            )
+        elif plan.base_context_digest:
+            receipt = self._store.commit_extension(
+                identity=snapshot.identity,
+                base_context_digest=plan.base_context_digest,
+                token_ids=plan.token_ids,
+                identity_salt=self._context_digest_salt,
+                tail_chunks=chunks,
+            )
+        else:
+            receipt = self._store.commit(
+                identity=snapshot.identity,
+                context_digest=plan.digest,
+                chunks=chunks,
+                span_tokens=plan.span_tokens,
+            )
         alias_digests = self._publish_row_prefix_aliases(snapshot)
         with self._capacity_lock:
             self._note_capacity_commit_locked(receipt.allocated_bytes_upper_bound)

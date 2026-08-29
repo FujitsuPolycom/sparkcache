@@ -86,6 +86,12 @@ TP/DCP/PP geometry fails startup.
 one-shot root clear described below; it is an operator action token, not a
 cache-identity field.
 
+`spark_cache_publication_schema` defaults to `snapshot-v1`. Profile storage
+mode `per_token_rows` maps `tail-cow-v1` to the row-tail namespace. Storage
+mode `block_pages_v1` maps the same operator value to the page-delta namespace.
+Both values are part of cache identity and therefore cleanly miss
+`snapshot-v1` entries. Streaming-snapshot deployments reject the option.
+
 ## Storage and integrity
 
 `ManifestStore` publishes files in this order:
@@ -188,10 +194,24 @@ when placement completes and intentionally excludes that bookkeeping.
   descriptors; default publication selects 4,096-token boundaries and retains
   at most 64 aliases. Exact manifests take precedence over aliases with the
   same digest.
+- **Immutable row tails — implemented, unqualified.** Setting
+  `spark_cache_publication_schema` to `tail-cow-v1` selects a distinct cache
+  namespace. The scheduler selects the longest earlier prefix advertised by
+  every physical rank. Workers snapshot only rows after that boundary and
+  publish `sparkcache-tail-manifest/v1` metadata over authenticated descriptor
+  chains and immutable replacement-tail objects. A partial terminal chunk is
+  replaced, never modified. Restore rejection recomputes the request.
 - **Opaque-page aliases — unsupported.** A `block_pages_v1` chunk is a byte
   partition of one complete HMA boundary snapshot, not an independently usable
-  token range. Producing earlier GLM boundaries requires a page-semantic format
-  and a distinct cache namespace.
+  token range, so arbitrary earlier-prefix aliases cannot be derived from its
+  chunks.
+- **Immutable block-page tails — implemented, unqualified.** The
+  `sparkcache-hybrid-page-delta/v1` codec reuses only byte-identical page
+  prefixes and binds the base snapshot, layout, block counts, and
+  recurrent/sliding boundary. `sparkcache-page-delta-manifest/v1` embeds its
+  authenticated base graph, allowing capacity maintenance to retain shared
+  objects after older roots are removed. Restore reconstructs the verified
+  full snapshot before Python or native page placement.
 - **Concurrent shared GPU prefix — implemented.** One leader restores a
   persistent digest. After every rank succeeds, up to sixteen waiting followers
   attach through vLLM block references. Two leases may remain reusable for

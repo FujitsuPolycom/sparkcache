@@ -140,6 +140,7 @@ from sparkcache.spark_context_cache_connector import (  # noqa: E402
     SparkContextCacheConnector,
     _ReqPlan,
 )
+from sparkcache.spark_context_cache_hybrid import decode_page_snapshot  # noqa: E402
 from sparkcache.spark_context_cache_store import (  # noqa: E402
     CapacityPolicy,
     EntryKey,
@@ -306,6 +307,144 @@ class HybridAllocatorContractTests(unittest.TestCase):
 
 
 class HybridPageRoundTripTests(unittest.TestCase):
+    def test_page_tail_publication_restores_changed_sliding_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connector = _make_connector(
+                root,
+                0,
+                extra_config={
+                    "spark_cache_model_profile": "deepseek-v4-fp8-hma",
+                    "spark_cache_publication_schema": "tail-cow-v1",
+                },
+                tp=2,
+                dcp=1,
+                kv_cache_config=_hybrid_kv_cache_config(),
+            )
+            full = (torch.arange(10 * 64 * 8).reshape(10, 64, 8) % 251).to(torch.uint8)
+            compressed = (torch.arange(10 * 2 * 8).reshape(10, 2, 8) % 241).to(
+                torch.uint8
+            )
+            state = torch.arange(10 * 4 * 16, dtype=torch.float32).reshape(10, 4, 16)
+            pools = {"full": full, "compressed": compressed, "state": state}
+            connector.register_kv_caches(pools)
+            tokens = tuple(range(1024))
+            base_digest = connector._digest(list(tokens), 512)
+            result_digest = connector._digest(list(tokens), 1024)
+            base_groups = ((3,), (4,))
+            result_groups = ((3, 5), (4, 2))
+            connector._store_one(
+                _ReqPlan(
+                    "page-base",
+                    base_digest,
+                    512,
+                    base_groups[0],
+                    True,
+                    block_ids_by_group=base_groups,
+                    token_ids=tokens[:512],
+                )
+            )
+            expected_full = full[[3, 5]].clone()
+            expected_compressed = compressed[[3, 5]].clone()
+            expected_state = state[[2]].clone()
+            connector._store_one(
+                _ReqPlan(
+                    "page-tail",
+                    result_digest,
+                    1024,
+                    result_groups[0],
+                    True,
+                    block_ids_by_group=result_groups,
+                    token_ids=tokens,
+                    base_context_digest=base_digest,
+                    base_span_tokens=512,
+                )
+            )
+            for tensor in pools.values():
+                tensor.zero_()
+            destination = ((6, 7), (8, 9))
+
+            restored = connector._load_one(
+                _ReqPlan(
+                    "page-load",
+                    result_digest,
+                    1024,
+                    destination[0],
+                    False,
+                    block_ids_by_group=destination,
+                )
+            )
+
+            self.assertTrue(restored)
+            self.assertTrue(torch.equal(full[[6, 7]], expected_full))
+            self.assertTrue(torch.equal(compressed[[6, 7]], expected_compressed))
+            self.assertTrue(torch.equal(state[[9]], expected_state))
+
+            materialized = []
+
+            def native_placement(**kwargs):
+                materialized.append(kwargs["encoded_pages"])
+                return types.SimpleNamespace(
+                    source_bytes=len(kwargs["encoded_pages"]),
+                    copy_and_submit_ms=1.0,
+                    finish_ms=1.0,
+                )
+
+            connector._native_restore_enabled = True
+            connector._native_adapters = [object()]
+            connector._native_execute_hybrid = native_placement
+            self.assertTrue(
+                connector._load_one(
+                    _ReqPlan(
+                        "page-native-load",
+                        result_digest,
+                        1024,
+                        destination[0],
+                        False,
+                        block_ids_by_group=destination,
+                    )
+                )
+            )
+            self.assertEqual(len(materialized), 1)
+            self.assertEqual(
+                decode_page_snapshot(
+                    connector._page_layout,
+                    materialized[0],
+                    (2, 1),
+                )["state"],
+                expected_state.view(torch.uint8).numpy().tobytes(),
+            )
+            sweep = connector.sweep_integrity()
+            self.assertEqual(sweep["invalidated"], 0)
+            self.assertGreaterEqual(sweep["checked"], 2)
+            manifest = json.loads(
+                (
+                    root
+                    / "manifests"
+                    / connector._identity(0).storage_key
+                    / f"{result_digest}.json"
+                ).read_bytes()
+            )
+            delta_path = (
+                root / "chunks" / f"{manifest['delta_chunks'][0]['sha256']}.spcc"
+            )
+            damaged = bytearray(delta_path.read_bytes())
+            damaged[-1] ^= 1
+            delta_path.write_bytes(damaged)
+            self.assertFalse(
+                connector._load_one(
+                    _ReqPlan(
+                        "page-corrupt-load",
+                        result_digest,
+                        1024,
+                        destination[0],
+                        False,
+                        block_ids_by_group=destination,
+                    )
+                )
+            )
+            self.assertNotIn(result_digest, connector._held)
+
     def test_multiple_group_pages_restore_byte_exactly_to_new_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(
