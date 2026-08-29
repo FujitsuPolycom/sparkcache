@@ -44,6 +44,37 @@ class TransposedSource(ctypes.Structure):
     ]
 
 
+class PageDestination(ctypes.Structure):
+    _fields_ = [
+        ("destination_base", ctypes.c_uint64),
+        ("destination_pages", ctypes.c_uint64),
+        ("destination_page_stride_bytes", ctypes.c_uint32),
+        ("bytes_per_page", ctypes.c_uint32),
+        ("group_index", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+    ]
+
+
+class PageGroup(ctypes.Structure):
+    _fields_ = [
+        ("first_slot_index", ctypes.c_uint32),
+        ("slot_count", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
+    ]
+
+
+class PageCopySpan(ctypes.Structure):
+    _fields_ = [
+        ("arena_offset_bytes", ctypes.c_uint64),
+        ("snapshot_offset_bytes", ctypes.c_uint64),
+        ("destination_byte_offset", ctypes.c_uint64),
+        ("byte_count", ctypes.c_uint64),
+        ("destination_index", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+    ]
+
+
 class Config(ctypes.Structure):
     _fields_ = [
         ("abi_version", ctypes.c_uint32),
@@ -101,14 +132,29 @@ class ArenaView(ctypes.Structure):
     ]
 
 
+class PageAbiInfo(ctypes.Structure):
+    _fields_ = [
+        ("abi_version", ctypes.c_uint32),
+        ("sizeof_destination", ctypes.c_uint32),
+        ("sizeof_group", ctypes.c_uint32),
+        ("sizeof_copy_span", ctypes.c_uint32),
+        ("capability_flags", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32 * 3),
+    ]
+
+
 def test_c_abi_layout_is_fixed() -> None:
     assert ctypes.sizeof(Destination) == 32
     assert ctypes.sizeof(Chunk) == 64
     assert ctypes.sizeof(TransposedSource) == 16
+    assert ctypes.sizeof(PageDestination) == 32
+    assert ctypes.sizeof(PageGroup) == 16
+    assert ctypes.sizeof(PageCopySpan) == 40
     assert ctypes.sizeof(Config) == 48
     assert ctypes.sizeof(Stats) == 56
     assert ctypes.sizeof(AbiInfo) == 64
     assert ctypes.sizeof(ArenaView) == 40
+    assert ctypes.sizeof(PageAbiInfo) == 32
     text = HEADER.read_text(encoding="utf-8")
     assert "#define SPARK_CACHE_PLACEMENT_ABI_VERSION 1u" in text
     assert "#define SPARK_CACHE_PLACEMENT_MAX_RECORD_KINDS 4u" in text
@@ -119,6 +165,8 @@ def test_c_abi_layout_is_fixed() -> None:
         "spark_cache_placement_runtime_last_error",
         "spark_cache_placement_copy_last_error",
         "spark_cache_placement_status_string",
+        "spark_cache_placement_query_page_abi",
+        "spark_cache_reference_scatter_pages",
     ):
         assert symbol in text
 
@@ -143,10 +191,14 @@ def test_exact_glm_inventory_and_fallback_slab_counts() -> None:
 def test_direct_path_has_one_slot_upload_and_one_kernel_per_slab() -> None:
     text = CUDA.read_text(encoding="utf-8")
     begin = text.index("spark_cache_placement_begin_restore")
-    acquire = text.index("spark_cache_placement_acquire_arena")
-    begin_body = text[begin:acquire]
+    page_begin = text.index("spark_cache_placement_begin_page_restore")
+    begin_body = text[begin:page_begin]
     assert begin_body.count("cudaMemcpy(") == 1
     assert "placement->stats.slot_uploads = 1;" in begin_body
+
+    acquire = text.index("spark_cache_placement_acquire_arena")
+    page_begin_body = text[page_begin:acquire]
+    assert page_begin_body.count("cudaMemcpy(") == 2
 
     direct = text.index("spark_cache_placement_submit_direct_slab")
     transposed = text.index("spark_cache_placement_submit_transposed_slab")

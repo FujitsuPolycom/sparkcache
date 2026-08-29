@@ -224,6 +224,164 @@ void test_duplicate_slots_are_rejected() {
       &error));
 }
 
+void test_page_abi_and_byte_exact_scatter() {
+  SparkCachePagePlacementAbiInfo abi{};
+  assert(
+      spark_cache_placement_query_page_abi(&abi) ==
+      SPARK_CACHE_PLACEMENT_OK);
+  assert(abi.abi_version == SPARK_CACHE_PAGE_PLACEMENT_ABI_VERSION);
+  assert(abi.sizeof_destination == 32);
+  assert(abi.sizeof_group == 16);
+  assert(abi.sizeof_copy_span == 40);
+  assert(
+      (abi.capability_flags & SPARK_CACHE_PAGE_CAP_REFERENCE_SCATTER) != 0);
+
+  std::array<std::uint8_t, 64> arena{};
+  arena.fill(0xee);
+  const auto fill = [&](std::size_t offset, std::uint8_t first,
+                        std::size_t count) {
+    for (std::size_t index = 0; index < count; ++index) {
+      arena[offset + index] = static_cast<std::uint8_t>(first + index);
+    }
+  };
+  fill(2, 1, 5);
+  fill(20, 6, 3);
+  fill(30, 9, 4);
+  fill(40, 13, 9);
+
+  std::array<std::uint8_t, 20> destination0{};
+  std::array<std::uint8_t, 12> destination1{};
+  std::array<std::uint8_t, 22> destination2{};
+  destination0.fill(0xcc);
+  destination1.fill(0xcc);
+  destination2.fill(0xcc);
+  const std::array<SparkCachePageDestinationDescriptor, 3> destinations{{
+      {
+          reinterpret_cast<std::uintptr_t>(destination0.data() + 1),
+          3,
+          6,
+          4,
+          0,
+          0,
+      },
+      {
+          reinterpret_cast<std::uintptr_t>(destination1.data() + 1),
+          3,
+          3,
+          2,
+          0,
+          0,
+      },
+      {
+          reinterpret_cast<std::uintptr_t>(destination2.data() + 1),
+          4,
+          5,
+          3,
+          1,
+          0,
+      },
+  }};
+  const std::array<SparkCachePageGroupDescriptor, 2> groups{{
+      {0, 2, 0, 0},
+      {2, 3, 0, 0},
+  }};
+  const std::array<std::uint32_t, 5> slots{2, 0, 1, 3, 0};
+  const std::array<SparkCachePageCopySpan, 4> spans{{
+      {2, 0, 0, 5, 0, 0},
+      {20, 5, 5, 3, 0, 0},
+      {30, 8, 0, 4, 1, 0},
+      {40, 12, 0, 9, 2, 0},
+  }};
+  std::array<char, 256> error{};
+  assert(
+      spark_cache_reference_scatter_pages(
+          arena.data(),
+          arena.size(),
+          21,
+          spans.data(),
+          spans.size(),
+          destinations.data(),
+          destinations.size(),
+          groups.data(),
+          groups.size(),
+          slots.data(),
+          slots.size(),
+          error.data(),
+          error.size()) == SPARK_CACHE_PLACEMENT_OK);
+
+  // Group 0 remaps logical pages [0, 1] to physical pages [2, 0].
+  assert((std::array<std::uint8_t, 4>{
+              destination0[13], destination0[14], destination0[15],
+              destination0[16]} ==
+          std::array<std::uint8_t, 4>{1, 2, 3, 4}));
+  assert((std::array<std::uint8_t, 4>{
+              destination0[1], destination0[2], destination0[3],
+              destination0[4]} ==
+          std::array<std::uint8_t, 4>{5, 6, 7, 8}));
+  assert((std::array<std::uint8_t, 2>{
+              destination1[7], destination1[8]} ==
+          std::array<std::uint8_t, 2>{9, 10}));
+  assert((std::array<std::uint8_t, 2>{
+              destination1[1], destination1[2]} ==
+          std::array<std::uint8_t, 2>{11, 12}));
+  // Group 1 independently remaps [0, 1, 2] to [1, 3, 0].
+  assert((std::array<std::uint8_t, 3>{
+              destination2[6], destination2[7], destination2[8]} ==
+          std::array<std::uint8_t, 3>{13, 14, 15}));
+  assert((std::array<std::uint8_t, 3>{
+              destination2[16], destination2[17], destination2[18]} ==
+          std::array<std::uint8_t, 3>{16, 17, 18}));
+  assert((std::array<std::uint8_t, 3>{
+              destination2[1], destination2[2], destination2[3]} ==
+          std::array<std::uint8_t, 3>{19, 20, 21}));
+
+  // Outer canaries and stride padding prove no adjacent bytes were touched.
+  assert(destination0.front() == 0xcc && destination0.back() == 0xcc);
+  assert(destination1.front() == 0xcc && destination1.back() == 0xcc);
+  assert(destination2.front() == 0xcc && destination2.back() == 0xcc);
+  assert(destination0[5] == 0xcc && destination0[6] == 0xcc);
+  assert(destination1[3] == 0xcc && destination1[6] == 0xcc);
+  assert(destination2[4] == 0xcc && destination2[5] == 0xcc);
+}
+
+void test_page_validation_is_atomic_before_copy() {
+  std::array<std::uint8_t, 8> arena{1, 2, 3, 4, 5, 6, 7, 8};
+  std::array<std::uint8_t, 10> destination{};
+  destination.fill(0xa5);
+  const SparkCachePageDestinationDescriptor descriptor{
+      reinterpret_cast<std::uintptr_t>(destination.data() + 1),
+      2,
+      4,
+      2,
+      0,
+      0,
+  };
+  const SparkCachePageGroupDescriptor group{0, 2, 0, 0};
+  const std::array<std::uint32_t, 2> duplicate_slots{1, 1};
+  const SparkCachePageCopySpan span{0, 0, 0, 4, 0, 0};
+  std::array<char, 128> error{};
+  assert(
+      spark_cache_reference_scatter_pages(
+          arena.data(),
+          arena.size(),
+          4,
+          &span,
+          1,
+          &descriptor,
+          1,
+          &group,
+          1,
+          duplicate_slots.data(),
+          duplicate_slots.size(),
+          error.data(),
+          error.size()) == SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT);
+  assert(std::strstr(error.data(), "unique within each group") != nullptr);
+  assert(std::all_of(
+      destination.begin(),
+      destination.end(),
+      [](std::uint8_t value) { return value == 0xa5; }));
+}
+
 }  // namespace
 
 int main() {
@@ -232,5 +390,7 @@ int main() {
   test_parse_and_byte_exact_scatter();
   test_parser_rejects_wrong_positions();
   test_duplicate_slots_are_rejected();
+  test_page_abi_and_byte_exact_scatter();
+  test_page_validation_is_atomic_before_copy();
   return 0;
 }

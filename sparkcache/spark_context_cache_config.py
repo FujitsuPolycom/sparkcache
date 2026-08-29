@@ -544,7 +544,7 @@ def parse_connector_config(
             ),
         ),
     )
-    if native_restore_enabled:
+    if native_restore_enabled and storage_mode != "block_pages_v1":
         load_thread_limit = 1
     max_pending_restores_raw = extra(
         "spark_cache_max_pending_restores",

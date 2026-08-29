@@ -94,6 +94,11 @@ if(SPARK_CACHE_PLACEMENT_ENABLE_CUDA)
             app/spark_cache_native_probe.cu)
         target_link_libraries(spark_cache_native_probe
             PRIVATE spark_cache_placement CUDA::cudart)
+        add_executable(
+            spark_cache_hybrid_page_probe
+            app/spark_cache_hybrid_page_probe.cu)
+        target_link_libraries(spark_cache_hybrid_page_probe
+            PRIVATE spark_cache_placement CUDA::cudart)
 
         add_library(spark_cache_snapshot SHARED
             src/spark_cache_snapshot.cu)

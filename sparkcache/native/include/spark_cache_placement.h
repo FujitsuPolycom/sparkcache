@@ -19,6 +19,7 @@ extern "C" {
 #endif
 
 #define SPARK_CACHE_PLACEMENT_ABI_VERSION 1u
+#define SPARK_CACHE_PAGE_PLACEMENT_ABI_VERSION 1u
 #define SPARK_CACHE_PLACEMENT_ARENA_COUNT 2u
 #define SPARK_CACHE_PLACEMENT_MAX_RECORD_KINDS 4u
 
@@ -66,7 +67,15 @@ enum {
   SPARK_CACHE_CAP_STAGED_DEVICE = 1u << 2,
   SPARK_CACHE_CAP_DIRECT_ENCODED = 1u << 3,
   SPARK_CACHE_CAP_TRANSPOSED = 1u << 4,
-  SPARK_CACHE_CAP_LOW_PRIORITY_STREAMS = 1u << 5
+  SPARK_CACHE_CAP_LOW_PRIORITY_STREAMS = 1u << 5,
+  /* The optional page ABI and its CPU byte-exact reference are present. */
+  SPARK_CACHE_CAP_HYBRID_PAGE_REFERENCE = 1u << 6,
+  SPARK_CACHE_CAP_HYBRID_PAGE_CUDA = 1u << 7
+};
+
+enum {
+  SPARK_CACHE_PAGE_CAP_REFERENCE_SCATTER = 1u << 0,
+  SPARK_CACHE_PAGE_CAP_CUDA_SCATTER = 1u << 1
 };
 
 enum {
@@ -121,6 +130,47 @@ typedef struct SparkCacheTransposedSource {
   uint32_t flags;
 } SparkCacheTransposedSource;
 
+/*
+ * One opaque page tensor. `group_index` selects the current request's
+ * flattened physical-slot subvector. Page bytes are copied without assigning
+ * token-row semantics to attention, recurrent, or compressor state.
+ */
+typedef struct SparkCachePageDestinationDescriptor {
+  uint64_t destination_base;
+  uint64_t destination_pages;
+  uint32_t destination_page_stride_bytes;
+  uint32_t bytes_per_page;
+  uint32_t group_index;
+  uint32_t flags;
+} SparkCachePageDestinationDescriptor;
+
+/*
+ * A page group owns one contiguous subvector of the flattened physical-page
+ * slots. Slot values must be unique within a group; different groups may use
+ * the same numeric physical slot because they address different allocators.
+ */
+typedef struct SparkCachePageGroupDescriptor {
+  uint32_t first_slot_index;
+  uint32_t slot_count;
+  uint32_t flags;
+  uint32_t reserved;
+} SparkCachePageGroupDescriptor;
+
+/*
+ * One verified source extent. Spans must cover the logical snapshot in
+ * ascending `snapshot_offset_bytes` order and cover every destination from
+ * byte zero through all logical pages. Arena offsets may be discontiguous so
+ * callers can describe payload extents split by encoded chunk framing.
+ */
+typedef struct SparkCachePageCopySpan {
+  uint64_t arena_offset_bytes;
+  uint64_t snapshot_offset_bytes;
+  uint64_t destination_byte_offset;
+  uint64_t byte_count;
+  uint32_t destination_index;
+  uint32_t flags;
+} SparkCachePageCopySpan;
+
 typedef struct SparkCachePlacementConfig {
   uint32_t abi_version;
   uint32_t arena_mode;
@@ -164,6 +214,16 @@ typedef struct SparkCachePlacementAbiInfo {
   uint32_t reserved[5];
 } SparkCachePlacementAbiInfo;
 
+/* Separate fingerprint keeps every placement ABI v1 structure unchanged. */
+typedef struct SparkCachePagePlacementAbiInfo {
+  uint32_t abi_version;
+  uint32_t sizeof_destination;
+  uint32_t sizeof_group;
+  uint32_t sizeof_copy_span;
+  uint32_t capability_flags;
+  uint32_t reserved[3];
+} SparkCachePagePlacementAbiInfo;
+
 /*
  * Integer addresses make the arena ABI unambiguous for ctypes. `host_address`
  * is suitable for `(ctypes.c_ubyte * capacity).from_address(...)` followed by
@@ -183,6 +243,14 @@ typedef struct SparkCachePlacement SparkCachePlacement;
 
 SPARK_CACHE_API SparkCachePlacementStatus spark_cache_placement_query_abi(
     SparkCachePlacementAbiInfo* output);
+
+/*
+ * Optional hybrid-page capability query. Callers must resolve this symbol
+ * dynamically and retain the row path when it is absent.
+ */
+SPARK_CACHE_API SparkCachePlacementStatus
+spark_cache_placement_query_page_abi(
+    SparkCachePagePlacementAbiInfo* output);
 
 /*
  * Parse only after the caller has verified the manifest's outer SHA-256 over
@@ -223,6 +291,27 @@ spark_cache_reference_scatter_direct(
     char* error,
     size_t error_capacity);
 
+/*
+ * GPU-free byte-for-byte oracle for opaque hybrid pages. Destination bases
+ * must be writable host pointers. All validation completes before the first
+ * destination byte is changed.
+ */
+SPARK_CACHE_API SparkCachePlacementStatus
+spark_cache_reference_scatter_pages(
+    const void* arena_base,
+    uint64_t arena_used_bytes,
+    uint64_t snapshot_bytes,
+    const SparkCachePageCopySpan* spans,
+    uint32_t span_count,
+    const SparkCachePageDestinationDescriptor* destinations,
+    uint32_t destination_count,
+    const SparkCachePageGroupDescriptor* groups,
+    uint32_t group_count,
+    const uint32_t* slots,
+    uint32_t slot_count,
+    char* error,
+    size_t error_capacity);
+
 SPARK_CACHE_API SparkCachePlacementStatus spark_cache_placement_create(
     const SparkCachePlacementConfig* config,
     SparkCachePlacement** output);
@@ -236,6 +325,12 @@ spark_cache_placement_configure_destinations(
     const SparkCacheDestinationDescriptor* destinations,
     uint32_t destination_count);
 
+SPARK_CACHE_API SparkCachePlacementStatus
+spark_cache_placement_configure_page_destinations(
+    SparkCachePlacement* placement,
+    const SparkCachePageDestinationDescriptor* destinations,
+    uint32_t destination_count);
+
 /*
  * Begins one restore transaction and uploads the remapped physical slot vector
  * exactly once. All slots must be unique and in range for every destination.
@@ -244,6 +339,15 @@ SPARK_CACHE_API SparkCachePlacementStatus spark_cache_placement_begin_restore(
     SparkCachePlacement* placement,
     const uint32_t* slots,
     uint32_t slot_count);
+
+SPARK_CACHE_API SparkCachePlacementStatus
+spark_cache_placement_begin_page_restore(
+    SparkCachePlacement* placement,
+    const SparkCachePageGroupDescriptor* groups,
+    uint32_t group_count,
+    const uint32_t* slots,
+    uint32_t slot_count,
+    uint64_t snapshot_bytes);
 
 /*
  * Waits until an arena is no longer read by a prior kernel, then returns the
@@ -289,6 +393,14 @@ spark_cache_placement_submit_transposed_slab(
     uint64_t arena_used_bytes,
     const SparkCacheTransposedSource* sources,
     uint32_t source_count);
+
+SPARK_CACHE_API SparkCachePlacementStatus
+spark_cache_placement_submit_page_slab(
+    SparkCachePlacement* placement,
+    uint32_t arena_index,
+    uint64_t arena_used_bytes,
+    const SparkCachePageCopySpan* spans,
+    uint32_t span_count);
 
 /*
  * Synchronizes both arena streams, verifies complete coverage and the device

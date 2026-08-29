@@ -14,6 +14,7 @@ namespace {
 
 using spark_cache::placement::validate_destinations;
 using spark_cache::placement::validate_direct_slab;
+using spark_cache::placement::validate_page_scatter;
 using spark_cache::placement::validate_slots;
 
 constexpr std::array<std::uint8_t, 8> kChunkMagic{
@@ -273,6 +274,22 @@ bool parse_canonical_header(
 }  // namespace
 
 extern "C" SparkCachePlacementStatus
+spark_cache_placement_query_page_abi(
+    SparkCachePagePlacementAbiInfo* output) {
+  if (output == nullptr) {
+    return SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT;
+  }
+  SparkCachePagePlacementAbiInfo info{};
+  info.abi_version = SPARK_CACHE_PAGE_PLACEMENT_ABI_VERSION;
+  info.sizeof_destination = sizeof(SparkCachePageDestinationDescriptor);
+  info.sizeof_group = sizeof(SparkCachePageGroupDescriptor);
+  info.sizeof_copy_span = sizeof(SparkCachePageCopySpan);
+  info.capability_flags = SPARK_CACHE_PAGE_CAP_REFERENCE_SCATTER;
+  *output = info;
+  return SPARK_CACHE_PLACEMENT_OK;
+}
+
+extern "C" SparkCachePlacementStatus
 spark_cache_parse_verified_v1_chunk(
     const void* arena_base,
     std::uint64_t arena_used_bytes,
@@ -415,6 +432,83 @@ spark_cache_reference_scatter_direct(
                     destination.bytes_per_token,
             destination.bytes_per_token);
       }
+    }
+  }
+  write_error(error, error_capacity, "");
+  return SPARK_CACHE_PLACEMENT_OK;
+}
+
+extern "C" SparkCachePlacementStatus
+spark_cache_reference_scatter_pages(
+    const void* arena_base,
+    std::uint64_t arena_used_bytes,
+    std::uint64_t snapshot_bytes,
+    const SparkCachePageCopySpan* spans,
+    std::uint32_t span_count,
+    const SparkCachePageDestinationDescriptor* destinations,
+    std::uint32_t destination_count,
+    const SparkCachePageGroupDescriptor* groups,
+    std::uint32_t group_count,
+    const std::uint32_t* slots,
+    std::uint32_t slot_count,
+    char* error,
+    std::size_t error_capacity) {
+  auto fail = [&](SparkCachePlacementStatus status, std::string_view message) {
+    write_error(error, error_capacity, message);
+    return status;
+  };
+  if (arena_base == nullptr) {
+    return fail(
+        SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT,
+        "page scatter arena pointer is null");
+  }
+  std::string detail;
+  if (!validate_page_scatter(
+          arena_used_bytes,
+          snapshot_bytes,
+          spans,
+          span_count,
+          destinations,
+          destination_count,
+          groups,
+          group_count,
+          slots,
+          slot_count,
+          &detail)) {
+    return fail(SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT, detail);
+  }
+
+  const auto* arena = static_cast<const std::uint8_t*>(arena_base);
+  for (std::uint32_t span_index = 0; span_index < span_count; ++span_index) {
+    const auto& span = spans[span_index];
+    const auto& destination = destinations[span.destination_index];
+    const auto& group = groups[destination.group_index];
+    const auto* source = arena + span.arena_offset_bytes;
+    std::uint64_t logical_byte = span.destination_byte_offset;
+    std::uint64_t remaining = span.byte_count;
+    while (remaining != 0) {
+      const std::uint64_t logical_page =
+          logical_byte / destination.bytes_per_page;
+      const std::uint32_t page_offset = static_cast<std::uint32_t>(
+          logical_byte % destination.bytes_per_page);
+      const std::uint32_t physical_page = slots[
+          group.first_slot_index + static_cast<std::uint32_t>(logical_page)];
+      const std::uint64_t page_remaining =
+          destination.bytes_per_page - page_offset;
+      const std::size_t copied = static_cast<std::size_t>(
+          std::min(remaining, page_remaining));
+      auto* destination_base = reinterpret_cast<std::uint8_t*>(
+          static_cast<std::uintptr_t>(destination.destination_base));
+      std::memmove(
+          destination_base +
+              static_cast<std::size_t>(physical_page) *
+                  destination.destination_page_stride_bytes +
+              page_offset,
+          source,
+          copied);
+      source += copied;
+      logical_byte += copied;
+      remaining -= copied;
     }
   }
   write_error(error, error_capacity, "");

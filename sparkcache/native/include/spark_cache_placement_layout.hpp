@@ -10,6 +10,7 @@
 #include <limits>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 namespace spark_cache::placement {
 
@@ -27,10 +28,17 @@ static_assert(sizeof(SparkCacheChunkDescriptor) == 64);
 static_assert(alignof(SparkCacheChunkDescriptor) == 8);
 static_assert(sizeof(SparkCacheTransposedSource) == 16);
 static_assert(alignof(SparkCacheTransposedSource) == 8);
+static_assert(sizeof(SparkCachePageDestinationDescriptor) == 32);
+static_assert(alignof(SparkCachePageDestinationDescriptor) == 8);
+static_assert(sizeof(SparkCachePageGroupDescriptor) == 16);
+static_assert(alignof(SparkCachePageGroupDescriptor) == 4);
+static_assert(sizeof(SparkCachePageCopySpan) == 40);
+static_assert(alignof(SparkCachePageCopySpan) == 8);
 static_assert(sizeof(SparkCachePlacementConfig) == 48);
 static_assert(sizeof(SparkCachePlacementStats) == 56);
 static_assert(sizeof(SparkCachePlacementAbiInfo) == 64);
 static_assert(sizeof(SparkCacheArenaView) == 40);
+static_assert(sizeof(SparkCachePagePlacementAbiInfo) == 32);
 
 inline bool checked_add(
     std::uint64_t left,
@@ -310,6 +318,159 @@ inline bool validate_transposed_slab(
             source.source_offset_bytes, source_bytes, &source_end) ||
         source_end > arena_used_bytes) {
       return fail("transposed source span exceeds the arena");
+    }
+  }
+  return true;
+}
+
+inline bool validate_page_scatter(
+    std::uint64_t arena_used_bytes,
+    std::uint64_t snapshot_bytes,
+    const SparkCachePageCopySpan* spans,
+    std::uint32_t span_count,
+    const SparkCachePageDestinationDescriptor* destinations,
+    std::uint32_t destination_count,
+    const SparkCachePageGroupDescriptor* groups,
+    std::uint32_t group_count,
+    const std::uint32_t* slots,
+    std::uint32_t slot_count,
+    std::string* error) {
+  auto fail = [&](const char* message) {
+    if (error != nullptr) {
+      *error = message;
+    }
+    return false;
+  };
+  if (snapshot_bytes == 0 || spans == nullptr || span_count == 0 ||
+      destinations == nullptr || destination_count == 0 || groups == nullptr ||
+      group_count == 0 || slots == nullptr || slot_count == 0) {
+    return fail("page scatter arrays and byte counts must be nonempty");
+  }
+
+  std::uint64_t expected_first_slot = 0;
+  for (std::uint32_t group_index = 0; group_index < group_count;
+       ++group_index) {
+    const auto& group = groups[group_index];
+    std::uint64_t group_slot_end = 0;
+    if (group.flags != 0 || group.reserved != 0 || group.slot_count == 0 ||
+        group.first_slot_index != expected_first_slot ||
+        !checked_add(group.first_slot_index, group.slot_count, &group_slot_end) ||
+        group_slot_end > slot_count) {
+      return fail("page groups must cover the flattened slot vector contiguously");
+    }
+    std::unordered_set<std::uint32_t> unique;
+    unique.reserve(group.slot_count);
+    for (std::uint32_t index = 0; index < group.slot_count; ++index) {
+      if (!unique.insert(slots[group.first_slot_index + index]).second) {
+        return fail("physical page slots must be unique within each group");
+      }
+    }
+    expected_first_slot = group_slot_end;
+  }
+  if (expected_first_slot != slot_count) {
+    return fail("page groups do not cover the complete flattened slot vector");
+  }
+
+  std::uint32_t expected_group = 0;
+  for (std::uint32_t destination_index = 0;
+       destination_index < destination_count;
+       ++destination_index) {
+    const auto& destination = destinations[destination_index];
+    if (destination.flags != 0 || destination.destination_base == 0 ||
+        destination.destination_pages == 0 || destination.bytes_per_page == 0 ||
+        destination.destination_page_stride_bytes < destination.bytes_per_page ||
+        destination.group_index >= group_count) {
+      return fail("page destination geometry or flags are invalid");
+    }
+    if (destination_index == 0) {
+      expected_group = destination.group_index;
+    } else if (destination.group_index < expected_group ||
+               destination.group_index > expected_group + 1) {
+      return fail("page destinations must cover groups contiguously");
+    } else {
+      expected_group = destination.group_index;
+    }
+    if (destination.group_index != expected_group ||
+        (destination_index == 0 && destination.group_index != 0)) {
+      return fail("page destinations must begin with group zero");
+    }
+    const auto& group = groups[destination.group_index];
+    for (std::uint32_t slot_index = 0; slot_index < group.slot_count;
+         ++slot_index) {
+      if (slots[group.first_slot_index + slot_index] >=
+          destination.destination_pages) {
+        return fail("physical page slot exceeds destination capacity");
+      }
+    }
+    std::uint64_t destination_last_byte = 0;
+    if (!checked_mul(
+            destination.destination_pages - 1,
+            destination.destination_page_stride_bytes,
+            &destination_last_byte) ||
+        !checked_add(
+            destination.destination_base,
+            destination_last_byte,
+            &destination_last_byte) ||
+        !checked_add(
+            destination_last_byte,
+            destination.bytes_per_page,
+            &destination_last_byte)) {
+      return fail("page destination address range overflows");
+    }
+  }
+  if (expected_group + 1 != group_count) {
+    return fail("every page group must have at least one destination");
+  }
+
+  std::vector<std::uint64_t> covered(destination_count, 0);
+  std::uint64_t expected_snapshot_offset = 0;
+  for (std::uint32_t span_index = 0; span_index < span_count; ++span_index) {
+    const auto& span = spans[span_index];
+    if (span.flags != 0 || span.byte_count == 0 ||
+        span.destination_index >= destination_count ||
+        span.snapshot_offset_bytes != expected_snapshot_offset) {
+      return fail("page copy spans must cover the snapshot contiguously");
+    }
+    std::uint64_t arena_end = 0;
+    std::uint64_t snapshot_end = 0;
+    std::uint64_t destination_end = 0;
+    if (!checked_add(span.arena_offset_bytes, span.byte_count, &arena_end) ||
+        arena_end > arena_used_bytes ||
+        !checked_add(
+            span.snapshot_offset_bytes, span.byte_count, &snapshot_end) ||
+        snapshot_end > snapshot_bytes ||
+        span.destination_byte_offset != covered[span.destination_index] ||
+        !checked_add(
+            span.destination_byte_offset, span.byte_count, &destination_end)) {
+      return fail("page copy span exceeds an arena, snapshot, or destination");
+    }
+    const auto& destination = destinations[span.destination_index];
+    const auto& group = groups[destination.group_index];
+    std::uint64_t expected_destination_bytes = 0;
+    if (!checked_mul(
+            group.slot_count,
+            destination.bytes_per_page,
+            &expected_destination_bytes) ||
+        destination_end > expected_destination_bytes) {
+      return fail("page copy span exceeds destination logical pages");
+    }
+    covered[span.destination_index] = destination_end;
+    expected_snapshot_offset = snapshot_end;
+  }
+  if (expected_snapshot_offset != snapshot_bytes) {
+    return fail("page copy spans do not cover the complete snapshot");
+  }
+  for (std::uint32_t destination_index = 0;
+       destination_index < destination_count;
+       ++destination_index) {
+    const auto& destination = destinations[destination_index];
+    std::uint64_t expected_destination_bytes = 0;
+    if (!checked_mul(
+            groups[destination.group_index].slot_count,
+            destination.bytes_per_page,
+            &expected_destination_bytes) ||
+        covered[destination_index] != expected_destination_bytes) {
+      return fail("page spans do not cover every destination byte exactly once");
     }
   }
   return true;

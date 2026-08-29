@@ -9,6 +9,7 @@ from sparkcache.spark_context_cache_hybrid import (
     PageLayout,
     decode_page_snapshot,
     encode_page_snapshot,
+    plan_page_snapshot,
     split_snapshot,
 )
 
@@ -32,6 +33,66 @@ def _layout() -> PageLayout:
 
 
 class HybridPageCodecTests(unittest.TestCase):
+    def test_page_plan_describes_payloads_without_slicing_them(self) -> None:
+        layout = _layout()
+        payloads = {
+            "full": bytes(1024),
+            "compressed": bytes(32),
+            "state": bytes(768),
+        }
+        encoded = encode_page_snapshot(layout, (2, 3), payloads)
+
+        plan = plan_page_snapshot(layout, encoded, (2, 3))
+
+        self.assertEqual(plan.total_bytes, len(encoded))
+        self.assertEqual(plan.block_counts, (2, 3))
+        self.assertEqual(
+            [(span.layer_name, span.group_index, span.page_count) for span in plan.spans],
+            [
+                ("compressed", 0, 2),
+                ("full", 0, 2),
+                ("state", 1, 3),
+            ],
+        )
+        self.assertEqual(
+            {
+                span.layer_name: bytes(encoded[span.source_start : span.source_end])
+                for span in plan.spans
+            },
+            payloads,
+        )
+
+    def test_page_plan_accepts_header_prefix_plus_declared_total(self) -> None:
+        layout = _layout()
+        encoded = encode_page_snapshot(
+            layout,
+            (1, 1),
+            {"full": bytes(512), "compressed": bytes(16), "state": bytes(256)},
+        )
+        header_end = len(encoded) - 512 - 16 - 256
+
+        plan = plan_page_snapshot(
+            layout,
+            encoded[:header_end],
+            (1, 1),
+            total_bytes=len(encoded),
+        )
+
+        self.assertEqual(plan.header_bytes, header_end)
+        self.assertEqual(plan.spans[-1].source_end, len(encoded))
+
+    def test_page_plan_rejects_truncated_header_or_wrong_total(self) -> None:
+        layout = _layout()
+        encoded = encode_page_snapshot(
+            layout,
+            (1, 1),
+            {"full": bytes(512), "compressed": bytes(16), "state": bytes(256)},
+        )
+        with self.assertRaises(HybridCodecError):
+            plan_page_snapshot(layout, encoded[:10], (1, 1), total_bytes=len(encoded))
+        with self.assertRaises(HybridCodecError):
+            plan_page_snapshot(layout, encoded, (1, 1), total_bytes=len(encoded) + 1)
+
     def test_multi_group_pages_round_trip_byte_exactly(self) -> None:
         layout = _layout()
         payloads = {

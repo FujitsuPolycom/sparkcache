@@ -13,6 +13,7 @@ from pathlib import Path
 
 
 ABI_VERSION = 1
+PAGE_ABI_VERSION = 1
 ARENA_COUNT = 2
 MAX_RECORD_KINDS = 4
 
@@ -32,6 +33,9 @@ CAP_MANAGED = 1 << 1
 CAP_STAGED_DEVICE = 1 << 2
 CAP_DIRECT_ENCODED = 1 << 3
 CAP_LOW_PRIORITY_STREAMS = 1 << 5
+CAP_HYBRID_PAGE_REFERENCE = 1 << 6
+CAP_HYBRID_PAGE_CUDA = 1 << 7
+PAGE_CAP_REFERENCE_SCATTER = 1 << 0
 
 
 class PlacementConfig(ctypes.Structure):
@@ -78,6 +82,48 @@ class TransposedSource(ctypes.Structure):
         ("source_offset_bytes", ctypes.c_uint64),
         ("destination_index", ctypes.c_uint32),
         ("flags", ctypes.c_uint32),
+    ]
+
+
+class PageDestinationDescriptor(ctypes.Structure):
+    _fields_ = [
+        ("destination_base", ctypes.c_uint64),
+        ("destination_pages", ctypes.c_uint64),
+        ("destination_page_stride_bytes", ctypes.c_uint32),
+        ("bytes_per_page", ctypes.c_uint32),
+        ("group_index", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+    ]
+
+
+class PageGroupDescriptor(ctypes.Structure):
+    _fields_ = [
+        ("first_slot_index", ctypes.c_uint32),
+        ("slot_count", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
+    ]
+
+
+class PageCopySpan(ctypes.Structure):
+    _fields_ = [
+        ("arena_offset_bytes", ctypes.c_uint64),
+        ("snapshot_offset_bytes", ctypes.c_uint64),
+        ("destination_byte_offset", ctypes.c_uint64),
+        ("byte_count", ctypes.c_uint64),
+        ("destination_index", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+    ]
+
+
+class PagePlacementAbiInfo(ctypes.Structure):
+    _fields_ = [
+        ("abi_version", ctypes.c_uint32),
+        ("sizeof_destination", ctypes.c_uint32),
+        ("sizeof_group", ctypes.c_uint32),
+        ("sizeof_copy_span", ctypes.c_uint32),
+        ("capability_flags", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32 * 3),
     ]
 
 
@@ -222,6 +268,81 @@ def _bind(lib: ctypes.CDLL) -> None:
     lib.spark_cache_placement_status_string.restype = ctypes.c_char_p
 
 
+def bind_page_reference(lib: ctypes.CDLL) -> PagePlacementAbiInfo:
+    """Bind the optional page extension without changing row-ABI loading."""
+
+    try:
+        query = lib.spark_cache_placement_query_page_abi
+        reference = lib.spark_cache_reference_scatter_pages
+    except AttributeError as error:
+        raise NativePlacementError("library has no hybrid page extension") from error
+    query.argtypes = [ctypes.POINTER(PagePlacementAbiInfo)]
+    query.restype = ctypes.c_int
+    reference.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint64,
+        ctypes.c_uint64,
+        ctypes.POINTER(PageCopySpan),
+        ctypes.c_uint32,
+        ctypes.POINTER(PageDestinationDescriptor),
+        ctypes.c_uint32,
+        ctypes.POINTER(PageGroupDescriptor),
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+    ]
+    reference.restype = ctypes.c_int
+    if hasattr(lib, "spark_cache_placement_configure_page_destinations"):
+        lib.spark_cache_placement_configure_page_destinations.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(PageDestinationDescriptor),
+            ctypes.c_uint32,
+        ]
+        lib.spark_cache_placement_configure_page_destinations.restype = ctypes.c_int
+    if hasattr(lib, "spark_cache_placement_begin_page_restore"):
+        lib.spark_cache_placement_begin_page_restore.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(PageGroupDescriptor),
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_uint32,
+            ctypes.c_uint64,
+        ]
+        lib.spark_cache_placement_begin_page_restore.restype = ctypes.c_int
+    if hasattr(lib, "spark_cache_placement_submit_page_slab"):
+        lib.spark_cache_placement_submit_page_slab.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint64,
+            ctypes.POINTER(PageCopySpan),
+            ctypes.c_uint32,
+        ]
+        lib.spark_cache_placement_submit_page_slab.restype = ctypes.c_int
+    info = PagePlacementAbiInfo()
+    check(lib, query(ctypes.byref(info)), "page ABI")
+    expected = (
+        PAGE_ABI_VERSION,
+        ctypes.sizeof(PageDestinationDescriptor),
+        ctypes.sizeof(PageGroupDescriptor),
+        ctypes.sizeof(PageCopySpan),
+    )
+    actual = (
+        info.abi_version,
+        info.sizeof_destination,
+        info.sizeof_group,
+        info.sizeof_copy_span,
+    )
+    if actual != expected:
+        raise NativePlacementError(
+            f"hybrid page ABI mismatch: library={actual} binding={expected}"
+        )
+    if not info.capability_flags & PAGE_CAP_REFERENCE_SCATTER:
+        raise NativePlacementError("library lacks hybrid page reference scatter")
+    return info
+
+
 def _decode(value: bytes | None) -> str:
     return "" if value is None else value.decode("utf-8", errors="replace")
 
@@ -321,6 +442,7 @@ __all__ = [
     "ARENA_MANAGED",
     "ARENA_MAPPED_HOST",
     "ARENA_STAGED_DEVICE",
+    "PAGE_ABI_VERSION",
     "AbiInfo",
     "ArenaView",
     "ChunkDescriptor",
@@ -328,8 +450,13 @@ __all__ = [
     "NativePlacementError",
     "PlacementConfig",
     "PlacementStats",
+    "PageCopySpan",
+    "PageDestinationDescriptor",
+    "PageGroupDescriptor",
+    "PagePlacementAbiInfo",
     "TransposedSource",
     "arena_memoryview",
+    "bind_page_reference",
     "check",
     "handle_error",
     "load_library",

@@ -22,6 +22,10 @@ def test_ctypes_sizes_match_fixed_c_abi() -> None:
     assert ctypes.sizeof(native.PlacementStats) == 56
     assert ctypes.sizeof(native.AbiInfo) == 64
     assert ctypes.sizeof(native.ArenaView) == 40
+    assert ctypes.sizeof(native.PageDestinationDescriptor) == 32
+    assert ctypes.sizeof(native.PageGroupDescriptor) == 16
+    assert ctypes.sizeof(native.PageCopySpan) == 40
+    assert ctypes.sizeof(native.PagePlacementAbiInfo) == 32
 
 
 def test_integer_arena_address_becomes_writable_byte_view() -> None:

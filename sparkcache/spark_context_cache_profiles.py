@@ -81,6 +81,7 @@ class ModelProfile:
     # and capacity accounting deliberately remain unchanged; no implemented
     # shared-storage interface consumes this field.
     kv_replicated_across_tp: bool = False
+    native_page_restore: bool = False
 
     def __post_init__(self) -> None:
         if self.boundary_hidden_policy not in _BOUNDARY_POLICIES:
@@ -98,6 +99,10 @@ class ModelProfile:
         if self.storage_mode not in {"per_token_rows", "block_pages_v1"}:
             raise ProfileError(
                 f"profile {self.name}: unknown storage mode {self.storage_mode!r}"
+            )
+        if self.native_page_restore and self.storage_mode != "block_pages_v1":
+            raise ProfileError(
+                f"profile {self.name}: native_page_restore requires block pages"
             )
         families = {family for _, family in self.classification_rules}
         families |= self.required_families | self.optional_families
@@ -188,11 +193,13 @@ class ModelProfile:
                 f" below one chunk ({self.chunk_tokens} tokens)"
             )
         if native_restore:
-            if self.storage_mode != "per_token_rows":
-                raise ProfileError(
-                    f"profile {self.name}: native restore does not support"
-                    f" storage mode {self.storage_mode}"
-                )
+            if self.storage_mode == "block_pages_v1":
+                if not self.native_page_restore:
+                    raise ProfileError(
+                        f"profile {self.name}: native restore does not support"
+                        " this block-page layout"
+                    )
+                return
             persisted = self.persisted_families(self.default_draft_kv_policy)
             unmapped = {
                 family
@@ -252,6 +259,7 @@ PROFILES: Mapping[str, ModelProfile] = {
         required_families=frozenset({"target_ckv"}),
         chunk_tokens=256,
         storage_mode="block_pages_v1",
+        native_page_restore=True,
         kv_replicated_across_tp=True,
     ),
     "deepseek-v4-fp8-hma": ModelProfile(

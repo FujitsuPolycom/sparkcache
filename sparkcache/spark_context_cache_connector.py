@@ -82,6 +82,7 @@ from sparkcache.spark_context_cache_hybrid import (
     PageLayout,
     decode_page_snapshot,
     encode_page_snapshot,
+    plan_page_snapshot,
     split_snapshot,
 )
 from sparkcache.spark_context_cache_restore_timing import RestoreTiming
@@ -149,12 +150,21 @@ def _load_native_components() -> SimpleNamespace:
         "sparkcache.spark_context_cache_native_placement"
     )
     restore = importlib.import_module("sparkcache.spark_context_cache_native_restore")
+    hybrid_restore = importlib.import_module(
+        "sparkcache.spark_context_cache_native_hybrid_restore"
+    )
+    binding = importlib.import_module("sparkcache.spark_cache_native")
     return SimpleNamespace(
         NativePlacementLibrary=placement.NativePlacementLibrary,
         NativePlacementAdapter=placement.NativePlacementAdapter,
         ArenaMode=placement.ArenaMode,
         RecordKind=placement.RecordKind,
         execute_native_restore=restore.execute_native_restore,
+        execute_native_hybrid_placement=(
+            hybrid_restore.execute_native_hybrid_placement
+        ),
+        bind_page_reference=binding.bind_page_reference,
+        hybrid_page_cuda_capability=binding.CAP_HYBRID_PAGE_CUDA,
     )
 
 @dataclass
@@ -582,7 +592,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._finished_load_reqs: set[str] = set()
         self._load_stream: Any = None
         self._native_adapter: Any = None
+        self._native_adapters: list[Any] = []
         self._native_execute_restore: Any = None
+        self._native_execute_hybrid: Any = None
         self._native_required_record_mask = 0
         # Scheduler state.
         self._need_load: dict[str, tuple[str, int]] = {}
@@ -1249,6 +1261,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             raise RuntimeError(
                 "spark-context-cache: native placement is already configured"
             )
+        if self._storage_mode == "block_pages_v1":
+            self._configure_native_hybrid_restore()
+            return
         assert self._plans is not None
         if not self._plans:
             raise RuntimeError("spark-context-cache: native restore has no layer plans")
@@ -1353,6 +1368,81 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             len(self._plans),
             slot_capacity,
             max_chunks_per_slab,
+        )
+
+    def _configure_native_hybrid_restore(self) -> None:
+        layout = self._page_layout
+        if layout is None:
+            raise RuntimeError("native hybrid restore has no page layout")
+        first_layer = layout.groups[0].layers[0]
+        first_tensor = self._layer_tensors[first_layer.name]
+        device = first_tensor.device
+        if device.type != "cuda":
+            raise RuntimeError("native hybrid restore requires CUDA page tensors")
+        device_ordinal = (
+            int(device.index)
+            if device.index is not None
+            else int(torch.cuda.current_device())
+        )
+        destination_count = sum(len(group.layers) for group in layout.groups)
+        max_slots = 0
+        for group in layout.groups:
+            capacities = {
+                int(self._layer_tensors[layer.name].shape[0])
+                for layer in group.layers
+            }
+            if len(capacities) != 1:
+                raise RuntimeError(
+                    "native hybrid page group layers disagree on capacity"
+                )
+            max_slots += capacities.pop()
+        adapters = []
+        try:
+            components = _load_native_components()
+            library = components.NativePlacementLibrary.load(
+                self._native_library_path,
+                expected_sha256=self._native_library_sha256,
+            )
+            components.bind_page_reference(library.cdll)
+            if (
+                int(library.abi_info.capability_flags)
+                & int(components.hybrid_page_cuda_capability)
+                == 0
+            ):
+                raise RuntimeError("native library lacks hybrid page CUDA scatter")
+            for _lane in range(self._load_thread_limit):
+                adapter = components.NativePlacementAdapter.create(
+                    library,
+                    arena_mode=components.ArenaMode.MAPPED_HOST,
+                    arena_bytes=self._native_arena_bytes,
+                    max_destinations=destination_count,
+                    max_slots=max_slots,
+                    max_chunks_per_slab=max(64, destination_count),
+                    device_ordinal=device_ordinal,
+                )
+                adapters.append(adapter)
+                adapter.configure_pages(layout, self._layer_tensors)
+            execute = components.execute_native_hybrid_placement
+            if not callable(execute):
+                raise TypeError("native hybrid restore orchestrator is not callable")
+        except Exception as error:
+            for adapter in adapters:
+                with contextlib.suppress(Exception):
+                    adapter.close()
+            raise RuntimeError(
+                f"spark-context-cache: native hybrid restore configuration failed: {error}"
+            ) from error
+        self._native_adapters = adapters
+        self._native_adapter = adapters[0]
+        self._native_execute_hybrid = execute
+        self.counters["native_hybrid_configured"] = 1
+        logger.info(
+            "spark-context-cache: native hybrid restore configured"
+            " destinations=%d max_slots=%d arena_mib=%d lanes=%d",
+            destination_count,
+            max_slots,
+            self._native_arena_bytes // (1024 * 1024),
+            len(adapters),
         )
 
     def _maintain_capacity(
@@ -1973,13 +2063,14 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             while len(self._load_threads) < self._load_thread_limit:
                 thread = threading.Thread(
                     target=self._load_worker_main,
+                    args=(len(self._load_threads),),
                     name=f"spark-cache-load-{len(self._load_threads)}",
                     daemon=True,
                 )
                 thread.start()
                 self._load_threads.append(thread)
 
-    def _load_worker_main(self) -> None:
+    def _load_worker_main(self, lane_index: int = 0) -> None:
         while True:
             queued = self._load_queue.get()
             if queued is None:
@@ -1990,7 +2081,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             with contextlib.suppress(Exception):
                 timing.start_service()
             try:
-                verified = self._load_one(plan, timing=timing)
+                verified = self._load_one(
+                    plan,
+                    timing=timing,
+                    native_lane=lane_index,
+                )
             except Exception as error:  # noqa: BLE001
                 logger.warning(
                     "spark-context-cache: load crashed fail-closed: %s", error
@@ -2069,6 +2164,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         plan: _ReqPlan,
         *,
         timing: RestoreTiming | None = None,
+        native_lane: int = 0,
     ) -> bool:
         try:
             rank = self._worker_rank()
@@ -2114,7 +2210,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     self._invalidate_after_failure(plan.digest)
                 return False
             if self._storage_mode == "block_pages_v1":
-                return self._load_hybrid_pages(lookup, plan, timing=timing)
+                return self._load_hybrid_pages(
+                    lookup,
+                    plan,
+                    timing=timing,
+                    native_lane=native_lane,
+                )
             if self._native_restore_enabled:
                 if (
                     self._native_adapter is None
@@ -2265,6 +2366,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         plan: _ReqPlan,
         *,
         timing: RestoreTiming | None = None,
+        native_lane: int = 0,
     ) -> bool:
         layout = self._page_layout
         if layout is None:
@@ -2294,7 +2396,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 raise HybridCodecError("hybrid snapshot positions differ")
             encoded_parts.append(chunk.records[StateRecord.TARGET_CKV])
         encoded_pages = b"".join(encoded_parts)
-        payloads = decode_page_snapshot(
+        page_plan = plan_page_snapshot(
             layout,
             encoded_pages,
             tuple(len(group) for group in groups),
@@ -2306,6 +2408,55 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 "reassembly_decode",
                 time.perf_counter_ns() - reassembly_started,
             )
+        if self._native_restore_enabled:
+            if not self._native_adapters or not callable(
+                self._native_execute_hybrid
+            ):
+                raise RuntimeError(
+                    "native hybrid restore selected without a configured adapter"
+                )
+            if not 0 <= native_lane < len(self._native_adapters):
+                raise RuntimeError("native hybrid restore lane is unavailable")
+            try:
+                result = self._native_execute_hybrid(
+                    adapter=self._native_adapters[native_lane],
+                    request_id=plan.request_id,
+                    encoded_pages=encoded_pages,
+                    plan=page_plan,
+                    group_slots=groups,
+                )
+            except Exception as error:  # noqa: BLE001
+                logger.warning(
+                    "spark-context-cache: native hybrid placement failed: %s",
+                    error,
+                )
+                self._invalidate_after_failure(plan.digest)
+                return False
+            if timing is not None:
+                timing.observe(
+                    "h2d_submit",
+                    int(result.copy_and_submit_ms * 1_000_000),
+                )
+                timing.observe(
+                    "cuda_sync",
+                    int(result.finish_ms * 1_000_000),
+                )
+            self.counters["native_hybrid_load_verified"] = (
+                self.counters.get("native_hybrid_load_verified", 0) + 1
+            )
+            logger.info(
+                "spark-context-cache: native hybrid restored %d bytes"
+                " submit=%.1f ms finish=%.1f ms",
+                result.source_bytes,
+                result.copy_and_submit_ms,
+                result.finish_ms,
+            )
+            return True
+        payloads = decode_page_snapshot(
+            layout,
+            encoded_pages,
+            tuple(len(group) for group in groups),
+        )
         submit_started = time.perf_counter_ns()
         with self._load_write_context():
             for page_group, block_ids in zip(layout.groups, groups):
@@ -2465,7 +2616,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         for thread in self._load_threads:
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
         live_threads = sum(thread.is_alive() for thread in self._load_threads)
-        if self._native_adapter is not None and live_threads:
+        if (self._native_adapters or self._native_adapter is not None) and live_threads:
             # A native loader can still own the handle or mapped arenas.
             # Keep the adapter strongly reachable and let process teardown
             # reclaim it; destroying it here would be a use-after-close race.
@@ -2478,9 +2629,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 live_threads,
             )
             return None
-        if self._native_adapter is not None:
-            self._native_adapter.close()
-            self._native_adapter = None
+        adapters = self._native_adapters or (
+            [self._native_adapter] if self._native_adapter is not None else []
+        )
+        for adapter in adapters:
+            adapter.close()
+        self._native_adapters = []
+        self._native_adapter = None
         return None
 
     def wait_for_layer_load(self, layer_name: str) -> None:
