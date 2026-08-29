@@ -1,8 +1,8 @@
 # Publish the GLM-5.3 SparkCache image
 
-Status: **implemented** for image construction and private GHCR publication.
-Four-rank TP4/DCP1 serving remains unqualified until the exact registry digest
-passes the cache-enabled and cache-disabled procedures.
+Status: **implemented** for image construction and GHCR publication. The
+SparkCache digest recorded below is **qualified** for the cache-enabled and
+cache-disabled four-rank TP4/DCP1 procedures.
 
 The published artifact is a FujitsuPolycom community derivative. It is not an
 official NVIDIA, vLLM, local-inference-lab, B12X, Inco AI, Z.AI, or SparkCache
@@ -19,6 +19,9 @@ parent='ghcr.io/fujitsupolycom/sparkring-glm53-runtime@sha256:<runtime-digest>'
 
 The parent must carry the exact source, platform, transport, and license labels
 verified by `build_public_image.py`.
+
+The qualified parent is
+`ghcr.io/fujitsupolycom/sparkring-glm53-runtime@sha256:864adfe68f458223e186a19844ac80c7adc7365e5db1f25e109b85fc19850dcd`.
 
 ## Build
 
@@ -68,9 +71,15 @@ Keep the package private while its status is implemented. Pull the receipt's
 complete TP4/DCP1 qualification. Publish the qualification receipt before
 making the GHCR package public.
 
-Public GHCR visibility is irreversible. Confirm the image contains no model
+Changing a private GHCR package to public visibility is irreversible. Confirm
+the image contains no model
 weights, credentials, site configuration, cache entries, or unlicensed source
 before changing visibility.
+
+The qualified overlay is
+`ghcr.io/fujitsupolycom/sparkring-glm53-sparkcache@sha256:cd4045bba2a0f3dc55361560f8c3a3f171939854db28d48dfdae58eed9c44943`.
+Another build remains implemented until its own immutable digest passes the
+same qualification.
 
 ## Required public record
 

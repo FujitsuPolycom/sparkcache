@@ -12,11 +12,17 @@ traffic does not cross the network.
 Version `0.1.0a3` is **implemented**. GPU-free validation covers bounded
 macro-batch chunk publication, event-driven capacity maintenance when TTL
 expiry is disabled, post-commit manifest-read avoidance, and low-allocation
-prompt digests. The package artifact has no live-qualified deployment lane.
-The source-tree `glm53-flash-hybrid` profile is qualified separately for the
-exact GLM-5.3 Flash TP4/DCP1 deployment with DFlash2 using seven draft tokens
+prompt digests. The Python package artifact has no GLM-5.3 live-qualified
+deployment lane. The `glm53-flash-hybrid` profile is qualified in the
+source-bound OCI image for the exact GLM-5.3 Flash TP4/DCP1 deployment with
+DFlash2 using seven draft tokens
 recorded in
 [`GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md`](GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md).
+
+The qualified community image is
+`ghcr.io/fujitsupolycom/sparkring-glm53-sparkcache@sha256:cd4045bba2a0f3dc55361560f8c3a3f171939854db28d48dfdae58eed9c44943`.
+[`deploy/glm53_flash/README.md`](deploy/glm53_flash/README.md) provides pull,
+source-build, TP4 launch, and validation directions.
 
 ## Published release status
 
