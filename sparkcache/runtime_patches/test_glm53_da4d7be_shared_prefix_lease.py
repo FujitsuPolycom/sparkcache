@@ -31,6 +31,9 @@ class _Logger:
     def exception(self, *args):
         pass
 
+    def warning(self, *args):
+        pass
+
 logger = _Logger()
 
 @dataclass
@@ -397,3 +400,10 @@ def test_scheduler_patch_orders_publish_and_attach_after_verification() -> None:
     publish_at = source.index("get_shared_prefix_lease_to_publish")
     full_hit_at = source.index("# on a full prompt hit")
     assert cache_at < publish_at < full_hit_at
+
+
+def test_optional_lease_failures_log_without_tracebacks() -> None:
+    source = PATCH.read_text(encoding="utf-8")
+    assert "logger.exception" not in source
+    assert 'logger.warning("Lease pin skipped key=%s reason=%s"' in source
+    assert '"Lease attach skipped key=%s request=%s reason=%s"' in source

@@ -44,8 +44,8 @@
     {
       "path": "vllm/v1/core/kv_cache_manager.py",
       "accepted_sha256": {
-        "source_checkout": "11f6d4e4032c2266c10339e934dfb63c42676c0fd80b09a9a6a4030ca01dc7b8",
-        "jovian_glm53_runtime": "07f3d398ab500c6abaaab2fbc9af46626cc1c8dcf2bd12de82532c9288bfbec2"
+        "source_checkout": "6d47c1be74ddb20e85598708d1d27a90d163174bb67560dc89f2a134d94531ae",
+        "jovian_glm53_runtime": "9670ab245eec1d939fb214f956c968e22a5e2550901a1c3719e311c4a1603503"
       },
       "required_symbols": [
         "KVCacheManager.get_block_ids",

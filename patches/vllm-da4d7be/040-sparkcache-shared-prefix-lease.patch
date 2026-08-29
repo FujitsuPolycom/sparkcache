@@ -57,7 +57,7 @@ diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
          if required_blocks > available_blocks:
              # Cannot allocate new blocks
              return None
-@@ -707,6 +728,208 @@ class KVCacheManager:
+@@ -707,6 +728,209 @@ class KVCacheManager:
          """Get the blocks of a request."""
          return self.create_kv_cache_blocks(self.coordinator.get_blocks(request_id))
  
@@ -181,9 +181,9 @@ diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
 +                    lease_request_id, block_idx, source_block, hot_block
 +                )
 +                manager.new_block_ids.append(hot_block.block_id)
-+        except Exception:
++        except Exception as error:
 +            self.coordinator.free(lease_request_id)
-+            logger.exception("Failed to pin shared prefix lease %s", lease_key)
++            logger.warning("Lease pin skipped key=%s reason=%s", lease_key, error)
 +            return False
 +
 +        self._shared_prefix_leases[lease_key] = _SharedPrefixLease(
@@ -234,12 +234,13 @@ diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
 +                num_local_computed_tokens=lease.num_computed_tokens,
 +                num_external_computed_tokens=0,
 +            )
-+        except Exception:
++        except Exception as error:
 +            self.coordinator.free(target_request_id)
-+            logger.exception(
-+                "Failed to attach request %s to shared prefix lease %s",
-+                target_request_id,
++            logger.warning(
++                "Lease attach skipped key=%s request=%s reason=%s",
 +                lease_key,
++                target_request_id,
++                error,
 +            )
 +            return 0
 +        return lease.num_computed_tokens
