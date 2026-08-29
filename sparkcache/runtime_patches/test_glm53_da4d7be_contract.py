@@ -77,6 +77,7 @@ def test_glm53_image_applies_exact_hma_load_failure_recovery_patch() -> None:
 
 def test_glm53_shared_prefix_patches_have_exact_two_lineage_receipts() -> None:
     receipts = json.loads(PREIMAGES.read_text(encoding="utf-8"))
+    recipe = (ROOT / "deploy/glm53_flash/Containerfile").read_text("utf-8")
     expected = {
         "040-sparkcache-shared-prefix-lease.patch": (
             "vllm/v1/core/kv_cache_manager.py",
@@ -100,3 +101,6 @@ def test_glm53_shared_prefix_patches_have_exact_two_lineage_receipts() -> None:
         }
         patch_text = (PATCH.parent / patch_name).read_text(encoding="utf-8")
         assert required_text in patch_text
+        assert patch_name in recipe
+        assert receipt["accepted_preimage_sha256"]["jovian_glm53_runtime"] in recipe
+        assert receipt["accepted_postimage_sha256"]["jovian_glm53_runtime"] in recipe

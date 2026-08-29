@@ -40,6 +40,27 @@ RUN set -eu; \
     esac; \
     test "$(sha256sum "$scheduler" | awk '{print $1}')" = \
       9d2b2d52c2634c3f9b7dffdb631d60e1925f579dc63273df8166e973f04386a9; \
+    kv_manager="$root/vllm/v1/core/kv_cache_manager.py"; \
+    before="$(sha256sum "$kv_manager" | awk '{print $1}')"; \
+    case "$before" in \
+      02c71da26bbac81629248ee42b0a71bd2db817d339894d647d2ff6b66fd5ad19) \
+        patch --batch --forward -p1 -d "$root" \
+          < /opt/sparkcache-vllm-patches/040-sparkcache-shared-prefix-lease.patch ;; \
+      c75ee70b70568fd5002ad78ea6fba2bd20dc4913900586d977ae7ea98dffa416) ;; \
+      *) echo "unsupported installed kv_cache_manager.py SHA-256: $before" >&2; exit 1 ;; \
+    esac; \
+    test "$(sha256sum "$kv_manager" | awk '{print $1}')" = \
+      c75ee70b70568fd5002ad78ea6fba2bd20dc4913900586d977ae7ea98dffa416; \
+    before="$(sha256sum "$scheduler" | awk '{print $1}')"; \
+    case "$before" in \
+      9d2b2d52c2634c3f9b7dffdb631d60e1925f579dc63273df8166e973f04386a9) \
+        patch --batch --forward -p1 -d "$root" \
+          < /opt/sparkcache-vllm-patches/041-sparkcache-shared-prefix-attach.patch ;; \
+      4f8793c4ac4bf356a89c829b6e75b189e6bc4a74c97135208952d0bad1678f15) ;; \
+      *) echo "unsupported shared-prefix scheduler.py SHA-256: $before" >&2; exit 1 ;; \
+    esac; \
+    test "$(sha256sum "$scheduler" | awk '{print $1}')" = \
+      4f8793c4ac4bf356a89c829b6e75b189e6bc4a74c97135208952d0bad1678f15; \
     python3 /opt/sparkcache-src/sparkcache/runtime_patches/verify_lease_contract.py \
       --vllm-root "$root" \
       --contract /opt/sparkcache-src/sparkcache/runtime_patches/vllm-kv-block-lease-contract-da4d7be.json
