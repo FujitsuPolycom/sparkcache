@@ -2620,25 +2620,34 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     )
                     self.counters["load_failed"] += 1
                 self._finished_load_reqs.add(plan.request_id)
-                self._inflight_load_reqs.discard(plan.request_id)
                 self._load_cv.notify_all()
-            with contextlib.suppress(Exception):
-                logger.info("%s", timing.render())
-            if verified:
+            try:
                 with contextlib.suppress(Exception):
-                    ttl_seconds = self._capacity_policy.ttl_seconds
-                    self._store.touch(
-                        self._identity(self._worker_rank()),
-                        plan.digest,
-                        minimum_interval_seconds=(
-                            min(60, ttl_seconds // 2) if ttl_seconds else 60
-                        ),
+                    logger.info("%s", timing.render())
+                if verified:
+                    with contextlib.suppress(Exception):
+                        ttl_seconds = self._capacity_policy.ttl_seconds
+                        self._store.touch(
+                            self._identity(self._worker_rank()),
+                            plan.digest,
+                            minimum_interval_seconds=(
+                                min(60, ttl_seconds // 2) if ttl_seconds else 60
+                            ),
+                        )
+                    logger.info(
+                        "spark-context-cache: restored %d tokens async in %.1f ms",
+                        plan.span_tokens,
+                        1e3 * (time.perf_counter() - started),
                     )
-                logger.info(
-                    "spark-context-cache: restored %d tokens async in %.1f ms",
-                    plan.span_tokens,
-                    1e3 * (time.perf_counter() - started),
-                )
+            finally:
+                # Request completion may be published immediately after the
+                # verified placement edge, but connector quiescence includes
+                # every later filesystem/logging action owned by this work
+                # item. Tests and shutdown can therefore remove the cache root
+                # only after no loader can recreate or reopen its metadata.
+                with self._load_cv:
+                    self._inflight_load_reqs.discard(plan.request_id)
+                    self._load_cv.notify_all()
 
     def _load_write_context(self) -> Any:
         assert self._plans is not None

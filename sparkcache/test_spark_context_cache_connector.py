@@ -3961,14 +3961,23 @@ class AsyncRestoreTests(unittest.TestCase):
 
             started = threading.Event()
             release = threading.Event()
+            post_write_started = threading.Event()
+            post_write_release = threading.Event()
             original_restore = connector._store.restore
+            original_touch = connector._store.touch
 
             def gated_restore(lookup):
                 started.set()
                 self.assertTrue(release.wait(timeout=30))
                 return original_restore(lookup)
 
+            def gated_touch(*args, **kwargs):
+                post_write_started.set()
+                self.assertTrue(post_write_release.wait(timeout=30))
+                return original_touch(*args, **kwargs)
+
             connector._store.restore = gated_restore
+            connector._store.touch = gated_touch
             try:
                 connector.bind_connector_metadata(
                     SparkCacheConnectorMetadata(
@@ -4001,12 +4010,24 @@ class AsyncRestoreTests(unittest.TestCase):
                     10.0,
                     "empty completion polling exceeded 10 us/call",
                 )
+                release.set()
+                self.assertTrue(post_write_started.wait(timeout=30))
+                # Request completion is available after verified placement,
+                # but connector quiescence includes the remaining recency
+                # update that may open or recreate files under the cache root.
+                self.assertEqual(
+                    connector.get_finished(set()),
+                    (None, {"restore-me"}),
+                )
+                self.assertFalse(connector.wait_for_pending_loads(timeout=0))
+                post_write_release.set()
+                self.assertTrue(connector.wait_for_pending_loads(timeout=30))
+                self.assertEqual(connector.get_finished(set()), (None, None))
+                self.assertEqual(connector.counters["load_verified"], 1)
             finally:
                 release.set()
-
-            self.assertEqual(_drain(connector), {"restore-me"})
-            self.assertEqual(connector.get_finished(set()), (None, None))
-            self.assertEqual(connector.counters["load_verified"], 1)
+                post_write_release.set()
+                connector.shutdown()
 
     def test_async_restore_records_queue_and_service_phases(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
