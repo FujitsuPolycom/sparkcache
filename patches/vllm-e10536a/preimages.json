@@ -1,0 +1,38 @@
+{
+  "020-sparkcache-vmm-exemption.patch": {
+    "target_path": "vllm/config/vllm.py",
+    "accepted_preimage_sha256": {
+      "source_built_e105": "77f2656bf052aa27547c69a53581981b085bf58272e92ef45420917da91b3fe8"
+    },
+    "accepted_postimage_sha256": {
+      "source_built_e105": "852c2277bd99858cf940238856e7b7f51e9011f768d3c704c930bb9deaf73f61"
+    }
+  },
+  "030-sparkcache-hma-load-failure.patch": {
+    "target_path": "vllm/v1/core/sched/scheduler.py",
+    "accepted_preimage_sha256": {
+      "source_built_e105": "de03584bc174994f8c9e02cd11a718bcb16ad5167b83b245af069f47fbaa03fa"
+    },
+    "accepted_postimage_sha256": {
+      "source_built_e105": "b344acc4c9d2336808c4aff8bc2b5cd30c9d2a6fd4888587a00a1d70a204e3d8"
+    }
+  },
+  "040-sparkcache-shared-prefix-lease.patch": {
+    "target_path": "vllm/v1/core/kv_cache_manager.py",
+    "accepted_preimage_sha256": {
+      "source_built_e105": "5cd0c497e7eb11e80d60fcf5690a963137cbc6a29c7ae5efdff18dc4e94b5d1e"
+    },
+    "accepted_postimage_sha256": {
+      "source_built_e105": "25495df250fc3a308e94e7818edd5aa4ee1806c80439b22a618239286a6835e9"
+    }
+  },
+  "041-sparkcache-shared-prefix-attach.patch": {
+    "target_path": "vllm/v1/core/sched/scheduler.py",
+    "accepted_preimage_sha256": {
+      "source_built_e105": "b344acc4c9d2336808c4aff8bc2b5cd30c9d2a6fd4888587a00a1d70a204e3d8"
+    },
+    "accepted_postimage_sha256": {
+      "source_built_e105": "95f276ac252555a51618a5a98573d0a6f9692d68cb4bf5f03469e8359b73e855"
+    }
+  }
+}

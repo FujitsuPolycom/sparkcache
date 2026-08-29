@@ -23,7 +23,7 @@ python -m sparkcache.runtime_patches.verify_lease_contract \
   --vllm-root /path/to/vllm/source
 ```
 
-The GLM-5.3 Flash integration pins the seven-file serving safety contract
+The GLM-5.3 Flash integration pins the ten-file serving safety contract
 `vllm-kv-block-lease-contract-da4d7be.json` to
 `local-inference-lab/vllm@da4d7be6c97434f6942292ed8abbf4b32dc44355`.
 The accepted hashes cover both the repository checkout and
@@ -39,6 +39,20 @@ names a different upstream lineage:
 python -m sparkcache.runtime_patches.verify_lease_contract \
   --vllm-root /opt/spark-vllm \
   --contract sparkcache/runtime_patches/vllm-kv-block-lease-contract-da4d7be.json
+```
+
+The source-built GLM-5.3 candidate at
+`local-inference-lab/vllm@e10536aadf02a18fccddda7ec939c33147e8b0b3`
+uses `vllm-kv-block-lease-contract-e10536a.json` and the exact-input overlays
+under `patches/vllm-e10536a`. The contract covers the same ten SparkCache-owned
+interfaces after the fork added internal MTP5 and opt-in acceptance-length
+adaptation. It has **implemented** status and requires four-rank qualification
+before replacing a qualified runtime.
+
+```bash
+python -m sparkcache.runtime_patches.verify_lease_contract \
+  --vllm-root /path/to/e10536a/source \
+  --contract sparkcache/runtime_patches/vllm-kv-block-lease-contract-e10536a.json
 ```
 
 ## Narrow integration
@@ -64,7 +78,7 @@ creates a reserve/submit/preemption race in which vLLM can recycle the blocks
 after GPU work begins but before the event becomes visible. `handle.submit()`
 serializes the submission callback and fence publication against preemption.
 If the callback raises, submission status is unknown, the lease remains held,
-and the worker fails closed.
+and the worker stops rather than releasing blocks whose GPU use is uncertain.
 
 Map every logical macro batch to only its relevant physical block-table slice:
 

@@ -37,6 +37,28 @@ def test_build_command_binds_inspected_parent_and_source_digest() -> None:
     assert Path(command[-1]) == Path("/repo")
 
 
+def test_build_command_selects_the_e105_source_built_recipe(tmp_path: Path) -> None:
+    recipe = tmp_path / "deploy/glm53_flash/Containerfile.e10536a"
+    recipe.parent.mkdir(parents=True)
+    recipe.write_text("FROM scratch\n", encoding="utf-8")
+    with mock.patch(
+        "deploy.glm53_flash.build_image.subprocess.run",
+        return_value=subprocess.CompletedProcess([], 0, IMAGE_ID + "\n", ""),
+    ):
+        command = build_command(
+            repository=tmp_path,
+            base_image="local-glm53:e10536a",
+            base_image_id=IMAGE_ID,
+            source_sha256=SOURCE_ID,
+            sparkcache_revision=SPARKCACHE_REVISION,
+            base_image_licenses=LICENSES,
+            output_image="glm53-sparkcache:e10536a",
+            containerfile="deploy/glm53_flash/Containerfile.e10536a",
+        )
+
+    assert command[command.index("-f") + 1] == str(recipe.resolve())
+
+
 def test_build_command_rejects_parent_identity_drift() -> None:
     with mock.patch(
         "deploy.glm53_flash.build_image.subprocess.run",

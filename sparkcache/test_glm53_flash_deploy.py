@@ -9,6 +9,7 @@ from deploy.glm53_flash.profile import (
     ProfileError,
     build_kv_transfer_config,
     compact_json,
+    embedded_mtp_identity,
     immutable_revision_identity,
 )
 
@@ -23,6 +24,37 @@ def test_target_revision_identity_is_deterministic() -> None:
         "local-inference-lab/GLM-5.3-Flash-NVFP4",
         "520de24eabf507659eaef7c70f14fd584527facc",
     ) == TARGET_ID
+
+
+def test_embedded_mtp_policy_changes_the_cache_namespace() -> None:
+    static = embedded_mtp_identity(
+        target_checkpoint_sha256=TARGET_ID,
+        maximum_draft_tokens=5,
+    )
+    adaptive = embedded_mtp_identity(
+        target_checkpoint_sha256=TARGET_ID,
+        maximum_draft_tokens=5,
+        adaptive_initial_tokens=3,
+        adaptive_window=32,
+    )
+    assert len(static) == len(adaptive) == 64
+    assert static != adaptive
+
+
+@pytest.mark.parametrize(
+    ("initial", "window"),
+    [(3, None), (None, 32), (6, 32), (0, 32), (3, 0)],
+)
+def test_embedded_mtp_identity_rejects_incomplete_or_invalid_policy(
+    initial: int | None, window: int | None
+) -> None:
+    with pytest.raises(ProfileError):
+        embedded_mtp_identity(
+            target_checkpoint_sha256=TARGET_ID,
+            maximum_draft_tokens=5,
+            adaptive_initial_tokens=initial,
+            adaptive_window=window,
+        )
 
 
 def test_connector_config_binds_target_and_draft_without_optional_native_paths() -> None:

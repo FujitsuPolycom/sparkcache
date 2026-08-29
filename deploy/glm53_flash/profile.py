@@ -26,6 +26,43 @@ def immutable_revision_identity(repository: str, revision: str) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def embedded_mtp_identity(
+    *,
+    target_checkpoint_sha256: str,
+    maximum_draft_tokens: int,
+    adaptive_initial_tokens: int | None = None,
+    adaptive_window: int | None = None,
+) -> str:
+    """Return a distinct cache identity for target-embedded GLM MTP state.
+
+    Static and adaptive configurations intentionally receive different
+    identities. A change therefore produces a clean cache miss instead of
+    reusing entries published under another speculative-decoding policy.
+    """
+
+    target = _sha256(target_checkpoint_sha256, "target checkpoint identity")
+    if maximum_draft_tokens <= 0:
+        raise ProfileError("embedded MTP maximum draft tokens must be positive")
+    if (adaptive_initial_tokens is None) != (adaptive_window is None):
+        raise ProfileError("adaptive MTP identity requires both initial and window")
+    if adaptive_initial_tokens is not None and (
+        adaptive_initial_tokens <= 0
+        or adaptive_initial_tokens > maximum_draft_tokens
+        or adaptive_window is None
+        or adaptive_window <= 0
+    ):
+        raise ProfileError("adaptive MTP identity values are outside their bounds")
+    policy = (
+        "static"
+        if adaptive_initial_tokens is None
+        else f"adaptive:{adaptive_initial_tokens}:{adaptive_window}"
+    )
+    value = (
+        f"glm53-embedded-mtp-v1\0{target}\0{maximum_draft_tokens}\0{policy}"
+    ).encode("utf-8")
+    return hashlib.sha256(value).hexdigest()
+
+
 def _sha256(value: str, label: str) -> str:
     if SHA256_RE.fullmatch(value) is None:
         raise ProfileError(f"{label} must be a 64-character lowercase SHA-256")
