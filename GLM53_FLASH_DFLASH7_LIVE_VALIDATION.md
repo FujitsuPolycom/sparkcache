@@ -116,7 +116,7 @@ zero OOMs, and zero fatal-log matches after the qualified restart.
 The image build used `deploy/glm53_flash/build_image.py` independently on each
 rank with that rank's immutable base image ID and the SparkCache source digest
 in the serving-contract table. SparkRing commit
-[`d225c01ab7e9748ee71c3aa464a538a3c48aa52d`](https://github.com/FujitsuPolycom/sparkring/tree/d225c01ab7e9748ee71c3aa464a538a3c48aa52d)
+[`6e9e3acef62886a71531310673463972944b2b84`](https://github.com/FujitsuPolycom/sparkring/tree/6e9e3acef62886a71531310673463972944b2b84)
 publishes the sanitized TP4 launcher, runtime pins, cached and non-cached
 quickstarts, and qualification receipts corresponding to the model mounts,
 four-rank topology, and connector JSON.
