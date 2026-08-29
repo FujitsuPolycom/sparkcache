@@ -2713,12 +2713,26 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             flight = self._restore_flights.get(leader_digest)
             if flight is not None:
                 if flight.dispatched:
-                    # Worker completion owns the drain edge. Keep the flight
-                    # reserved until that signal arrives so an abort cannot
-                    # start a second restore into blocks that may still be
-                    # receiving writes.
-                    flight.leader_finished = True
-                    self.counters["restore_flight_leader_aborted"] += 1
+                    status = getattr(request, "status", None)
+                    status_name = getattr(status, "name", str(status or ""))
+                    completed_normally = status_name in {
+                        "FINISHED_STOPPED",
+                        "FINISHED_LENGTH_CAPPED",
+                        "FINISHED_REPETITION",
+                    }
+                    if flight.workers_finished and completed_normally:
+                        # The leader could only generate after vLLM published
+                        # its verified external blocks. Retiring here also
+                        # wakes an otherwise all-deferred follower cohort.
+                        self._retire_restore_flight(
+                            leader_digest, outcome="completed"
+                        )
+                    else:
+                        # Worker completion owns the drain edge. Keep aborted
+                        # or errored leaders reserved until that signal arrives
+                        # so no second restore can overlap outstanding writes.
+                        flight.leader_finished = True
+                        self.counters["restore_flight_leader_aborted"] += 1
                 else:
                     self._retire_restore_flight(leader_digest, outcome="cancelled")
         self._need_load.pop(request_id, None)

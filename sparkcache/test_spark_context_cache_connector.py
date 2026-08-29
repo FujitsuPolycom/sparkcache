@@ -3252,9 +3252,10 @@ class AsyncRestoreTests(unittest.TestCase):
                 connector.get_num_new_matched_tokens(follower, 0),
                 (None, False),
             )
+            leader.status = types.SimpleNamespace(name="FINISHED_LENGTH_CAPPED")
+            connector.request_finished(leader, list(self.BLOCKS))
             self.assertEqual(
-                connector.get_num_new_matched_tokens(leader, self.SPAN),
-                (0, False),
+                connector.counters["restore_flights_completed"], 1
             )
             self.assertNotIn(digest, connector._restore_flights)
             # vLLM supplies the newly published local-prefix length on the
