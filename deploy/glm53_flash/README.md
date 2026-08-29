@@ -102,6 +102,37 @@ that artifact-verification boundary at
 [`FujitsuPolycom/sparkring@d225c01`](https://github.com/FujitsuPolycom/sparkring/blob/d225c01ab7e9748ee71c3aa464a538a3c48aa52d/docs/GLM53_FLASH_DFLASH2_BF16_SPARKCACHE_TP4_QUICKSTART.md).
 Supplying an unverified digest is unsupported.
 
+## Concurrency benchmark
+
+`concurrency_benchmark.py` sends one synchronized C2, C8, or C16 cohort to an
+OpenAI-compatible endpoint. It supports byte-identical prompts and prompts
+with a common trunk plus deterministic request-specific tails. The tool only
+sends inference requests: it does not warm, clear, inspect, or otherwise
+manage SparkCache storage. `--cache-state` records the hot, cold, or
+uncontrolled condition prepared by the operator outside the benchmark.
+
+For example, this records a C16 run whose identical 128K-token-class prompt is
+expected to be hot:
+
+```bash
+python -m deploy.glm53_flash.concurrency_benchmark \
+  --endpoint http://spark-r0:8000 \
+  --model local-inference-lab/GLM-5.3-Flash-NVFP4 \
+  --concurrency 16 \
+  --scenario identical-prefix \
+  --cache-state hot \
+  --output receipts/glm53-c16-identical-hot.json
+```
+
+Use `--scenario shared-trunk` for a common prefix followed by distinct tails.
+The default 131,072 repetitions rely on the qualified model tokenizer's
+one-token encoding of `benchmark`; the receipt records every prompt SHA-256 so
+that model/tokenizer-specific runs can be compared exactly. Run separate
+commands for C2, C8, and C16 and for externally prepared hot/cold conditions.
+The JSON receipt keeps request results in request-index order and reports
+nearest-rank min/p50/p95/max latency. A nonzero exit means one or more requests
+failed or returned no OpenAI-compatible choice.
+
 ## Compatibility
 
 The profile creates a distinct cache namespace. It does not modify the
