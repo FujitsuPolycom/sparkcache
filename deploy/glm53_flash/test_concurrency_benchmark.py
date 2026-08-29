@@ -43,6 +43,37 @@ def test_prompt_shapes_are_stable_and_distinguish_scenarios() -> None:
     assert "tail-01 tail-01" in shared[1]
 
 
+def test_pretokenized_mode_excludes_tokenization_and_sends_token_ids() -> None:
+    tokenize_calls = 0
+    completion_calls = 0
+
+    def transport(
+        url: str, payload: bytes, headers: dict[str, str], timeout: float
+    ) -> TransportResult:
+        nonlocal tokenize_calls, completion_calls
+        body = json.loads(payload)
+        if url.endswith("/tokenize"):
+            tokenize_calls += 1
+            assert "messages" in body
+            return TransportResult(200, {"tokens": [10, 20, 30]})
+        completion_calls += 1
+        assert url.endswith("/v1/completions")
+        assert body["prompt"] == [10, 20, 30]
+        assert "messages" not in body
+        return TransportResult(200, {"choices": [{"text": "ok"}]})
+
+    receipt = run_benchmark(
+        _config(pretokenize=True),
+        transport=transport,
+    )
+
+    assert tokenize_calls == 1
+    assert completion_calls == 2
+    assert receipt["input_mode"] == "pretokenized"
+    assert [request["prompt_tokens"] for request in receipt["requests"]] == [3, 3]
+    assert receipt["validation_passed"] is True
+
+
 @pytest.mark.parametrize("concurrency", [2, 8, 16])
 def test_all_supported_cohorts_start_together_and_receipt_is_ordered(
     concurrency: int,

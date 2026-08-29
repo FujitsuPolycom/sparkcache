@@ -2,11 +2,11 @@
 
 Date: 2026-08-29
 
-Status: **experimental performance result, not yet a concurrency
-qualification**. This record covers the native direct-restore implementation,
-one 128K request, the earlier 16K concurrency comparison, continued generation,
-and GPU-free regression checks. C16 shared-prefix, mixed-trunk, unrelated-cold,
-and decode-interference measurements remain required.
+Status: **qualified for native direct restore, C2/C8/C16 shared-prefix
+correctness, bounded GPU block sharing, continued generation, and
+verified-or-recompute recovery** under the exact deployment recorded here.
+The aspirational sub-second C16 client target, unrelated-cold C16 matrix, and
+decode-interference measurement remain open performance work.
 
 ## Exact implementation and runtime
 
@@ -157,12 +157,51 @@ Diagnostic receipts:
 - `evidence/glm53-flash-dflash7-bf16/hotlease-599b65a-128k-c16.json`;
 - `evidence/glm53-flash-dflash7-bf16/post-hotlease-599b65a-semantic.json`.
 
+## Verified shared-block result
+
+Build `2b86fb9` normalized the leader's raw hybrid tables before hot-lease
+capture and substituted vLLM's authoritative recurrent checkpoint block into
+the logical boundary slot. Every physically partial 2,304-token page was then
+copied into a dedicated immutable hot block before the lease became visible.
+
+The fresh chat C16 run completed all sixteen requests and recorded exactly one
+813,068,464-byte restore on every rank. Client p50 was 2.980 seconds and the
+maximum was 5.064 seconds, down from the no-sharing baseline's 3.363-second
+p50 and 5.335-second maximum. This chat measurement still includes sixteen
+large prompt-tokenization operations.
+
+The pretokenized matrix tokenized each unique chat prompt before the timed
+barrier. Each identical request contained 131,096 token IDs and reused the
+stored 131,072-token prefix:
+
+| Cohort | Restore count per rank | Client min | Client p50 | Client max |
+|---:|---:|---:|---:|---:|
+| C2 | 1 | 0.541 s | 0.541 s | 0.737 s |
+| C8, same live lease | 0 | 0.407 s | 1.211 s | 1.218 s |
+| C16 | 1 | 0.735 s | 2.698 s | 2.701 s |
+| C16, distinct tails | 1 | 2.407 s | 3.894 s | 3.896 s |
+
+For the pretokenized C16 restore, per-rank cache service was 104.2--165.3 ms;
+the restore queue waited at most 3.2 ms. The remaining client latency is model
+work: follower partial-page copy-on-write, the uncached 24-token tail, and the
+DFlash output step. No request failed, no engine exited, queues drained to
+zero, and the post-roll semantic canary matched.
+
+Qualified receipts:
+
+- `evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-128k-c16.json`;
+- `evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-128k-c16-pretokenized.json`;
+- `evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-128k-c2-pretokenized.json`;
+- `evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-128k-c8-pretokenized.json`;
+- `evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-128k-c16-shared-trunk-pretokenized.json`;
+- `evidence/glm53-flash-dflash7-bf16/post-hotlease-2b86fb9-semantic.json`.
+
 ## Repository validation
 
 The exact source tree above passed:
 
-- `python -m pytest sparkcache -q`: 634 passed, 4 skipped;
-- `python -m pytest deploy -q`: 92 passed, 1 skipped;
+- `python -m pytest sparkcache -q`: 678 passed, 4 skipped;
+- `python -m pytest deploy -q`: 99 passed, 1 skipped;
 - `python -m ruff check sparkcache deploy`: all checks passed.
 
 ## Required concurrency qualification
@@ -191,8 +230,16 @@ to unpack`.
 The da4d7be image recipe now applies an exact-preimage scheduler correction.
 When any HMA group contains an invalid restored block, it discards the complete
 external prefix for that request and recomputes it; partially verified hybrid
-state is never published. The expanded eight-file vLLM source contract pins
+state is never published. The expanded ten-file vLLM source contract pins
 both this scheduler behavior and `KVCacheManager.get_block_ids()`. GPU-free
 tests execute the patched method against multi-group, disjoint, asynchronous,
-and preserved single-group recovery cases. A rebuilt thin image and an injected
-live restore rejection are still required before production qualification.
+and preserved single-group recovery cases.
+
+A live 4,096-token recovery canary temporarily removed rank 3's manifest after
+all four ranks had advertised it. Ranks 0--2 verified their restored pages;
+rank 3 reported an ordinary absent-entry miss. The patched scheduler discarded
+the complete external prefix, logged one request and 4,096 affected tokens,
+and recomputed. The request completed in 1.94 seconds, health remained 200,
+and no traceback or engine exit occurred. The displaced manifest was restored.
+The receipt is
+`evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-recovery-canary.json`.

@@ -125,6 +125,10 @@ python -m deploy.glm53_flash.concurrency_benchmark \
 ```
 
 Use `--scenario shared-trunk` for a common prefix followed by distinct tails.
+Use `--pretokenize` to render and tokenize each unique chat prompt before the
+timed start barrier, then send its token IDs through `/v1/completions`. This
+separates SparkCache, scheduler, and model latency from repeated 128K API-side
+tokenization while preserving the exact chat-template token sequence.
 The default header and 131,072 repetitions reproduce the prefix used by the
 recorded 128K native-restore entry; `--prefix-header` can select another
 fixture. They rely on the qualified model tokenizer's one-token encoding of

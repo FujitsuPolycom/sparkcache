@@ -39,6 +39,7 @@ class BenchmarkConfig:
     concurrency: int
     scenario: str
     cache_state: str
+    pretokenize: bool = False
     prefix_header: str = "Native 128K restore test.\n"
     prefix_repetitions: int = 131_072
     tail_repetitions: int = 32
@@ -91,16 +92,52 @@ def build_prompts(config: BenchmarkConfig) -> list[str]:
     ]
 
 
-def _request_body(config: BenchmarkConfig, prompt: str) -> bytes:
-    body = {
+def _request_body(
+    config: BenchmarkConfig,
+    prompt: str,
+    token_ids: tuple[int, ...] | None = None,
+) -> bytes:
+    body: dict[str, Any] = {
         "model": config.model,
-        "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.0,
         "max_tokens": config.max_tokens,
         "stream": False,
-        "chat_template_kwargs": {"enable_thinking": False},
     }
+    if token_ids is None:
+        body["messages"] = [{"role": "user", "content": prompt}]
+        body["chat_template_kwargs"] = {"enable_thinking": False}
+    else:
+        body["prompt"] = list(token_ids)
     return json.dumps(body, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
+def _tokenize_prompt(
+    config: BenchmarkConfig,
+    prompt: str,
+    transport: Transport,
+    headers: dict[str, str],
+) -> tuple[int, ...]:
+    payload = json.dumps(
+        {
+            "model": config.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    result = transport(
+        config.endpoint.rstrip("/") + "/tokenize",
+        payload,
+        headers,
+        config.timeout_seconds,
+    )
+    tokens = result.body.get("tokens")
+    if not 200 <= result.http_status < 300 or not isinstance(tokens, list):
+        raise RuntimeError("tokenization endpoint did not return token IDs")
+    if not tokens or any(type(token) is not int or token < 0 for token in tokens):
+        raise RuntimeError("tokenization endpoint returned invalid token IDs")
+    return tuple(tokens)
 
 
 def _urllib_transport(
@@ -152,14 +189,23 @@ def run_benchmark(
     config.validate()
     prompts = build_prompts(config)
     start_barrier = threading.Barrier(config.concurrency + 1)
-    url = config.endpoint.rstrip("/") + "/v1/chat/completions"
     headers = {"Content-Type": "application/json"}
     if config.api_key:
         headers["Authorization"] = f"Bearer {config.api_key}"
+    encoded_prompts: dict[str, tuple[int, ...]] = {}
+    if config.pretokenize:
+        for prompt in dict.fromkeys(prompts):
+            encoded_prompts[prompt] = _tokenize_prompt(
+                config, prompt, transport, headers
+            )
+    url = config.endpoint.rstrip("/") + (
+        "/v1/completions" if config.pretokenize else "/v1/chat/completions"
+    )
 
     def issue(index: int) -> dict[str, Any]:
         prompt = prompts[index]
-        payload = _request_body(config, prompt)
+        token_ids = encoded_prompts.get(prompt)
+        payload = _request_body(config, prompt, token_ids)
         start_barrier.wait()
         started = clock()
         try:
@@ -171,6 +217,7 @@ def run_benchmark(
                 "request_index": index,
                 "request_id": f"request-{index:02d}",
                 "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                "prompt_tokens": len(token_ids) if token_ids is not None else None,
                 "elapsed_seconds": round(elapsed, 6),
                 "http_status": response.http_status,
                 "response_valid": response_valid,
@@ -183,6 +230,7 @@ def run_benchmark(
                 "request_index": index,
                 "request_id": f"request-{index:02d}",
                 "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                "prompt_tokens": len(token_ids) if token_ids is not None else None,
                 "elapsed_seconds": round(elapsed, 6),
                 "http_status": None,
                 "response_valid": False,
@@ -204,6 +252,7 @@ def run_benchmark(
         "model": config.model,
         "scenario": config.scenario,
         "cache_state": config.cache_state,
+        "input_mode": "pretokenized" if config.pretokenize else "chat",
         "concurrency": config.concurrency,
         "prefix_header": config.prefix_header,
         "prefix_repetitions": config.prefix_repetitions,
@@ -225,6 +274,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--concurrency", type=int, choices=CONCURRENCY_LEVELS, required=True)
     parser.add_argument("--scenario", choices=SCENARIOS, required=True)
     parser.add_argument("--cache-state", choices=CACHE_STATES, required=True)
+    parser.add_argument(
+        "--pretokenize",
+        action="store_true",
+        help="tokenize each unique chat prompt before starting timed completions",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--prefix-header", default="Native 128K restore test.\n")
     parser.add_argument("--prefix-repetitions", type=int, default=131_072)
@@ -247,6 +301,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         concurrency=args.concurrency,
         scenario=args.scenario,
         cache_state=args.cache_state,
+        pretokenize=args.pretokenize,
         prefix_header=args.prefix_header,
         prefix_repetitions=args.prefix_repetitions,
         tail_repetitions=args.tail_repetitions,
