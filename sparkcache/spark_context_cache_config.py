@@ -57,6 +57,18 @@ def _nonnegative_config_int(value: Any, label: str) -> int:
     return parsed
 
 
+def _freeze_config_value(value: Any) -> Any:
+    """Recursively freeze connector metadata shared across runtime roles."""
+
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _freeze_config_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_config_value(item) for item in value)
+    return value
+
+
 def _cache_spec_reuse_policy(spec: Any) -> tuple[str, int | None]:
     """Classify one layer's supported persistent-cache reuse semantics."""
 
@@ -71,10 +83,13 @@ def _cache_spec_reuse_policy(spec: Any) -> tuple[str, int | None]:
     if "FullAttentionSpec" in class_names:
         return "full", None
     if "MambaSpec" in class_names:
-        raise RuntimeError(
-            "spark-context-cache: block-page storage does not support Mamba cache"
-            f" mode {getattr(spec, 'mamba_cache_mode', 'none')!r}"
-        )
+        mode = str(getattr(spec, "mamba_cache_mode", "none"))
+        if mode != "align":
+            raise RuntimeError(
+                "spark-context-cache: recurrent block-page restore requires"
+                f" mamba_cache_mode 'align' (configured: {mode!r})"
+            )
+        return "recurrent_align", None
     raise RuntimeError(
         "spark-context-cache: unsupported block-page KV-cache spec "
         f"{type(spec).__name__}"
@@ -109,6 +124,44 @@ def _group_reuse_policy(
     return policies.pop()
 
 
+def _recurrent_state_identity(
+    spec: Any, layer_names: Sequence[str]
+) -> dict[str, Any] | None:
+    """Return identity fields that affect Mamba-align checkpoint semantics."""
+
+    per_layer = getattr(spec, "kv_cache_specs", None)
+    layer_specs = tuple(
+        per_layer[name]
+        if isinstance(per_layer, dict) and name in per_layer
+        else spec
+        for name in layer_names
+    )
+    recurrent = tuple(
+        layer_spec
+        for layer_spec in layer_specs
+        if "MambaSpec" in {base.__name__ for base in type(layer_spec).__mro__}
+    )
+    if not recurrent:
+        return None
+    fields = (
+        "mamba_cache_mode",
+        "tokens_per_state",
+        "num_speculative_blocks",
+        "num_prefill_checkpoint_blocks",
+    )
+    values = {
+        field: {getattr(layer_spec, field, None) for layer_spec in recurrent}
+        for field in fields
+    }
+    inconsistent = [field for field, choices in values.items() if len(choices) != 1]
+    if inconsistent:
+        raise RuntimeError(
+            "spark-context-cache: recurrent group mixes incompatible state"
+            " geometry: " + ", ".join(inconsistent)
+        )
+    return {field: next(iter(choices)) for field, choices in values.items()}
+
+
 def kv_group_topology(kv_cache_config: Any) -> tuple[dict[str, Any], ...]:
     groups = tuple(getattr(kv_cache_config, "kv_cache_groups", ()) or ())
     topology = []
@@ -116,19 +169,21 @@ def kv_group_topology(kv_cache_config: Any) -> tuple[dict[str, Any], ...]:
         spec = getattr(group, "kv_cache_spec", None)
         layers = tuple(sorted(getattr(group, "layer_names", ()) or ()))
         reuse_policy, reuse_window_tokens = _group_reuse_policy(spec, layers)
-        topology.append(
-            {
-                "group": group_index,
-                "spec": type(spec).__name__,
-                "block_size": int(getattr(spec, "block_size", 0) or 0),
-                "storage_block_size": int(getattr(spec, "storage_block_size", 0) or 0),
-                "page_size_bytes": int(getattr(spec, "page_size_bytes", 0) or 0),
-                "reuse_policy": reuse_policy,
-                "reuse_window_tokens": reuse_window_tokens,
-                "eagle": bool(getattr(group, "is_eagle_group", False)),
-                "layers": layers,
-            }
-        )
+        group_identity = {
+            "group": group_index,
+            "spec": type(spec).__name__,
+            "block_size": int(getattr(spec, "block_size", 0) or 0),
+            "storage_block_size": int(getattr(spec, "storage_block_size", 0) or 0),
+            "page_size_bytes": int(getattr(spec, "page_size_bytes", 0) or 0),
+            "reuse_policy": reuse_policy,
+            "reuse_window_tokens": reuse_window_tokens,
+            "eagle": bool(getattr(group, "is_eagle_group", False)),
+            "layers": layers,
+        }
+        recurrent_state = _recurrent_state_identity(spec, layers)
+        if recurrent_state is not None:
+            group_identity["recurrent_state"] = recurrent_state
+        topology.append(group_identity)
     return tuple(topology)
 
 
@@ -515,9 +570,7 @@ def parse_connector_config(
         block_size=block_size,
         profile=profile,
         storage_mode=storage_mode,
-        group_topology=tuple(
-            MappingProxyType(dict(group)) for group in group_topology
-        ),
+        group_topology=tuple(_freeze_config_value(group) for group in group_topology),
         chunk_tokens=chunk_tokens,
         root=root,
         capacity_policy=capacity_policy,
@@ -532,7 +585,7 @@ def parse_connector_config(
         native_arena_bytes=native_arena_bytes,
         native_io_workers=native_io_workers,
         scheduler_probe=scheduler_probe,
-        identity_base=MappingProxyType(dict(identity_base)),
+        identity_base=_freeze_config_value(identity_base),
         load_thread_limit=load_thread_limit,
         max_pending_restores=max_pending_restores,
     )

@@ -200,6 +200,32 @@ def test_unknown_named_source_state_fails_closed(tmp_path: Path) -> None:
         verify_contract(root, contract)
 
 
+def test_mixed_named_source_states_fail_closed(tmp_path: Path) -> None:
+    root, contract = write_contract(tmp_path, "vllm/base.py", b"source state")
+    second = root / "vllm/scheduler.py"
+    second.write_bytes(b"runtime state")
+    payload = json.loads(contract.read_text("utf-8"))
+    payload["files"][0].pop("sha256")
+    payload["files"][0]["accepted_sha256"] = {
+        "source_checkout": hashlib.sha256(b"source state").hexdigest(),
+        "installed_runtime": hashlib.sha256(b"runtime state").hexdigest(),
+    }
+    payload["files"].append(
+        {
+            "path": "vllm/scheduler.py",
+            "accepted_sha256": {
+                "source_checkout": hashlib.sha256(b"other source").hexdigest(),
+                "installed_runtime": hashlib.sha256(b"runtime state").hexdigest(),
+            },
+            "required_symbols": [],
+        }
+    )
+    contract.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ContractError, match="one coherent named source state"):
+        verify_contract(root, contract)
+
+
 def test_record_cannot_mix_single_and_named_source_states(tmp_path: Path) -> None:
     root, contract = write_contract(tmp_path, "vllm/base.py", b"source")
     payload = json.loads(contract.read_text("utf-8"))

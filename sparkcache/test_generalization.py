@@ -132,6 +132,35 @@ class ProfileRegistryTests(unittest.TestCase):
                 native_restore=True,
             )
 
+    def test_glm53_profile_is_distinct_hybrid_namespace(self) -> None:
+        profile = resolve_profile("glm53-flash-hybrid")
+        self.assertEqual(profile.storage_mode, "block_pages_v1")
+        self.assertEqual(profile.default_draft_kv_policy, "separate")
+        self.assertEqual(profile.required_families, frozenset({"target_ckv"}))
+        self.assertNotEqual(
+            profile.quantization_layout,
+            resolve_profile("glm52-nvfp4").quantization_layout,
+        )
+
+    def test_glm53_profile_accepts_resolved_hybrid_scheduler_block_size(self) -> None:
+        profile = resolve_profile("glm53-flash-hybrid")
+        profile.validate_for_deployment(
+            dcp_degree=1,
+            block_size=2304,
+            min_span_tokens=4096,
+            native_restore=False,
+        )
+
+    def test_glm53_profile_rejects_incommensurate_scheduler_block_size(self) -> None:
+        profile = resolve_profile("glm53-flash-hybrid")
+        with self.assertRaisesRegex(ProfileError, "not mutually divisible"):
+            profile.validate_for_deployment(
+                dcp_degree=1,
+                block_size=384,
+                min_span_tokens=4096,
+                native_restore=False,
+            )
+
 
 class DeploymentValidationTests(unittest.TestCase):
     def test_indivisible_dcp_degree_fails_startup(self) -> None:

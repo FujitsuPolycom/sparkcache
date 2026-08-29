@@ -1,0 +1,36 @@
+ARG BASE_IMAGE=invalid.invalid/supply-an-immutable-base-image
+FROM ${BASE_IMAGE}
+
+ARG SPARKCACHE_SOURCE_SHA256
+ARG BASE_IMAGE_ID
+COPY sparkcache /opt/sparkcache-src/sparkcache
+COPY patches/vllm-da4d7be /opt/sparkcache-vllm-patches
+COPY deploy/deployment_contract/source.py /opt/sparkcache-source-identity.py
+
+RUN set -eu; \
+    case "$BASE_IMAGE_ID" in sha256:[0-9a-f][0-9a-f]*) ;; \
+      *) echo "BASE_IMAGE_ID must be an immutable sha256 image ID" >&2; exit 1 ;; \
+    esac; \
+    actual_source="$(python3 -c 'import importlib.util, pathlib; spec = importlib.util.spec_from_file_location("source_identity", "/opt/sparkcache-source-identity.py"); module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module); print(module.source_tree_sha256(pathlib.Path("/opt/sparkcache-src/sparkcache")))')"; \
+    test "$actual_source" = "$SPARKCACHE_SOURCE_SHA256"; \
+    root=/usr/local/lib/python3.12/dist-packages; \
+    config="$root/vllm/config/vllm.py"; \
+    before="$(sha256sum "$config" | awk '{print $1}')"; \
+    case "$before" in \
+      e6a6e4087331b897bb3116720f608cc23b43dcdbca9c65187aa54dbbd5c0e16e) \
+        patch --batch --forward -p1 -d "$root" \
+          < /opt/sparkcache-vllm-patches/020-sparkcache-vmm-exemption.patch ;; \
+      b97316bf3c8ba7ba575cc8d4d2ded62bc3ae24f160e6e2aee4cabe34f9444671) ;; \
+      *) echo "unsupported installed vllm.py SHA-256: $before" >&2; exit 1 ;; \
+    esac; \
+    test "$(sha256sum "$config" | awk '{print $1}')" = \
+      b97316bf3c8ba7ba575cc8d4d2ded62bc3ae24f160e6e2aee4cabe34f9444671; \
+    python3 /opt/sparkcache-src/sparkcache/runtime_patches/verify_lease_contract.py \
+      --vllm-root "$root" \
+      --contract /opt/sparkcache-src/sparkcache/runtime_patches/vllm-kv-block-lease-contract-da4d7be.json
+
+ENV PYTHONPATH=/opt/sparkcache-src
+LABEL org.opencontainers.image.source="https://github.com/FujitsuPolycom/sparkcache" \
+      org.sparkcache.deployment-profile="glm53-flash-hybrid" \
+      org.sparkcache.parent-image-id="${BASE_IMAGE_ID}" \
+      org.sparkcache.source-sha256="${SPARKCACHE_SOURCE_SHA256}"

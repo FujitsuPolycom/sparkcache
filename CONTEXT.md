@@ -32,7 +32,10 @@ A profile adapter applies model-specific policy to a deployment contract.
 DeepSeek-V4 and GLM-5.2 adapters own their accepted model arguments,
 checkpoint and cache identities, tensor and decode-context parallel geometry,
 quantization rules, environment requirements, and model-specific overlay
-hashes. Shared deployment mechanics must not weaken or replace those rules.
+hashes. The GLM-5.3 Flash directory owns a narrower derived-image and connector-
+configuration contract; its SparkRing launcher owns inspection-to-launch and
+checkpoint-mount validation. Shared deployment mechanics must not weaken or
+replace those rules.
 
 ### Transformed inspection
 

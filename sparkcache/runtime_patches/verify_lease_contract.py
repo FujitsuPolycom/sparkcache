@@ -79,6 +79,7 @@ def verify_contract(vllm_root: Path, contract_path: Path) -> list[Path]:
 
     root = vllm_root.resolve()
     verified: list[Path] = []
+    coherent_named_states: set[str] | None = None
     for record in files:
         if not isinstance(record, dict):
             raise ContractError("invalid lease-contract file record")
@@ -131,7 +132,10 @@ def verify_contract(vllm_root: Path, contract_path: Path) -> list[Path]:
             actual = _sha256(candidate)
         except OSError as error:
             raise ContractError(f"cannot hash {relative}: {error}") from error
-        if actual not in accepted.values():
+        matching_states = {
+            label for label, digest in accepted.items() if actual == digest
+        }
+        if not matching_states:
             states = ", ".join(
                 f"{label}={digest}" for label, digest in accepted.items()
             )
@@ -139,6 +143,17 @@ def verify_contract(vllm_root: Path, contract_path: Path) -> list[Path]:
                 f"vLLM lease-contract mismatch for {relative}: "
                 f"expected one of [{states}], got {actual}"
             )
+        if accepted_named is not None:
+            coherent_named_states = (
+                matching_states
+                if coherent_named_states is None
+                else coherent_named_states & matching_states
+            )
+            if not coherent_named_states:
+                raise ContractError(
+                    "vLLM lease-contract files do not share one coherent"
+                    " named source state"
+                )
         _verify_required_symbols(candidate, relative, record.get("required_symbols"))
         verified.append(candidate)
     return verified

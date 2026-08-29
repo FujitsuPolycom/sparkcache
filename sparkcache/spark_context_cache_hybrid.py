@@ -47,10 +47,14 @@ class PageGroup:
     def __post_init__(self) -> None:
         if self.block_size <= 0 or not self.layers:
             raise HybridCodecError("page group geometry is incomplete")
-        if self.reuse_policy not in {"full", "sliding"}:
+        if self.reuse_policy not in {"full", "sliding", "recurrent_align"}:
             raise HybridCodecError("page group reuse policy is unsupported")
-        if self.reuse_policy == "full" and self.reuse_window_tokens is not None:
-            raise HybridCodecError("full page group cannot declare a reuse window")
+        if self.reuse_policy in {"full", "recurrent_align"} and (
+            self.reuse_window_tokens is not None
+        ):
+            raise HybridCodecError(
+                f"{self.reuse_policy} page group cannot declare a reuse window"
+            )
         if self.reuse_policy == "sliding" and (
             self.reuse_window_tokens is None or self.reuse_window_tokens <= 1
         ):
