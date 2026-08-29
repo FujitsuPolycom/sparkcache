@@ -107,6 +107,7 @@ if TYPE_CHECKING:
 logger = init_logger("vllm.spark_context_cache")
 
 _CAPACITY_RETRY_SECONDS = 5.0
+_CLEAR_ONCE_LOCK_TIMEOUT_SECONDS = 30.0
 _QUORUM_REPORT_BATCH_SIZE = 64
 _QUORUM_DELTA_HISTORY_SIZE = 64
 _QUORUM_PENDING_DELTA_LIMIT = 64
@@ -526,12 +527,37 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._group_topology = config.group_topology
         self._chunk_tokens = config.chunk_tokens
         self._root = config.root
+        self._store = ManifestStore(self._root)
+        self._clear_once_token = config.clear_once_token
+        self._cache_available = True
+        if self._clear_once_token:
+            try:
+                cleared = self._store.clear_once(
+                    self._clear_once_token,
+                    lock_timeout_seconds=_CLEAR_ONCE_LOCK_TIMEOUT_SECONDS,
+                )
+            except Exception as error:  # noqa: BLE001 - serving remains available
+                self._cache_available = False
+                logger.warning(
+                    "spark-context-cache: clear-once did not complete;"
+                    " persistent cache is disabled for role=%s: %s",
+                    role.name,
+                    error,
+                )
+            else:
+                logger.info(
+                    "spark-context-cache: clear-once %s for role=%s",
+                    "removed owned cache data" if cleared else "already completed",
+                    role.name,
+                )
         self._capacity_policy = config.capacity_policy
         self._min_span = config.min_span
         self._max_span = config.max_span
-        self._store_enabled = config.store_enabled
-        self._restore_enabled = config.restore_enabled
-        self._streaming_snapshots_enabled = config.streaming_snapshots_enabled
+        self._store_enabled = config.store_enabled and self._cache_available
+        self._restore_enabled = config.restore_enabled and self._cache_available
+        self._streaming_snapshots_enabled = (
+            config.streaming_snapshots_enabled and self._cache_available
+        )
         self._streaming_runtime: Any = None
         if self._streaming_snapshots_enabled:
             # An explicit opt-in never falls back to end-of-prefill snapshots.
@@ -550,7 +576,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             # Resolve the adapter before native import/allocation so a
             # partially configured deployment fails closed at startup.
             self._install_streaming_runtime(role)
-        self._native_restore_enabled = config.native_restore_enabled
+        self._native_restore_enabled = (
+            config.native_restore_enabled and self._cache_available
+        )
         self._native_library_path = config.native_library_path
         self._native_library_sha256 = config.native_library_sha256
         self._native_arena_bytes = config.native_arena_bytes
@@ -559,7 +587,6 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._context_digest_salt = config.build_identity(0, 0).storage_key
         self._scheduler_probe = config.scheduler_probe
         self._shard_rank = 0
-        self._store = ManifestStore(self._root)
         self._capacity_estimated_bytes = 0
         self._capacity_status: dict[str, int | bool] = {
             "max_bytes": self._capacity_policy.max_bytes,
@@ -1618,7 +1645,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             # The adapter closes over this connector. Bind only after the
             # complete tensor inventory and canonical layer plans exist.
             runtime.bind_kv_caches()
-        if self._capacity_policy.enabled and self._role is KVConnectorRole.WORKER:
+        if (
+            self._cache_available
+            and self._capacity_policy.enabled
+            and self._role is KVConnectorRole.WORKER
+        ):
             report = self._maintain_capacity(force=True)
             self._ensure_capacity_thread()
             if (

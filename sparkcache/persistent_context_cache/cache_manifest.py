@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import struct
 import threading
 import time
@@ -39,6 +40,15 @@ _PREFIX_SEGMENT_DESCRIPTORS = 16
 _MAX_PREFIX_ALIASES = 64
 _PREFIX_SEGMENT_SCHEMA = "sparkcache-prefix-descriptor-segment/v1"
 _PREFIX_ALIAS_SCHEMA = "sparkcache-prefix-alias/v1"
+_CLEAR_ONCE_SCHEMA = "sparkcache-clear-once/v1"
+_CLEAR_ONCE_MARKER_DIRECTORY = ".sparkcache-clear-once"
+_CLEAR_ONCE_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}\Z")
+_CACHE_DATA_DIRECTORIES = (
+    "chunks",
+    "manifests",
+    "prefix-aliases",
+    "prefix-index",
+)
 
 
 class _ProcessRootLock:
@@ -47,7 +57,13 @@ class _ProcessRootLock:
         self._readers = 0
         self._writer = False
 
-    def acquire(self, *, shared: bool, blocking: bool) -> bool:
+    def acquire(
+        self,
+        *,
+        shared: bool,
+        blocking: bool,
+        timeout_seconds: float | None = None,
+    ) -> bool:
         with self._condition:
             def available() -> bool:
                 return (
@@ -59,7 +75,11 @@ class _ProcessRootLock:
             if not blocking and not available():
                 return False
             if blocking:
-                self._condition.wait_for(available)
+                if not self._condition.wait_for(
+                    available,
+                    timeout=timeout_seconds,
+                ):
+                    return False
             if shared:
                 self._readers += 1
             else:
@@ -379,10 +399,20 @@ def _process_root_lock(root: Path) -> _ProcessRootLock:
 class _RootGuard(AbstractContextManager["_RootGuard"]):
     """Process-local plus POSIX advisory lock for one manifest root."""
 
-    def __init__(self, root: Path, *, shared: bool, blocking: bool) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        shared: bool,
+        blocking: bool,
+        timeout_seconds: float | None = None,
+    ) -> None:
+        if timeout_seconds is not None and timeout_seconds < 0:
+            raise ValueError("root-lock timeout must be non-negative")
         self._root = root
         self._shared = shared
         self._blocking = blocking
+        self._timeout_seconds = timeout_seconds
         self._process_lock = _process_root_lock(root)
         self._stream: Any = None
         self._entered = False
@@ -391,6 +421,7 @@ class _RootGuard(AbstractContextManager["_RootGuard"]):
         if not self._process_lock.acquire(
             shared=self._shared,
             blocking=self._blocking,
+            timeout_seconds=self._timeout_seconds,
         ):
             raise BlockingIOError("manifest root is busy")
         try:
@@ -398,9 +429,21 @@ class _RootGuard(AbstractContextManager["_RootGuard"]):
             if _fcntl is not None:
                 self._stream = (self._root / ".maintenance.lock").open("a+b")
                 operation = _fcntl.LOCK_SH if self._shared else _fcntl.LOCK_EX
-                if not self._blocking:
+                if not self._blocking or self._timeout_seconds is not None:
                     operation |= _fcntl.LOCK_NB
-                _fcntl.flock(self._stream.fileno(), operation)
+                if self._blocking and self._timeout_seconds is not None:
+                    deadline = time.monotonic() + self._timeout_seconds
+                    while True:
+                        try:
+                            _fcntl.flock(self._stream.fileno(), operation)
+                            break
+                        except BlockingIOError:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise BlockingIOError("manifest root is busy")
+                            time.sleep(min(0.05, remaining))
+                else:
+                    _fcntl.flock(self._stream.fileno(), operation)
             self._entered = True
             return self
         except BaseException:
@@ -479,6 +522,118 @@ def _ensure_durable_directory(path: Path) -> None:
         else:
             _fsync_directory(directory)
             _fsync_directory(directory.parent)
+
+
+def validate_clear_once_request(
+    root: Path | str,
+    token: object,
+) -> tuple[Path, str]:
+    """Validate a bounded operator token and its rank-local cache root.
+
+    The clear operation removes only named SparkCache data directories, never
+    the configured root itself. Requiring an absolute, non-broad, non-symlinked
+    root prevents a malformed launch option from turning those directory names
+    into deletion targets under a filesystem root or user home.
+    """
+
+    if not isinstance(token, str) or _CLEAR_ONCE_TOKEN.fullmatch(token) is None:
+        raise ValueError(
+            "spark_cache_clear_once must be a 1-128 character string using"
+            " letters, digits, '.', '_', ':', '@', '+', or '-'"
+        )
+    configured = Path(root)
+    if not configured.is_absolute():
+        raise ValueError("spark_cache_clear_once requires an absolute cache root")
+    if ".." in configured.parts:
+        raise ValueError("spark_cache_clear_once rejects parent path traversal")
+    try:
+        resolved = configured.resolve(strict=False)
+    except (OSError, RuntimeError) as error:
+        raise ValueError("spark_cache_clear_once cache root cannot be resolved") from error
+    anchor = Path(resolved.anchor)
+    if resolved == anchor or len(resolved.parts) < 3:
+        raise ValueError("spark_cache_clear_once rejects broad cache roots")
+    try:
+        user_home = Path.home().resolve(strict=False)
+    except (OSError, RuntimeError):
+        user_home = None
+    if user_home is not None and resolved == user_home:
+        raise ValueError("spark_cache_clear_once rejects the user home directory")
+
+    # Reject an existing symlink in any configured path component. A mount may
+    # be the intended rank-local NVMe root, but a symlink could redirect the
+    # fixed SparkCache child names after operator validation.
+    cursor = configured
+    while cursor != cursor.parent:
+        if cursor.is_symlink():
+            raise ValueError("spark_cache_clear_once rejects symlinked cache roots")
+        cursor = cursor.parent
+
+    token_digest = _sha256(
+        _CLEAR_ONCE_SCHEMA.encode("ascii") + b"\0" + token.encode("utf-8")
+    )
+    return resolved, token_digest
+
+
+def _remove_tree_without_following_links(path: Path) -> None:
+    """Remove one owned tree without traversing symlinks or nested mounts."""
+
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        path.unlink()
+        _fsync_directory(path.parent)
+        return
+    if path.is_mount():
+        raise OSError(f"cache-owned path is a separate mount: {path}")
+    for child in tuple(path.iterdir()):
+        _remove_tree_without_following_links(child)
+    _fsync_directory(path)
+    path.rmdir()
+    _fsync_directory(path.parent)
+
+
+def _publish_clear_once_completion(path: Path, token_digest: str) -> None:
+    """Atomically and durably record one successfully completed clear."""
+
+    payload = _canonical_json(
+        {
+            "schema": _CLEAR_ONCE_SCHEMA,
+            "token_sha256": token_digest,
+        }
+    )
+    temporary = path.with_name(f".{path.name}.writing-{uuid.uuid4().hex}")
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    _fsync_directory(path.parent)
+
+
+def _clear_once_completed(path: Path, token_digest: str) -> bool:
+    """Return whether one marker proves completion for its token digest."""
+
+    try:
+        if path.is_symlink() or not path.is_file():
+            return False
+        marker = json.loads(path.read_bytes())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return bool(
+        isinstance(marker, dict)
+        and marker.get("schema") == _CLEAR_ONCE_SCHEMA
+        and marker.get("token_sha256") == token_digest
+        and set(marker) == {"schema", "token_sha256"}
+    )
 
 
 def _publish_immutable(path: Path, payload: bytes) -> None:
@@ -1117,6 +1272,59 @@ class ManifestStore:
 
     def __init__(self, root: Path | str) -> None:
         self.root = Path(root)
+
+    def clear_once(
+        self,
+        token: str,
+        *,
+        lock_timeout_seconds: float = 30.0,
+    ) -> bool:
+        """Clear owned cache data once for one durable operator token.
+
+        Returns ``True`` when this call removed the configured root's owned
+        data and published a completion marker. Returns ``False`` when a valid
+        marker already proves that the same token completed. Lock contention
+        raises :class:`BlockingIOError` after the bounded timeout so a caller
+        can continue serving without using the optional persistent cache.
+        """
+
+        root, token_digest = validate_clear_once_request(self.root, token)
+        guard = _RootGuard(
+            root,
+            shared=False,
+            blocking=True,
+            timeout_seconds=lock_timeout_seconds,
+        )
+        guard.__enter__()
+        try:
+            # Revalidate after acquiring the root-level lock. This catches an
+            # operator or external process replacing the configured root while
+            # this process waited.
+            locked_root, locked_digest = validate_clear_once_request(root, token)
+            if locked_root != root or locked_digest != token_digest:
+                raise OSError("cache root changed while waiting for clear")
+            marker_directory = root / _CLEAR_ONCE_MARKER_DIRECTORY
+            if marker_directory.is_symlink():
+                raise OSError("clear-once marker directory is a symlink")
+            if marker_directory.exists() and not marker_directory.is_dir():
+                raise OSError("clear-once marker path is not a directory")
+            if marker_directory.exists() and marker_directory.is_mount():
+                raise OSError("clear-once marker directory is a separate mount")
+            marker_path = marker_directory / f"{token_digest}.json"
+            if marker_path.is_symlink():
+                raise OSError("clear-once completion marker is a symlink")
+            if _clear_once_completed(marker_path, token_digest):
+                return False
+
+            for name in _CACHE_DATA_DIRECTORIES:
+                _remove_tree_without_following_links(root / name)
+
+            _ensure_durable_directory(marker_directory)
+            _publish_clear_once_completion(marker_path, token_digest)
+            _fsync_directory(root)
+            return True
+        finally:
+            guard.__exit__(None, None, None)
 
     @staticmethod
     def _capacity_entry(path: Path) -> _CapacityEntry:

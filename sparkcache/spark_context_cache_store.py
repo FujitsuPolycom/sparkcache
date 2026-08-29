@@ -13,6 +13,7 @@ from sparkcache.persistent_context_cache.cache_manifest import (
     MaintenanceReport,
     ManifestStore,
     StateRecord,
+    validate_clear_once_request,
 )
 
 __all__ = [
@@ -26,4 +27,5 @@ __all__ = [
     "MaintenanceReport",
     "ManifestStore",
     "StateRecord",
+    "validate_clear_once_request",
 ]

@@ -67,7 +67,8 @@ leaves the connector unloaded.
     "spark_cache_restore": true,
     "spark_cache_max_bytes": 214748364800,
     "spark_cache_low_watermark_bytes": 193273528320,
-    "spark_cache_ttl_seconds": 0
+    "spark_cache_ttl_seconds": 0,
+    "spark_cache_clear_once": ""
   }
 }
 ```
@@ -80,6 +81,10 @@ derives the draft identity from the target checkpoint.
 The model profile is part of cache identity. Implemented profiles are defined
 in `spark_context_cache_profiles.py`; an unknown profile or unsupported
 TP/DCP/PP geometry fails startup.
+
+`spark_cache_clear_once` is empty by default. A non-empty value requests the
+one-shot root clear described below; it is an operator action token, not a
+cache-identity field.
 
 ## Storage and integrity
 
@@ -115,6 +120,43 @@ The watermark is a post-commit reclamation target, not a preallocation
 reservation. One publisher per rank-local root is qualified; multiple
 publishers can transiently exceed the watermark until maintenance reconciles
 physical use.
+
+## One-shot cache clear
+
+Set `spark_cache_clear_once` to an operator-chosen token when a deployment must
+discard the configured rank-local SparkCache contents before reuse:
+
+```json
+"spark_cache_clear_once": "glm53-native-layout-2026-08-29"
+```
+
+The token must contain 1--128 letters, digits, periods, underscores, colons,
+at signs, plus signs, or hyphens, and must begin with a letter or digit. The
+configured cache root must be an absolute, non-broad path and cannot contain a
+symlinked component.
+
+Each process takes the root's exclusive maintenance lock. If the token has no
+completion marker, SparkCache removes only `chunks/`, `manifests/`,
+`prefix-aliases/`, and `prefix-index/` below that exact root. It never removes
+the root, `.maintenance.lock`, `.sparkcache-clear-once/`, unknown root children,
+or sibling model and JIT paths.
+
+After every owned path is durably removed, SparkCache atomically records schema
+`sparkcache-clear-once/v1` under `.sparkcache-clear-once/`. The marker filename
+contains a domain-separated SHA-256 of the token rather than the token text. A restart
+with the same token is a no-op, even if cache entries were published after the
+clear. A different token requests another clear and preserves every earlier
+completion marker.
+
+Root-lock waiting is bounded to 30 seconds. A lock timeout or filesystem error
+leaves the requested token incomplete and disables persistent store, restore,
+streaming publication, and native restore for that connector process. Model
+serving can continue without persistent cache use, and a later startup retries
+the same token.
+
+The option does not change `CacheIdentity`, digest values, chunk geometry, or
+storage schemas. It is a destructive operator action scoped to the configured
+rank-local root; use one deliberate token across the ranks that should clear.
 
 ## Restore timing
 

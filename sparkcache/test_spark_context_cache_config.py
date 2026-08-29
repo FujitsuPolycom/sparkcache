@@ -81,6 +81,25 @@ class ParseConnectorConfigTests(unittest.TestCase):
         config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
         self.assertTrue(config.store_enabled)
         self.assertTrue(config.restore_enabled)
+        self.assertEqual(config.clear_once_token, "")
+
+    def test_clear_once_accepts_operator_token_and_absolute_rank_root(self) -> None:
+        root = (Path.cwd() / "cache" / "rank-0").resolve()
+        vllm, _ = _make_vllm_config(
+            {
+                "spark_cache_root": str(root),
+                "spark_cache_clear_once": "deployment-2026-08-29T20:15",
+            }
+        )
+
+        config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+
+        self.assertEqual(config.root, str(root))
+        self.assertEqual(
+            config.clear_once_token,
+            "deployment-2026-08-29T20:15",
+        )
+        self.assertNotIn("clear_once", config.identity_base)
 
     def test_extra_config_takes_precedence_over_env(self) -> None:
         """Extra-config value wins because env is only the default fallback."""
@@ -292,6 +311,52 @@ class ErrorPathTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
         self.assertIn("pipeline parallelism is unsupported", str(ctx.exception))
+
+    def test_clear_once_requires_a_string_token(self) -> None:
+        vllm, _ = _make_vllm_config({"spark_cache_clear_once": 17})
+        with self.assertRaises(RuntimeError) as ctx:
+            cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+        self.assertIn("spark_cache_clear_once must be a string", str(ctx.exception))
+
+    def test_clear_once_rejects_unsafe_token_syntax(self) -> None:
+        root = str((Path.cwd() / "cache" / "rank-0").resolve())
+        for token in (" whitespace", "path/segment", ".leading", "x" * 129):
+            with self.subTest(token=token):
+                vllm, _ = _make_vllm_config(
+                    {
+                        "spark_cache_root": root,
+                        "spark_cache_clear_once": token,
+                    }
+                )
+                with self.assertRaises(RuntimeError) as ctx:
+                    cfg.parse_connector_config(
+                        vllm,
+                        vllm.kv_transfer_config,
+                        None,
+                    )
+                self.assertIn("1-128 character string", str(ctx.exception))
+
+    def test_clear_once_rejects_relative_and_broad_roots(self) -> None:
+        roots = (
+            "relative/cache",
+            str(Path(Path.cwd().anchor)),
+            str(Path(Path.cwd().anchor) / "cache"),
+            str(Path.home()),
+        )
+        for root in roots:
+            with self.subTest(root=root):
+                vllm, _ = _make_vllm_config(
+                    {
+                        "spark_cache_root": root,
+                        "spark_cache_clear_once": "clear-2026-08-29",
+                    }
+                )
+                with self.assertRaises(RuntimeError):
+                    cfg.parse_connector_config(
+                        vllm,
+                        vllm.kv_transfer_config,
+                        None,
+                    )
 
     def test_load_failure_policy_must_be_recompute(self) -> None:
         vllm, _ = _make_vllm_config()

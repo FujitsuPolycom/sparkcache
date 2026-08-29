@@ -8,6 +8,7 @@ import multiprocessing
 import os
 import tempfile
 import threading
+import time
 import unittest
 import weakref
 from pathlib import Path
@@ -74,7 +75,210 @@ def _hold_open_transaction(
     transaction.abort()
 
 
+def _clear_once_in_subprocess(
+    root: str,
+    token: str,
+    start: Any,
+    results: Any,
+) -> None:
+    start.wait(timeout=10)
+    try:
+        results.put(("ok", ManifestStore(root).clear_once(token)))
+    except BaseException as error:
+        results.put(("error", type(error).__name__, str(error)))
+
+
 class ManifestStoreTests(unittest.TestCase):
+    def test_clear_once_preserves_markers_and_non_cache_siblings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            root = parent / "cache" / "rank-0"
+            model = parent / "models" / "checkpoint.bin"
+            jit = parent / "jit" / "kernel.bin"
+            model.parent.mkdir()
+            jit.parent.mkdir()
+            model.write_bytes(b"model")
+            jit.write_bytes(b"jit")
+            for name in (
+                "chunks",
+                "manifests",
+                "prefix-aliases",
+                "prefix-index",
+            ):
+                path = root / name / "nested" / "payload"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(name.encode())
+            operator_file = root / "operator-note.txt"
+            operator_file.write_text("preserve", encoding="utf-8")
+            store = ManifestStore(root)
+
+            self.assertTrue(store.clear_once("rollout-2026-08-29"))
+
+            for name in (
+                "chunks",
+                "manifests",
+                "prefix-aliases",
+                "prefix-index",
+            ):
+                self.assertFalse((root / name).exists())
+            self.assertEqual(model.read_bytes(), b"model")
+            self.assertEqual(jit.read_bytes(), b"jit")
+            self.assertEqual(operator_file.read_text(encoding="utf-8"), "preserve")
+            marker_directory = root / ".sparkcache-clear-once"
+            markers = tuple(marker_directory.glob("*.json"))
+            self.assertEqual(len(markers), 1)
+            marker = json.loads(markers[0].read_bytes())
+            self.assertEqual(marker["schema"], "sparkcache-clear-once/v1")
+            self.assertNotIn("rollout-2026-08-29", markers[0].read_text())
+
+            later_chunk = root / "chunks" / "later.spcc"
+            later_chunk.parent.mkdir()
+            later_chunk.write_bytes(b"later")
+            self.assertFalse(store.clear_once("rollout-2026-08-29"))
+            self.assertEqual(later_chunk.read_bytes(), b"later")
+
+            self.assertTrue(store.clear_once("rollout-2026-08-30"))
+            self.assertFalse(later_chunk.exists())
+            self.assertEqual(len(tuple(marker_directory.glob("*.json"))), 2)
+
+    def test_clear_once_records_nothing_after_failed_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "cache" / "rank-0"
+            chunk = root / "chunks" / "payload.spcc"
+            chunk.parent.mkdir(parents=True)
+            chunk.write_bytes(b"payload")
+            store = ManifestStore(root)
+            with mock.patch.object(
+                cache_manifest,
+                "_remove_tree_without_following_links",
+                side_effect=OSError("synthetic removal failure"),
+            ):
+                with self.assertRaisesRegex(OSError, "synthetic removal failure"):
+                    store.clear_once("failed-clear")
+
+            marker_directory = root / ".sparkcache-clear-once"
+            self.assertFalse(tuple(marker_directory.glob("*.json")))
+            self.assertEqual(chunk.read_bytes(), b"payload")
+            self.assertTrue(store.clear_once("failed-clear"))
+
+    def test_clear_once_unlinks_owned_symlink_without_following_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            root = parent / "cache" / "rank-0"
+            target = parent / "models"
+            target.mkdir()
+            model = target / "checkpoint.bin"
+            model.write_bytes(b"model")
+            root.mkdir(parents=True)
+            try:
+                (root / "chunks").symlink_to(target, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"directory symlinks unavailable: {error}")
+
+            self.assertTrue(ManifestStore(root).clear_once("symlink-child"))
+
+            self.assertFalse((root / "chunks").exists())
+            self.assertEqual(model.read_bytes(), b"model")
+
+    def test_clear_once_rejects_symlinked_marker_directory_before_deletion(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            root = parent / "cache" / "rank-0"
+            chunk = root / "chunks" / "payload.spcc"
+            chunk.parent.mkdir(parents=True)
+            chunk.write_bytes(b"payload")
+            target = parent / "marker-target"
+            target.mkdir()
+            try:
+                (root / ".sparkcache-clear-once").symlink_to(
+                    target,
+                    target_is_directory=True,
+                )
+            except OSError as error:
+                self.skipTest(f"directory symlinks unavailable: {error}")
+
+            with self.assertRaisesRegex(OSError, "marker directory is a symlink"):
+                ManifestStore(root).clear_once("symlink-marker")
+
+            self.assertEqual(chunk.read_bytes(), b"payload")
+            self.assertFalse(tuple(target.iterdir()))
+
+    def test_clear_once_same_process_concurrency_removes_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "cache" / "rank-0"
+            chunk = root / "chunks" / "payload.spcc"
+            chunk.parent.mkdir(parents=True)
+            chunk.write_bytes(b"payload")
+            barrier = threading.Barrier(8)
+            results: list[bool] = []
+            errors: list[BaseException] = []
+
+            def clear() -> None:
+                try:
+                    barrier.wait(timeout=5)
+                    results.append(ManifestStore(root).clear_once("concurrent"))
+                except BaseException as error:
+                    errors.append(error)
+
+            threads = [threading.Thread(target=clear) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+
+            self.assertFalse(errors)
+            self.assertEqual(results.count(True), 1)
+            self.assertEqual(results.count(False), 7)
+
+    @unittest.skipIf(cache_manifest._fcntl is None, "requires POSIX flock")
+    def test_clear_once_cross_process_concurrency_removes_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "cache" / "rank-0"
+            chunk = root / "chunks" / "payload.spcc"
+            chunk.parent.mkdir(parents=True)
+            chunk.write_bytes(b"payload")
+            context = multiprocessing.get_context("spawn")
+            start = context.Event()
+            results = context.Queue()
+            processes = [
+                context.Process(
+                    target=_clear_once_in_subprocess,
+                    args=(str(root), "multiprocess", start, results),
+                )
+                for _ in range(2)
+            ]
+            for process in processes:
+                process.start()
+            start.set()
+            outcomes = [results.get(timeout=15) for _ in processes]
+            for process in processes:
+                process.join(timeout=15)
+                self.assertEqual(process.exitcode, 0)
+
+            self.assertEqual(sorted(outcomes), [("ok", False), ("ok", True)])
+
+    def test_clear_once_lock_wait_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "cache" / "rank-0"
+            guard = cache_manifest._RootGuard(
+                root,
+                shared=False,
+                blocking=True,
+            )
+            guard.__enter__()
+            try:
+                started = time.monotonic()
+                with self.assertRaises(BlockingIOError):
+                    ManifestStore(root).clear_once(
+                        "bounded-wait",
+                        lock_timeout_seconds=0.01,
+                    )
+                self.assertLess(time.monotonic() - started, 1.0)
+            finally:
+                guard.__exit__(None, None, None)
+
     def test_capacity_policy_rejects_invalid_geometry(self) -> None:
         for kwargs in (
             {"max_bytes": True},

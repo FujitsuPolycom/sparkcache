@@ -12,6 +12,7 @@ from .cache_manifest import (
     ManifestStore,
     PrefixAliasReceipt,
     StateRecord,
+    validate_clear_once_request,
 )
 
 __all__ = [
@@ -26,4 +27,5 @@ __all__ = [
     "ManifestStore",
     "PrefixAliasReceipt",
     "StateRecord",
+    "validate_clear_once_request",
 ]

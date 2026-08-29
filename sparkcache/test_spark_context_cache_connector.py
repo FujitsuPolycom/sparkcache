@@ -615,6 +615,48 @@ class CheckpointIdentityTests(unittest.TestCase):
         )
 
 
+class ClearOnceStartupTests(unittest.TestCase):
+    def test_connector_clears_owned_data_once_before_cache_use(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "cache" / "rank-0"
+            stale = root / "chunks" / "stale.spcc"
+            stale.parent.mkdir(parents=True)
+            stale.write_bytes(b"stale")
+            settings = {"spark_cache_clear_once": "rollout-2026-08-29"}
+
+            connector = _make_connector(root, 0, extra_config=settings)
+
+            self.assertTrue(connector._cache_available)
+            self.assertFalse(stale.exists())
+            later = root / "chunks" / "later.spcc"
+            later.parent.mkdir()
+            later.write_bytes(b"later")
+
+            replacement = _make_connector(root, 0, extra_config=settings)
+
+            self.assertTrue(replacement._cache_available)
+            self.assertEqual(later.read_bytes(), b"later")
+
+    def test_clear_once_lock_timeout_disables_only_persistent_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                connector_module.ManifestStore,
+                "clear_once",
+                side_effect=BlockingIOError("manifest root is busy"),
+            ):
+                connector = _make_connector(
+                    Path(directory) / "cache" / "rank-0",
+                    0,
+                    extra_config={"spark_cache_clear_once": "busy-root"},
+                )
+
+            self.assertFalse(connector._cache_available)
+            self.assertFalse(connector._store_enabled)
+            self.assertFalse(connector._restore_enabled)
+            self.assertFalse(connector._streaming_snapshots_enabled)
+            self.assertFalse(connector._native_restore_enabled)
+
+
 class _FakeCudaTensor:
     def __init__(self, pointer: int, width: int):
         self.shape = (8, 64, width)

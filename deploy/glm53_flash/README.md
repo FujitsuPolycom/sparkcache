@@ -114,6 +114,16 @@ checkpoints. `build_kv_transfer_config` validates configuration syntax and
 identity shape; the launcher remains responsible for hashing mounted model
 artifacts.
 
+An operator can set string key `spark_cache_clear_once` in
+`kv_connector_extra_config` to clear only SparkCache-owned data under each
+configured rank-local root. The token is durably remembered after successful
+removal, so an unchanged static launch configuration does not clear again after
+a restart. A different token requests another clear. Lock timeout or removal
+failure disables persistent caching for that connector process and leaves the
+token incomplete for retry; it does not delay model serving indefinitely. See
+[`sparkcache/README.md`](../../sparkcache/README.md#one-shot-cache-clear) for
+token, root-path, and deletion-scope rules.
+
 Native page restore is disabled unless the launch supplies all of:
 
 - `SPARK_CONTEXT_CACHE_NATIVE_RESTORE=1`;

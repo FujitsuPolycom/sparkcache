@@ -32,6 +32,7 @@ from sparkcache.spark_context_cache_profiles import (
 from sparkcache.spark_context_cache_store import (
     CacheIdentity,
     CapacityPolicy,
+    validate_clear_once_request,
 )
 from sparkcache.streaming.feature_gate import (
     ENVIRONMENT_KEY as _STREAMING_SNAPSHOTS_ENV,
@@ -217,6 +218,7 @@ class ConnectorConfig:
     group_topology: tuple[Mapping[str, Any], ...]
     chunk_tokens: int
     root: str
+    clear_once_token: str
     capacity_policy: CapacityPolicy
     min_span: int
     max_span: int
@@ -305,10 +307,27 @@ def parse_connector_config(
             "spark-context-cache: kv_load_failure_policy must be"
             f" 'recompute' (configured: {load_policy!r})"
         )
-    root = extra(
-        "spark_cache_root",
-        os.environ.get("SPARK_CONTEXT_CACHE_ROOT", "/cache/context"),
+    root = str(
+        extra(
+            "spark_cache_root",
+            os.environ.get("SPARK_CONTEXT_CACHE_ROOT", "/cache/context"),
+        )
     )
+    clear_once_raw = extra("spark_cache_clear_once", "")
+    if not isinstance(clear_once_raw, str):
+        raise RuntimeError(
+            "spark-context-cache: spark_cache_clear_once must be a string"
+        )
+    clear_once_token = clear_once_raw
+    if clear_once_token:
+        try:
+            validated_root, _token_digest = validate_clear_once_request(
+                root,
+                clear_once_token,
+            )
+        except ValueError as error:
+            raise RuntimeError(f"spark-context-cache: {error}") from error
+        root = str(validated_root)
     max_bytes = _nonnegative_config_int(
         extra(
             "spark_cache_max_bytes",
@@ -573,6 +592,7 @@ def parse_connector_config(
         group_topology=tuple(_freeze_config_value(group) for group in group_topology),
         chunk_tokens=chunk_tokens,
         root=root,
+        clear_once_token=clear_once_token,
         capacity_policy=capacity_policy,
         min_span=min_span,
         max_span=max_span,
