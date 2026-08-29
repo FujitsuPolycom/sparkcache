@@ -162,7 +162,7 @@ def _load_native_components() -> SimpleNamespace:
         RecordKind=placement.RecordKind,
         execute_native_restore=restore.execute_native_restore,
         execute_native_hybrid_placement=(
-            hybrid_restore.execute_native_hybrid_placement
+            hybrid_restore.execute_native_hybrid_restore
         ),
         bind_page_reference=binding.bind_page_reference,
         hybrid_page_cuda_capability=binding.CAP_HYBRID_PAGE_CUDA,
@@ -2401,6 +2401,62 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         )
         if len(groups) != len(layout.groups):
             raise HybridCodecError("request block tables disagree with page groups")
+        if self._native_restore_enabled:
+            if not self._native_adapters or not callable(
+                self._native_execute_hybrid
+            ):
+                raise RuntimeError(
+                    "native hybrid restore selected without a configured adapter"
+                )
+            if not 0 <= native_lane < len(self._native_adapters):
+                raise RuntimeError("native hybrid restore lane is unavailable")
+            try:
+                result = self._native_execute_hybrid(
+                    adapter=self._native_adapters[native_lane],
+                    request_id=plan.request_id,
+                    lookup=lookup,
+                    cache_root=self._root,
+                    layout=layout,
+                    group_slots=groups,
+                    expected_span_tokens=plan.span_tokens,
+                    arena_bytes=self._native_arena_bytes,
+                    io_workers=self._native_io_workers,
+                )
+            except Exception as error:  # noqa: BLE001
+                logger.warning(
+                    "spark-context-cache: native hybrid placement failed: %s",
+                    error,
+                )
+                self._invalidate_after_failure(plan.digest)
+                return False
+            if timing is not None:
+                timing.page_bytes = result.source_bytes
+                timing.observe(
+                    "restore_read",
+                    int(result.read_and_hash_ms * 1_000_000),
+                )
+                timing.observe("reassembly_decode", 0)
+                timing.observe(
+                    "h2d_submit",
+                    int(result.copy_and_submit_ms * 1_000_000),
+                )
+                timing.observe(
+                    "cuda_sync",
+                    int(result.finish_ms * 1_000_000),
+                )
+            self.counters["native_hybrid_load_verified"] = (
+                self.counters.get("native_hybrid_load_verified", 0) + 1
+            )
+            logger.info(
+                "spark-context-cache: native hybrid direct restored %d bytes"
+                " slabs=%d read_hash=%.1f ms submit=%.1f ms finish=%.1f ms",
+                result.source_bytes,
+                result.slabs,
+                result.read_and_hash_ms,
+                result.copy_and_submit_ms,
+                result.finish_ms,
+            )
+            return True
         restore_started = time.perf_counter_ns()
         chunks = self._store.restore(lookup)
         if timing is not None:
