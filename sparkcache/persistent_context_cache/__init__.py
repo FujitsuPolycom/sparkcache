@@ -10,7 +10,9 @@ from .cache_manifest import (
     LookupResult,
     MaintenanceReport,
     ManifestStore,
+    PrefixAliasReceipt,
     StateRecord,
+    validate_clear_once_request,
 )
 
 __all__ = [
@@ -23,5 +25,7 @@ __all__ = [
     "LookupResult",
     "MaintenanceReport",
     "ManifestStore",
+    "PrefixAliasReceipt",
     "StateRecord",
+    "validate_clear_once_request",
 ]

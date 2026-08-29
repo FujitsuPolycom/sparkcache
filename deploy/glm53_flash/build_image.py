@@ -10,6 +10,7 @@ from pathlib import Path
 
 
 SHA256_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
+GIT_COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 
 
 def build_command(
@@ -18,12 +19,18 @@ def build_command(
     base_image: str,
     base_image_id: str,
     source_sha256: str,
+    sparkcache_revision: str,
+    base_image_licenses: str,
     output_image: str,
 ) -> list[str]:
     if SHA256_ID.fullmatch(base_image_id) is None:
         raise ValueError("base_image_id must be sha256 followed by 64 lowercase hex")
     if re.fullmatch(r"[0-9a-f]{64}", source_sha256) is None:
         raise ValueError("source_sha256 must be 64 lowercase hex characters")
+    if GIT_COMMIT.fullmatch(sparkcache_revision) is None:
+        raise ValueError("sparkcache_revision must be a 40-character Git commit")
+    if not base_image_licenses.strip():
+        raise ValueError("base_image_licenses must identify the parent image terms")
     inspected = subprocess.run(
         ["docker", "image", "inspect", "--format", "{{.Id}}", base_image],
         check=True,
@@ -45,6 +52,10 @@ def build_command(
         f"BASE_IMAGE_ID={base_image_id}",
         "--build-arg",
         f"SPARKCACHE_SOURCE_SHA256={source_sha256}",
+        "--build-arg",
+        f"SPARKCACHE_REVISION={sparkcache_revision}",
+        "--build-arg",
+        f"BASE_IMAGE_LICENSES={base_image_licenses}",
         "-t",
         output_image,
         str(repository),
@@ -57,13 +68,32 @@ def main() -> int:
     parser.add_argument("--base-image", required=True)
     parser.add_argument("--base-image-id", required=True)
     parser.add_argument("--source-sha256", required=True)
+    parser.add_argument("--sparkcache-revision")
+    parser.add_argument(
+        "--base-image-licenses",
+        default=(
+            "LicenseRef-NVIDIA-Deep-Learning-Container AND Apache-2.0 "
+            "AND BSD-3-Clause"
+        ),
+    )
     parser.add_argument("--output-image", required=True)
     args = parser.parse_args()
+    repository = args.repository.resolve()
+    sparkcache_revision = args.sparkcache_revision
+    if sparkcache_revision is None:
+        sparkcache_revision = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
     command = build_command(
-        repository=args.repository.resolve(),
+        repository=repository,
         base_image=args.base_image,
         base_image_id=args.base_image_id,
         source_sha256=args.source_sha256,
+        sparkcache_revision=sparkcache_revision,
+        base_image_licenses=args.base_image_licenses,
         output_image=args.output_image,
     )
     subprocess.run(command, check=True)

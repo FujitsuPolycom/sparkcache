@@ -28,13 +28,34 @@
     {
       "path": "vllm/v1/core/sched/scheduler.py",
       "accepted_sha256": {
-        "source_checkout": "edfa3af964698cd17d62188acfeacc7b8985aab5b4dcb672944a3c2ea77990ba",
-        "jovian_glm53_runtime": "98bfb14fa37e8c2a2db5aba96bf8a6f0e6d1c0393ef686b075208889a2e46ab3"
+        "source_checkout": "d39e87932cec308bbb3fd4ab9f8f39df39ca7efd6437645dac4cebe33765136b",
+        "jovian_glm53_runtime": "4f8793c4ac4bf356a89c829b6e75b189e6bc4a74c97135208952d0bad1678f15"
       },
       "required_symbols": [
+        "Scheduler.schedule",
         "Scheduler._connector_finished",
+        "Scheduler._update_waiting_for_remote_kv",
+        "Scheduler._finalize_shared_prefix_leases",
         "Scheduler._update_from_kv_xfer_finished",
+        "Scheduler._update_requests_with_invalid_blocks",
         "Scheduler._free_blocks"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_manager.py",
+      "accepted_sha256": {
+        "source_checkout": "25495df250fc3a308e94e7818edd5aa4ee1806c80439b22a618239286a6835e9",
+        "jovian_glm53_runtime": "ee03dc9ce2b720c0be6e9f572d23580ba96eff68fe3406250557e83071654af0"
+      },
+      "required_symbols": [
+        "KVCacheManager.get_block_ids",
+        "KVCacheManager.publish_shared_prefix_lease",
+        "KVCacheManager.attach_shared_prefix_lease",
+        "KVCacheManager.mark_shared_prefix_lease_ready",
+        "KVCacheManager.expire_shared_prefix_leases",
+        "KVCacheManager.discard_shared_prefix_lease",
+        "KVCacheManager.evict_shared_prefix_leases_until_free",
+        "KVCacheManager.take_kv_cache_block_copies"
       ]
     },
     {
@@ -44,7 +65,8 @@
         "jovian_glm53_runtime": "62a4d3818a616c25fb2816d157162e5786134c45954eb5e7fa8c3795d0735324"
       },
       "required_symbols": [
-        "SchedulerOutput.preempted_req_ids"
+        "SchedulerOutput.preempted_req_ids",
+        "SchedulerOutput.kv_cache_block_copies"
       ]
     },
     {
@@ -54,7 +76,31 @@
         "jovian_glm53_runtime": "699ecba3b6cc4a96d32621ee00d078b9dde8f4f82844ac2c5d8ec40c5e81a9e7"
       },
       "required_symbols": [
-        "GPUModelRunner.execute_model"
+        "GPUModelRunner.execute_model",
+        "GPUModelRunner._update_states"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/block_pool.py",
+      "accepted_sha256": {
+        "source_checkout": "426e488ae0c7dd41f1c197f7681fa11fafc008347e6f9cdbeea7412ec0db9151",
+        "jovian_glm53_runtime": "ddee56dccb2208411b3a035918e917ce8f56a9858471e9ca12b420d5d79bc69c"
+      },
+      "required_symbols": [
+        "BlockPool.touch",
+        "BlockPool.free_blocks"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_coordinator.py",
+      "accepted_sha256": {
+        "source_checkout": "dce51ce7f09355d89abf727da10a9fa2ee18fc41df75a3eee39e63ab3fe1ad15",
+        "jovian_glm53_runtime": "37be4bb55d40d78e2210b28c0a3f55e1027872af21335de5ca3c61f09c3856af"
+      },
+      "required_symbols": [
+        "KVCacheCoordinator.allocate_new_computed_blocks",
+        "KVCacheCoordinator.free",
+        "KVCacheCoordinator.get_blocks"
       ]
     },
     {
@@ -64,6 +110,11 @@
         "jovian_glm53_runtime": "e4b1c5c38b63b708fd55aa40a9ab0d008b266d006a63dcfcef55890ac1371cb8"
       },
       "required_symbols": [
+        "SingleTypeKVCacheManager.add_local_computed_blocks",
+        "SingleTypeKVCacheManager.get_num_skipped_tokens",
+        "SingleTypeKVCacheManager._apply_cow",
+        "SingleTypeKVCacheManager.take_pending_cow_copies",
+        "SingleTypeKVCacheManager.pop_blocks_for_free",
         "MambaManager.remove_skipped_blocks",
         "MambaManager.allocate_new_blocks"
       ]

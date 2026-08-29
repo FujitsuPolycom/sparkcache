@@ -1,0 +1,34 @@
+{
+  "schema": "sparkcache-glm53-hotlease-runtime/v1",
+  "source_revision": "2b86fb9d02fa3595cca5caa864b81aedce44b8bb",
+  "source_sha256": "b3e84d220e215bdad99455a7eefb431b9aea248e0edb6ff417319c420433f55a",
+  "scheduler_sha256": "4f8793c4ac4bf356a89c829b6e75b189e6bc4a74c97135208952d0bad1678f15",
+  "kv_cache_manager_sha256": "ee03dc9ce2b720c0be6e9f572d23580ba96eff68fe3406250557e83071654af0",
+  "native_library_sha256": "683cb9e0420da9c68e3263093077fdbcaa400913ff0fb1d18639771213220605",
+  "ranks": {
+    "0": {
+      "image_id": "sha256:80b407904d21211d9a6b435c8ee4292ce66bfebcf802d94deb6605cdbc94d648",
+      "restore_count": 1,
+      "restore_service_ms": 165.285
+    },
+    "1": {
+      "image_id": "sha256:de4e219db4bdc2dfe4a2bcf2d5adb11655da22b5d40bf42494028c5ed128ea83",
+      "restore_count": 1,
+      "restore_service_ms": 121.479
+    },
+    "2": {
+      "image_id": "sha256:b5c29a1fc97fe7e086b62cffd832d90b292dc4f60cbf10c5593ef2f3debea365",
+      "restore_count": 1,
+      "restore_service_ms": 113.09
+    },
+    "3": {
+      "image_id": "sha256:9aeaf31b13af8a940734e31ec2963ce2714db535430ce7953a8baa5cf6dd4401",
+      "restore_count": 1,
+      "restore_service_ms": 104.202
+    }
+  },
+  "active_health_status": 200,
+  "all_containers_running": true,
+  "all_exit_codes": 0,
+  "validation_passed": true
+}

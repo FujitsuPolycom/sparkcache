@@ -1,0 +1,735 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="An interactive explanation of SparkCache exact-prefix discovery, row-prefix aliases, verified restore, and bounded shared GPU-prefix reuse.">
+  <title>SparkCache · Prefix reuse explorer</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --ink: #f4f8fb;
+      --muted: #9fb0c2;
+      --faint: #718398;
+      --bg: #06111c;
+      --panel: #0b1b2b;
+      --panel-2: #0e2235;
+      --line: #1c3a52;
+      --cyan: #30dfc4;
+      --cyan-dim: #123f45;
+      --blue: #6cb5ff;
+      --amber: #ffc369;
+      --amber-dim: #49371d;
+      --red: #ff6f78;
+      --red-dim: #4b222b;
+      --green: #8ce49c;
+      --shadow: 0 22px 70px rgba(0, 0, 0, .28);
+      --radius: 18px;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      min-width: 320px;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 12% 0%, rgba(39, 113, 167, .23), transparent 32rem),
+        radial-gradient(circle at 95% 22%, rgba(24, 159, 143, .10), transparent 28rem),
+        var(--bg);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.55;
+    }
+
+    button, input { font: inherit; }
+    button { color: inherit; }
+    a { color: var(--blue); }
+    a:hover { color: #a9d5ff; }
+    :focus-visible { outline: 3px solid var(--amber); outline-offset: 3px; }
+    code, .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+    code { color: #c7e7ff; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+
+    .shell { width: min(1180px, calc(100% - 32px)); margin: 0 auto; padding: 62px 0 80px; }
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      color: var(--cyan);
+      font-size: .75rem;
+      font-weight: 800;
+      letter-spacing: .15em;
+      text-transform: uppercase;
+    }
+    .eyebrow::before { content: ""; width: 24px; height: 2px; background: currentColor; }
+
+    .hero { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(280px, .65fr); gap: 42px; align-items: end; }
+    h1 { margin: 12px 0 16px; max-width: 820px; font-size: clamp(2.45rem, 6vw, 5.4rem); line-height: .98; letter-spacing: -.055em; }
+    h1 em { color: var(--cyan); font-style: normal; }
+    .lede { max-width: 760px; margin: 0; color: #bfd0de; font-size: clamp(1.02rem, 2vw, 1.26rem); }
+    .hero-note { padding: 20px; border: 1px solid var(--line); border-radius: var(--radius); background: rgba(11, 27, 43, .78); box-shadow: var(--shadow); }
+    .hero-note strong { display: block; margin-bottom: 6px; color: var(--amber); font-size: .76rem; letter-spacing: .1em; text-transform: uppercase; }
+    .hero-note p { margin: 0; color: var(--muted); font-size: .91rem; }
+
+    .status-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 36px 0 64px; }
+    .status-pill { min-height: 82px; padding: 15px 16px; border: 1px solid var(--line); border-radius: 14px; background: rgba(7, 21, 34, .72); }
+    .status-pill .value { display: block; color: var(--ink); font-size: 1.05rem; font-weight: 800; }
+    .status-pill .label { color: var(--faint); font-size: .78rem; }
+    .status-tag { display: inline-block; margin-bottom: 5px; padding: 2px 7px; border: 1px solid #267365; border-radius: 999px; color: var(--cyan); font: 800 .62rem "SFMono-Regular", Consolas, monospace; letter-spacing: .05em; text-transform: uppercase; }
+    .status-tag.limited { border-color: #7a5a2d; color: var(--amber); }
+
+    section { margin-top: 30px; padding: clamp(20px, 4vw, 36px); border: 1px solid var(--line); border-radius: var(--radius); background: linear-gradient(145deg, rgba(14, 34, 53, .94), rgba(8, 24, 39, .96)); box-shadow: var(--shadow); }
+    .section-head { display: flex; justify-content: space-between; gap: 30px; align-items: end; margin-bottom: 24px; }
+    .section-head h2 { margin: 0; font-size: clamp(1.45rem, 3vw, 2.2rem); letter-spacing: -.035em; }
+    .section-head p { max-width: 570px; margin: 0; color: var(--muted); font-size: .94rem; }
+    .num { color: var(--cyan); font-family: "SFMono-Regular", Consolas, monospace; font-size: .78em; }
+
+    .token-row { display: flex; gap: 7px; margin: 18px 0; }
+    .token {
+      display: grid;
+      flex: 1;
+      min-width: 0;
+      min-height: 58px;
+      place-items: center;
+      border: 1px solid #346480;
+      border-radius: 9px;
+      background: #11334a;
+      color: #d8efff;
+      font-weight: 900;
+      box-shadow: inset 0 -12px 20px rgba(3, 14, 24, .22);
+    }
+    .token small { display: block; color: #89a7bb; font-size: .6rem; font-weight: 600; }
+    .token.new { border-color: #86602f; background: #3a2e1c; color: var(--amber); }
+    .token.live { flex: .23; border-style: dashed; color: var(--faint); background: transparent; }
+    .context-example { display: grid; grid-template-columns: minmax(245px, .7fr) minmax(0, 1.3fr); gap: 18px; }
+    .messages, .serialized { padding: 20px; border: 1px solid var(--line); border-radius: 14px; background: rgba(3, 14, 24, .55); }
+    .messages h3, .serialized h3 { margin: 0 0 4px; font-size: 1rem; }
+    .messages > p, .serialized > p { margin: 0 0 16px; color: var(--faint); font-size: .78rem; }
+    .message { display: grid; grid-template-columns: 70px 1fr auto; gap: 10px; align-items: center; margin-top: 7px; padding: 10px 11px; border: 1px solid #29465a; border-radius: 9px; background: #081a28; }
+    .message-role { color: var(--blue); font: 800 .68rem "SFMono-Regular", Consolas, monospace; text-transform: uppercase; }
+    .message:nth-of-type(3) .message-role { color: var(--amber); }
+    .message:nth-of-type(4) .message-role { color: var(--cyan); }
+    .message:nth-of-type(5) .message-role { color: #cf9cff; }
+    .message-text { overflow: hidden; color: #c5d2dc; font-size: .75rem; text-overflow: ellipsis; white-space: nowrap; }
+    .message-count { color: var(--faint); font: .65rem "SFMono-Regular", Consolas, monospace; white-space: nowrap; }
+    .context-track { position: relative; display: grid; grid-template-columns: 384fr 148fr 430fr 385fr; height: 76px; overflow: hidden; border: 1px solid #31536a; border-radius: 10px; background: #061522; }
+    .message-segment { display: grid; min-width: 0; place-items: center; border-right: 1px solid rgba(255,255,255,.12); color: white; font: 800 .68rem "SFMono-Regular", Consolas, monospace; text-align: center; }
+    .message-segment small { display: block; opacity: .65; font-size: .58rem; font-weight: 600; }
+    .message-segment.system { background: #18466a; }
+    .message-segment.user-one { background: #765323; }
+    .message-segment.assistant { background: #176a5c; }
+    .message-segment.user-two { background: #624378; }
+    .boundary-line { position: absolute; top: 0; bottom: 0; z-index: 2; width: 1px; background: rgba(255,255,255,.72); box-shadow: 0 0 0 1px rgba(0,0,0,.2); }
+    .boundary-line::after { content: attr(data-at); position: absolute; top: 3px; left: 4px; color: rgba(255,255,255,.78); font: .55rem "SFMono-Regular", Consolas, monospace; }
+    .chunk-grid { display: grid; grid-template-columns: repeat(5, 256fr) 67fr; gap: 4px; margin-top: 8px; }
+    .chunk-cell { min-width: 0; padding: 8px 2px; border: 1px solid #2c5d70; border-radius: 6px; background: #0c2c3e; color: #cae8f6; text-align: center; font: 800 .65rem "SFMono-Regular", Consolas, monospace; }
+    .chunk-cell small { display: block; margin-top: 2px; color: var(--faint); font-size: .52rem; font-weight: 600; }
+    .chunk-cell.remainder { border-style: dashed; border-color: #685276; background: #211b2b; color: #cf9cff; }
+    .span-summary { display: grid; grid-template-columns: 1280fr 67fr; gap: 4px; margin-top: 9px; }
+    .safe-span, .remainder-span { padding: 6px; border-radius: 5px; text-align: center; font-size: .62rem; }
+    .safe-span { border: 1px solid #267365; background: var(--cyan-dim); color: var(--cyan); }
+    .remainder-span { border: 1px dashed #685276; color: #cf9cff; }
+    .context-note { margin: 16px 0 0; padding: 11px 13px; border-left: 3px solid var(--cyan); background: rgba(18, 63, 69, .35); color: var(--muted); font-size: .79rem; }
+
+    .lab { padding: 0; overflow: hidden; }
+    .lab-head { padding: clamp(20px, 4vw, 34px); border-bottom: 1px solid var(--line); background: rgba(6, 17, 28, .45); }
+    .scenario-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 20px; }
+    .scenario-tab, .step-button {
+      border: 1px solid #2a506b;
+      border-radius: 9px;
+      background: #102b41;
+      cursor: pointer;
+      font-size: .8rem;
+      font-weight: 760;
+      transition: transform .15s ease, border-color .15s ease, background .15s ease;
+    }
+    .scenario-tab { padding: 8px 12px; }
+    .scenario-tab:hover, .step-button:hover { transform: translateY(-1px); border-color: var(--cyan); }
+    .scenario-tab[aria-selected="true"] { border-color: var(--cyan); background: var(--cyan); color: #03201e; }
+
+    .controls { display: grid; grid-template-columns: auto 1fr auto; gap: 18px; align-items: center; padding: 16px clamp(20px, 4vw, 34px); border-bottom: 1px solid var(--line); }
+    .button-group { display: flex; gap: 8px; }
+    .step-button { min-width: 42px; padding: 8px 11px; }
+    .step-button:disabled { cursor: default; opacity: .35; transform: none; }
+    .step-button.playing { border-color: var(--cyan); color: var(--cyan); }
+    .slider-wrap { display: flex; gap: 12px; align-items: center; color: var(--muted); font-size: .8rem; }
+    input[type="range"] { width: 100%; accent-color: var(--cyan); }
+    .step-count { min-width: 94px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; background: #061522; color: var(--cyan); text-align: center; font: 800 .78rem "SFMono-Regular", Consolas, monospace; }
+
+    .lab-grid { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(290px, .75fr); }
+    .stage { min-height: 470px; padding: clamp(20px, 4vw, 34px); border-right: 1px solid var(--line); }
+    .stage-label { color: var(--cyan); font-size: .72rem; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+    .stage h3 { margin: 6px 0 7px; font-size: 1.35rem; }
+    .stage-copy { min-height: 46px; margin: 0 0 22px; color: var(--muted); font-size: .9rem; }
+    .prompt-viz { margin-bottom: 24px; }
+    .prompt-viz .token { transition: opacity .25s ease, border-color .25s ease, background .25s ease, transform .25s ease; }
+    .token.inactive { opacity: .26; }
+    .token.chosen { border-color: var(--cyan); background: #10493f; color: #bffff2; transform: translateY(-3px); }
+    .token.compute { border-color: var(--amber); background: var(--amber-dim); color: var(--amber); transform: translateY(-3px); }
+    .token.fail { border-color: var(--red); background: var(--red-dim); color: #ffd8dc; }
+
+    .candidate-layout { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 15px; align-items: start; }
+    .candidate-list { display: grid; gap: 6px; }
+    .candidate { display: flex; justify-content: space-between; align-items: center; min-height: 34px; padding: 7px 9px; border: 1px solid #223f55; border-radius: 7px; background: #071725; color: var(--faint); font: .73rem "SFMono-Regular", Consolas, monospace; transition: .2s ease; }
+    .candidate::after { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #355066; }
+    .candidate.checked { border-color: #506777; color: #c3d1da; }
+    .candidate.selected { border-color: var(--cyan); background: var(--cyan-dim); color: var(--cyan); transform: translateX(4px); }
+    .candidate.selected::after { background: var(--cyan); box-shadow: 0 0 0 4px rgba(48, 223, 196, .12); }
+    .candidate.failed { border-color: var(--red); color: var(--red); }
+    .candidate.failed::after { background: var(--red); }
+
+    .quorum { display: grid; grid-template-columns: 48px repeat(5, 1fr); gap: 5px; text-align: center; }
+    .q-head { color: var(--faint); font: .67rem "SFMono-Regular", Consolas, monospace; }
+    .rank-label { display: flex; align-items: center; color: #b7c7d3; font: .71rem "SFMono-Regular", Consolas, monospace; }
+    .q-cell { min-height: 31px; border: 1px solid #263f52; border-radius: 6px; background: #091927; position: relative; }
+    .q-cell.hit::after, .q-cell.alias::after, .q-cell.miss::after, .q-cell.corrupt::after { position: absolute; inset: 0; display: grid; place-items: center; font-size: .72rem; font-weight: 900; }
+    .q-cell.hit { border-color: #246a61; background: #10382f; }
+    .q-cell.hit::after { content: "✓"; color: var(--cyan); }
+    .q-cell.alias { border-color: #446fa3; background: #102d4c; }
+    .q-cell.alias::after { content: "A"; color: var(--blue); }
+    .q-cell.miss::after { content: "—"; color: #4b6476; }
+    .q-cell.corrupt { border-color: var(--red); background: var(--red-dim); }
+    .q-cell.corrupt::after { content: "!"; color: var(--red); }
+    .q-cell.focus { outline: 2px solid var(--amber); outline-offset: 1px; }
+    .matrix-note { grid-column: 2 / -1; margin-top: 5px; color: var(--faint); font-size: .71rem; text-align: left; }
+
+    .result { padding: clamp(20px, 4vw, 30px); background: rgba(4, 16, 26, .46); }
+    .result-kicker { color: var(--faint); font-size: .7rem; font-weight: 800; letter-spacing: .13em; text-transform: uppercase; }
+    .result-value { margin: 4px 0 0; font-size: clamp(2.4rem, 6vw, 4.6rem); font-weight: 900; line-height: 1; letter-spacing: -.06em; }
+    .result-value span { color: var(--cyan); }
+    .result-unit { color: var(--muted); font-size: .78rem; }
+    .meter { height: 11px; margin: 22px 0 8px; overflow: hidden; border-radius: 999px; background: #1c2934; }
+    .meter-fill { width: 0; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #1ba991, var(--cyan)); transition: width .35s ease; }
+    .meter.fail .meter-fill { background: var(--red); }
+    .result-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 18px 0; }
+    .stat { padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: #071725; }
+    .stat b { display: block; font: 800 1.08rem "SFMono-Regular", Consolas, monospace; }
+    .stat small { color: var(--faint); font-size: .7rem; }
+    .verdict { margin-top: 16px; padding: 12px; border: 1px solid #235e58; border-radius: 9px; background: var(--cyan-dim); color: #bffff2; font-size: .8rem; }
+    .verdict.fail { border-color: #74333c; background: var(--red-dim); color: #ffd3d7; }
+
+    .alias-visual { display: grid; grid-template-columns: .8fr 1.2fr; gap: 18px; }
+    .payload-bank, .aliases { padding: 20px; border: 1px solid var(--line); border-radius: 14px; background: rgba(4, 16, 26, .5); }
+    .payload-bank h3, .aliases h3 { margin: 0 0 4px; font-size: 1rem; }
+    .mini-copy { margin: 0 0 18px; color: var(--faint); font-size: .8rem; }
+    .file-row { display: flex; gap: 7px; }
+    .file { flex: 1; padding: 22px 4px 9px; border: 1px solid #2b6279; border-radius: 7px; background: #0c2d40; text-align: center; font: 800 .74rem "SFMono-Regular", Consolas, monospace; }
+    .file small { display: block; margin-top: 4px; color: var(--faint); font-size: .58rem; }
+    .descriptor-map { display: grid; grid-template-columns: minmax(110px, .7fr) auto minmax(180px, 1.3fr); gap: 8px; align-items: center; margin-top: 13px; }
+    .descriptor-node { padding: 10px; border: 1px solid #315a75; border-radius: 8px; background: #0b2639; color: #c5dbea; font: 700 .66rem "SFMono-Regular", Consolas, monospace; text-align: center; }
+    .descriptor-node.alias-node { border-color: #39749b; color: var(--blue); }
+    .descriptor-node.payload-node { border-color: #267365; color: var(--cyan); }
+    .descriptor-arrow { color: var(--cyan); font-weight: 900; text-align: center; }
+    .alias-row { display: grid; grid-template-columns: 92px 1fr; gap: 8px; align-items: center; margin-top: 7px; }
+    .alias-name { color: var(--cyan); font: .7rem "SFMono-Regular", Consolas, monospace; }
+    .refs { display: flex; gap: 4px; }
+    .ref { flex: 1; height: 24px; border: 1px solid #36556a; border-radius: 5px; background: #102c3e; color: #aac1d1; text-align: center; font: 700 .64rem/22px "SFMono-Regular", Consolas, monospace; }
+    .alias-caption { margin: 17px 0 0; padding-top: 13px; border-top: 1px solid var(--line); color: var(--muted); font-size: .83rem; }
+
+    .flow { display: grid; grid-template-columns: 1fr auto 1.15fr auto 1fr; gap: 12px; align-items: stretch; }
+    .flow-card { padding: 18px; border: 1px solid var(--line); border-radius: 12px; background: rgba(4, 16, 26, .52); }
+    .flow-card .icon { display: grid; width: 34px; height: 34px; margin-bottom: 12px; place-items: center; border-radius: 9px; background: var(--cyan-dim); color: var(--cyan); font-weight: 900; }
+    .flow-card h3 { margin: 0 0 4px; font-size: .95rem; }
+    .flow-card p { margin: 0; color: var(--muted); font-size: .78rem; }
+    .arrow { align-self: center; color: var(--cyan); font-size: 1.25rem; }
+    .ranks { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 12px; }
+    .rank { padding: 7px; border: 1px solid #2c5c70; border-radius: 6px; color: #b9d4e5; background: #0b2a3c; font: .68rem "SFMono-Regular", Consolas, monospace; text-align: center; }
+
+    .safety-grid, .evidence-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .safety-card, .evidence-card { padding: 18px; border: 1px solid var(--line); border-radius: 12px; background: rgba(4, 16, 26, .52); }
+    .safety-card strong, .evidence-card strong { display: block; margin-bottom: 6px; color: var(--cyan); font-size: .87rem; }
+    .safety-card p, .evidence-card p { margin: 0; color: var(--muted); font-size: .8rem; }
+    .evidence-card strong { color: var(--amber); }
+
+    .share-layout { display: grid; grid-template-columns: minmax(250px, .7fr) minmax(0, 1.3fr); gap: 18px; }
+    .share-controls, .share-stage { padding: 20px; border: 1px solid var(--line); border-radius: 14px; background: rgba(4, 16, 26, .52); }
+    .share-controls h3, .share-stage h3 { margin: 0 0 6px; font-size: 1rem; }
+    .share-controls p, .share-stage > p { margin: 0; color: var(--muted); font-size: .8rem; }
+    .concurrency-buttons { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; margin: 18px 0; }
+    .concurrency-button { padding: 9px; border: 1px solid #2a506b; border-radius: 8px; background: #102b41; cursor: pointer; font-weight: 850; }
+    .concurrency-button[aria-pressed="true"] { border-color: var(--cyan); background: var(--cyan); color: #03201e; }
+    .share-metrics { display: grid; gap: 8px; }
+    .share-metric { padding: 11px 12px; border: 1px solid var(--line); border-radius: 9px; background: #071725; }
+    .share-metric b { display: block; color: var(--cyan); font: 850 1rem "SFMono-Regular", Consolas, monospace; }
+    .share-metric small { color: var(--faint); font-size: .7rem; }
+    .lease-flow { display: grid; grid-template-columns: minmax(105px, .7fr) auto minmax(150px, 1fr) auto minmax(160px, 1.25fr); gap: 9px; align-items: center; margin: 20px 0; }
+    .lease-node { min-height: 86px; padding: 12px; border: 1px solid #315a75; border-radius: 10px; background: #0a2234; text-align: center; }
+    .lease-node b { display: block; margin-bottom: 5px; color: var(--cyan); font-size: .8rem; }
+    .lease-node small { color: var(--faint); font-size: .66rem; }
+    .lease-node.verified { border-color: #267365; background: #10382f; }
+    .lease-arrow { color: var(--cyan); font-size: 1.2rem; font-weight: 900; }
+    .request-fan { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; }
+    .request-card { min-height: 48px; padding: 6px 3px; border: 1px solid #34556b; border-radius: 6px; background: #0c2638; text-align: center; }
+    .request-card b { display: block; color: #d7ebf7; font: 750 .61rem "SFMono-Regular", Consolas, monospace; }
+    .request-card small { color: var(--amber); font-size: .55rem; }
+    .request-card.leader { border-color: var(--cyan); }
+    .rank-band { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 12px; }
+    .rank-band span { padding: 7px 4px; border: 1px solid #28556a; border-radius: 6px; color: #b9d4e5; background: #0b2a3c; font: .64rem "SFMono-Regular", Consolas, monospace; text-align: center; }
+    .share-note { margin-top: 14px; padding: 11px 12px; border-left: 3px solid var(--amber); background: rgba(73, 55, 29, .44); color: #dfc89f; font-size: .76rem; }
+
+    .evidence-table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; }
+    .evidence-table { width: 100%; border-collapse: collapse; min-width: 700px; background: rgba(4, 16, 26, .52); }
+    .evidence-table th, .evidence-table td { padding: 12px 14px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    .evidence-table th { color: var(--faint); font: 800 .67rem "SFMono-Regular", Consolas, monospace; letter-spacing: .05em; text-transform: uppercase; }
+    .evidence-table td { color: #c7d5df; font-size: .78rem; }
+    .evidence-table tr:last-child td { border-bottom: 0; }
+    .evidence-table strong { color: var(--cyan); }
+
+    footer { display: flex; justify-content: space-between; gap: 24px; margin-top: 34px; padding: 18px 4px; color: var(--faint); font-size: .76rem; }
+    footer p { margin: 0; }
+    .source-links { display: flex; flex-wrap: wrap; gap: 12px; }
+
+    @media (max-width: 850px) {
+      .hero, .lab-grid, .alias-visual, .context-example, .share-layout { grid-template-columns: 1fr; }
+      .status-strip { grid-template-columns: 1fr 1fr; }
+      .stage { min-height: 0; border-right: 0; border-bottom: 1px solid var(--line); }
+      .flow { grid-template-columns: 1fr; }
+      .arrow { transform: rotate(90deg); justify-self: center; }
+      .safety-grid, .evidence-grid { grid-template-columns: 1fr; }
+      .lease-flow { grid-template-columns: 1fr; }
+      .lease-arrow { transform: rotate(90deg); justify-self: center; }
+      .section-head { display: block; }
+      .section-head p { margin-top: 8px; }
+    }
+
+    @media (max-width: 620px) {
+      .shell { width: min(100% - 18px, 1180px); padding-top: 34px; }
+      .status-strip { grid-template-columns: 1fr; }
+      .controls { grid-template-columns: 1fr; }
+      .button-group { justify-content: center; }
+      .candidate-layout { grid-template-columns: 1fr; }
+      .candidate-list { grid-template-columns: repeat(5, 1fr); }
+      .candidate { display: grid; min-width: 0; padding: 6px 2px; text-align: center; }
+      .candidate::after { display: none; }
+      .alias-row { grid-template-columns: 76px 1fr; }
+      .descriptor-map { grid-template-columns: 1fr; }
+      .descriptor-arrow { transform: rotate(90deg); }
+      .request-fan { grid-template-columns: repeat(2, 1fr); }
+      footer { display: block; }
+      .source-links { margin-top: 10px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="hero">
+      <div>
+        <span class="eyebrow">Persistent context for vLLM</span>
+        <h1>Reuse the longest <em>verified prefix</em></h1>
+        <p class="lede">SparkCache finds the longest stored prompt boundary available on every physical rank. One verified restore can then supply bounded shared GPU blocks to concurrent requests while each request computes its own tail.</p>
+      </div>
+      <aside class="hero-note">
+        <strong>Example configuration</strong>
+        <p>The qualified example uses tensor parallelism degree 4 (TP4) and decode-context parallelism degree 1 (DCP1) across four DGX Spark systems. Each rank owns a different shard and local cache.</p>
+      </aside>
+    </header>
+
+    <div class="status-strip" aria-label="Request summary">
+      <div class="status-pill"><span class="status-tag">Implemented</span><span class="value">256 tokens</span><span class="label">logical identity and admission boundary</span></div>
+      <div class="status-pill"><span class="status-tag">Implemented</span><span class="value">Longest exact</span><span class="label">stored boundary advertised by every rank</span></div>
+      <div class="status-pill"><span class="status-tag">Implemented</span><span class="value">Row aliases</span><span class="label">sparse authenticated metadata over durable row chunks</span></div>
+      <div class="status-pill"><span class="status-tag limited">Qualified</span><span class="value">1 → 16</span><span class="label">one GLM restore served a 16-request cohort</span></div>
+    </div>
+
+    <section aria-labelledby="problem-title">
+      <div class="section-head">
+        <h2 id="problem-title"><span class="num">01</span> Messages become one token stream</h2>
+        <p>Role boundaries and cache boundaries are independent. After chat templating and tokenization, SparkCache sees one ordered sequence of token IDs.</p>
+      </div>
+      <div class="context-example">
+        <article class="messages">
+          <h3>Example conversation</h3>
+          <p>Illustrative text; token counts show the serialized size.</p>
+          <div class="message"><span class="message-role">system</span><span class="message-text">You are an operations assistant. Use the attached runbook…</span><span class="message-count">384</span></div>
+          <div class="message"><span class="message-role">user</span><span class="message-text">Summarize the incident timeline and identify the first fault…</span><span class="message-count">148</span></div>
+          <div class="message"><span class="message-role">assistant</span><span class="message-text">The first observable fault occurs at 09:14 when rank 2…</span><span class="message-count">430</span></div>
+          <div class="message"><span class="message-role">user</span><span class="message-text">Now compare that result with the deployment logs from Friday…</span><span class="message-count">385</span></div>
+        </article>
+        <article class="serialized">
+          <h3>Serialized prompt · 1,347 tokens</h3>
+          <p>White lines mark real 256-token logical boundaries.</p>
+          <div class="context-track" aria-label="Messages crossing five complete logical cache intervals and one remainder">
+            <div class="message-segment system">system<small>384</small></div>
+            <div class="message-segment user-one">user<small>148</small></div>
+            <div class="message-segment assistant">assistant<small>430</small></div>
+            <div class="message-segment user-two">new user<small>385</small></div>
+            <span class="boundary-line" data-at="256" style="left:19.01%"></span>
+            <span class="boundary-line" data-at="512" style="left:38.01%"></span>
+            <span class="boundary-line" data-at="768" style="left:57.02%"></span>
+            <span class="boundary-line" data-at="1024" style="left:76.02%"></span>
+            <span class="boundary-line" data-at="1280" style="left:95.03%"></span>
+          </div>
+          <div class="chunk-grid" aria-label="Logical cache intervals"><div class="chunk-cell">A<small>0–256</small></div><div class="chunk-cell">B<small>256–512</small></div><div class="chunk-cell">C<small>512–768</small></div><div class="chunk-cell">D<small>768–1024</small></div><div class="chunk-cell">E<small>1024–1280</small></div><div class="chunk-cell remainder">+67</div></div>
+          <div class="span-summary"><div class="safe-span">five complete logical intervals · 1,280 tokens</div><div class="remainder-span" aria-label="67-token remainder"></div></div>
+          <p class="context-note"><strong>Important:</strong> these 256-token intervals are real for hashing, alignment, manifest positions, and admission. In GLM-5.3 <code>block_pages_v1</code>, they do not correspond to independently usable physical KV objects.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="lab" aria-labelledby="lab-title">
+      <div class="lab-head">
+        <div class="section-head" style="margin-bottom:0">
+          <h2 id="lab-title"><span class="num">02</span> Longest stored-prefix restore</h2>
+          <p><span class="status-tag">Implemented</span> Choose a scenario, then inspect hashing, exact or row-alias discovery, all-rank availability, byte verification, restore, and private tail prefill.</p>
+        </div>
+        <div class="scenario-tabs" role="tablist" aria-label="Reusable-prefix scenarios">
+          <button class="scenario-tab" type="button" id="scenario-exact" role="tab" aria-controls="prefix-panel" aria-selected="true" tabindex="0" data-scenario="exact">Exact 1,024 on every rank</button>
+          <button class="scenario-tab" type="button" id="scenario-alias" role="tab" aria-controls="prefix-panel" aria-selected="false" tabindex="-1" data-scenario="alias">Row alias at 768</button>
+          <button class="scenario-tab" type="button" id="scenario-missing" role="tab" aria-controls="prefix-panel" aria-selected="false" tabindex="-1" data-scenario="missing">1,024 absent on rank 3</button>
+          <button class="scenario-tab" type="button" id="scenario-corrupt" role="tab" aria-controls="prefix-panel" aria-selected="false" tabindex="-1" data-scenario="corrupt">Rank 2 object fails verification</button>
+          <button class="scenario-tab" type="button" id="scenario-cold" role="tab" aria-controls="prefix-panel" aria-selected="false" tabindex="-1" data-scenario="cold">No stored boundary</button>
+        </div>
+      </div>
+      <div class="controls">
+        <div class="button-group">
+          <button class="step-button" type="button" id="reset" aria-label="Start over">↺</button>
+          <button class="step-button" type="button" id="previous" aria-label="Previous step">←</button>
+          <button class="step-button" type="button" id="next" aria-label="Next step">→</button>
+        </div>
+        <label class="slider-wrap">Step <input id="step-range" type="range" min="0" max="5" value="0" aria-label="Request step"></label>
+        <div class="step-count" id="step-count">1 / 6</div>
+      </div>
+      <div class="lab-grid" id="prefix-panel" role="tabpanel" aria-labelledby="scenario-exact">
+        <div class="stage">
+          <span class="stage-label" id="stage-label">Step 1 · boundary</span>
+          <h3 id="stage-title">Align to complete logical intervals</h3>
+          <p class="stage-copy" id="stage-copy">The prompt has 1,347 tokens. SparkCache excludes the live token and rounds down to five complete 256-token intervals: 1,280 potentially reusable tokens.</p>
+          <div class="prompt-viz">
+            <div class="token-row" id="prompt-row" aria-label="Prompt chunk state"></div>
+          </div>
+          <div class="candidate-layout">
+            <div class="candidate-list" id="candidate-list" aria-label="Prefix candidates"></div>
+            <div class="quorum" id="quorum" aria-label="All-rank reusable-prefix availability matrix"></div>
+          </div>
+        </div>
+        <aside class="result" aria-live="polite">
+          <span class="result-kicker">Reusable target context</span>
+          <div class="result-value"><span id="restored-value">0</span></div>
+          <div class="result-unit">tokens admitted for external restore</div>
+          <div class="meter" id="meter"><div class="meter-fill" id="meter-fill"></div></div>
+          <div class="result-unit" id="meter-label">0% of the 1,280-token safe span</div>
+          <div class="result-stats">
+            <div class="stat"><b id="prefill-value">1,280</b><small>target tokens to prefill</small></div>
+            <div class="stat"><b id="disk-reads">0</b><small>candidate disk probes</small></div>
+          </div>
+          <div class="verdict" id="verdict">No prefix is selected at the alignment step. If no reusable entry qualifies, vLLM computes the prompt normally.</div>
+        </aside>
+      </div>
+    </section>
+
+    <section aria-labelledby="alias-title">
+      <div class="section-head">
+        <h2 id="alias-title"><span class="num">03</span> One boundary, two physical meanings</h2>
+        <p>Both storage modes use 256-token logical boundaries. Only row-oriented payloads can describe an earlier prefix by selecting an authenticated leading subset of stored chunks.</p>
+      </div>
+      <div class="alias-visual">
+        <article class="payload-bank">
+          <h3><span class="status-tag">Implemented</span> <code>per_token_rows</code></h3>
+          <p class="mini-copy">Each encoded chunk contains the rank-owned tensor rows for one logical token interval.</p>
+          <div class="file-row"><div class="file">rows A<small>0–256</small></div><div class="file">rows B<small>256–512</small></div><div class="file">rows C<small>512–768</small></div><div class="file">rows D<small>768–1024</small></div></div>
+          <div class="descriptor-map" aria-label="A 768-token alias selects three authenticated row chunks">
+            <div class="descriptor-node alias-node">alias · 768 tokens</div><div class="descriptor-arrow" aria-hidden="true">→</div><div class="descriptor-node payload-node">authenticated descriptors → rows A + B + C</div>
+          </div>
+          <p class="alias-caption"><code>sparkcache-prefix-alias/v1</code> metadata selects an earlier row boundary through authenticated descriptor segments. It references durable chunks without copying their payload bytes.</p>
+        </article>
+        <article class="aliases">
+          <h3><span class="status-tag limited">Qualified exact snapshots</span> <code>block_pages_v1</code></h3>
+          <p class="mini-copy">SparkCache encodes one opaque hybrid-memory-allocator (HMA) page snapshot for an exact boundary, then partitions that encoded byte stream across chunk files.</p>
+          <div class="alias-row"><span class="alias-name">snapshot</span><div class="refs"><span class="ref">header</span><span class="ref">all layer pages</span><span class="ref">all groups</span></div></div>
+          <div class="alias-row"><span class="alias-name">on disk</span><div class="refs"><span class="ref">byte 1/4</span><span class="ref">byte 2/4</span><span class="ref">byte 3/4</span><span class="ref">byte 4/4</span></div></div>
+          <p class="alias-caption"><strong>Alias truncation is unsupported.</strong> Each file is a byte partition of the whole snapshot, not token-local KV. Removing a file cannot create a valid earlier GLM prefix.</p>
+        </article>
+      </div>
+    </section>
+
+    <section aria-labelledby="flow-title">
+      <div class="section-head">
+        <h2 id="flow-title"><span class="num">04</span> Scheduler selection and rank verification</h2>
+        <p><span class="status-tag">Implemented</span> Workers advertise compact digest metadata. During restore, every rank reads and verifies its own shard from local storage; SparkCache sends no KV payload through a cache transport.</p>
+      </div>
+      <div class="flow">
+        <article class="flow-card"><div class="icon">1</div><h3>Scheduler</h3><p>Hashes tokens once, records the wire-compatible digest at each eligible boundary, and scans longest-first. A candidate is an exact manifest or a permitted row-prefix alias.</p></article>
+        <div class="arrow" aria-hidden="true">→</div>
+        <article class="flow-card"><div class="icon">4×</div><h3>All-rank availability</h3><p>A digest is eligible only when every expected physical TP rank advertises a compatible reusable entry from the same worker-process generation.</p><div class="ranks"><span class="rank">rank 0</span><span class="rank">rank 1</span><span class="rank">rank 2</span><span class="rank">rank 3</span></div></article>
+        <div class="arrow" aria-hidden="true">→</div>
+        <article class="flow-card"><div class="icon">✓</div><h3>Worker verification</h3><p>Each rank opens the selected root, checks identity and compatibility, and verifies referenced objects. Restored blocks become usable only after coordinated success.</p></article>
+      </div>
+    </section>
+
+    <section aria-labelledby="safety-title">
+      <div class="section-head">
+        <h2 id="safety-title"><span class="num">05</span> Verified-or-recompute restore</h2>
+        <p>Context is restored only after identity, quorum, compatibility, and chunk integrity checks pass.</p>
+      </div>
+      <div class="safety-grid">
+        <article class="safety-card"><strong>Verified state or recomputation</strong><p>A missing rank, malformed manifest, incompatible identity, or bad chunk hash becomes a miss. The request recomputes instead of consuming unverified KV state.</p></article>
+        <article class="safety-card"><strong>Identity stays topology-bound</strong><p>Checkpoint digests, layout, TP/DCP, physical rank, chunk geometry, record schema, draft policy, and the prefix-key format remain part of the namespace.</p></article>
+        <article class="safety-card"><strong>Optional work cannot stall serving</strong><p>An incomplete worker inventory or a full restore backlog makes the request compute normally. Unrelated inference does not wait for optional cache work.</p></article>
+      </div>
+    </section>
+
+    <section aria-labelledby="shared-title">
+      <div class="section-head">
+        <h2 id="shared-title"><span class="num">06</span> Restore once, attach by reference</h2>
+        <p><span class="status-tag limited">Qualified through C16</span> C1, C8, and C16 mean one, eight, and sixteen concurrent requests. Each physical rank restores its local shard once for a shared persistent digest.</p>
+      </div>
+      <div class="share-layout">
+        <aside class="share-controls">
+          <h3>Requests sharing one prefix</h3>
+          <p>Choose a cohort size. The diagram uses the qualified 131,072-token entry: it is available on every rank but has not yet been retained in GPU memory.</p>
+          <div class="concurrency-buttons" role="group" aria-label="Concurrent request count">
+            <button class="concurrency-button" type="button" data-concurrency="1" aria-pressed="false">C1</button>
+            <button class="concurrency-button" type="button" data-concurrency="8" aria-pressed="false">C8</button>
+            <button class="concurrency-button" type="button" data-concurrency="16" aria-pressed="true">C16</button>
+          </div>
+          <div class="share-metrics" aria-live="polite">
+            <div class="share-metric"><b id="restore-count">1 per rank</b><small>persistent restores with sharing</small></div>
+            <div class="share-metric"><b id="avoided-count">15 per rank</b><small>duplicate restores avoided</small></div>
+            <div class="share-metric"><b id="follower-count">15 followers</b><small>requests attached to verified blocks</small></div>
+          </div>
+          <p class="share-note">An in-progress restore accepts at most 16 waiting followers. At most two completed leases remain retained, each for 15 seconds.</p>
+        </aside>
+        <div class="share-stage">
+          <h3>One local copy per rank; ordinary references per request</h3>
+          <p>A leader receives verified persistent state. vLLM retains that multi-group block table only after every worker finishes and every partial-page copy completes.</p>
+          <div class="lease-flow" aria-label="Persistent snapshot to leader, verified lease, and request-owned tails">
+            <div class="lease-node"><b>rank-local NVMe</b><small>813 MB authenticated snapshot</small></div>
+            <div class="lease-arrow" aria-hidden="true">→</div>
+            <div class="lease-node"><b>leader restore</b><small>private destination blocks</small></div>
+            <div class="lease-arrow" aria-hidden="true">→</div>
+            <div class="lease-node verified"><b>verified GPU prefix</b><div class="request-fan" id="request-fan"></div></div>
+          </div>
+          <div class="rank-band" aria-label="Independent rank-local restores"><span>rank 0 · one shard</span><span>rank 1 · one shard</span><span>rank 2 · one shard</span><span>rank 3 · one shard</span></div>
+          <div class="share-note">Each request owns its ordinary block references and computes a private tail. A partial physical page is copied into a dedicated immutable block before follower attachment.</div>
+        </div>
+      </div>
+    </section>
+
+    <section aria-labelledby="limits-title">
+      <div class="section-head">
+        <h2 id="limits-title"><span class="num">07</span> Storage-mode boundaries</h2>
+        <p>Implemented prefix reuse depends on payload semantics. Logical 256-token geometry alone does not make every stored object independently reusable.</p>
+      </div>
+      <div class="safety-grid">
+        <article class="safety-card"><strong><span class="status-tag">Implemented</span> Exact stored boundaries</strong><p>Every supported storage mode may reuse an exact snapshot published for an earlier aligned request boundary when all ranks advertise it.</p></article>
+        <article class="safety-card"><strong><span class="status-tag">Implemented</span> Sparse row-prefix aliases</strong><p>A row source manifest produces bounded descriptor chains and selected earlier-prefix aliases. GPU-free regressions pass; live model-serving qualification remains absent.</p></article>
+        <article class="safety-card"><strong><span class="status-tag limited">Unsupported</span> Tail-only publication</strong><p>A grown conversation may publish another complete snapshot. Row tail publication is unsupported. HMA tail-only storage requires a page-semantic format and distinct cache namespace.</p></article>
+      </div>
+    </section>
+
+    <section aria-labelledby="deployment-title">
+      <div class="section-head">
+        <h2 id="deployment-title"><span class="num">08</span> Practical effects at C1, C8, and C16</h2>
+        <p><span class="status-tag limited">Qualified</span> These measurements use the exact GLM-5.3 TP4/DCP1 source runtime identified in the linked validation record. Client and per-rank cache-service timings are labeled separately.</p>
+      </div>
+      <div class="evidence-table-wrap">
+        <table class="evidence-table">
+          <caption class="sr-only">Recorded SparkCache restore performance by prompt-prefix size and concurrent request count</caption>
+          <thead><tr><th scope="col">Prefix and concurrency</th><th scope="col">Comparison</th><th scope="col">Recorded effect</th></tr></thead>
+          <tbody>
+            <tr><td><strong>8,192 tokens · C1</strong></td><td>qualified Python page restore</td><td>147.2–194.0 ms cache service per rank</td></tr>
+            <tr><td><strong>16,384 tokens · C8</strong></td><td>Python/Torch vs native placement</td><td>9.45–10.64 s vs 1.2–2.1 s client latency</td></tr>
+            <tr><td><strong>131,072 tokens · C1</strong></td><td>reconstruction pipeline vs cold direct restore</td><td>1.29–1.46 s vs 131–250 ms cache service per rank</td></tr>
+            <tr><td><strong>131,072 tokens · C16</strong></td><td>independent vs shared restore</td><td>16 × 813 MB became 1 × 813 MB per rank; the host-warm restore took 104–165 ms per rank; standard-chat client p50 fell from 3.363 s to 2.980 s</td></tr>
+            <tr><td><strong>131,072 tokens · pretokenized C16</strong></td><td>standalone measurement</td><td>2.698 s client p50 and 2.701 s maximum; not compared with chat timing</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="context-note">The 16-request qualification used vLLM <code>--max-num-seqs 32</code>. Every request completed, each rank performed one external restore, and the semantic canary passed.</p>
+      <p class="context-note">Unrelated-cold C16 and decode-interference remain unqualified. See the <a href="../GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md">native restore and concurrency validation</a> for exact runtime identities and receipts.</p>
+    </section>
+
+    <footer>
+      <p>Implemented behavior, qualification boundaries, and unsupported storage modes · 2026-08-29.</p>
+      <div class="source-links">
+        <a href="https://github.com/FujitsuPolycom/sparkcache/tree/main">main</a>
+        <a href="../ROADMAP.md">research roadmap</a>
+        <a href="../GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md">native restore record</a>
+      </div>
+    </footer>
+  </main>
+
+  <script>
+    (() => {
+      const steps = [
+        { label: "Step 1 · boundary", title: "Align to complete logical intervals", copy: "The prompt has 1,347 tokens. SparkCache excludes the live token and rounds down to five complete 256-token intervals: 1,280 potentially reusable tokens." },
+        { label: "Step 2 · hashing", title: "Generate exact prefix digests in one pass", copy: "One incremental SHA-256 pass copies the exact wire-compatible digest at 256, 512, 768, 1,024, and 1,280 tokens. Extending the prompt does not change an earlier boundary's digest." },
+        { label: "Step 3 · availability", title: "Find the longest advertised root", copy: "The scheduler scans boundary digests longest-first. It selects the first exact manifest or permitted row alias advertised by every expected physical rank." },
+        { label: "Step 4 · verification", title: "Read and verify the selected root", copy: "Workers open only the selected root, verify identity and record compatibility, and authenticate every referenced object before restored blocks can be released." },
+        { label: "Step 5 · coordinated outcome", title: "Restore together or recompute together", copy: "All ranks commit to the same outcome. If one shard cannot be verified, the external restore is cancelled everywhere; no rank continues with partially trusted KV state." },
+        { label: "Step 6 · continuation", title: "Prefill the uncached tail", copy: "After a successful restore, vLLM computes the aligned tail plus the live remainder. Publishing the grown request writes another complete snapshot; tail-only publication is unsupported." }
+      ];
+
+      const scenarios = {
+        exact: {
+          entries: [{1024:"exact"}, {1024:"exact"}, {1024:"exact"}, {1024:"exact"}], candidate: 1024, kind: "exact", corruptRank: null,
+          verdict: "All four ranks verify the exact 1,024-token snapshot. That snapshot restores from rank-local NVMe; logical interval E is the aligned tail to prefill."
+        },
+        alias: {
+          entries: [{768:"alias"}, {768:"alias"}, {768:"alias"}, {768:"alias"}], candidate: 768, kind: "alias", corruptRank: null,
+          verdict: "All four ranks verify the authenticated 768-token row alias. Its descriptor chain resolves to durable row chunks A–C; intervals D–E are private tail prefill."
+        },
+        missing: {
+          entries: [{1024:"exact",768:"exact"}, {1024:"exact",768:"exact"}, {1024:"exact",768:"exact"}, {768:"exact"}], candidate: 768, kind: "exact", corruptRank: null,
+          verdict: "Rank 3 does not advertise the exact 1,024-token snapshot, so selection falls back to an exact 768-token snapshot present everywhere. Logical intervals D–E are prefilled by the model."
+        },
+        corrupt: {
+          entries: [{1024:"exact"}, {1024:"exact"}, {1024:"exact"}, {1024:"exact"}], candidate: 1024, kind: "exact", corruptRank: 2,
+          verdict: "Rank 2 advertises the exact 1,024-token snapshot but its object does not pass byte verification. Every rank abandons the restore and the full safe span recomputes."
+        },
+        cold: {
+          entries: [{}, {}, {}, {}], candidate: 0, kind: null, corruptRank: null,
+          verdict: "No all-rank candidate exists. SparkCache returns a normal cache miss and vLLM prefills the full safe span."
+        }
+      };
+
+      const boundaries = [1280, 1024, 768, 512, 256];
+      const letters = ["A", "B", "C", "D", "E"];
+      let scenarioName = "exact";
+      let step = 0;
+
+      const $ = (id) => document.getElementById(id);
+      const promptRow = $("prompt-row");
+      const candidates = $("candidate-list");
+      const quorum = $("quorum");
+      const range = $("step-range");
+
+      function buildStatic() {
+        promptRow.innerHTML = letters.map((letter, index) => `<div class="token" data-chunk="${index}">${letter}<small>boundary</small></div>`).join("") + '<div class="token live">+67<small>live</small></div>';
+        candidates.innerHTML = boundaries.map(n => `<div class="candidate" data-prefix="${n}"><span>prefix</span><b>${n}</b></div>`).join("");
+      }
+
+      function buildQuorum(scenario, focusPrefix) {
+        const headers = '<span></span>' + boundaries.map(n => `<span class="q-head">${n}</span>`).join("");
+        const rows = scenario.entries.map((entries, rank) => {
+          const cells = boundaries.map((boundary) => {
+            let kind = entries[boundary] || "miss";
+            if (scenario.corruptRank === rank && boundary === scenario.candidate && step >= 3) kind = "corrupt";
+            const focus = focusPrefix === boundary ? " focus" : "";
+            const meaning = {exact:"exact manifest", alias:"row alias", miss:"absent", corrupt:"object failed verification"}[kind];
+            return `<span class="q-cell ${kind}${focus}" aria-label="rank ${rank}, ${boundary}-token prefix, ${meaning}"></span>`;
+          }).join("");
+          return `<span class="rank-label">rank ${rank}</span>${cells}`;
+        }).join("");
+        quorum.innerHTML = headers + rows + '<span class="matrix-note">✓ exact manifest · A authenticated row alias · — absent · ! object failed verification</span>';
+      }
+
+      function admittedTokens(scenario) {
+        if (step < 4 || scenario.corruptRank !== null) return 0;
+        return scenario.candidate;
+      }
+
+      function update() {
+        const scenario = scenarios[scenarioName];
+        const admitted = admittedTokens(scenario);
+        const focusPrefix = step >= 2 && scenario.candidate ? scenario.candidate : null;
+        $("stage-label").textContent = steps[step].label;
+        $("stage-title").textContent = steps[step].title;
+        $("stage-copy").textContent = steps[step].copy;
+        $("step-count").textContent = `${step + 1} / ${steps.length}`;
+        range.value = step;
+        $("previous").disabled = step === 0;
+        $("next").disabled = step === steps.length - 1;
+
+        document.querySelectorAll("#prompt-row .token[data-chunk]").forEach((node, index) => {
+          node.className = "token";
+          if (step === 0 && index === 4) node.classList.add("inactive");
+          if (step >= 4) {
+            if (scenario.corruptRank !== null) node.classList.add("fail");
+            else if (index < admitted / 256) node.classList.add("chosen");
+            else node.classList.add("compute");
+          }
+          node.querySelector("small").textContent = step >= 4 ? (scenario.corruptRank !== null ? "recompute" : index < admitted / 256 ? "restore" : "prefill") : "boundary";
+        });
+
+        document.querySelectorAll(".candidate").forEach((node) => {
+          const value = Number(node.dataset.prefix);
+          node.className = "candidate";
+          if (step >= 2 && value > scenario.candidate) node.classList.add("checked");
+          if (step >= 2 && value === scenario.candidate && scenario.candidate) node.classList.add("selected");
+          if (step >= 3 && scenario.corruptRank !== null && value === scenario.candidate) node.classList.add("failed");
+        });
+
+        buildQuorum(scenario, focusPrefix);
+        $("restored-value").textContent = admitted.toLocaleString();
+        $("prefill-value").textContent = (1280 - admitted).toLocaleString();
+        $("disk-reads").textContent = step >= 3 && scenario.candidate ? "1" : "0";
+        const percent = Math.round(admitted / 1280 * 100);
+        $("meter-fill").style.width = `${percent}%`;
+        $("meter-label").textContent = `${percent}% of the 1,280-token safe span`;
+        $("meter").classList.toggle("fail", scenario.corruptRank !== null && step >= 3);
+        $("verdict").classList.toggle("fail", scenario.corruptRank !== null && step >= 3);
+        $("verdict").textContent = step < 2
+          ? "No prefix is selected yet. If no reusable entry qualifies, vLLM computes the prompt normally."
+          : step < 4
+            ? scenario.candidate ? `The ${scenario.candidate.toLocaleString()}-token ${scenario.kind === "alias" ? "row alias" : "exact snapshot"} is being checked; no KV state is usable yet.` : scenario.verdict
+            : scenario.verdict;
+      }
+
+      function setStep(value) {
+        step = Math.max(0, Math.min(steps.length - 1, value));
+        update();
+      }
+
+      const scenarioTabs = [...document.querySelectorAll(".scenario-tab")];
+      function selectScenario(button, moveFocus = false) {
+        scenarioName = button.dataset.scenario;
+        scenarioTabs.forEach(tab => {
+          const active = tab === button;
+          tab.setAttribute("aria-selected", String(active));
+          tab.tabIndex = active ? 0 : -1;
+        });
+        $("prefix-panel").setAttribute("aria-labelledby", button.id);
+        setStep(0);
+        if (moveFocus) button.focus();
+      }
+
+      scenarioTabs.forEach((button, buttonIndex) => {
+        button.addEventListener("click", () => {
+          selectScenario(button);
+        });
+        button.addEventListener("keydown", event => {
+          let targetIndex = null;
+          if (event.key === "ArrowRight") targetIndex = (buttonIndex + 1) % scenarioTabs.length;
+          if (event.key === "ArrowLeft") targetIndex = (buttonIndex - 1 + scenarioTabs.length) % scenarioTabs.length;
+          if (event.key === "Home") targetIndex = 0;
+          if (event.key === "End") targetIndex = scenarioTabs.length - 1;
+          if (targetIndex !== null) {
+            event.preventDefault();
+            selectScenario(scenarioTabs[targetIndex], true);
+          }
+        });
+      });
+      $("reset").addEventListener("click", () => setStep(0));
+      $("previous").addEventListener("click", () => setStep(step - 1));
+      $("next").addEventListener("click", () => setStep(step + 1));
+      range.addEventListener("input", () => setStep(Number(range.value)));
+
+      function updateConcurrency(value) {
+        const requests = Number(value);
+        $("restore-count").textContent = "1 per rank";
+        $("avoided-count").textContent = `${Math.max(0, requests - 1)} per rank`;
+        $("follower-count").textContent = `${Math.max(0, requests - 1)} followers`;
+        $("request-fan").innerHTML = Array.from({length: requests}, (_, index) =>
+          `<div class="request-card ${index === 0 ? "leader" : ""}"><b>request ${index + 1}</b><small>${index === 0 ? "leader + tail" : "ref + tail"}</small></div>`
+        ).join("");
+        document.querySelectorAll(".concurrency-button").forEach(button => {
+          button.setAttribute("aria-pressed", String(Number(button.dataset.concurrency) === requests));
+        });
+      }
+
+      document.querySelectorAll(".concurrency-button").forEach(button => {
+        button.addEventListener("click", () => updateConcurrency(button.dataset.concurrency));
+      });
+
+      buildStatic();
+      update();
+      updateConcurrency(16);
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,29 @@
+{
+  "schema": "sparkcache-glm53-recovery-canary/v1",
+  "source_revision": "2b86fb9d02fa3595cca5caa864b81aedce44b8bb",
+  "context_digest": "c33f009c6bac6b4bd749a7ced1d8b8a5156752f9a61acd4065fa56ea8baa060e",
+  "span_tokens": 4096,
+  "fault": {
+    "rank": 3,
+    "kind": "manifest_temporarily_absent",
+    "recovery": "manifest_restored_after_request"
+  },
+  "worker_outcomes": {
+    "rank_0": "verified",
+    "rank_1": "verified",
+    "rank_2": "verified",
+    "rank_3": "recompute"
+  },
+  "scheduler": {
+    "requests_rescheduled": 1,
+    "tokens_affected": 4096,
+    "engine_error": false
+  },
+  "client": {
+    "elapsed_seconds": 1.94,
+    "prompt_tokens": 4115,
+    "finish_reason": "length"
+  },
+  "post_request_health_status": 200,
+  "validation_passed": true
+}

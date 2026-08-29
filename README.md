@@ -1,201 +1,326 @@
 # SparkCache
 
+## What SparkCache is
+
 > [!WARNING]
-> **Alpha research software.** Use for evaluation; APIs, cache formats, and
-> supported profiles may change.
+> **Alpha research software.** Use SparkCache for evaluation. APIs, cache
+> formats, deployment patches, and supported profiles may change.
 
 SparkCache is a persistent, rank-local NVMe context cache for vLLM's
-KV-Connector-V1 interface. Each tensor-parallel worker stores the KV state it
-owns and restores that state from its own disk after an engine restart. Cache
-traffic does not cross the network.
+KV-Connector-V1 interface. Each tensor-parallel worker stores and restores only
+the model state owned by its physical rank.
 
-Version `0.1.0a3` is **implemented**. GPU-free validation covers bounded
-macro-batch chunk publication, event-driven capacity maintenance when TTL
-expiry is disabled, post-commit manifest-read avoidance, and low-allocation
-prompt digests. The package artifact has not been qualified in a live
-deployment.
-The source-tree `glm53-flash-hybrid` profile is qualified separately for the
-exact GLM-5.3 Flash TP4/DCP1 deployment with DFlash2 using seven draft tokens
-recorded in
-[`GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md`](GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md).
-Build and connector configuration are documented in
-[`deploy/glm53_flash/README.md`](deploy/glm53_flash/README.md); the corresponding
-four-Spark cached and cache-disabled quickstarts are pinned through the
-SparkRing commit linked from that guide. Standalone public reproduction is
-**unsupported** because the qualified ARM64 parent images and exact patched
-NCCL build are not published.
+Normal restore reads each rank's local filesystem. SparkCache does not send KV
+payload over a cache network. vLLM collectives may still use Ethernet, a
+switched fabric, or a switchless ring.
 
-## Published release status
+Deployment labels use TP for tensor-parallel degree and DCP for
+decode-context-parallel degree.
 
-| Package artifact | Qualified deployments | Evidence |
+PyPI version `0.1.0a3` is **implemented** and GPU-free tested. Its package
+artifact has no live serving qualification. Qualification belongs to an exact
+artifact, model, topology, and vLLM source contract.
+
+The public GLM-5.3 OCI artifact is qualified for its recorded 8,192-token
+Python-placement restore. The source deployment separately qualifies native
+131,072-token restore and bounded shared-prefix reuse. See
+[the public image record](deploy/glm53_flash/IMAGE_ANNOUNCEMENT.md),
+[the GLM-5.3 validation](GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md), and
+[the native restore record](GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md).
+
+The public image does not contain the model checkpoints. Native restore and
+shared GPU-prefix qualification belong to a later source-bound runtime that has
+no published OCI digest.
+
+## Implemented capabilities
+
+| Capability | Status | Scope |
 |---|---|---|
-| [`0.1.0a2`](https://pypi.org/project/sparkcache/0.1.0a2/) | GLM-5.2 EXL3 3.5-bpw TP4/DCP4 | [`GLM52_A2_LIVE_VALIDATION.md`](GLM52_A2_LIVE_VALIDATION.md) |
-| [`0.1.0a1`](https://pypi.org/project/sparkcache/0.1.0a1/) | DeepSeek-V4-Flash-0731 TP2/DCP1, DeepSeek-V4-Flash-0731 TP4/DCP1, and GLM-5.2 EXL3 3.5-bpw TP4/DCP4 | [`MULTI_MODEL_LIVE_VALIDATION.md`](MULTI_MODEL_LIVE_VALIDATION.md) |
+| Content-addressed persistent snapshots | **implemented** | Immutable chunks, manifest-last publication, rank-local capacity control, and verified restore |
+| Longest stored exact-boundary discovery | **implemented** | One incremental token-digest pass; longest all-rank candidate wins |
+| Sparse row-prefix aliases | **implemented** | Authenticated metadata over `per_token_rows`; GPU-free regression coverage |
+| Opaque hybrid-memory-allocator page snapshots | **qualified** | Listed DeepSeek-V4 and GLM deployments only |
+| Native direct page restore | **qualified** | Exact GLM-5.3 TP4/DCP1 source deployment recorded below |
+| Concurrent shared GPU-prefix reuse | **qualified** | Up to 16 waiting followers, two retained prefixes, 15-second retention; GLM-5.3 through 16 concurrent requests |
+| Streaming snapshots | **research-only** | GLM-5.2 DCP4 inventory; disabled for opaque page profiles |
+| Buddy replication | **research-only** | Protocol and receiver state exist; no network carrier is included |
 
-The DeepSeek profiles in `0.1.0a2` are **implemented** but **unqualified** for
-that package artifact. Qualification does not transfer to another
-package version, model, topology, or vLLM source contract. Other combinations
-are implemented, research-only, or unsupported as stated in the support table.
-The wheel and source distribution for each published version match the
-artifacts built by the protected release workflow.
+## Verified persistent-restore model
 
-## Installation
+SparkCache uses a verified-or-recompute rule. Restored blocks reach inference
+only after identity, compatibility, all-rank availability, and payload-integrity
+checks succeed.
 
-Install the available dependency-free storage engine and verification tooling
-from PyPI:
+If any physical rank cannot prove its shard, vLLM discards the complete external
+prefix on every rank and computes the request normally. Partially verified
+hybrid state is never published.
+
+The persistent transaction has six steps:
+
+1. The scheduler hashes eligible 256-token boundaries in one incremental pass.
+2. Every physical rank advertises structurally compatible reusable entries for
+   its worker-process generation.
+3. The scheduler selects the longest digest advertised by every expected rank.
+4. Workers read their local objects, verify encoded bytes, and place state into
+   private request blocks.
+5. Coordinated worker completion accepts the whole external prefix or rejects
+   it on every rank.
+6. A completed prefill publishes immutable chunks before an atomic, fsynced
+   manifest makes the entry discoverable.
+
+Cache identity binds checkpoint digests, model layout, TP/DCP degrees, physical
+rank, chunk geometry, record schema, draft policy, and page-reuse policy.
+Incompatible entries produce a cache miss.
+
+Persistent files contain no CUDA pointers, allocator block tables, physical
+slot coordinates, or transport sequence numbers.
+
+## Quickstart for qualified deployments
+
+Install the package artifact that matches the intended qualification evidence:
 
 ```bash
-python -m pip install sparkcache
-```
-
-Select the exact artifact whose qualification evidence matches the deployment:
-
-```bash
-# GLM-5.2 TP4/DCP4
+# GLM-5.2 EXL3 3.5-bpw at TP4/DCP4
 python -m pip install sparkcache==0.1.0a2
 
-# DeepSeek-V4 TP2/DCP1 or TP4/DCP1
+# DeepSeek-V4 at TP2/DCP1 or TP4/DCP1
 python -m pip install sparkcache==0.1.0a1
 ```
 
-The wheel and Python source distribution contain the importable `sparkcache`
-package and exact-hash vLLM lease contracts. They intentionally omit the
-repository-level `patches/` and `deploy/` trees and the optional native
-C++/CUDA sources. A PyPI-only installation therefore does not construct a
-supported vLLM serving runtime.
+Use [the GLM-5.2 deployment guide](deploy/glm52_35bpw/README.md) or
+[the DeepSeek-V4 deployment guide](deploy/deepseek_v4/README.md). Each builder
+verifies its accepted serving source and emits a source-bound overlay receipt.
 
-The optional `connector` extra installs PyTorch for CPU-side development. It
-does not install vLLM, select a CUDA build, or patch a serving environment:
+The DeepSeek profiles in `0.1.0a2` are **implemented** but **unqualified** for
+that package artifact. DeepSeek qualification remains bound to `0.1.0a1`.
 
-```bash
-python -m pip install 'sparkcache[connector]'
-```
-
-Qualified serving deployments require the repository tag whose version
-matches the installed package. The checkout supplies the model-specific
-deployment transformers, vLLM patches, native sources, and evidence records:
+The GLM-5.3 source deployment uses this repository and
+[its deployment guide](deploy/glm53_flash/README.md):
 
 ```bash
-# Use v0.1.0a2 for GLM-5.2 or v0.1.0a1 for DeepSeek-V4.
-SPARKCACHE_TAG=v0.1.0a2
-git clone --branch "$SPARKCACHE_TAG" --depth 1 \
-  https://github.com/FujitsuPolycom/sparkcache.git
+git clone https://github.com/FujitsuPolycom/sparkcache.git
 cd sparkcache
 python -m pip install '.[connector]'
 ```
 
-Use [`deploy/deepseek_v4/`](deploy/deepseek_v4/README.md) for the qualified
-DeepSeek-V4 profiles or
-[`deploy/glm52_35bpw/`](deploy/glm52_35bpw/README.md) for the qualified
-GLM-5.2 profile. Those builders attest the accepted serving-image sources and
-produce source-bound overlay receipts. Configure vLLM with connector module
-path `sparkcache.spark_context_cache_connector`. A source deployment adds the
-directory containing the `sparkcache` package to `PYTHONPATH`; it does not add
-the package directory itself.
+The qualified 8,192-token public image is available by immutable digest:
 
-## System contract
+```bash
+docker pull ghcr.io/fujitsupolycom/sparkring-glm53-sparkcache@sha256:cd4045bba2a0f3dc55361560f8c3a3f171939854db28d48dfdae58eed9c44943
+```
 
-SparkCache provides these invariants:
+The matching SparkRing procedure is pinned at
+[`FujitsuPolycom/sparkring@6e9e3ace`](https://github.com/FujitsuPolycom/sparkring/blob/6e9e3acef62886a71531310673463972944b2b84/docs/GLM53_FLASH_DFLASH2_BF16_SPARKCACHE_TP4_QUICKSTART.md).
 
-- **Fail-closed restore.** Content-addressed chunks are SHA-256 verified before
-  restored blocks are released to inference. Missing, incompatible, or corrupt
-  state becomes a cache miss and recompute.
-- **Manifest-last durability.** Immutable chunks are fsynced before an atomic,
-  fsynced manifest makes an entry discoverable.
-- **Physical-rank quorum.** The scheduler admits an external prefix only after
-  every tensor-parallel worker reports a compatible manifest from its current
-  process generation.
-- **Topology-bound identity.** Checkpoint digests, model layout, TP/DCP degree,
-  physical rank, chunk geometry, record schema, and page-reuse policy determine
-  the storage namespace. Incompatible configurations miss instead of aliasing.
-- **Bounded optional work.** Store, restore, maintenance, streaming publication,
-  and replication failures do not block unrelated inference. Native ownership
-  failures remain fatal when continuing could expose or reuse blocks still read
-  by CUDA.
-- **Rank-local capacity policy.** High/low watermarks, optional TTL expiry,
-  manifest-recency LRU eviction, and orphan collection account physical bytes
-  across every identity namespace under one cache root.
+The wheel contains the Python package and exact-hash vLLM source contracts. It
+omits `patches/`, `deploy/`, and optional C++/CUDA sources, so a wheel alone
+does not construct a supported vLLM serving runtime.
 
-## Implemented interfaces
+Configure vLLM with connector module path
+`sparkcache.spark_context_cache_connector`. A source deployment adds the
+directory containing `sparkcache/` to `PYTHONPATH`.
 
-| Path | Interface |
+## Qualified models and measured results
+
+Qualification applies only to the named artifact, model, topology, and source
+contract. Detailed commands, runtime identities, and receipts remain in the
+linked validation records.
+
+The `0.1.0a1` serving receipts used `--max-num-batched-tokens 4096`. A value of
+8192 is known to run, but performance and capacity at that value are outside
+the package qualification.
+
+| Artifact and deployment | Restored tokens | Cache service per rank | Evidence |
+|---|---:|---:|---|
+| `0.1.0a1`, DeepSeek-V4-Flash-0731 TP2/DCP1 | 73,728 | 459.8–517.0 ms | [release-wheel validation](MULTI_MODEL_LIVE_VALIDATION.md) |
+| `0.1.0a1`, DeepSeek-V4-Flash-0731 TP4/DCP1 | 73,728 | 413.9–494.6 ms | [release-wheel validation](MULTI_MODEL_LIVE_VALIDATION.md) |
+| `0.1.0a1`, GLM-5.2 EXL3 3.5-bpw TP4/DCP4 | 225,536 | 3.39–3.95 s | [release-wheel validation](MULTI_MODEL_LIVE_VALIDATION.md) |
+| `0.1.0a2`, GLM-5.2 EXL3 3.5-bpw TP4/DCP4 | 225,536 | 3.17–4.17 s | [package validation](GLM52_A2_LIVE_VALIDATION.md) |
+| Public GLM-5.3 OCI image, TP4/DCP1 | 8,192 | 156.8–171.8 ms | [public image record](deploy/glm53_flash/IMAGE_ANNOUNCEMENT.md) |
+| GLM-5.3 source deployment, TP4/DCP1 | 8,192 | 147.2–194.0 ms | [GLM-5.3 validation](GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md) |
+
+The native GLM-5.3 work changes practical restore cost across prefix sizes and
+concurrency. C1, C8, and C16 mean one, eight, and sixteen concurrent requests.
+
+Client timing includes scheduler and model work. Cache-service timing isolates
+rank-local restore work. The pretokenized result is not compared with chat API
+timing.
+
+| Prefix and concurrency | Comparison | Recorded result |
+|---|---|---|
+| 8,192 tokens, C1 | qualified Python page restore | 147.2–194.0 ms cache service per rank |
+| 16,384 tokens, C8 | Python/Torch placement vs native placement | 9.45–10.64 s vs 1.2–2.1 s client latency |
+| 131,072 tokens, C1 | reconstruction pipeline vs cold direct mapped-arena restore | 1.29–1.46 s vs 131–250 ms cache service per rank; a host-warm restore reached 104–165 ms |
+| 131,072-token shared prefix, C16 | independent restores vs shared verified GPU blocks | rank-local work fell from 16 × 813 MB to 1 × 813 MB; standard-chat client p50 fell from 3.363 s to 2.980 s |
+| 131,072-token shared prefix, pretokenized C16 | standalone measurement | 2.698 s client p50 and 2.701 s maximum |
+
+The 16-request shared-prefix qualification used vLLM `--max-num-seqs 32`.
+Every request succeeded and each rank performed one external restore. The
+historical post-run canary accepted any content ending in
+`SPARKCACHE_GLM53_OK`; its receipt proves continued generation and the marker
+suffix, not exact visible output.
+
+Two- and eight-request identical-prefix cohorts and a 16-request shared-trunk
+cohort with distinct tails also passed under the recorded runtime.
+
+## Prefix reuse
+
+The logical cache boundary is 256 tokens. The scheduler computes wire-compatible
+digests at each eligible boundary and selects the longest reusable digest
+advertised by every physical rank.
+
+An exact manifest represents one complete aligned snapshot. A grown conversation
+can reuse an earlier exact snapshot when every rank still advertises that exact
+boundary.
+
+For row-oriented storage, identified by `per_token_rows`, SparkCache also
+publishes authenticated sparse aliases over already durable chunk payloads.
+Exact manifests take precedence over aliases with the same digest.
+
+Default alias publication selects 4,096-token descriptor boundaries and the
+source boundary, retaining at most 64 aliases. Alias graphs participate in TTL,
+LRU, capacity accounting, invalidation, and orphan collection.
+
+Opaque hybrid page storage, identified by `block_pages_v1`, encodes a complete
+boundary snapshot and partitions its bytes across chunk files. Those byte
+partitions are not independently usable token ranges.
+
+Concurrent requests for one persistent digest are coalesced around one restore.
+After every worker finishes, patched vLLM retains the verified multi-group block
+table as a bounded shared-prefix lease.
+
+A lease permits at most 16 waiting followers and remains eligible for 15
+seconds. At most two prefixes remain retained; allocation pressure releases
+lease references before denying ordinary serving allocations.
+
+Each partial physical page is copied into a dedicated immutable block before a
+lease becomes attachable. Followers use ordinary vLLM block references and
+copy-on-write handling for their private tails.
+
+## Operations
+
+`spark_cache_max_bytes` is the high watermark for filesystem-allocated bytes
+under one rank-local root. Maintenance evicts least-recently-used roots down to
+`spark_cache_low_watermark_bytes`.
+
+`spark_cache_ttl_seconds` expires roots by recency; zero disables TTL. Capacity
+accounting counts shared chunks and alias segments once and preserves every
+object referenced by a surviving root.
+
+Each asynchronous restore emits one compact `sparkcache-restore-timing/v1` JSON
+record. It separates queue wait, manifest lookup, read and verification,
+reconstruction, device submission, and CUDA synchronization.
+
+Timing collection is diagnostic. Missing timing data cannot make cached state
+eligible. A restore either supplies verified state or causes request
+recomputation.
+
+Repeated restores do not rewrite KV payload files. A successful restore may
+update manifest recency metadata at most once per minute.
+
+Publishing a reusable context writes immutable payload objects and a manifest.
+A growing conversation can publish another complete snapshot, so SparkCache
+must not be described as having negligible SSD wear.
+
+Operators should monitor the NVMe Data Units Written counter and compare its
+daily change with workload publication volume. Device endurance depends on
+context size, unique publication rate, retention, and storage amplification.
+
+SparkCache does not expose hourly write budgets, daily write budgets, or a
+physical-write-amplification estimate. Those controls are **unsupported**.
+
+## vLLM source contracts and native components
+
+SparkCache verifies whole-file hashes and required symbols before accepting a
+patched vLLM source tree. A different hash is unsupported until its ownership
+and recovery behavior are derived and tested.
+
+| vLLM source contract | Status | Scope |
+|---|---|---|
+| `vllm-project/vllm@fcc614141e5e9ab18cb304c476f7feed2a9552e3` with `patches/vllm/` | **implemented** | Exact patch inputs are published; no standalone public runtime builder is provided |
+| vLLM build `e2666d9a6` with `patches/vllm-e2666d9a6/` | **qualified** | DeepSeek-V4 and GLM-5.2 builders verify source, patch, and postimage hashes |
+| `local-inference-lab/vllm@da4d7be6c97434f6942292ed8abbf4b32dc44355` with `patches/vllm-da4d7be/` | **qualified** | GLM-5.3 HMA recovery, native restore, and bounded shared-prefix attachment |
+
+The GLM-5.3 contract at
+[`vllm-kv-block-lease-contract-da4d7be.json`](sparkcache/runtime_patches/vllm-kv-block-lease-contract-da4d7be.json)
+pins ten vLLM files and the symbols used for ownership, copying, and recovery.
+
+`libspark_cache_placement` provides the optional C++/CUDA placement path. Its
+page ABI uses mapped host arenas, authenticated copy spans, and a CUDA scatter
+kernel for opaque hybrid pages.
+
+Native loading requires an explicit library path and SHA-256. CUDA 13 builds
+run a GPU-free byte-exact reference test and a CUDA hybrid-page probe before
+model-serving qualification.
+
+Native direct restore reads `.spcc` objects into alternating mapped arenas,
+hashes complete files in place, validates authenticated extents, and overlaps
+read work with CUDA submission.
+
+## Repository map and development validation
+
+| Path | Responsibility |
 |---|---|
-| `sparkcache.spark_context_cache_connector` | vLLM scheduler/worker connector, quorum, asynchronous store/restore, hybrid-memory-allocator (HMA) page handling, and capacity reporting |
-| `sparkcache/spark_context_cache_config.py` | immutable connector configuration and cache-identity construction |
-| `sparkcache/persistent_context_cache/cache_manifest.py` | content-addressed chunk and manifest store |
-| `sparkcache/spark_context_cache_profiles.py` | named model-layout and geometry contracts |
-| `sparkcache/spark_context_cache_native_placement.py` | checksum-attested native placement adapter |
-| `sparkcache/streaming/` | bounded write-behind planner, block leases, native gather ring, journal, and progress runtime |
-| `sparkcache/replication/` | carrier-independent buddy-replication protocol and receiver state machine |
-| `sparkcache/runtime_patches/` | exact-hash vLLM ownership contracts |
-| `deploy/deepseek_v4/` | DeepSeek-V4 checkpoint, overlay, launch, semantic, capacity, and corruption checks |
-| `deploy/glm52_35bpw/` | GLM-5.2 EXL3 3.5-bpw TP4/DCP4 inspection-to-launch tooling |
-| `deploy/glm53_flash/` | GLM-5.3 Flash hybrid-page image and connector configuration contract |
-| `deploy/deployment_contract/` | model-neutral inspection, command, port, source identity, overlay receipt, container launch, and semantic-check mechanics |
+| `sparkcache/spark_context_cache_connector.py` | scheduler admission, worker I/O, all-rank availability, restore coalescing, shared-prefix coordination, and vLLM callbacks |
+| `sparkcache/persistent_context_cache/cache_manifest.py` | exact manifests, row-prefix aliases, immutable chunks, lookup, invalidation, capacity, and garbage collection |
+| `sparkcache/spark_context_cache_native_hybrid_restore.py` | authenticated direct reads, slab planning, and mapped-arena page placement |
+| `sparkcache/spark_context_cache_restore_timing.py` | machine-readable asynchronous restore timing |
+| `sparkcache/runtime_patches/` | exact-hash vLLM source contracts and GPU-free patch execution tests |
+| `sparkcache/native/` | C++/CUDA ABI, parser, reference implementation, kernel, and probes |
+| `deploy/deepseek_v4/` | DeepSeek-V4 build, launch, capacity, corruption, and semantic procedures |
+| `deploy/glm52_35bpw/` | GLM-5.2 TP4/DCP4 inspection, build, launch, and semantic procedures |
+| `deploy/glm53_flash/` | GLM-5.3 image, connector, benchmark, publication, and source-verification tools |
+| `evidence/glm53-flash-dflash7-bf16/` | immutable GLM-5.3 request, runtime, recovery, and concurrency receipts |
 
-## Support status
-
-| Capability | Status | Evidence or limitation |
-|---|---|---|
-| Per-token row storage at TP1/TP2/TP4 and DCP1/DCP2/DCP4 | **implemented** | GPU-free topology and round-trip matrix; DCP must divide TP and profile chunk geometry |
-| DeepSeek-V4 opaque HMA pages at TP2/DCP1 | **qualified** | `0.1.0a1`; `MULTI_MODEL_LIVE_VALIDATION.md`; 73,728 restored tokens in 459.8–517.0 ms per rank |
-| DeepSeek-V4-Flash-0731 opaque HMA pages at TP4/DCP1 | **qualified** | `0.1.0a1`; `MULTI_MODEL_LIVE_VALIDATION.md`; 73,728 restored tokens in 413.9–494.6 ms per rank |
-| DeepSeek-V4 HMA pages at DCP2/DCP4 | **unsupported** | opaque page ownership and DSpark rolling-state sharding are undefined; see `deploy/deepseek_v4/DCP_SUPPORT.md` |
-| GLM-5.2 EXL3 3.5-bpw per-token rows at TP4/DCP4 | **qualified** | `0.1.0a1`: `MULTI_MODEL_LIVE_VALIDATION.md`, 3.39–3.95 seconds per rank; `0.1.0a2`: `GLM52_A2_LIVE_VALIDATION.md`, 3.17–4.17 seconds per rank; 225,536 restored tokens |
-| GLM-5.3 Flash hybrid pages with BF16 DFlash2 using seven draft tokens at TP4/DCP1 | **qualified** | Source-tree deployment only; `GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md`; 8,192 restored tokens in 147.2–194.0 ms per rank |
-| Native direct restore | **implemented** | checksum-attested adapter and CPU-testable ABI/layout checks; disabled in qualified DeepSeek profiles |
-| Streaming snapshots | **research-only** | GLM-5.2 DCP4 inventory only; not profile-general and disabled for opaque block pages |
-| Buddy replication | **research-only** | protocol/state machines implemented; network carrier absent |
-| Qwen recurrent-state persistence | **unsupported** | no profile, record schema, or live qualification |
-| Longest-stored-prefix restore for grown conversations | **unsupported** | exact full-span digests only; design work is tracked in `ROADMAP.md` |
-
-## Qualified release matrix
-
-The exact `0.1.0a1` wheel passed cold store, coordinated engine restart,
-all-rank manifest discovery, external restore, exact semantic output, and a
-fresh post-restore canary in three serving profiles. Every profile used
-`--max-num-batched-tokens 4096`. That value is the scheduler budget covered by
-the published receipts, not a configuration ceiling. Operators may change the
-value, and `8192` is known to work. Performance and capacity behavior at other
-values are outside the published qualification evidence.
-
-| Profile | Prompt / restored tokens | Restore time by rank |
-|---|---:|---:|
-| DeepSeek-V4-Flash-0731 TP2/DCP1 | 73,774 / 73,728 | 459.8, 517.0 ms |
-| DeepSeek-V4-Flash-0731 TP4/DCP1 | 73,774 / 73,728 | 483.9, 413.9, 443.0, 494.6 ms |
-| GLM-5.2 EXL3 3.5-bpw TP4/DCP4 | 225,555 / 225,536 | 3,954.2, 3,385.0, 3,649.6, 3,722.4 ms |
-
-See [the complete release-wheel evidence](MULTI_MODEL_LIVE_VALIDATION.md) and
-the model-specific deployment instructions under `deploy/`.
-
-## vLLM compatibility
-
-| Source contract | Status | Construction boundary |
-|---|---|---|
-| `vllm-project/vllm@fcc614141e5e9ab18cb304c476f7feed2a9552e3` with `patches/vllm/` | **implemented** | Patch sources and exact preimage hashes are published. A standalone public runtime builder is **unsupported**; a PyPI installation does not construct or attest this runtime. |
-| vLLM build `e2666d9a6` with `patches/vllm-e2666d9a6/` and `sparkcache/runtime_patches/vllm-kv-block-lease-contract-e2666d9a6.json` | **qualified** | The DeepSeek-V4 and GLM-5.2 deployment builders apply exact lineage-specific patch chains, verify postimages, and bind the results to the SparkCache source tree. |
-| `local-inference-lab/vllm@da4d7be6c97434f6942292ed8abbf4b32dc44355` with `sparkcache/runtime_patches/vllm-kv-block-lease-contract-da4d7be.json` | **qualified** | The GLM-5.3 Flash source deployment verifies coherent repository and installed-runtime hashes, applies the exact VMM exemption, and passes TP4/DCP1 store/restart/restore with BF16 DFlash2 using seven draft tokens. |
-
-Any other whole-file hash is **unsupported** until its ownership contract is
-derived and tested.
-
-## Validation
-
-The default suite is GPU-free; vLLM is stubbed and torch runs on CPU:
+Run the GPU-free repository checks with:
 
 ```bash
 python -m pytest sparkcache -q
 python -m pytest deploy -q
-python -m ruff check .
+python -m ruff check sparkcache deploy
 ```
 
-CUDA 13 is required only to build and execute the optional native libraries
-under `sparkcache/native/`.
+CUDA execution requires a CUDA 13 build from
+[`sparkcache/native/CMakeLists.txt`](sparkcache/native/CMakeLists.txt).
 
-`DEPLOYMENT_CONTRACT_PARITY_VALIDATION.md` records byte-identical inspection
-and Docker-command results across eight model-specific source inspections and
-six live rank inspections from four-Spark and two-Spark development systems.
+## Limitations and research work
 
-## License
+Tail-only publication is **unsupported**. Publishing a grown context can write
+another complete snapshot. Row-prefix aliases reduce lookup metadata and reuse
+payload objects; they do not make publication incremental.
 
-Apache-2.0.
+Opaque HMA snapshots cannot be shortened by truncating chunk lists. Tail-only
+GLM storage requires a page-semantic physical format, byte-exact restore tests,
+and a distinct cache namespace.
+
+Sparse row-prefix aliases are **implemented** but have no live model-serving
+qualification. Their behavior is covered by GPU-free publication, discovery,
+restore, capacity, and corruption regressions.
+
+The GLM shared-prefix runtime is qualified through 16 concurrent requests under
+`--max-num-seqs 32`. Cohorts of 24 or 32 requests and more than 16 waiting
+followers are **unsupported** by qualification evidence.
+
+The unrelated-cold 16-request matrix and decode-interference measurement are
+**unqualified**. The shared-prefix measurements do not establish those workload
+bounds.
+
+Cross-topology or heterogeneous-TP reuse is **unsupported**. Persistent identity
+is bound to topology and physical rank; no canonical cross-shard format exists.
+
+DeepSeek-V4 opaque HMA pages at DCP2 or DCP4 are **unsupported** because page
+ownership and rolling-state sharding are undefined for those layouts.
+
+Streaming snapshots and buddy replication remain **research-only**. Qwen
+recurrent-state persistence and network cache backends are **unsupported**.
+
+## License and support
+
+SparkCache is licensed under Apache-2.0. See [`LICENSE`](LICENSE) for the full
+terms.
+
+Report defects and compatibility requests through the
+[SparkCache issue tracker](https://github.com/FujitsuPolycom/sparkcache/issues).
+
+Include the package or source revision, vLLM source contract, model profile,
+topology, and relevant receipt paths.

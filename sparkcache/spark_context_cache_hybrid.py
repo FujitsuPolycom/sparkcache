@@ -83,6 +83,104 @@ class PageLayout:
         return hashlib.sha256(encoded).hexdigest()
 
 
+@dataclass(frozen=True)
+class PagePayloadSpan:
+    layer_name: str
+    group_index: int
+    source_start: int
+    source_end: int
+    page_count: int
+    bytes_per_page: int
+
+
+@dataclass(frozen=True)
+class PageSnapshotPlan:
+    header_bytes: int
+    total_bytes: int
+    block_counts: tuple[int, ...]
+    spans: tuple[PagePayloadSpan, ...]
+
+
+def plan_page_snapshot(
+    layout: PageLayout,
+    encoded_prefix: bytes | bytearray | memoryview,
+    expected_block_counts: Sequence[int],
+    *,
+    total_bytes: int | None = None,
+) -> PageSnapshotPlan:
+    """Validate the small SPHP1 header and describe payload byte extents.
+
+    ``encoded_prefix`` may be the complete snapshot or only the header bytes.
+    Native restore uses the latter after authenticating the containing .spcc
+    object, avoiding a Python slice for every layer payload.
+    """
+
+    prefix = len(_MAGIC) + _HEADER_LENGTH.size
+    view = memoryview(encoded_prefix).cast("B")
+    if len(view) < prefix or bytes(view[: len(_MAGIC)]) != _MAGIC:
+        raise HybridCodecError("hybrid page snapshot has an invalid prefix")
+    (header_length,) = _HEADER_LENGTH.unpack_from(view, len(_MAGIC))
+    header_end = prefix + header_length
+    if header_length <= 0 or header_end > len(view):
+        raise HybridCodecError("hybrid page snapshot header is truncated")
+    try:
+        header = json.loads(bytes(view[prefix:header_end]))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise HybridCodecError("hybrid page snapshot header is invalid") from error
+    try:
+        counts = tuple(int(count) for count in expected_block_counts)
+    except (TypeError, ValueError) as error:
+        raise HybridCodecError("hybrid page block counts are invalid") from error
+    if any(count <= 0 for count in counts):
+        raise HybridCodecError("hybrid page block counts must be positive")
+    if (
+        not isinstance(header, dict)
+        or header.get("schema") != "sparkcache-hybrid-pages/v1"
+        or header.get("layout_sha256") != layout.digest
+        or tuple(header.get("block_counts", ())) != counts
+        or len(counts) != len(layout.groups)
+    ):
+        raise HybridCodecError("hybrid page snapshot identity or block counts differ")
+    if total_bytes is None:
+        total = len(view)
+    elif isinstance(total_bytes, bool) or not isinstance(total_bytes, int):
+        raise HybridCodecError("hybrid page total bytes must be an integer")
+    else:
+        total = total_bytes
+    if total < header_end or len(view) > total:
+        raise HybridCodecError("hybrid page snapshot total length is invalid")
+
+    spans = []
+    offset = header_end
+    for group_index, (group, count) in enumerate(zip(layout.groups, counts)):
+        for layer in group.layers:
+            size = count * layer.bytes_per_page
+            end = offset + size
+            if end > total:
+                raise HybridCodecError(
+                    f"hybrid page snapshot is truncated at {layer.name}"
+                )
+            spans.append(
+                PagePayloadSpan(
+                    layer_name=layer.name,
+                    group_index=group_index,
+                    source_start=offset,
+                    source_end=end,
+                    page_count=count,
+                    bytes_per_page=layer.bytes_per_page,
+                )
+            )
+            offset = end
+    if offset != total:
+        raise HybridCodecError("hybrid page snapshot has trailing bytes")
+    return PageSnapshotPlan(
+        header_bytes=header_end,
+        total_bytes=total,
+        block_counts=counts,
+        spans=tuple(spans),
+    )
+
+
 def encode_page_snapshot(
     layout: PageLayout,
     block_counts: Sequence[int],
@@ -124,41 +222,11 @@ def decode_page_snapshot(
     encoded: bytes,
     expected_block_counts: Sequence[int],
 ) -> dict[str, bytes]:
-    prefix = len(_MAGIC) + _HEADER_LENGTH.size
-    if len(encoded) < prefix or not encoded.startswith(_MAGIC):
-        raise HybridCodecError("hybrid page snapshot has an invalid prefix")
-    (header_length,) = _HEADER_LENGTH.unpack_from(encoded, len(_MAGIC))
-    header_end = prefix + header_length
-    if header_length <= 0 or header_end > len(encoded):
-        raise HybridCodecError("hybrid page snapshot header is truncated")
-    try:
-        header = json.loads(encoded[prefix:header_end])
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise HybridCodecError("hybrid page snapshot header is invalid") from error
-    counts = tuple(int(count) for count in expected_block_counts)
-    if (
-        header.get("schema") != "sparkcache-hybrid-pages/v1"
-        or header.get("layout_sha256") != layout.digest
-        or tuple(header.get("block_counts", ())) != counts
-        or len(counts) != len(layout.groups)
-    ):
-        raise HybridCodecError("hybrid page snapshot identity or block counts differ")
-
-    payloads: dict[str, bytes] = {}
-    offset = header_end
-    for group, count in zip(layout.groups, counts):
-        for layer in group.layers:
-            size = count * layer.bytes_per_page
-            end = offset + size
-            if end > len(encoded):
-                raise HybridCodecError(
-                    f"hybrid page snapshot is truncated at {layer.name}"
-                )
-            payloads[layer.name] = encoded[offset:end]
-            offset = end
-    if offset != len(encoded):
-        raise HybridCodecError("hybrid page snapshot has trailing bytes")
-    return payloads
+    plan = plan_page_snapshot(layout, encoded, expected_block_counts)
+    return {
+        span.layer_name: encoded[span.source_start : span.source_end]
+        for span in plan.spans
+    }
 
 
 def split_snapshot(encoded: bytes, part_count: int) -> tuple[bytes, ...]:

@@ -120,6 +120,50 @@ def context_prefix_digest(
     return digest.hexdigest()
 
 
+def chunk_prefix_digests(
+    token_ids: Iterable[int],
+    identity_salt: str,
+    *,
+    boundaries: Iterable[int],
+) -> tuple[tuple[int, str], ...]:
+    """Return existing exact-context digests in one incremental hash pass."""
+
+    packed = _u32_array(token_ids, "token_ids")
+    try:
+        requested = tuple(boundaries)
+    except TypeError as error:
+        raise CodecError("boundaries must be an iterable of token counts") from error
+    previous = 0
+    for boundary in requested:
+        if (
+            isinstance(boundary, bool)
+            or not isinstance(boundary, int)
+            or boundary <= 0
+            or boundary % CHUNK_TOKENS
+        ):
+            raise CodecError(
+                f"boundaries must be positive multiples of {CHUNK_TOKENS} tokens"
+            )
+        if boundary <= previous:
+            raise CodecError("boundaries must be strictly increasing")
+        if boundary > len(packed):
+            raise CodecError("boundary must identify a prefix of token_ids")
+        previous = boundary
+    if not requested:
+        return ()
+    digest = hashlib.sha256()
+    digest.update(identity_salt.encode("ascii"))
+    digest.update(b"\x00")
+    raw = memoryview(packed).cast("B")
+    result = []
+    previous = 0
+    for boundary in requested:
+        digest.update(raw[previous * packed.itemsize : boundary * packed.itemsize])
+        result.append((boundary, digest.copy().hexdigest()))
+        previous = boundary
+    return tuple(result)
+
+
 def chunk_count(span_tokens: int, chunk_tokens: int = CHUNK_TOKENS) -> int:
     if chunk_tokens <= 0:
         raise CodecError("chunk_tokens must be positive")

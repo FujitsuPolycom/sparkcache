@@ -16,8 +16,12 @@
 namespace {
 
 using spark_cache::placement::validate_config;
+using spark_cache::placement::checked_add;
+using spark_cache::placement::checked_mul;
 using spark_cache::placement::validate_destinations;
 using spark_cache::placement::validate_direct_slab;
+using spark_cache::placement::validate_page_completion;
+using spark_cache::placement::validate_page_scatter;
 using spark_cache::placement::validate_slots;
 using spark_cache::placement::validate_transposed_slab;
 
@@ -41,6 +45,8 @@ struct ArenaState {
   SparkCacheChunkDescriptor* device_chunks = nullptr;
   SparkCacheTransposedSource* host_sources = nullptr;
   SparkCacheTransposedSource* device_sources = nullptr;
+  SparkCachePageCopySpan* host_page_spans = nullptr;
+  SparkCachePageCopySpan* device_page_spans = nullptr;
   cudaStream_t stream = nullptr;
   cudaEvent_t complete = nullptr;
   bool acquired = false;
@@ -50,7 +56,8 @@ struct ArenaState {
 enum class RestoreMode {
   kUnset,
   kDirect,
-  kTransposed
+  kTransposed,
+  kPages
 };
 
 }  // namespace
@@ -59,13 +66,23 @@ struct SparkCachePlacement {
   SparkCachePlacementConfig config{};
   std::array<ArenaState, SPARK_CACHE_PLACEMENT_ARENA_COUNT> arenas{};
   SparkCacheDestinationDescriptor* device_destinations = nullptr;
+  SparkCachePageDestinationDescriptor* device_page_destinations = nullptr;
+  SparkCachePageGroupDescriptor* device_page_groups = nullptr;
   std::uint32_t* device_slots = nullptr;
   std::uint32_t* device_error = nullptr;
   std::vector<SparkCacheDestinationDescriptor> destinations;
+  std::vector<SparkCachePageDestinationDescriptor> page_destinations;
+  std::vector<SparkCachePageGroupDescriptor> page_groups;
+  std::vector<std::uint32_t> page_slots;
   std::vector<bool> submitted_destinations;
   std::uint32_t destination_count = 0;
+  std::uint32_t page_destination_count = 0;
+  std::uint32_t page_group_count = 0;
   std::uint32_t slot_count = 0;
   std::uint32_t submitted_rows = 0;
+  std::uint64_t page_snapshot_bytes = 0;
+  std::uint64_t page_submitted_snapshot_bytes = 0;
+  std::vector<std::uint64_t> page_destination_covered;
   RestoreMode restore_mode = RestoreMode::kUnset;
   bool restore_active = false;
   SparkCachePlacementStats stats{};
@@ -270,6 +287,66 @@ __global__ void scatter_transposed_kernel(
   }
 }
 
+__global__ void scatter_page_kernel(
+    const std::uint8_t* arena,
+    std::uint64_t arena_used_bytes,
+    const SparkCachePageCopySpan* spans,
+    std::uint32_t span_count,
+    const SparkCachePageDestinationDescriptor* destinations,
+    std::uint32_t destination_count,
+    const SparkCachePageGroupDescriptor* groups,
+    std::uint32_t group_count,
+    const std::uint32_t* slots,
+    std::uint32_t slot_count,
+    std::uint32_t* device_error) {
+  const std::uint32_t span_index = blockIdx.x;
+  if (span_index >= span_count) {
+    return;
+  }
+  const SparkCachePageCopySpan span = spans[span_index];
+  if (span.destination_index >= destination_count ||
+      span.arena_offset_bytes + span.byte_count < span.arena_offset_bytes ||
+      span.arena_offset_bytes + span.byte_count > arena_used_bytes) {
+    set_device_error(device_error, kDeviceChunkBounds);
+    return;
+  }
+  const SparkCachePageDestinationDescriptor destination =
+      destinations[span.destination_index];
+  if (destination.group_index >= group_count ||
+      destination.bytes_per_page == 0) {
+    set_device_error(device_error, kDeviceDestinationBounds);
+    return;
+  }
+  const SparkCachePageGroupDescriptor group = groups[destination.group_index];
+  const auto* source = arena + span.arena_offset_bytes;
+  auto* destination_base = reinterpret_cast<std::uint8_t*>(
+      static_cast<std::uintptr_t>(destination.destination_base));
+  for (std::uint64_t index = threadIdx.x; index < span.byte_count;
+       index += blockDim.x) {
+    const std::uint64_t logical_byte =
+        span.destination_byte_offset + index;
+    const std::uint64_t logical_page =
+        logical_byte / destination.bytes_per_page;
+    if (logical_page >= group.slot_count ||
+        group.first_slot_index + logical_page >= slot_count) {
+      set_device_error(device_error, kDeviceSlotBounds);
+      return;
+    }
+    const std::uint32_t physical_page =
+        slots[group.first_slot_index + logical_page];
+    if (physical_page >= destination.destination_pages) {
+      set_device_error(device_error, kDeviceDestinationBounds);
+      return;
+    }
+    const std::uint64_t page_offset =
+        logical_byte % destination.bytes_per_page;
+    destination_base[
+        static_cast<std::uint64_t>(physical_page) *
+            destination.destination_page_stride_bytes +
+        page_offset] = source[index];
+  }
+}
+
 void release_arena(ArenaState* arena, std::uint32_t arena_mode) {
   if (arena == nullptr) {
     return;
@@ -288,6 +365,9 @@ void release_arena(ArenaState* arena, std::uint32_t arena_mode) {
   }
   if (arena->host_sources != nullptr) {
     cudaFreeHost(arena->host_sources);
+  }
+  if (arena->host_page_spans != nullptr) {
+    cudaFreeHost(arena->host_page_spans);
   }
   if (arena_mode == SPARK_CACHE_ARENA_MANAGED) {
     if (arena->device != nullptr) {
@@ -314,6 +394,12 @@ void release_placement(SparkCachePlacement* placement) {
   }
   if (placement->device_destinations != nullptr) {
     cudaFree(placement->device_destinations);
+  }
+  if (placement->device_page_destinations != nullptr) {
+    cudaFree(placement->device_page_destinations);
+  }
+  if (placement->device_page_groups != nullptr) {
+    cudaFree(placement->device_page_groups);
   }
   if (placement->device_slots != nullptr) {
     cudaFree(placement->device_slots);
@@ -427,7 +513,9 @@ extern "C" SparkCachePlacementStatus spark_cache_placement_query_abi(
       SPARK_CACHE_CAP_STAGED_DEVICE |
       SPARK_CACHE_CAP_DIRECT_ENCODED |
       SPARK_CACHE_CAP_TRANSPOSED |
-      SPARK_CACHE_CAP_LOW_PRIORITY_STREAMS;
+      SPARK_CACHE_CAP_LOW_PRIORITY_STREAMS |
+      SPARK_CACHE_CAP_HYBRID_PAGE_REFERENCE |
+      SPARK_CACHE_CAP_HYBRID_PAGE_CUDA;
   *output = info;
   set_error(nullptr, "");
   return SPARK_CACHE_PLACEMENT_OK;
@@ -476,6 +564,18 @@ extern "C" SparkCachePlacementStatus spark_cache_placement_create(
       reinterpret_cast<void**>(&placement->device_destinations),
       static_cast<std::size_t>(config->max_destinations) *
           sizeof(SparkCacheDestinationDescriptor));
+  if (result == cudaSuccess) {
+    result = cudaMalloc(
+        reinterpret_cast<void**>(&placement->device_page_destinations),
+        static_cast<std::size_t>(config->max_destinations) *
+            sizeof(SparkCachePageDestinationDescriptor));
+  }
+  if (result == cudaSuccess) {
+    result = cudaMalloc(
+        reinterpret_cast<void**>(&placement->device_page_groups),
+        static_cast<std::size_t>(config->max_destinations) *
+            sizeof(SparkCachePageGroupDescriptor));
+  }
   if (result == cudaSuccess) {
     result = cudaMalloc(
         reinterpret_cast<void**>(&placement->device_slots),
@@ -534,6 +634,19 @@ extern "C" SparkCachePlacementStatus spark_cache_placement_create(
       result = cudaHostGetDevicePointer(
           reinterpret_cast<void**>(&arena.device_chunks),
           arena.host_chunks,
+          0);
+    }
+    if (result == cudaSuccess) {
+      result = cudaHostAlloc(
+          reinterpret_cast<void**>(&arena.host_page_spans),
+          static_cast<std::size_t>(config->max_chunks_per_slab) *
+              sizeof(SparkCachePageCopySpan),
+          cudaHostAllocMapped | cudaHostAllocPortable);
+    }
+    if (result == cudaSuccess) {
+      result = cudaHostGetDevicePointer(
+          reinterpret_cast<void**>(&arena.device_page_spans),
+          arena.host_page_spans,
           0);
     }
     if (result == cudaSuccess) {
@@ -622,6 +735,64 @@ spark_cache_placement_configure_destinations(
 }
 
 extern "C" SparkCachePlacementStatus
+spark_cache_placement_configure_page_destinations(
+    SparkCachePlacement* placement,
+    const SparkCachePageDestinationDescriptor* destinations,
+    std::uint32_t destination_count) {
+  if (placement == nullptr || destinations == nullptr || destination_count == 0 ||
+      destination_count > placement->config.max_destinations) {
+    return SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT;
+  }
+  if (placement->restore_active) {
+    set_error(placement, "cannot change page destinations during a restore");
+    return SPARK_CACHE_PLACEMENT_INVALID_STATE;
+  }
+  std::uint32_t last_group = 0;
+  for (std::uint32_t index = 0; index < destination_count; ++index) {
+    const auto& destination = destinations[index];
+    if (destination.flags != 0 || destination.destination_base == 0 ||
+        destination.destination_pages == 0 || destination.bytes_per_page == 0 ||
+        destination.destination_page_stride_bytes < destination.bytes_per_page ||
+        (index == 0 && destination.group_index != 0) ||
+        (index != 0 && (destination.group_index < last_group ||
+                        destination.group_index > last_group + 1))) {
+      set_error(placement, "page destination geometry or group order is invalid");
+      return SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT;
+    }
+    std::uint64_t destination_end = 0;
+    if (!checked_mul(
+            destination.destination_pages - 1,
+            destination.destination_page_stride_bytes,
+            &destination_end) ||
+        !checked_add(
+            destination.destination_base, destination_end, &destination_end) ||
+        !checked_add(
+            destination_end,
+            destination.bytes_per_page,
+            &destination_end)) {
+      set_error(placement, "page destination address range overflows");
+      return SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT;
+    }
+    last_group = destination.group_index;
+  }
+  const cudaError_t result = cudaMemcpy(
+      placement->device_page_destinations,
+      destinations,
+      static_cast<std::size_t>(destination_count) *
+          sizeof(SparkCachePageDestinationDescriptor),
+      cudaMemcpyHostToDevice);
+  if (result != cudaSuccess) {
+    return cuda_failure(placement, "cudaMemcpy(page destinations)", result);
+  }
+  placement->page_destinations.assign(
+      destinations, destinations + destination_count);
+  placement->page_destination_count = destination_count;
+  placement->stats.destination_table_uploads += 1;
+  set_error(placement, "");
+  return SPARK_CACHE_PLACEMENT_OK;
+}
+
+extern "C" SparkCachePlacementStatus
 spark_cache_placement_begin_restore(
     SparkCachePlacement* placement,
     const std::uint32_t* slots,
@@ -675,6 +846,108 @@ spark_cache_placement_begin_restore(
       placement->submitted_destinations.begin(),
       placement->submitted_destinations.end(),
       false);
+  set_error(placement, "");
+  return SPARK_CACHE_PLACEMENT_OK;
+}
+
+extern "C" SparkCachePlacementStatus
+spark_cache_placement_begin_page_restore(
+    SparkCachePlacement* placement,
+    const SparkCachePageGroupDescriptor* groups,
+    std::uint32_t group_count,
+    const std::uint32_t* slots,
+    std::uint32_t slot_count,
+    std::uint64_t snapshot_bytes) {
+  if (placement == nullptr || placement->page_destination_count == 0 ||
+      groups == nullptr || group_count == 0 || slots == nullptr ||
+      slot_count == 0 || slot_count > placement->config.max_slots ||
+      group_count > placement->config.max_destinations || snapshot_bytes == 0) {
+    return SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT;
+  }
+  if (placement->restore_active) {
+    set_error(placement, "a restore transaction is already active");
+    return SPARK_CACHE_PLACEMENT_INVALID_STATE;
+  }
+  for (auto& arena : placement->arenas) {
+    const auto status = wait_arena(placement, &arena);
+    if (status != SPARK_CACHE_PLACEMENT_OK) {
+      return status;
+    }
+    arena.acquired = false;
+  }
+  std::uint64_t expected_first = 0;
+  for (std::uint32_t group_index = 0; group_index < group_count; ++group_index) {
+    const auto& group = groups[group_index];
+    if (group.flags != 0 || group.reserved != 0 || group.slot_count == 0 ||
+        group.first_slot_index != expected_first ||
+        expected_first + group.slot_count > slot_count) {
+      set_error(placement, "page groups do not cover slots contiguously");
+      return SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT;
+    }
+    std::unordered_set<std::uint32_t> unique;
+    for (std::uint32_t index = 0; index < group.slot_count; ++index) {
+      if (!unique.insert(slots[group.first_slot_index + index]).second) {
+        set_error(placement, "page slots repeat within one group");
+        return SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT;
+      }
+    }
+    expected_first += group.slot_count;
+  }
+  if (expected_first != slot_count) {
+    set_error(placement, "page groups do not cover every slot");
+    return SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT;
+  }
+  if (static_cast<std::uint64_t>(
+          placement->page_destinations.back().group_index) +
+          1 !=
+      group_count) {
+    set_error(placement, "every page group must have at least one destination");
+    return SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT;
+  }
+  for (const auto& destination : placement->page_destinations) {
+    if (destination.group_index >= group_count) {
+      set_error(placement, "page destination references a missing group");
+      return SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT;
+    }
+    const auto& group = groups[destination.group_index];
+    for (std::uint32_t index = 0; index < group.slot_count; ++index) {
+      if (slots[group.first_slot_index + index] >= destination.destination_pages) {
+        set_error(placement, "page slot exceeds destination capacity");
+        return SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT;
+      }
+    }
+  }
+  cudaError_t result = cudaMemcpy(
+      placement->device_page_groups,
+      groups,
+      static_cast<std::size_t>(group_count) * sizeof(SparkCachePageGroupDescriptor),
+      cudaMemcpyHostToDevice);
+  if (result == cudaSuccess) {
+    result = cudaMemcpy(
+        placement->device_slots,
+        slots,
+        static_cast<std::size_t>(slot_count) * sizeof(std::uint32_t),
+        cudaMemcpyHostToDevice);
+  }
+  if (result == cudaSuccess) {
+    result = cudaMemset(placement->device_error, 0, sizeof(std::uint32_t));
+  }
+  if (result != cudaSuccess) {
+    return cuda_failure(placement, "initialize page restore arrays", result);
+  }
+  placement->page_groups.assign(groups, groups + group_count);
+  placement->page_slots.assign(slots, slots + slot_count);
+  placement->page_group_count = group_count;
+  placement->slot_count = slot_count;
+  placement->page_snapshot_bytes = snapshot_bytes;
+  placement->page_submitted_snapshot_bytes = 0;
+  placement->page_destination_covered.assign(
+      placement->page_destination_count, 0);
+  placement->restore_mode = RestoreMode::kUnset;
+  placement->restore_active = true;
+  placement->stats = SparkCachePlacementStats{};
+  placement->stats.slot_uploads = 1;
+  placement->stats.destination_table_uploads = 1;
   set_error(placement, "");
   return SPARK_CACHE_PLACEMENT_OK;
 }
@@ -839,8 +1112,9 @@ spark_cache_placement_submit_transposed_slab(
   if (required != SPARK_CACHE_PLACEMENT_OK) {
     return required;
   }
-  if (placement->restore_mode == RestoreMode::kDirect) {
-    set_error(placement, "cannot mix transposed and direct restore slabs");
+  if (placement->restore_mode != RestoreMode::kUnset &&
+      placement->restore_mode != RestoreMode::kTransposed) {
+    set_error(placement, "cannot mix transposed and non-transposed restore slabs");
     return SPARK_CACHE_PLACEMENT_INVALID_STATE;
   }
   if (arena_used_bytes == 0 ||
@@ -917,6 +1191,103 @@ spark_cache_placement_submit_transposed_slab(
 }
 
 extern "C" SparkCachePlacementStatus
+spark_cache_placement_submit_page_slab(
+    SparkCachePlacement* placement,
+    std::uint32_t arena_index,
+    std::uint64_t arena_used_bytes,
+    const SparkCachePageCopySpan* spans,
+    std::uint32_t span_count) {
+  ArenaState* arena = nullptr;
+  const auto required = require_active_arena(placement, arena_index, &arena);
+  if (required != SPARK_CACHE_PLACEMENT_OK) {
+    return required;
+  }
+  if (placement->restore_mode != RestoreMode::kUnset &&
+      placement->restore_mode != RestoreMode::kPages) {
+    set_error(placement, "cannot mix page and row restore slabs");
+    return SPARK_CACHE_PLACEMENT_INVALID_STATE;
+  }
+  if (arena_used_bytes == 0 ||
+      arena_used_bytes > placement->config.arena_bytes ||
+      span_count > placement->config.max_chunks_per_slab) {
+    set_error(placement, "page slab exceeds configured bounds");
+    return SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT;
+  }
+  if (spans == nullptr || span_count == 0) {
+    set_error(placement, "page slab spans are empty");
+    return SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT;
+  }
+  std::uint64_t next_snapshot = placement->page_submitted_snapshot_bytes;
+  auto next_covered = placement->page_destination_covered;
+  for (std::uint32_t index = 0; index < span_count; ++index) {
+    const auto& span = spans[index];
+    if (span.flags != 0 || span.byte_count == 0 ||
+        span.destination_index >= placement->page_destination_count ||
+        span.snapshot_offset_bytes != next_snapshot ||
+        span.destination_byte_offset != next_covered[span.destination_index] ||
+        span.arena_offset_bytes + span.byte_count < span.arena_offset_bytes ||
+        span.arena_offset_bytes + span.byte_count > arena_used_bytes ||
+        next_snapshot + span.byte_count < next_snapshot ||
+        next_snapshot + span.byte_count > placement->page_snapshot_bytes) {
+      set_error(placement, "page slab span coverage or bounds are invalid");
+      return SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT;
+    }
+    const auto& destination =
+        placement->page_destinations[span.destination_index];
+    const auto& group = placement->page_groups[destination.group_index];
+    const std::uint64_t destination_bytes =
+        static_cast<std::uint64_t>(group.slot_count) *
+        destination.bytes_per_page;
+    if (span.destination_byte_offset + span.byte_count <
+            span.destination_byte_offset ||
+        span.destination_byte_offset + span.byte_count > destination_bytes) {
+      set_error(placement, "page slab exceeds destination logical bytes");
+      return SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT;
+    }
+    next_snapshot += span.byte_count;
+    next_covered[span.destination_index] += span.byte_count;
+  }
+  std::memcpy(
+      arena->host_page_spans,
+      spans,
+      static_cast<std::size_t>(span_count) * sizeof(SparkCachePageCopySpan));
+  std::atomic_thread_fence(std::memory_order_release);
+  auto status = prepare_source_arena(placement, arena, arena_used_bytes);
+  if (status != SPARK_CACHE_PLACEMENT_OK) {
+    return status;
+  }
+  scatter_page_kernel<<<span_count, kThreadsPerBlock, 0, arena->stream>>>(
+      arena->device,
+      arena_used_bytes,
+      arena->device_page_spans,
+      span_count,
+      placement->device_page_destinations,
+      placement->page_destination_count,
+      placement->device_page_groups,
+      placement->page_group_count,
+      placement->device_slots,
+      placement->slot_count,
+      placement->device_error);
+  cudaError_t result = cudaGetLastError();
+  if (result == cudaSuccess) {
+    result = cudaEventRecord(arena->complete, arena->stream);
+  }
+  if (result != cudaSuccess) {
+    return cuda_failure(placement, "launch page scatter kernel", result);
+  }
+  arena->acquired = false;
+  arena->in_flight = true;
+  placement->restore_mode = RestoreMode::kPages;
+  placement->page_submitted_snapshot_bytes = next_snapshot;
+  placement->page_destination_covered = std::move(next_covered);
+  placement->stats.source_bytes += arena_used_bytes;
+  placement->stats.restored_rows = placement->slot_count;
+  placement->stats.slabs_submitted += 1;
+  placement->stats.scatter_kernel_launches += 1;
+  return SPARK_CACHE_PLACEMENT_OK;
+}
+
+extern "C" SparkCachePlacementStatus
 spark_cache_placement_finish_restore(
     SparkCachePlacement* placement,
     SparkCachePlacementStats* stats) {
@@ -942,6 +1313,21 @@ spark_cache_placement_finish_restore(
             "transposed slabs do not cover every destination");
         return SPARK_CACHE_PLACEMENT_INVALID_STATE;
       }
+    }
+  }
+  if (placement->restore_mode == RestoreMode::kPages) {
+    std::string detail;
+    if (!validate_page_completion(
+            placement->page_snapshot_bytes,
+            placement->page_submitted_snapshot_bytes,
+            placement->page_destinations.data(),
+            placement->page_destination_count,
+            placement->page_groups.data(),
+            placement->page_group_count,
+            placement->page_destination_covered,
+            &detail)) {
+      set_error(placement, detail);
+      return SPARK_CACHE_PLACEMENT_INVALID_STATE;
     }
   }
   for (auto& arena : placement->arenas) {
@@ -992,6 +1378,11 @@ spark_cache_placement_abort_restore(SparkCachePlacement* placement) {
   placement->restore_mode = RestoreMode::kUnset;
   placement->slot_count = 0;
   placement->submitted_rows = 0;
+  placement->page_snapshot_bytes = 0;
+  placement->page_submitted_snapshot_bytes = 0;
+  placement->page_destination_covered.clear();
+  placement->page_groups.clear();
+  placement->page_slots.clear();
   set_error(placement, "");
   return SPARK_CACHE_PLACEMENT_OK;
 }

@@ -24,6 +24,10 @@ from unittest import mock
 import torch
 
 import sparkcache.spark_context_cache_codec as codec
+from sparkcache.spark_context_cache_restore_timing import (
+    RESTORE_TIMING_PREFIX,
+    RestoreTiming,
+)
 
 
 def _install_vllm_stubs() -> None:
@@ -202,6 +206,49 @@ class CodecTests(unittest.TestCase):
                         token_count=invalid,
                     )
 
+    def test_incremental_prefix_digests_match_existing_exact_keys(self) -> None:
+        tokens = list(range(1400))
+        boundaries = (256, 512, 768, 1024, 1280)
+        produced = codec.chunk_prefix_digests(
+            tokens,
+            "identity",
+            boundaries=boundaries,
+        )
+        self.assertEqual(
+            produced,
+            tuple(
+                (
+                    boundary,
+                    codec.context_prefix_digest(
+                        tokens,
+                        "identity",
+                        token_count=boundary,
+                    ),
+                )
+                for boundary in boundaries
+            ),
+        )
+        self.assertEqual(
+            produced[:4],
+            codec.chunk_prefix_digests(
+                tokens[:1100],
+                "identity",
+                boundaries=boundaries[:4],
+            ),
+        )
+
+    def test_incremental_prefix_digest_boundaries_are_strict(self) -> None:
+        tokens = list(range(1024))
+        for boundaries in ((0,), (255,), (512, 256), (256, 256), (1280,)):
+            with self.subTest(boundaries=boundaries), self.assertRaises(
+                codec.CodecError
+            ):
+                codec.chunk_prefix_digests(
+                    tokens,
+                    "identity",
+                    boundaries=boundaries,
+                )
+
     def test_vectorized_integer_codec_matches_v1_wire_bytes(self) -> None:
         tokens = [0, 1, 255, 65535, 2**32 - 1]
         v1_reference_bytes = b"".join(
@@ -297,8 +344,13 @@ class HybridPageRoundTripTests(unittest.TestCase):
                 source_groups[0],
                 True,
                 block_ids_by_group=source_groups,
+                token_ids=tuple(range(1024)),
             )
             connector._store_one(store_plan)
+            self.assertEqual(
+                connector.counters["prefix_alias_publication_attempted"], 0
+            )
+            self.assertFalse((Path(directory) / "prefix-aliases").exists())
             for tensor in pools.values():
                 tensor.zero_()
             state[4].fill_(777)
@@ -561,6 +613,48 @@ class CheckpointIdentityTests(unittest.TestCase):
         self.assertNotEqual(
             first._identity(0).storage_key, replacement._identity(0).storage_key
         )
+
+
+class ClearOnceStartupTests(unittest.TestCase):
+    def test_connector_clears_owned_data_once_before_cache_use(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "cache" / "rank-0"
+            stale = root / "chunks" / "stale.spcc"
+            stale.parent.mkdir(parents=True)
+            stale.write_bytes(b"stale")
+            settings = {"spark_cache_clear_once": "rollout-2026-08-29"}
+
+            connector = _make_connector(root, 0, extra_config=settings)
+
+            self.assertTrue(connector._cache_available)
+            self.assertFalse(stale.exists())
+            later = root / "chunks" / "later.spcc"
+            later.parent.mkdir()
+            later.write_bytes(b"later")
+
+            replacement = _make_connector(root, 0, extra_config=settings)
+
+            self.assertTrue(replacement._cache_available)
+            self.assertEqual(later.read_bytes(), b"later")
+
+    def test_clear_once_lock_timeout_disables_only_persistent_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                connector_module.ManifestStore,
+                "clear_once",
+                side_effect=BlockingIOError("manifest root is busy"),
+            ):
+                connector = _make_connector(
+                    Path(directory) / "cache" / "rank-0",
+                    0,
+                    extra_config={"spark_cache_clear_once": "busy-root"},
+                )
+
+            self.assertFalse(connector._cache_available)
+            self.assertFalse(connector._store_enabled)
+            self.assertFalse(connector._restore_enabled)
+            self.assertFalse(connector._streaming_snapshots_enabled)
+            self.assertFalse(connector._native_restore_enabled)
 
 
 class _FakeCudaTensor:
@@ -1140,8 +1234,10 @@ class SchedulerChunkedPrefillTests(unittest.TestCase):
             self.assertTrue(plan.is_store)
             self.assertEqual(plan.span_tokens, 1024)
             self.assertEqual(plan.block_ids, (10, 11, 12, 13))
+            self.assertEqual(plan.token_ids, tuple(token_ids[:1024]))
             self.assertEqual(meta2.offers, [])
             self.assertEqual(connector._store_progress, {})
+            self.assertEqual(connector._store_token_ids, {})
 
     def test_full_quorum_suppresses_store_before_progress_is_created(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1214,6 +1310,205 @@ class SchedulerChunkedPrefillTests(unittest.TestCase):
             self.assertEqual(metadata.plans, [])
             self.assertEqual(connector._store_progress, {})
             self.assertEqual(connector.counters["store_skipped_quorum"], 1)
+
+
+class PrefixAliasConnectorTests(unittest.TestCase):
+    SPAN = 8192
+    PREFIX = 4096
+    BLOCK_SIZE = 64
+
+    def test_row_store_advertises_and_restores_sparse_prefix_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connector = _make_connector(root, 0, self.BLOCK_SIZE)
+            pool = _make_pools(40, self.BLOCK_SIZE)
+            original = {name: tensor.clone() for name, tensor in pool.items()}
+            connector.register_kv_caches(pool)
+            tokens = list(range(self.SPAN + 100))
+            exact_digest = connector._digest(tokens, self.SPAN)
+            prefix_digest = connector._digest(tokens, self.PREFIX)
+            plan = _ReqPlan(
+                "long-turn",
+                exact_digest,
+                self.SPAN,
+                tuple(range(32)),
+                True,
+                token_ids=tuple(tokens[: self.SPAN]),
+            )
+
+            connector.bind_connector_metadata(
+                SparkCacheConnectorMetadata(plans=[plan])
+            )
+            connector.wait_for_save()
+            _drain_store(connector)
+
+            identity = connector._identity(0)
+            self.assertFalse(
+                connector._store.lookup(identity, prefix_digest).is_hit
+            )
+            with mock.patch.object(
+                connector._store,
+                "lookup",
+                wraps=connector._store.lookup,
+            ) as lookup:
+                alias_lookup, is_alias = connector._lookup_reusable(
+                    identity,
+                    prefix_digest,
+                    verify_chunks=False,
+                    verify_chunk_metadata=True,
+                )
+            lookup.assert_called_once()
+            self.assertTrue(alias_lookup.is_hit)
+            self.assertTrue(is_alias)
+            self.assertEqual(alias_lookup.root_kind, "prefix_alias")
+            self.assertEqual(
+                connector._held,
+                {exact_digest, prefix_digest},
+            )
+            self.assertEqual(
+                connector.counters["prefix_alias_publication_attempted"], 1
+            )
+            self.assertEqual(connector.counters["prefix_aliases_published"], 2)
+
+            connector._quorum[prefix_digest] = {0, 1, 2, 3}
+            continued = types.SimpleNamespace(
+                request_id="scheduler-alias-probe",
+                prompt_token_ids=tokens[: self.PREFIX + 100],
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(continued, 0),
+                (self.PREFIX, True),
+            )
+            self.assertEqual(
+                connector.counters["prefix_alias_scheduler_probe_hit"], 1
+            )
+            connector._need_load.clear()
+            connector._retire_restore_flight(
+                prefix_digest,
+                outcome="cancelled",
+            )
+
+            for tensor in pool.values():
+                tensor.zero_()
+            load_plan = _ReqPlan(
+                "continued-turn",
+                prefix_digest,
+                self.PREFIX,
+                tuple(range(16)),
+                False,
+            )
+            self.assertTrue(connector._load_one(load_plan))
+            self.assertEqual(connector.counters["prefix_alias_restore_hit"], 1)
+            slots = codec.local_slots_for_positions(
+                codec.owned_positions(self.PREFIX, 4, 0),
+                load_plan.block_ids,
+                self.BLOCK_SIZE,
+                4,
+            )
+            slot_tensor = torch.tensor(slots, dtype=torch.long)
+            for name, width in _LAYERS.items():
+                actual = pool[name].reshape(-1, width)
+                expected = original[name].reshape(-1, width)
+                torch.testing.assert_close(
+                    actual[slot_tensor],
+                    expected[slot_tensor],
+                    rtol=0,
+                    atol=0,
+                )
+
+            restarted = _make_connector(root, 0, self.BLOCK_SIZE)
+            restarted.register_kv_caches(_make_pools(40, self.BLOCK_SIZE))
+            self.assertIn(exact_digest, restarted._held)
+            self.assertIn(prefix_digest, restarted._held)
+            self.assertEqual(
+                restarted.counters["prefix_aliases_discovered"], 1
+            )
+
+    def test_alias_publication_failure_preserves_exact_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(Path(directory), 0, self.BLOCK_SIZE)
+            connector.register_kv_caches(_make_pools(8, self.BLOCK_SIZE))
+            tokens = list(range(1024))
+            digest = connector._digest(tokens, 1024)
+            plan = _ReqPlan(
+                "exact-survives",
+                digest,
+                1024,
+                (3, 0, 5, 1),
+                True,
+                token_ids=tuple(tokens),
+            )
+            connector._store.publish_prefix_aliases = mock.Mock(
+                side_effect=OSError("alias directory unavailable")
+            )
+
+            connector.bind_connector_metadata(
+                SparkCacheConnectorMetadata(plans=[plan])
+            )
+            connector.wait_for_save()
+            _drain_store(connector)
+
+            self.assertTrue(
+                connector._store.lookup(connector._identity(0), digest).is_hit
+            )
+            self.assertIn(digest, connector._held)
+            self.assertEqual(connector.counters["store_committed"], 1)
+            self.assertEqual(connector.counters["store_failed"], 0)
+            self.assertEqual(connector.counters["prefix_alias_publication_failed"], 1)
+            self.assertEqual(connector.counters["prefix_aliases_published"], 0)
+
+    def test_streaming_snapshot_never_publishes_row_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(Path(directory), 0, self.BLOCK_SIZE)
+            connector.register_kv_caches(_make_pools(8, self.BLOCK_SIZE))
+            tokens = tuple(range(1024))
+            plan = _ReqPlan(
+                "streaming",
+                connector._digest(list(tokens), 1024),
+                1024,
+                (3, 0, 5, 1),
+                True,
+                token_ids=tokens,
+            )
+            snapshot = connector._snapshot_store(plan)
+            connector._streaming_snapshots_enabled = True
+            connector._store.publish_prefix_aliases = mock.Mock()
+
+            self.assertEqual(connector._publish_row_prefix_aliases(snapshot), set())
+            connector._store.publish_prefix_aliases.assert_not_called()
+            self.assertEqual(
+                connector.counters["prefix_alias_publication_attempted"], 0
+            )
+
+    def test_alias_invalidation_cannot_delete_same_digest_exact_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connector = _make_connector(root, 0, self.BLOCK_SIZE)
+            identity = connector._identity(0)
+            digest = "a" * 64
+            exact_path = (
+                root / "manifests" / identity.storage_key / f"{digest}.json"
+            )
+            alias_path = (
+                root
+                / "prefix-aliases"
+                / identity.storage_key
+                / f"{digest}.json"
+            )
+            exact_path.parent.mkdir(parents=True)
+            alias_path.parent.mkdir(parents=True)
+            exact_path.write_bytes(b"exact")
+            alias_path.write_bytes(b"alias")
+
+            self.assertTrue(
+                connector._invalidate_reusable(
+                    identity,
+                    digest,
+                    is_alias=True,
+                )
+            )
+            self.assertEqual(exact_path.read_bytes(), b"exact")
+            self.assertFalse(alias_path.exists())
 
 
 class StartupDiscoveryTests(unittest.TestCase):
@@ -2905,6 +3200,110 @@ class QuorumAdmissionTests(unittest.TestCase):
             matched, _ = c.get_num_new_matched_tokens(req, 0)
             self.assertEqual(matched, 1024)
 
+    def test_extended_prompt_restores_longest_previous_exact_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(Path(directory), 0, 64)
+            connector.register_kv_caches(_make_pools(8, 64))
+            tokens = list(range(1400))
+            shorter = connector._digest(tokens, 1024)
+            connector.bind_connector_metadata(
+                SparkCacheConnectorMetadata(
+                    plans=[_ReqPlan("stored-turn", shorter, 1024, (3, 0, 5, 1), True)]
+                )
+            )
+            connector.wait_for_save()
+            _drain_store(connector)
+            for rank in range(4):
+                connector.update_connector_output(
+                    types.SimpleNamespace(
+                        invalid_block_ids=set(),
+                        kv_connector_stats=types.SimpleNamespace(
+                            data={
+                                "spark_context_cache": {
+                                    "rank": rank,
+                                    "held": [shorter],
+                                }
+                            }
+                        ),
+                    )
+                )
+
+            request = types.SimpleNamespace(
+                request_id="extended-turn",
+                prompt_token_ids=tokens,
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(request, 0),
+                (1024, True),
+            )
+            self.assertEqual(connector._need_load["extended-turn"], (shorter, 1024))
+
+    def test_longest_candidate_requires_every_physical_rank(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(Path(directory), 0, 64)
+            connector.register_kv_caches(_make_pools(8, 64))
+            tokens = list(range(1400))
+            shorter = connector._digest(tokens, 1024)
+            longer = connector._digest(tokens, 1280)
+            for request_id, digest, span, blocks in (
+                ("short", shorter, 1024, (3, 0, 5, 1)),
+                ("long", longer, 1280, (3, 0, 5, 1, 2)),
+            ):
+                connector.bind_connector_metadata(
+                    SparkCacheConnectorMetadata(
+                        plans=[_ReqPlan(request_id, digest, span, blocks, True)]
+                    )
+                )
+                connector.wait_for_save()
+                _drain_store(connector)
+            for rank in range(4):
+                held = [shorter, longer] if rank < 3 else [shorter]
+                connector.update_connector_output(
+                    types.SimpleNamespace(
+                        invalid_block_ids=set(),
+                        kv_connector_stats=types.SimpleNamespace(
+                            data={"spark_context_cache": {"rank": rank, "held": held}}
+                        ),
+                    )
+                )
+            request = types.SimpleNamespace(
+                request_id="fallback",
+                prompt_token_ids=tokens,
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(request, 0),
+                (1024, True),
+            )
+            connector._need_load.clear()
+            connector._quorum[longer].add(3)
+            request.request_id = "prefer-longer"
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(request, 0),
+                (1280, True),
+            )
+
+    def test_oversized_prompt_can_restore_bounded_previous_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                64,
+                extra_config={"spark_cache_max_span_tokens": "1024"},
+            )
+            connector.register_kv_caches(_make_pools(8, 64))
+            tokens = list(range(2000))
+            digest = connector._digest(tokens, 1024)
+            connector._quorum[digest] = {0, 1, 2, 3}
+            connector._scheduler_probe = "none"
+            request = types.SimpleNamespace(
+                request_id="oversized-prefix",
+                prompt_token_ids=tokens,
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(request, 0),
+                (1024, True),
+            )
+
     def test_rank_withdrawing_stops_the_offer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             c = _make_connector(Path(directory) / "r0", 0, 64)
@@ -3042,6 +3441,467 @@ class AsyncRestoreTests(unittest.TestCase):
         table = list(block_ids or self.BLOCKS)
         return types.SimpleNamespace(get_block_ids=lambda: (table,))
 
+    def _cohort_connector(self, root: Path, *, max_pending: int = 2):
+        connector = _make_connector(
+            root,
+            0,
+            64,
+            extra_config={"spark_cache_max_pending_restores": str(max_pending)},
+        )
+        connector._scheduler_probe = "none"
+        return connector
+
+    @staticmethod
+    def _offer(connector, tokens):
+        digest = connector._digest(tokens, 1024)
+        connector._quorum[digest] = {0, 1, 2, 3}
+        return digest
+
+    def test_identical_requests_share_one_restore_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            tokens = list(range(1100))
+            digest = self._offer(connector, tokens)
+            leader = types.SimpleNamespace(
+                request_id="leader", prompt_token_ids=tokens
+            )
+            follower = types.SimpleNamespace(
+                request_id="follower", prompt_token_ids=tokens
+            )
+
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(leader, 0),
+                (self.SPAN, True),
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(follower, 0),
+                (None, False),
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(follower, 0),
+                (None, False),
+            )
+            connector.update_state_after_alloc(
+                leader, self._blocks_stub(), self.SPAN
+            )
+            metadata = connector.build_connector_meta(_empty_scheduler_output())
+
+            self.assertEqual([plan.request_id for plan in metadata.plans], ["leader"])
+            self.assertEqual(connector.counters["restore_flights_started"], 1)
+            self.assertEqual(connector.counters["restore_flights_joined"], 1)
+            connector.update_connector_output(
+                types.SimpleNamespace(
+                    invalid_block_ids=set(), finished_recving={"leader"}
+                )
+            )
+            self.assertIn(digest, connector._restore_flights)
+            self.assertTrue(connector._restore_flights[digest].workers_finished)
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(follower, 0),
+                (None, False),
+            )
+            leader.status = types.SimpleNamespace(name="FINISHED_LENGTH_CAPPED")
+            connector.request_finished(leader, list(self.BLOCKS))
+            self.assertEqual(
+                connector.counters["restore_flights_completed"], 1
+            )
+            self.assertNotIn(digest, connector._restore_flights)
+            # vLLM supplies the newly published local-prefix length on the
+            # follower's next lookup; no second external restore is planned.
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(follower, self.SPAN),
+                (0, False),
+            )
+
+    def test_partially_computed_request_does_not_wait_for_zero_token_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            tokens = list(range(1100))
+            digest = self._offer(connector, tokens)
+            leader = types.SimpleNamespace(
+                request_id="partial-prefix-leader", prompt_token_ids=tokens
+            )
+            partial = types.SimpleNamespace(
+                request_id="partial-prefix-follower", prompt_token_ids=tokens
+            )
+            joined_then_local = types.SimpleNamespace(
+                request_id="joined-then-local", prompt_token_ids=tokens
+            )
+
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(leader, 0),
+                (self.SPAN, True),
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(partial, 256),
+                (0, False),
+            )
+            self.assertNotIn(
+                partial.request_id, connector._restore_flight_followers
+            )
+
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(joined_then_local, 0),
+                (None, False),
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(joined_then_local, 256),
+                (0, False),
+            )
+            self.assertNotIn(
+                joined_then_local.request_id, connector._restore_flight_followers
+            )
+            self.assertNotIn(
+                joined_then_local.request_id,
+                connector._restore_flights[digest].followers,
+            )
+
+    def test_verified_flight_publishes_lease_for_joined_and_late_followers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            tokens = list(range(1100))
+            digest = self._offer(connector, tokens)
+            leader = types.SimpleNamespace(
+                request_id="lease-leader", prompt_token_ids=tokens
+            )
+            early = types.SimpleNamespace(
+                request_id="early-follower", prompt_token_ids=tokens
+            )
+            late = types.SimpleNamespace(
+                request_id="late-follower", prompt_token_ids=tokens
+            )
+
+            connector.get_num_new_matched_tokens(leader, 0)
+            connector.get_num_new_matched_tokens(early, 0)
+            connector.update_state_after_alloc(
+                leader, self._blocks_stub(), self.SPAN
+            )
+            connector.build_connector_meta(_empty_scheduler_output())
+            self.assertIsNone(connector.get_shared_prefix_lease_to_publish(leader))
+
+            connector.update_connector_output(
+                types.SimpleNamespace(
+                    invalid_block_ids=set(), finished_recving={leader.request_id}
+                )
+            )
+            self.assertEqual(
+                connector.get_shared_prefix_lease_to_publish(leader),
+                (digest, self.SPAN, 15.0),
+            )
+            connector.shared_prefix_lease_published(leader.request_id, digest)
+
+            self.assertEqual(
+                connector.get_shared_prefix_lease_candidate(early),
+                (digest, self.SPAN),
+            )
+            self.assertEqual(
+                connector.get_shared_prefix_lease_candidate(late),
+                (digest, self.SPAN),
+            )
+            connector.shared_prefix_lease_attached(early.request_id, digest)
+            connector.shared_prefix_lease_attached(late.request_id, digest)
+            self.assertEqual(connector.counters["shared_prefix_leases_attached"], 2)
+
+    def test_shared_prefix_lease_expires_and_late_request_can_restore_again(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            tokens = list(range(1100))
+            digest = self._offer(connector, tokens)
+            leader = types.SimpleNamespace(
+                request_id="expiring-leader", prompt_token_ids=tokens
+            )
+            connector.get_num_new_matched_tokens(leader, 0)
+            connector.update_state_after_alloc(
+                leader, self._blocks_stub(), self.SPAN
+            )
+            connector.build_connector_meta(_empty_scheduler_output())
+            connector.update_connector_output(
+                types.SimpleNamespace(
+                    invalid_block_ids=set(), finished_recving={leader.request_id}
+                )
+            )
+            with mock.patch(
+                "sparkcache.spark_context_cache_connector.time.monotonic",
+                return_value=10.0,
+            ):
+                connector.shared_prefix_lease_published(leader.request_id, digest)
+
+            late = types.SimpleNamespace(
+                request_id="after-expiry", prompt_token_ids=tokens
+            )
+            with mock.patch(
+                "sparkcache.spark_context_cache_connector.time.monotonic",
+                return_value=25.001,
+            ):
+                self.assertIsNone(
+                    connector.get_shared_prefix_lease_candidate(late)
+                )
+            self.assertNotIn(digest, connector._restore_flights)
+            self.assertEqual(connector.counters["shared_prefix_leases_expired"], 1)
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(late, 0),
+                (self.SPAN, True),
+            )
+
+    def test_shared_prefix_lease_follower_count_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            tokens = list(range(1100))
+            digest = self._offer(connector, tokens)
+            leader = types.SimpleNamespace(
+                request_id="bounded-leader", prompt_token_ids=tokens
+            )
+            connector.get_num_new_matched_tokens(leader, 0)
+            connector.update_state_after_alloc(
+                leader, self._blocks_stub(), self.SPAN
+            )
+            connector.build_connector_meta(_empty_scheduler_output())
+            connector.update_connector_output(
+                types.SimpleNamespace(
+                    invalid_block_ids=set(), finished_recving={leader.request_id}
+                )
+            )
+            connector.shared_prefix_lease_published(leader.request_id, digest)
+
+            for index in range(16):
+                follower = types.SimpleNamespace(
+                    request_id=f"bounded-follower-{index}",
+                    prompt_token_ids=tokens,
+                )
+                self.assertEqual(
+                    connector.get_shared_prefix_lease_candidate(follower),
+                    (digest, self.SPAN),
+                )
+            overflow = types.SimpleNamespace(
+                request_id="bounded-overflow", prompt_token_ids=tokens
+            )
+            self.assertIsNone(connector.get_shared_prefix_lease_candidate(overflow))
+            self.assertEqual(
+                connector.counters["restore_flight_follower_overflow"], 1
+            )
+
+    def test_shared_prefix_hot_flights_are_bounded_to_two_digests(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            digests = []
+            for index in range(3):
+                tokens = [index * 10_000 + value for value in range(1100)]
+                digest = self._offer(connector, tokens)
+                digests.append(digest)
+                leader = types.SimpleNamespace(
+                    request_id=f"hot-leader-{index}", prompt_token_ids=tokens
+                )
+                self.assertEqual(
+                    connector.get_num_new_matched_tokens(leader, 0),
+                    (self.SPAN, True),
+                )
+                connector.update_state_after_alloc(
+                    leader, self._blocks_stub(), self.SPAN
+                )
+                connector.build_connector_meta(_empty_scheduler_output())
+                connector.update_connector_output(
+                    types.SimpleNamespace(
+                        invalid_block_ids=set(),
+                        finished_recving={leader.request_id},
+                    )
+                )
+                self.assertTrue(
+                    connector.shared_prefix_lease_published(
+                        leader.request_id, digest
+                    )
+                )
+
+            self.assertEqual(set(connector._restore_flights), set(digests[1:]))
+            self.assertEqual(connector.counters["shared_prefix_leases_evicted"], 1)
+
+    def test_rejected_lease_publication_releases_waiting_followers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            tokens = list(range(1100))
+            digest = self._offer(connector, tokens)
+            leader = types.SimpleNamespace(
+                request_id="rejected-publish-leader", prompt_token_ids=tokens
+            )
+            follower = types.SimpleNamespace(
+                request_id="rejected-publish-follower", prompt_token_ids=tokens
+            )
+            connector.get_num_new_matched_tokens(leader, 0)
+            connector.get_num_new_matched_tokens(follower, 0)
+            connector.update_state_after_alloc(
+                leader, self._blocks_stub(), self.SPAN
+            )
+            connector.build_connector_meta(_empty_scheduler_output())
+            connector.update_connector_output(
+                types.SimpleNamespace(
+                    invalid_block_ids=set(), finished_recving={leader.request_id}
+                )
+            )
+
+            connector.shared_prefix_lease_rejected(leader.request_id, digest)
+
+            self.assertNotIn(digest, connector._restore_flights)
+            self.assertNotIn(
+                follower.request_id, connector._restore_flight_followers
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(follower, 0),
+                (self.SPAN, True),
+            )
+
+    def test_aborted_leader_retires_immediately_when_worker_writes_already_drained(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            tokens = list(range(1100))
+            digest = self._offer(connector, tokens)
+            leader = types.SimpleNamespace(
+                request_id="drained-abort", prompt_token_ids=tokens
+            )
+            connector.get_num_new_matched_tokens(leader, 0)
+            connector.update_state_after_alloc(
+                leader, self._blocks_stub(), self.SPAN
+            )
+            connector.build_connector_meta(_empty_scheduler_output())
+            connector.update_connector_output(
+                types.SimpleNamespace(
+                    invalid_block_ids=set(), finished_recving={leader.request_id}
+                )
+            )
+            leader.status = types.SimpleNamespace(name="FINISHED_ABORTED")
+
+            connector.request_finished(leader, list(self.BLOCKS))
+
+            self.assertNotIn(digest, connector._restore_flights)
+            self.assertEqual(connector.counters["restore_flight_leader_aborted"], 1)
+
+    def test_unique_flights_are_bounded_but_identical_follower_can_join(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory), max_pending=2)
+            requests = []
+            for index in range(3):
+                tokens = [index * 10_000 + value for value in range(1100)]
+                self._offer(connector, tokens)
+                requests.append(
+                    types.SimpleNamespace(
+                        request_id=f"request-{index}", prompt_token_ids=tokens
+                    )
+                )
+
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(requests[0], 0),
+                (self.SPAN, True),
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(requests[1], 0),
+                (self.SPAN, True),
+            )
+            same_digest = types.SimpleNamespace(
+                request_id="same-digest",
+                prompt_token_ids=requests[0].prompt_token_ids,
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(same_digest, 0),
+                (None, False),
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(requests[2], 0),
+                (0, False),
+            )
+            self.assertEqual(len(connector._restore_flights), 2)
+            self.assertEqual(connector.counters["restore_skip_backlog"], 1)
+
+    def test_failed_leader_releases_followers_to_recompute(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            tokens = list(range(1100))
+            digest = self._offer(connector, tokens)
+            leader = types.SimpleNamespace(
+                request_id="bad-leader", prompt_token_ids=tokens
+            )
+            follower = types.SimpleNamespace(
+                request_id="waiting-follower", prompt_token_ids=tokens
+            )
+            connector.get_num_new_matched_tokens(leader, 0)
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(follower, 0),
+                (None, False),
+            )
+            connector.update_state_after_alloc(
+                leader, self._blocks_stub(), self.SPAN
+            )
+            connector.build_connector_meta(_empty_scheduler_output())
+            connector.update_connector_output(
+                types.SimpleNamespace(
+                    invalid_block_ids={self.BLOCKS[0]},
+                    finished_recving={"bad-leader"},
+                )
+            )
+
+            self.assertNotIn(digest, connector._quorum)
+            self.assertEqual(connector.counters["restore_flights_failed"], 1)
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(follower, 0),
+                (0, False),
+            )
+
+    def test_aborted_dispatched_leader_drains_before_flight_retires(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            tokens = list(range(1100))
+            digest = self._offer(connector, tokens)
+            leader = types.SimpleNamespace(
+                request_id="aborted-leader", prompt_token_ids=tokens
+            )
+            follower = types.SimpleNamespace(
+                request_id="patient-follower", prompt_token_ids=tokens
+            )
+            connector.get_num_new_matched_tokens(leader, 0)
+            connector.get_num_new_matched_tokens(follower, 0)
+            connector.update_state_after_alloc(
+                leader, self._blocks_stub(), self.SPAN
+            )
+            connector.build_connector_meta(_empty_scheduler_output())
+
+            connector.request_finished(leader, list(self.BLOCKS))
+            self.assertIn(digest, connector._restore_flights)
+            self.assertTrue(connector._restore_flights[digest].leader_finished)
+            newcomer = types.SimpleNamespace(
+                request_id="newcomer", prompt_token_ids=tokens
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(newcomer, 0),
+                (None, False),
+            )
+
+            connector.update_connector_output(
+                types.SimpleNamespace(
+                    invalid_block_ids=set(), finished_recving={"aborted-leader"}
+                )
+            )
+            self.assertNotIn(digest, connector._restore_flights)
+            self.assertEqual(connector.counters["restore_flight_leader_aborted"], 1)
+
+    def test_finished_follower_leaves_the_cohort_without_affecting_leader(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            tokens = list(range(1100))
+            digest = self._offer(connector, tokens)
+            leader = types.SimpleNamespace(
+                request_id="live-leader", prompt_token_ids=tokens
+            )
+            follower = types.SimpleNamespace(
+                request_id="gone-follower", prompt_token_ids=tokens
+            )
+            connector.get_num_new_matched_tokens(leader, 0)
+            connector.get_num_new_matched_tokens(follower, 0)
+
+            connector.request_finished(follower, [])
+
+            self.assertIn(digest, connector._restore_flights)
+            self.assertNotIn("gone-follower", connector._restore_flight_followers)
+            self.assertNotIn(
+                "gone-follower", connector._restore_flights[digest].followers
+            )
+
     def test_full_quorum_parks_only_the_restoring_request(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(Path(directory), 0, 64)
@@ -3101,14 +3961,23 @@ class AsyncRestoreTests(unittest.TestCase):
 
             started = threading.Event()
             release = threading.Event()
+            post_write_started = threading.Event()
+            post_write_release = threading.Event()
             original_restore = connector._store.restore
+            original_touch = connector._store.touch
 
             def gated_restore(lookup):
                 started.set()
                 self.assertTrue(release.wait(timeout=30))
                 return original_restore(lookup)
 
+            def gated_touch(*args, **kwargs):
+                post_write_started.set()
+                self.assertTrue(post_write_release.wait(timeout=30))
+                return original_touch(*args, **kwargs)
+
             connector._store.restore = gated_restore
+            connector._store.touch = gated_touch
             try:
                 connector.bind_connector_metadata(
                     SparkCacheConnectorMetadata(
@@ -3141,11 +4010,94 @@ class AsyncRestoreTests(unittest.TestCase):
                     10.0,
                     "empty completion polling exceeded 10 us/call",
                 )
+                release.set()
+                self.assertTrue(post_write_started.wait(timeout=30))
+                # Request completion is available after verified placement,
+                # but connector quiescence includes the remaining recency
+                # update that may open or recreate files under the cache root.
+                self.assertEqual(
+                    connector.get_finished(set()),
+                    (None, {"restore-me"}),
+                )
+                self.assertFalse(connector.wait_for_pending_loads(timeout=0))
+                post_write_release.set()
+                self.assertTrue(connector.wait_for_pending_loads(timeout=30))
+                self.assertEqual(connector.get_finished(set()), (None, None))
+                self.assertEqual(connector.counters["load_verified"], 1)
             finally:
                 release.set()
+                post_write_release.set()
+                connector.shutdown()
 
-            self.assertEqual(_drain(connector), {"restore-me"})
-            self.assertEqual(connector.get_finished(set()), (None, None))
+    def test_async_restore_records_queue_and_service_phases(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(Path(directory), 0, 64)
+            connector.register_kv_caches(_make_pools(8, 64))
+            digest = "7" * 64
+            self._store_entry(connector, digest)
+            connector.bind_connector_metadata(
+                SparkCacheConnectorMetadata(
+                    plans=[
+                        _ReqPlan(
+                            "timed-restore",
+                            digest,
+                            self.SPAN,
+                            self.BLOCKS,
+                            False,
+                        )
+                    ]
+                )
+            )
+
+            with mock.patch.object(connector_module.logger, "info") as log_info:
+                connector.start_load_kv(None)
+                self.assertEqual(_drain(connector), {"timed-restore"})
+
+            rendered = next(
+                call.args[1]
+                for call in log_info.call_args_list
+                if len(call.args) == 2
+                and isinstance(call.args[1], str)
+                and call.args[1].startswith(RESTORE_TIMING_PREFIX)
+            )
+            record = json.loads(rendered.removeprefix(RESTORE_TIMING_PREFIX))
+            self.assertEqual(record["request_id"], "timed-restore")
+            self.assertEqual(record["outcome"], "verified")
+            self.assertGreaterEqual(record["queue_wait_ms"], 0)
+            self.assertGreater(record["service_ms"], 0)
+            self.assertGreater(record["phase_ms"]["manifest_lookup"], 0)
+            self.assertGreater(record["phase_ms"]["restore_read"], 0)
+            self.assertGreater(record["phase_ms"]["reassembly_decode"], 0)
+            self.assertGreater(record["phase_ms"]["h2d_submit"], 0)
+
+    def test_timing_failure_does_not_prevent_restore_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(Path(directory), 0, 64)
+            connector.register_kv_caches(_make_pools(8, 64))
+            digest = "6" * 64
+            self._store_entry(connector, digest)
+            connector.bind_connector_metadata(
+                SparkCacheConnectorMetadata(
+                    plans=[
+                        _ReqPlan(
+                            "timing-failure",
+                            digest,
+                            self.SPAN,
+                            self.BLOCKS,
+                            False,
+                        )
+                    ]
+                )
+            )
+
+            with mock.patch.object(
+                RestoreTiming,
+                "start_service",
+                side_effect=RuntimeError("synthetic timing failure"),
+            ):
+                connector.start_load_kv(None)
+                self.assertEqual(_drain(connector), {"timing-failure"})
+
             self.assertEqual(connector.counters["load_verified"], 1)
 
     def test_corrupt_restore_finishes_for_clean_recompute(self) -> None:
@@ -4740,7 +5692,21 @@ class DeepSeekTP4HMAPageTests(unittest.TestCase):
                     block_ids_by_group=destination_tables,
                 )
 
-                self.assertTrue(connector._load_one(load))
+                timing = RestoreTiming(
+                    request_id=load.request_id,
+                    digest=load.digest,
+                    span_tokens=load.span_tokens,
+                    storage_mode="block_pages_v1",
+                    enqueued_ns=time.perf_counter_ns(),
+                )
+                timing.start_service()
+                self.assertTrue(connector._load_one(load, timing=timing))
+                timing.finish("verified")
+                self.assertGreater(timing.phase_ns["restore_read"], 0)
+                self.assertGreater(timing.phase_ns["reassembly_decode"], 0)
+                self.assertGreater(timing.phase_ns["h2d_submit"], 0)
+                self.assertGreater(timing.page_bytes, 0)
+                self.assertEqual(timing.chunk_count, 4)
 
                 destination_selected = connector._select_group_blocks_for_span(
                     destination_tables,

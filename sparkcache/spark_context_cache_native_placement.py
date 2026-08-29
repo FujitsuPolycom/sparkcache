@@ -246,6 +246,78 @@ def build_destination_descriptors(
     return tuple(descriptors)
 
 
+def build_page_destination_descriptors(
+    layout: Any,
+    registered_tensors: Mapping[str, Any],
+) -> tuple[native.PageDestinationDescriptor, ...]:
+    """Build stable opaque-page destinations in PageLayout order."""
+
+    groups = tuple(getattr(layout, "groups", ()) or ())
+    layers = tuple(layer for group in groups for layer in group.layers)
+    names = {layer.name for layer in layers}
+    if not groups or set(registered_tensors) != names:
+        raise NativePlacementContractError(
+            "registered tensor set does not match page layout"
+        )
+    descriptors = []
+    for group_index, group in enumerate(groups):
+        for layer in group.layers:
+            tensor = registered_tensors[layer.name]
+            if getattr(getattr(tensor, "device", None), "type", None) != "cuda":
+                raise NativePlacementContractError(
+                    f"registered page layer {layer.name} must be a CUDA tensor"
+                )
+            shape = tuple(getattr(tensor, "shape", ()) or ())
+            expected_shape = tuple(layer.page_shape)
+            if len(shape) < 2 or tuple(shape[1:]) != expected_shape:
+                raise NativePlacementContractError(
+                    f"registered page layer {layer.name} shape differs from layout"
+                )
+            element_size = int(tensor.element_size())
+            stride = tuple(tensor.stride())
+            expected_stride = 1
+            for dimension, actual_stride in zip(
+                reversed(shape[1:]),
+                reversed(stride[1:]),
+            ):
+                if int(actual_stride) != expected_stride:
+                    raise NativePlacementContractError(
+                        f"registered page layer {layer.name} page interior"
+                        " is not contiguous"
+                    )
+                expected_stride *= int(dimension)
+            page_stride = _u32(
+                int(stride[0]) * element_size,
+                f"{layer.name} page stride",
+                positive=True,
+            )
+            page_bytes = _u32(
+                int(layer.bytes_per_page),
+                f"{layer.name} bytes per page",
+                positive=True,
+            )
+            if page_stride < page_bytes:
+                raise NativePlacementContractError(
+                    f"registered page layer {layer.name} page stride overlaps"
+                )
+            pointer = _u64(
+                int(tensor.data_ptr()),
+                f"{layer.name} data pointer",
+                positive=True,
+            )
+            descriptors.append(
+                native.PageDestinationDescriptor(
+                    pointer,
+                    _u64(int(shape[0]), f"{layer.name} page capacity", positive=True),
+                    page_stride,
+                    page_bytes,
+                    group_index,
+                    0,
+                )
+            )
+    return tuple(descriptors)
+
+
 class NativePlacementLibrary:
     """SHA-256 attestation in front of the canonical strict ABI loader."""
 
@@ -343,9 +415,11 @@ class NativePlacementAdapter:
         self._max_slots = max_slots
         self._arena_mode = arena_mode
         self._configured = False
+        self._page_configured = False
         self._closed = False
         self._active: ParkedRestore | None = None
         self._descriptors: tuple[native.DestinationDescriptor, ...] = ()
+        self._page_descriptors: tuple[native.PageDestinationDescriptor, ...] = ()
 
     @classmethod
     def create(
@@ -448,6 +522,35 @@ class NativePlacementAdapter:
         self._configured = True
         return descriptors
 
+    def configure_pages(
+        self,
+        layout: Any,
+        registered_tensors: Mapping[str, Any],
+    ) -> tuple[native.PageDestinationDescriptor, ...]:
+        self._ensure_open()
+        if self._active is not None:
+            raise NativePlacementContractError(
+                "cannot reconfigure while a restore is active"
+            )
+        descriptors = build_page_destination_descriptors(layout, registered_tensors)
+        if len(descriptors) > self._max_destinations:
+            raise NativePlacementContractError(
+                "page destination count exceeds configured maximum"
+            )
+        native_descriptors = (native.PageDestinationDescriptor * len(descriptors))(
+            *descriptors
+        )
+        self._call(
+            "configure page destinations",
+            self.library.cdll.spark_cache_placement_configure_page_destinations,
+            self._handle,
+            native_descriptors,
+            len(descriptors),
+        )
+        self._page_descriptors = descriptors
+        self._page_configured = True
+        return descriptors
+
     def begin_parked_restore(
         self,
         request_id: str,
@@ -483,6 +586,53 @@ class NativePlacementAdapter:
             len(slot_tuple),
         )
         restore = ParkedRestore(self, request_id, slot_tuple)
+        self._active = restore
+        return restore
+
+    def begin_parked_page_restore(
+        self,
+        request_id: str,
+        group_slots: Sequence[Sequence[int]],
+        *,
+        snapshot_bytes: int,
+    ) -> ParkedRestore:
+        self._ensure_open()
+        if not self._page_configured:
+            raise NativePlacementContractError(
+                "page destinations must be configured before restore"
+            )
+        if self._active is not None:
+            raise NativePlacementContractError(
+                f"native restore already active for {self._active.request_id}"
+            )
+        if not isinstance(request_id, str) or not request_id:
+            raise NativePlacementContractError("request_id must be a nonempty string")
+        flattened = []
+        groups = []
+        for supplied in group_slots:
+            slots = tuple(_u32(slot, "page slot") for slot in supplied)
+            if not slots or len(set(slots)) != len(slots):
+                raise NativePlacementContractError(
+                    "page slots must be nonempty and unique within each group"
+                )
+            groups.append(native.PageGroupDescriptor(len(flattened), len(slots), 0, 0))
+            flattened.extend(slots)
+        if not groups or len(flattened) > self._max_slots:
+            raise NativePlacementContractError("page slot vector exceeds configured maximum")
+        snapshot_bytes = _u64(snapshot_bytes, "snapshot_bytes", positive=True)
+        native_groups = (native.PageGroupDescriptor * len(groups))(*groups)
+        native_slots = (ctypes.c_uint32 * len(flattened))(*flattened)
+        self._call(
+            "begin page restore",
+            self.library.cdll.spark_cache_placement_begin_page_restore,
+            self._handle,
+            native_groups,
+            len(groups),
+            native_slots,
+            len(flattened),
+            snapshot_bytes,
+        )
+        restore = ParkedRestore(self, request_id, tuple(flattened))
         self._active = restore
         return restore
 
@@ -673,6 +823,29 @@ class ParkedRestore:
             _u32(len(chunk_tuple), "chunk_count", positive=True),
         )
 
+    def submit_page_slab(
+        self,
+        *,
+        arena_index: int,
+        arena_used_bytes: int,
+        spans: Sequence[native.PageCopySpan],
+    ) -> None:
+        span_tuple = tuple(spans)
+        if not span_tuple or not all(
+            isinstance(item, native.PageCopySpan) for item in span_tuple
+        ):
+            raise NativePlacementContractError("page slab requires page copy spans")
+        native_spans = (native.PageCopySpan * len(span_tuple))(*span_tuple)
+        self._call(
+            "submit page slab",
+            self._adapter.library.cdll.spark_cache_placement_submit_page_slab,
+            self._adapter._handle,
+            _u32(arena_index, "arena_index"),
+            _u64(arena_used_bytes, "arena_used_bytes", positive=True),
+            native_spans,
+            _u32(len(span_tuple), "span_count", positive=True),
+        )
+
     def finish(self) -> native.PlacementStats:
         self._require_parked()
         stats = native.PlacementStats()
@@ -724,4 +897,5 @@ __all__ = [
     "SparkCacheDestinationDescriptor",
     "SparkCachePlacementStats",
     "build_destination_descriptors",
+    "build_page_destination_descriptors",
 ]

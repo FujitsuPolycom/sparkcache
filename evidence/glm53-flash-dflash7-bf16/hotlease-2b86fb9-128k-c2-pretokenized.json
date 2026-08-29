@@ -1,0 +1,46 @@
+{
+  "schema": "sparkcache-glm53-concurrency-benchmark/v1",
+  "model": "glm-5.3-flash-nvfp4-dflash7-bf16-tp4",
+  "scenario": "identical-prefix",
+  "cache_state": "hot",
+  "input_mode": "pretokenized",
+  "concurrency": 2,
+  "prefix_header": "Native 128K restore test.\n",
+  "prefix_repetitions": 131072,
+  "tail_repetitions": 32,
+  "max_tokens": 1,
+  "requests": [
+    {
+      "request_index": 0,
+      "request_id": "request-00",
+      "prompt_sha256": "a2e0c04fb8effeb85f267e8d735a78a4be758725e817ef51354a12fae7949ad2",
+      "prompt_tokens": 131096,
+      "elapsed_seconds": 0.541123,
+      "http_status": 200,
+      "response_valid": true,
+      "ok": true,
+      "error_type": null
+    },
+    {
+      "request_index": 1,
+      "request_id": "request-01",
+      "prompt_sha256": "a2e0c04fb8effeb85f267e8d735a78a4be758725e817ef51354a12fae7949ad2",
+      "prompt_tokens": 131096,
+      "elapsed_seconds": 0.737336,
+      "http_status": 200,
+      "response_valid": true,
+      "ok": true,
+      "error_type": null
+    }
+  ],
+  "aggregate": {
+    "request_count": 2,
+    "succeeded": 2,
+    "failed": 0,
+    "min_seconds": 0.541123,
+    "p50_seconds": 0.541123,
+    "p95_seconds": 0.737336,
+    "max_seconds": 0.737336
+  },
+  "validation_passed": true
+}

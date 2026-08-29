@@ -11,6 +11,8 @@ from deploy.glm53_flash.build_image import build_command
 
 IMAGE_ID = "sha256:" + "1" * 64
 SOURCE_ID = "2" * 64
+SPARKCACHE_REVISION = "4" * 40
+LICENSES = "LicenseRef-NVIDIA-Deep-Learning-Container AND Apache-2.0"
 
 
 def test_build_command_binds_inspected_parent_and_source_digest() -> None:
@@ -23,11 +25,15 @@ def test_build_command_binds_inspected_parent_and_source_digest() -> None:
             base_image="local-glm53:source-locked",
             base_image_id=IMAGE_ID,
             source_sha256=SOURCE_ID,
+            sparkcache_revision=SPARKCACHE_REVISION,
+            base_image_licenses=LICENSES,
             output_image="glm53-sparkcache:qualified",
         )
 
     assert f"BASE_IMAGE_ID={IMAGE_ID}" in command
     assert f"SPARKCACHE_SOURCE_SHA256={SOURCE_ID}" in command
+    assert f"SPARKCACHE_REVISION={SPARKCACHE_REVISION}" in command
+    assert f"BASE_IMAGE_LICENSES={LICENSES}" in command
     assert Path(command[-1]) == Path("/repo")
 
 
@@ -42,5 +48,32 @@ def test_build_command_rejects_parent_identity_drift() -> None:
                 base_image="local-glm53:source-locked",
                 base_image_id=IMAGE_ID,
                 source_sha256=SOURCE_ID,
+                sparkcache_revision=SPARKCACHE_REVISION,
+                base_image_licenses=LICENSES,
                 output_image="glm53-sparkcache:qualified",
             )
+
+
+def test_build_command_rejects_missing_revision_or_license() -> None:
+    arguments = {
+        "repository": Path("/repo"),
+        "base_image": "local-glm53:source-locked",
+        "base_image_id": IMAGE_ID,
+        "source_sha256": SOURCE_ID,
+        "sparkcache_revision": SPARKCACHE_REVISION,
+        "base_image_licenses": LICENSES,
+        "output_image": "glm53-sparkcache:implemented",
+    }
+    with pytest.raises(ValueError, match="40-character Git commit"):
+        build_command(**{**arguments, "sparkcache_revision": "short"})
+    with pytest.raises(ValueError, match="parent image terms"):
+        build_command(**{**arguments, "base_image_licenses": ""})
+
+
+def test_containerfile_records_revision_license_and_notice() -> None:
+    recipe = (
+        Path(__file__).with_name("Containerfile").read_text(encoding="utf-8")
+    )
+    assert 'org.opencontainers.image.revision="${SPARKCACHE_REVISION}"' in recipe
+    assert 'org.opencontainers.image.licenses="${BASE_IMAGE_LICENSES}"' in recipe
+    assert "COPY LICENSE /usr/share/licenses/SparkCache/LICENSE" in recipe
