@@ -35,7 +35,10 @@ def test_prompt_shapes_are_stable_and_distinguish_scenarios() -> None:
 
     assert identical[0] == identical[1]
     assert shared[0] != shared[1]
-    assert all(prompt.startswith("benchmark " * 4) for prompt in shared)
+    assert all(
+        prompt.startswith("Native 128K restore test.\n" + "benchmark " * 4)
+        for prompt in shared
+    )
     assert "tail-00 tail-00" in shared[0]
     assert "tail-01 tail-01" in shared[1]
 

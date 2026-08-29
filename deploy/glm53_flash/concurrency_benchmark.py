@@ -39,6 +39,7 @@ class BenchmarkConfig:
     concurrency: int
     scenario: str
     cache_state: str
+    prefix_header: str = "Native 128K restore test.\n"
     prefix_repetitions: int = 131_072
     tail_repetitions: int = 32
     max_tokens: int = 1
@@ -77,7 +78,7 @@ def build_prompts(config: BenchmarkConfig) -> list[str]:
     """Build stable prompts for identical-prefix or shared-trunk cohorts."""
 
     config.validate()
-    prefix = "benchmark " * config.prefix_repetitions
+    prefix = config.prefix_header + "benchmark " * config.prefix_repetitions
     if config.scenario == "identical-prefix":
         prompt = prefix + "\nReturn one word."
         return [prompt] * config.concurrency
@@ -204,6 +205,7 @@ def run_benchmark(
         "scenario": config.scenario,
         "cache_state": config.cache_state,
         "concurrency": config.concurrency,
+        "prefix_header": config.prefix_header,
         "prefix_repetitions": config.prefix_repetitions,
         "tail_repetitions": config.tail_repetitions,
         "max_tokens": config.max_tokens,
@@ -224,6 +226,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--scenario", choices=SCENARIOS, required=True)
     parser.add_argument("--cache-state", choices=CACHE_STATES, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--prefix-header", default="Native 128K restore test.\n")
     parser.add_argument("--prefix-repetitions", type=int, default=131_072)
     parser.add_argument("--tail-repetitions", type=int, default=32)
     parser.add_argument("--max-tokens", type=int, default=1)
@@ -244,6 +247,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         concurrency=args.concurrency,
         scenario=args.scenario,
         cache_state=args.cache_state,
+        prefix_header=args.prefix_header,
         prefix_repetitions=args.prefix_repetitions,
         tail_repetitions=args.tail_repetitions,
         max_tokens=args.max_tokens,

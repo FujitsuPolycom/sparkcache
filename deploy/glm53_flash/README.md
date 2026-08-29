@@ -125,9 +125,11 @@ python -m deploy.glm53_flash.concurrency_benchmark \
 ```
 
 Use `--scenario shared-trunk` for a common prefix followed by distinct tails.
-The default 131,072 repetitions rely on the qualified model tokenizer's
-one-token encoding of `benchmark`; the receipt records every prompt SHA-256 so
-that model/tokenizer-specific runs can be compared exactly. Run separate
+The default header and 131,072 repetitions reproduce the prefix used by the
+recorded 128K native-restore entry; `--prefix-header` can select another
+fixture. They rely on the qualified model tokenizer's one-token encoding of
+`benchmark`. The receipt records every prompt SHA-256 so that
+model/tokenizer-specific runs can be compared exactly. Run separate
 commands for C2, C8, and C16 and for externally prepared hot/cold conditions.
 The JSON receipt keeps request results in request-index order and reports
 nearest-rank min/p50/p95/max latency. A nonzero exit means one or more requests
