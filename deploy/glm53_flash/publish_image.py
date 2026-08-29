@@ -13,7 +13,11 @@ from typing import Any, Iterable
 
 
 RECEIPT_SCHEMA = "sparkcache-glm53-image-publication/v1"
-DESTINATION = re.compile(r"ghcr\.io/fujitsupolycom/[a-z0-9._/-]+:[a-z0-9._-]+\Z")
+BUILD_RECEIPT_SCHEMA = "sparkcache-glm53-public-image/v1"
+DESTINATION = re.compile(
+    r"ghcr\.io/fujitsupolycom/sparkring-glm53-sparkcache:[a-z0-9._-]+\Z"
+)
+SHA256_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
 class PublishError(RuntimeError):
@@ -45,7 +49,10 @@ def run(argv: Iterable[str]) -> str:
 
 def validate_destination(destination: str) -> None:
     if DESTINATION.fullmatch(destination) is None:
-        raise PublishError("destination must be a semantic ghcr.io/fujitsupolycom tag")
+        raise PublishError(
+            "destination must use the FujitsuPolycom SparkCache GLM-5.3 GHCR"
+            " repository and a semantic tag"
+        )
     if destination.endswith(":latest"):
         raise PublishError("the moving latest tag is not a publication identity")
 
@@ -69,17 +76,31 @@ def publish(
 ) -> dict[str, Any]:
     validate_destination(destination)
     build_receipt = load_json(build_receipt_path, "build receipt")
+    if build_receipt.get("schema") != BUILD_RECEIPT_SCHEMA:
+        raise PublishError("build receipt schema is not a GLM-5.3 SparkCache image")
     image_id = build_receipt.get("image", {}).get("image_id")
-    if not isinstance(image_id, str) or not image_id.startswith("sha256:"):
+    if not isinstance(image_id, str) or SHA256_ID.fullmatch(image_id) is None:
         raise PublishError("build receipt does not contain an immutable image ID")
-    sbom = load_json(sbom_path, "SPDX SBOM")
-    if not str(sbom.get("spdxVersion", "")).startswith("SPDX-"):
-        raise PublishError("SBOM does not declare an SPDX version")
+    if sbom_path.exists():
+        raise PublishError(f"SBOM output path already exists: {sbom_path}")
     inspected_id = run(("docker", "image", "inspect", "--format", "{{.Id}}", image))
     if inspected_id != image_id:
         raise PublishError(
             f"local image drift: build receipt names {image_id}, Docker reports {inspected_id}"
         )
+    sbom_path.parent.mkdir(parents=True, exist_ok=True)
+    run(
+        (
+            "syft",
+            "scan",
+            f"docker:{image_id}",
+            "--output",
+            f"spdx-json={sbom_path}",
+        )
+    )
+    sbom = load_json(sbom_path, "generated SPDX SBOM")
+    if not str(sbom.get("spdxVersion", "")).startswith("SPDX-"):
+        raise PublishError("generated SBOM does not declare an SPDX version")
     run(("docker", "tag", image_id, destination))
     run(("docker", "push", destination))
     raw_digests = run(
@@ -105,6 +126,8 @@ def publish(
             "format": "SPDX JSON",
             "path": str(sbom_path),
             "sha256": sha256_file(sbom_path),
+            "source_image_id": image_id,
+            "generator": "syft",
         },
         "limitation": (
             "The registry artifact is implemented but unqualified. Four-rank "
@@ -118,7 +141,12 @@ def main() -> int:
     parser.add_argument("--image", required=True)
     parser.add_argument("--destination", required=True)
     parser.add_argument("--build-receipt", required=True, type=Path)
-    parser.add_argument("--sbom", required=True, type=Path)
+    parser.add_argument(
+        "--sbom",
+        required=True,
+        type=Path,
+        help="new path for the SPDX JSON SBOM generated from the immutable image ID",
+    )
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     try:

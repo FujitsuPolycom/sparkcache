@@ -20,9 +20,33 @@ from deploy.glm53_flash.build_image import build_command  # noqa: E402
 
 
 RECEIPT_SCHEMA = "sparkcache-glm53-public-image/v1"
-IMMUTABLE_IMAGE = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}\Z")
+IMMUTABLE_IMAGE = re.compile(
+    r"ghcr\.io/fujitsupolycom/sparkring-glm53-runtime@sha256:[0-9a-f]{64}\Z"
+)
+GIT_COMMIT = re.compile(r"[0-9a-f]{40}\Z")
+SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 EXPECTED_LICENSES = (
     "LicenseRef-NVIDIA-Deep-Learning-Container AND Apache-2.0 AND BSD-3-Clause"
+)
+EXPECTED_PARENT_LABELS = {
+    "org.opencontainers.image.source": "https://github.com/FujitsuPolycom/sparkring",
+    "org.opencontainers.image.licenses": EXPECTED_LICENSES,
+    "org.jovian.architecture": "linux-arm64-sm121",
+    "org.jovian.vllm.commit": "da4d7be6c97434f6942292ed8abbf4b32dc44355",
+    "org.jovian.b12x.commit": "2fcf23a0ce269be27b2e03fece73d46e90e6aeea",
+    "org.jovian.transport": "sparkring-nccl-2.30.7-source-built",
+    "org.sparkring.nccl.commit": "73cf112295c33aee2b895f329f592f2a9b4b0f97",
+    "org.sparkring.nccl.patched-tree": "abdeb053b94c3f6d472cd55ae2b79ca821299009",
+    "org.sparkring.nccl.patch-sha256": (
+        "6709063fa1c25055ae77a9397dea5d89643f8211d25e7990bdd11597d08c0dde"
+    ),
+}
+IMAGE_INPUT_PATHS = (
+    "sparkcache",
+    "deploy/glm53_flash",
+    "deploy/deployment_contract/source.py",
+    "patches/vllm-da4d7be",
+    "LICENSE",
 )
 
 
@@ -55,10 +79,44 @@ def inspect_image(image: str) -> dict[str, Any]:
 
 def require_clean_sources(repository: Path) -> str:
     revision = run(("git", "-C", str(repository), "rev-parse", "HEAD"))
-    paths = ("sparkcache", "deploy/glm53_flash", "patches/vllm-da4d7be", "LICENSE")
-    if run(("git", "-C", str(repository), "status", "--porcelain", "--", *paths)):
+    if run(
+        (
+            "git",
+            "-C",
+            str(repository),
+            "status",
+            "--porcelain",
+            "--",
+            *IMAGE_INPUT_PATHS,
+        )
+    ):
         raise PublicBuildError("SparkCache image inputs differ from the checked-out revision")
     return revision
+
+
+def validate_parent(parent: dict[str, Any]) -> dict[str, str]:
+    """Return the exact labels after proving the SparkRing runtime contract."""
+
+    if parent.get("Architecture") != "arm64" or parent.get("Os") != "linux":
+        raise PublicBuildError("parent image must use linux/arm64")
+    labels = parent.get("Config", {}).get("Labels") or {}
+    if not isinstance(labels, dict):
+        raise PublicBuildError("parent image labels must be a JSON object")
+    for name, expected in EXPECTED_PARENT_LABELS.items():
+        observed = labels.get(name)
+        if observed != expected:
+            raise PublicBuildError(
+                f"parent label {name} drift: expected {expected!r}, got {observed!r}"
+            )
+    patterned = {
+        "org.opencontainers.image.revision": GIT_COMMIT,
+        "org.sparkring.source-receipt-sha256": SHA256,
+    }
+    for name, pattern in patterned.items():
+        observed = labels.get(name)
+        if not isinstance(observed, str) or pattern.fullmatch(observed) is None:
+            raise PublicBuildError(f"parent label {name} is not an immutable identity")
+    return {name: str(labels[name]) for name in (*EXPECTED_PARENT_LABELS, *patterned)}
 
 
 def build_public_image(
@@ -68,18 +126,14 @@ def build_public_image(
     output_image: str,
 ) -> dict[str, Any]:
     if IMMUTABLE_IMAGE.fullmatch(base_image) is None:
-        raise PublicBuildError("base image must be a registry reference ending in @sha256:<64 hex>")
+        raise PublicBuildError(
+            "base image must be an immutable FujitsuPolycom SparkRing GLM-5.3"
+            " runtime reference"
+        )
     run(("docker", "pull", "--platform", "linux/arm64", base_image))
     parent = inspect_image(base_image)
-    if parent.get("Architecture") != "arm64" or parent.get("Os") != "linux":
-        raise PublicBuildError("parent image must use linux/arm64")
-    parent_labels = parent.get("Config", {}).get("Labels") or {}
-    parent_licenses = parent_labels.get("org.opencontainers.image.licenses")
-    if parent_licenses != EXPECTED_LICENSES:
-        raise PublicBuildError(
-            "parent license label drift: expected "
-            f"{EXPECTED_LICENSES!r}, got {parent_licenses!r}"
-        )
+    parent_labels = validate_parent(parent)
+    parent_licenses = parent_labels["org.opencontainers.image.licenses"]
     revision = require_clean_sources(repository)
     source_sha256 = source_tree_sha256(repository / "sparkcache")
     command = build_command(
@@ -115,6 +169,7 @@ def build_public_image(
             "reference": base_image,
             "image_id": parent["Id"],
             "repo_digests": sorted(parent.get("RepoDigests") or []),
+            "labels": parent_labels,
         },
         "sparkcache": {
             "revision": revision,
