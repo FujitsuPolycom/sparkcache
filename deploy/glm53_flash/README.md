@@ -1,75 +1,100 @@
 # GLM-5.3 Flash hybrid context-cache deployment
 
-Status: **qualified** for the exact GLM-5.3 Flash TP4/DCP1 source deployment
-with DFlash2 using seven draft tokens in
-[`GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md`](../../GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md).
-GPU-free tests cover hybrid-page store/restore and exact vLLM source
-verification. The live record covers an 8,192-token persistent restore; its
-limitations do not transfer qualification to other source trees, checkpoints,
-topologies, scheduler budgets, or span lengths.
+## Support status
 
-The `glm53-flash-hybrid` profile stores opaque target-model cache pages for
-GLM-5.3 Flash. The stored transaction includes sparse-MLA pages, C4 selector
-tail bytes, and the KDA/GDN recurrent checkpoint at the aligned persistent
-boundary. The profile requires vLLM `--mamba-cache-mode align` and rejects
-other recurrent-cache modes.
+The `glm53-flash-hybrid` profile is **qualified** for GLM-5.3 Flash at
+TP4/DCP1 with BF16 DFlash2 using seven draft tokens under two exact runtime
+records:
 
-External speculative-draft state is recomputed after a target-prefix restore.
-The seven-token DFlash2 deployment, identified as `dflash7` in launch commands,
-pins
-`incoai/GLM-5.3-Flash-DFlash2@dc77ff1c99eeb2df044ee3d4f0094eb033fee410`
-with BF16 weight SHA-256
-`b33c03475ba7322cf398828f2d8d1be376df30dc05c6b40c28c8ea8da23e410b`.
-The selected MTP or DFlash checkpoint SHA-256 remains part of `CacheIdentity`,
-so entries created with different draft models cannot share a namespace.
+- [`GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md`](../../GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md)
+  records an 8,192-token persistent restore through the Python page-placement
+  path at 147.2--194.0 ms per rank.
+- [`GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md`](../../GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md)
+  records native direct restore of a 131,072-token prefix, multi-group
+  recovery, and bounded shared GPU-prefix reuse through C16.
 
-The derived image applies a narrow VMM compatibility exemption because
-`SparkContextCacheConnector` does not register GPU virtual addresses with an
-external transport. It verifies the seven-file KV-block lease contract for
-`local-inference-lab/vllm@da4d7be6c97434f6942292ed8abbf4b32dc44355`
-against the Python files installed in the serving image.
+Qualification applies only to the checkpoint revisions, source contracts,
+topology, settings, and immutable artifacts named in those records. It does
+not transfer to another vLLM tree, target or draft checkpoint, TP/DCP geometry,
+scheduler configuration, or registry image.
 
-## Source provenance
+Standalone public reproduction is **unsupported** because the qualified ARM64
+parent images and exact patched NCCL build are not published. The source-bound
+image tools are **implemented** for use with an eligible immutable parent;
+[`PUBLISHING.md`](PUBLISHING.md) keeps a registry package private until one
+registry digest completes four-rank qualification.
+
+## Stored state and prefix behavior
+
+The profile stores opaque target-model pages under storage mode
+`block_pages_v1`. One transaction contains sparse-MLA pages, C4 selector tail
+bytes, and KDA/GDN recurrent checkpoints at one aligned persistent boundary.
+The profile requires vLLM `--mamba-cache-mode align` and rejects other
+recurrent-cache modes.
+
+The logical cache geometry is 256 tokens. The scheduler computes compatible
+digests at every eligible boundary and selects the longest exact snapshot
+advertised by all four physical ranks. A grown conversation can therefore
+reuse an earlier request boundary when that exact snapshot still exists on
+every rank.
+
+Opaque page chunks are authenticated byte partitions of one complete boundary
+snapshot; they are not independent 256-token KV objects. Sparse prefix aliases
+are **implemented** only for `per_token_rows`. Creating an earlier GLM prefix
+by truncating an opaque page manifest is **unsupported**. Tail-only GLM
+publication requires a page-semantic format and a distinct cache namespace.
+
+Concurrent requests for the same persistent digest use one restore leader.
+After all workers report successful restoration, patched vLLM retains the
+leader's normalized multi-group block table as a bounded shared-prefix lease.
+The implementation permits sixteen waiting followers, two retained leases,
+and a fifteen-second lease lifetime. Partial physical pages are copied into
+dedicated immutable blocks before followers can attach. Lease rejection skips
+the optimization and lets requests restore or recompute normally.
+
+## Checkpoint and runtime identity
 
 The target checkpoint is
 `local-inference-lab/GLM-5.3-Flash-NVFP4@520de24eabf507659eaef7c70f14fd584527facc`.
 Its published configuration identifies ModelOpt
 `0.39.0.dev290+gf9d9a71de.d20260407` as the quantization producer. Routed
-experts in target layers 3–44 use NVFP4, and the embedded MTP expert layer 45
-uses MXFP8. The checkpoint repository does not identify the exact source
-checkpoint revision used for quantization, so this deployment does not infer
-one.
+experts in target layers 3--44 use NVFP4, and embedded MTP expert layer 45 uses
+MXFP8. The repository does not identify the unquantized source revision, so
+this deployment does not infer one.
 
-The serving engine is the `local-inference-lab/vllm` fork on branch
-`dev/jovian-judgement`, pinned at
-`da4d7be6c97434f6942292ed8abbf4b32dc44355`. The runtime contains direct branch
-commits for GLM-5.3 model support (`e0db84abe`), B12X integration (`0c878821c`),
-C4 cache pages (`4dbd82b9c`), C4 behavior (`1036123e9`), and DFlash speculation
-(`e7097feb6`). Its merged pull-request lineage includes
-[#493](https://github.com/local-inference-lab/vllm/pull/493) for captured
-custom-operation resource lifetime,
-[#494](https://github.com/local-inference-lab/vllm/pull/494) for independent
-target/draft KV formats,
-[#497](https://github.com/local-inference-lab/vllm/pull/497) for processor
-revision binding, and
-[#499](https://github.com/local-inference-lab/vllm/pull/499) for serialized
-MXFP8 DFlash projections. Pull request #499 explicitly names #493 and #494 as
-deployment dependencies. The BF16 DFlash checkpoint does not exercise the
-MXFP8-only projection path, but the exact pinned runtime includes it.
+The DFlash2 checkpoint is
+`incoai/GLM-5.3-Flash-DFlash2@dc77ff1c99eeb2df044ee3d4f0094eb033fee410`.
+Its BF16 weights have SHA-256
+`b33c03475ba7322cf398828f2d8d1be376df30dc05c6b40c28c8ea8da23e410b`.
+External speculative-draft state is recomputed after target-prefix restore.
+The draft checkpoint digest remains part of `CacheIdentity`, so another draft
+model cannot share this namespace.
 
-The runtime image pins `local-inference-lab/b12x` commit
-`2fcf23a0ce269be27b2e03fece73d46e90e6aeea` (`Accept runtime QSA cache page
-sizes`). GitHub reports no pull request associated with that commit.
+The serving engine is `local-inference-lab/vllm` branch
+`dev/jovian-judgement` at
+`da4d7be6c97434f6942292ed8abbf4b32dc44355`. The runtime includes GLM-5.3
+support, B12X integration, C4 cache pages, and DFlash speculation. Its merged
+pull-request lineage includes
+[#493](https://github.com/local-inference-lab/vllm/pull/493),
+[#494](https://github.com/local-inference-lab/vllm/pull/494),
+[#497](https://github.com/local-inference-lab/vllm/pull/497), and
+[#499](https://github.com/local-inference-lab/vllm/pull/499).
 
-The VMM exemption in
-`patches/vllm-da4d7be/020-sparkcache-vmm-exemption.patch` adapts the existing
-SparkCache patch
-`patches/vllm-e2666d9a6/020-sparkcache-vmm-exemption.patch` to the exact
-GLM-5.3 runtime preimage. No GLM-5.3 model or kernel source is copied into this
-repository.
+The image pins `local-inference-lab/b12x` commit
+`2fcf23a0ce269be27b2e03fece73d46e90e6aeea`. GitHub reports no pull request
+associated with that commit.
+
+The image applies exact-input SparkCache patches for KV ownership, the VMM
+exemption, multi-group restore recovery, bounded shared-prefix retention, and
+follower attachment. The ten-file contract
+`sparkcache/runtime_patches/vllm-kv-block-lease-contract-da4d7be.json` verifies
+whole-file hashes and required symbols against installed vLLM source. An
+unrecognized hash is unsupported.
+
+## Image construction
 
 Build from the repository root after recording the exact local parent image
-ID:
+ID and SparkCache source-tree digest:
 
 ```bash
 python deploy/glm53_flash/build_image.py \
@@ -79,40 +104,41 @@ python deploy/glm53_flash/build_image.py \
   --output-image glm53-flash-sparkcache:da4d7be-glm53-hybrid
 ```
 
-The builder resolves `--base-image` with `docker image inspect` and rejects an
-identity different from `--base-image-id`. The qualified image is not a
-standalone public vLLM runtime.
+The builder rejects a parent whose resolved image ID differs from
+`--base-image-id`. The container build verifies the SparkCache source digest,
+patch inputs and outputs, and the ten-file vLLM contract.
 
-[`PUBLISHING.md`](PUBLISHING.md) defines the source-bound public image path. It
-builds the SparkCache overlay from an immutable SparkRing runtime digest,
-records the parent and output identities, requires an SPDX SBOM, and keeps the
-registry package private until one digest passes four-rank qualification.
+The connector must use role `kv_both`, load-failure policy `recompute`, model
+profile `glm53-flash-hybrid`, and exact lowercase SHA-256 identities for both
+checkpoints. `build_kv_transfer_config` validates configuration syntax and
+identity shape; the launcher remains responsible for hashing mounted model
+artifacts.
 
-The serving command must use `SparkContextCacheConnector`, role `kv_both`,
-load-failure policy `recompute`, model profile `glm53-flash-hybrid`, and exact
-64-character lowercase SHA-256 identities for both target and draft
-checkpoints. Streaming snapshots and native direct restore remain disabled for
-this profile.
+Native page restore is disabled unless the launch supplies all of:
 
-`build_kv_transfer_config` validates the syntax and namespace role of caller-
-supplied checkpoint identities; it does not inspect model mounts. A launcher
-must verify the target artifact manifest and the DFlash config and weight
-SHA-256 values before starting vLLM. The qualified SparkRing TP4 launcher owns
-that artifact-verification boundary at
+- `SPARK_CONTEXT_CACHE_NATIVE_RESTORE=1`;
+- an attested `SPARK_CONTEXT_CACHE_NATIVE_LIBRARY` path;
+- its `SPARK_CONTEXT_CACHE_NATIVE_LIBRARY_SHA256`;
+- a 64, 128, or 256 MiB `SPARK_CONTEXT_CACHE_NATIVE_ARENA_BYTES` value.
+
+The qualified 128K runtime used two host restore workers, two native placement
+lanes, and two 256 MiB mapped-host arenas per rank. Streaming snapshots remain
+unsupported for opaque page storage.
+
+The matching four-Spark launch and artifact-verification procedure is pinned
+at
 [`FujitsuPolycom/sparkring@6e9e3ac`](https://github.com/FujitsuPolycom/sparkring/blob/6e9e3acef62886a71531310673463972944b2b84/docs/GLM53_FLASH_DFLASH2_BF16_SPARKCACHE_TP4_QUICKSTART.md).
-Supplying an unverified digest is unsupported.
 
 ## Concurrency benchmark
 
-`concurrency_benchmark.py` sends one synchronized C2, C8, or C16 cohort to an
-OpenAI-compatible endpoint. It supports byte-identical prompts and prompts
-with a common trunk plus deterministic request-specific tails. The tool only
-sends inference requests: it does not warm, clear, inspect, or otherwise
-manage SparkCache storage. `--cache-state` records the hot, cold, or
-uncontrolled condition prepared by the operator outside the benchmark.
+`concurrency_benchmark.py` sends synchronized C2, C8, or C16 cohorts to an
+OpenAI-compatible endpoint. Scenario `identical-prefix` repeats one prompt;
+`shared-trunk` adds deterministic request-specific tails. `--pretokenize`
+removes repeated API-side chat tokenization from the timed interval.
 
-For example, this records a C16 run whose identical 128K-token-class prompt is
-expected to be hot:
+The tool does not warm, clear, or inspect SparkCache. The operator prepares the
+storage condition and records it with `--cache-state`. Each JSON receipt binds
+the model, prompt hashes, request results, and min/p50/p95/max latency.
 
 ```bash
 python -m deploy.glm53_flash.concurrency_benchmark \
@@ -121,25 +147,20 @@ python -m deploy.glm53_flash.concurrency_benchmark \
   --concurrency 16 \
   --scenario identical-prefix \
   --cache-state hot \
+  --pretokenize \
   --output receipts/glm53-c16-identical-hot.json
 ```
 
-Use `--scenario shared-trunk` for a common prefix followed by distinct tails.
-Use `--pretokenize` to render and tokenize each unique chat prompt before the
-timed start barrier, then send its token IDs through `/v1/completions`. This
-separates SparkCache, scheduler, and model latency from repeated 128K API-side
-tokenization while preserving the exact chat-template token sequence.
-The default header and 131,072 repetitions reproduce the prefix used by the
-recorded 128K native-restore entry; `--prefix-header` can select another
-fixture. They rely on the qualified model tokenizer's one-token encoding of
-`benchmark`. The receipt records every prompt SHA-256 so that
-model/tokenizer-specific runs can be compared exactly. Run separate
-commands for C2, C8, and C16 and for externally prepared hot/cold conditions.
-The JSON receipt keeps request results in request-index order and reports
-nearest-rank min/p50/p95/max latency. A nonzero exit means one or more requests
-failed or returned no OpenAI-compatible choice.
+The default fixture reproduces the recorded 131,072-token persistent prefix.
+See the native restore validation record for exact runtime identities, results,
+and committed receipts.
 
 ## Compatibility
 
-The profile creates a distinct cache namespace. It does not modify the
-`glm52-nvfp4` profile, its alias, or any GLM-5.2 cache identity field.
+The native placement path, longest exact-boundary search, and shared GPU lease
+do not change `CacheIdentity`, digest values, 256-token logical geometry, exact
+manifest format, or existing chunk bytes. Missing or incompatible state remains
+a cache miss followed by ordinary computation.
+
+The `glm53-flash-hybrid` namespace remains distinct from `glm52-nvfp4` and all
+DeepSeek namespaces. Cross-topology and heterogeneous-TP reuse are unsupported.

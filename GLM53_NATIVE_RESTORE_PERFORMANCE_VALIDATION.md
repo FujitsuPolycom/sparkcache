@@ -1,246 +1,212 @@
-# GLM-5.3 native direct-restore performance validation
+# GLM-5.3 native restore and shared-prefix validation
 
 Date: 2026-08-29
 
-Status: **qualified for native direct restore, C2/C8/C16 shared-prefix
-correctness, bounded GPU block sharing, continued generation, and
-verified-or-recompute recovery** under the exact deployment recorded here.
-The aspirational sub-second C16 client target, unrelated-cold C16 matrix, and
-decode-interference measurement remain open performance work.
+## Status
 
-## Exact implementation and runtime
+Native direct restore, verified multi-group recovery, bounded shared GPU-prefix
+reuse, C2/C8/C16 completion, shared-trunk C16 completion, and continued
+generation are **qualified** for the exact GLM-5.3 Flash TP4/DCP1 runtime
+identified below.
+
+The qualification does not cover unrelated-cold C16 behavior, interference
+with unrelated decode traffic, C24/C32 cohorts, more than sixteen waiting
+followers, another checkpoint, another topology, or another vLLM source tree.
+Those cases remain outside the qualification evidence. Tail-only publication
+and page-semantic GLM prefix aliases are **unsupported**.
+
+## Qualified runtime identity
 
 | Attribute | Value |
 |---|---|
-| SparkCache branch | `codex/hybrid-restore-phase-timing` |
-| Timing implementation | `175f940` |
-| Native page placement | `71f367b` |
-| Multi-slab restore and exact-prefix discovery | `8e7f5fc` |
-| Direct pipelined slab restore | `94c4493` |
-| Full authenticated span-table bound | `9dbf73c` |
-| SparkCache source-tree SHA-256 | `368cc18dbccc262a1f2a1f1eef5aced90690031abd1f2fedf3d192e60a67012b` |
-| Qualified parent/runtime image | `sha256:7c007cf673c35f5818da7fea8faa343304baed00f489efdcbd027d6616b8a290` |
+| SparkCache source revision | `2b86fb9d02fa3595cca5caa864b81aedce44b8bb` |
+| SparkCache source-tree SHA-256 | `b3e84d220e215bdad99455a7eefb431b9aea248e0edb6ff417319c420433f55a` |
+| vLLM source revision | `local-inference-lab/vllm@da4d7be6c97434f6942292ed8abbf4b32dc44355` |
 | Serving topology | GLM-5.3 Flash, TP4/DCP1, one rank on each of `spark-r0` through `spark-r3` |
-| Restore workers | Two host restore workers and two native placement lanes per rank |
-| Native arenas | Two 256 MiB mapped-host arenas per rank |
-| Restore safety | Restore only authenticated, identity-compatible extents; otherwise recompute |
+| Scheduler capacity | `--max-num-seqs 32` |
+| Restore concurrency | Two host restore workers and two native placement lanes per rank |
+| Native staging | Two 256 MiB mapped-host arenas per rank |
+| Persistent prefix | 131,072 tokens and 813,068,464 encoded bytes per rank |
+| Runtime receipt | `evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-runtime.json` |
 
-The direct path reads each immutable `.spcc` object into alternating mapped-host
-arenas with `pread`, computes its whole-file SHA-256 in place, validates its
-extent table, and submits authenticated spans directly to the page-placement
-kernel. It avoids Python `ContextChunk` reconstruction and the previous
-813 MiB join/copy operation.
+The runtime receipt records one immutable image ID per rank, native library
+SHA-256 `683cb9e0420da9c68e3263093077fdbcaa400913ff0fb1d18639771213220605`,
+scheduler SHA-256
+`4f8793c4ac4bf356a89c829b6e75b189e6bc4a74c97135208952d0bad1678f15`,
+and KV-cache-manager SHA-256
+`ee03dc9ce2b720c0be6e9f572d23580ba96eff68fe3406250557e83071654af0`.
 
-The span-table limit is 4,096, matching the validated native ABI maximum. The
-first 128K attempt exposed the earlier 64-span adapter limit; increasing this
-adapter bound does not change cache identity, digest values, chunk geometry, or
-the on-disk format.
+The direct page-placement implementation is identified by these commits:
 
-## 128K direct-restore result
+| Responsibility | Revision |
+|---|---|
+| Restore phase timing | `175f9401984a03744d7fe1a985d7c2ef6035f949` |
+| Native hybrid-page placement | `71f367be07788d611698a251fe866d678b0034ae` |
+| Multi-slab restore and exact-prefix discovery | `8e7f5fc62fd4fffdd661aca9ea634cf130c45d1a` |
+| Direct pipelined slab restore | `94c44930a13df5c668d777e0270e7d8203069d7c` |
+| Authenticated span-table bound | `9dbf73c0caab89b24346567e2769752ac746e114` |
 
-Each rank restored 813,068,464 bytes through four native slabs.
+The 131,072-token single-request measurement used source-tree SHA-256
+`368cc18dbccc262a1f2a1f1eef5aced90690031abd1f2fedf3d192e60a67012b`
+and parent/runtime image
+`sha256:7c007cf673c35f5818da7fea8faa343304baed00f489efdcbd027d6616b8a290`.
+The shared-prefix qualification used source revision `2b86fb9d...` and
+source-tree SHA-256 `b3e84d...` identified in the table above.
 
-| Rank | Restore service | Read and hash | Native submit | CUDA finish |
+## Implemented restore path
+
+Native restore reads immutable `.spcc` objects directly into alternating
+mapped-host arenas with `pread`, hashes every complete file in place, validates
+its authenticated extent table, and submits only validated spans to the CUDA
+page-placement kernel. Read work and CUDA submission overlap across slabs.
+
+This path avoids Python `ContextChunk` reconstruction and an 813 MiB
+intermediate join/copy. The adapter accepts at most 4,096 authenticated spans,
+matching the validated native ABI. These changes do not alter `CacheIdentity`,
+digest values, 256-token logical geometry, or the on-disk exact-manifest and
+chunk formats.
+
+## Practical restore gains
+
+### One 131,072-token prefix
+
+Each rank restored 813,068,464 bytes through four slabs:
+
+| Rank | Cache service | Read and hash | Native submit | CUDA finish |
 |---:|---:|---:|---:|---:|
 | 0 | 141.9 ms | 77.9 ms | 25.4 ms | 3.4 ms |
 | 1 | 131.3 ms | 84.6 ms | 13.4 ms | 3.4 ms |
 | 2 | 139.0 ms | 92.7 ms | 14.1 ms | 3.4 ms |
 | 3 | 250.1 ms | 140.7 ms | 20.1 ms | 3.4 ms |
 
-The slowest rank completed cache service in 250.1 ms, below the 500 ms C1
-target. End-to-end client latency was 0.907 seconds; that includes scheduler
-work, live-token execution, and DFlash generation in addition to cache restore.
-A fresh post-restore semantic canary reported `semantic_match: true`, and the
-HTTP health endpoint remained 200.
+The Python reconstruction pipeline measured 1.29--1.46 seconds per rank for
+the same stored prefix. Native cache service therefore reduced the slowest-rank
+time to 250.1 ms. End-to-end client latency was 0.907 seconds, including
+scheduler work, live-token execution, and DFlash generation. A separate
+semantic canary matched and HTTP health remained 200.
 
-Before the direct `pread` pipeline, the same 128K entry required 1.29--1.46
-seconds of cache service per rank. Its dominant costs were 395--417 ms for
-read/verification, 200--243 ms for Python reconstruction, 373--438 ms for the
-arena copy/submission path, and 142--160 ms for CUDA completion. The direct
-path removes the reconstruction and large intermediate copy from the request
-critical path.
+### Eight concurrent 16K prefixes
 
-## Earlier 16K concurrency comparison
+The Python/Torch placement path produced 1.54--1.57 second submission spikes;
+eight clients completed in 9.45--10.64 seconds. Native placement submitted in
+6--15 ms, and two restore lanes completed eight clients in approximately
+1.2--2.1 seconds. This diagnostic isolates page placement as the dominant
+serialized cost in that workload; it is not a separate deployment
+qualification.
 
-The original Python/Torch placement path developed 1.54--1.57 second submit
-spikes under concurrent restore, and one restore worker amplified queue delay
-to about 2.7 seconds. Eight simultaneous clients completed in 9.45--10.64
-seconds.
+## Concurrency and shared GPU blocks
 
-Native placement submitted in 6--15 ms. With two restore workers and lanes,
-the observed maximum queue delay fell to about 0.93 seconds and eight clients
-completed in approximately 1.2--2.1 seconds. This is strong evidence that the
-Python/Torch page-placement section caused the earlier serialized stall, but
-it is not a completed C16 qualification.
+The independent-restore baseline issued a complete external restore for every
+request: two per rank for C2, eight for C8, and sixteen for C16.
 
-## 128K concurrency baseline
+| Cohort | Client min | Client p50 | Client max |
+|---:|---:|---:|---:|
+| C2 | 1.282 s | 1.282 s | 1.377 s |
+| C8 | 0.947 s | 2.017 s | 3.129 s |
+| C16 | 1.063 s | 3.363 s | 5.335 s |
 
-After rolling the scheduler recovery correction in `b00c6d4`, a synchronized
-fixture reproduced persisted digest `53d5e0f5fe6b...`. Every request restored
-131,072 tokens and 813,068,464 bytes per rank. The baseline predates
-single-flight cohort sharing, so logs record one complete restore per request:
-2 for C2, 8 for C8, and 16 for C16 on every rank.
+Bounded shared-prefix leases changed the rank-local work from sixteen complete
+813 MiB restores to one. The standard chat C16 measurement completed every
+request at 2.980 seconds p50 and 5.064 seconds maximum. This measurement
+includes sixteen large prompt-tokenization operations.
 
-| Cohort | Cache state | Client min | Client p50 | Client p95/max |
-|---:|---|---:|---:|---:|
-| C2 | first read after restart | 1.282 s | 1.282 s | 1.377 s |
-| C8 | host/filesystem warm | 0.947 s | 2.017 s | 3.129 s |
-| C16 | host/filesystem warm | 1.063 s | 3.363 s | 5.335 s |
+Pretokenized requests preserve the exact chat-template token sequence while
+moving tokenizer work outside the timed interval:
 
-All 26 requests succeeded. No load failure, placement failure, engine death,
-container exit, or semantic-canary failure was observed. C2 per-rank cache
-service ranged from 283.9 to 564.7 ms, with queue wait below 0.4 ms. This
-baseline demonstrates that native placement removed the earlier Python submit
-stall, while also quantifying the remaining duplication: C16 still reads,
-verifies, and places the same snapshot sixteen times per rank.
+| Cohort | External restores per rank | Client min | Client p50 | Client max |
+|---:|---:|---:|---:|---:|
+| C2 | 1 | 0.541 s | 0.541 s | 0.737 s |
+| C8, retained lease | 0 | 0.407 s | 1.211 s | 1.218 s |
+| C16 | 1 | 0.735 s | 2.698 s | 2.701 s |
+| C16, common trunk and distinct tails | 1 | 2.407 s | 3.894 s | 3.896 s |
 
-Committed receipts:
+The pretokenized C16 restore used 104.2--165.3 ms of cache service per rank
+and at most 3.2 ms of restore-queue wait. Every request completed, queues
+drained to zero, no engine exited, and the post-run semantic canary matched.
+
+Qualified receipts:
+
+- `evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-128k-c2-pretokenized.json`;
+- `evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-128k-c8-pretokenized.json`;
+- `evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-128k-c16.json`;
+- `evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-128k-c16-pretokenized.json`;
+- `evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-128k-c16-shared-trunk-pretokenized.json`;
+- `evidence/glm53-flash-dflash7-bf16/post-hotlease-2b86fb9-semantic.json`.
+
+Baseline receipts:
 
 - `evidence/glm53-flash-dflash7-bf16/native-128k-c2-b00c6d4.json`;
 - `evidence/glm53-flash-dflash7-bf16/native-128k-c8-hot-b00c6d4.json`;
 - `evidence/glm53-flash-dflash7-bf16/native-128k-c16-hot-b00c6d4.json`;
 - `evidence/glm53-flash-dflash7-bf16/post-b00c6d4-semantic.json`.
 
-### Initial single-flight result and retention diagnosis
+## Shared-prefix ownership
 
-The first single-flight tracer bullet proved restore coalescing but initially
-left fifteen requests deferred because no runnable request remained to wake the
-scheduler. After adding a verified-leader completion wake edge, C16 completed,
-but each follower started another external restore: p50 was 4.740 seconds and
-the maximum was 8.252 seconds. The run was correct but slower than the baseline
-and is not a qualification result.
+One request leads restoration for a persistent digest. Followers wait without
+allocating another external restore. A lease becomes visible only after every
+worker reports successful restoration and the scheduler normalizes the
+leader's multi-group HMA block tables.
 
-vLLM metrics showed zero local-prefix hit tokens and 100% external-prefix hits.
-A CPU differential probe initially implicated the GLM hybrid-cache retention
-policy: a minimal Mamba+EAGLE fixture with retention zero lost its common hit,
-while a positive aligned interval retained it. That result did not generalize
-to the full GLM topology. A live run with
-`--prefix-cache-retention-interval 18432` still recorded zero local-prefix hit
-tokens and sixteen external restores. The retention setting is therefore not
-part of the profile contract.
+The recurrent-cache manager's authenticated checkpoint slot replaces the
+logical partial-boundary slot when required. Every physically partial
+2,304-token page is copied into a dedicated immutable block before the lease
+becomes attachable. Followers acquire ordinary vLLM block references and use
+copy-on-write handling for private tails.
 
-The remaining boundary is explicit HMA block ownership: at least one live
-cache group is not rediscoverable through the common hash lookup after the
-leader advances. The next implementation attaches followers directly to the
-verified leader's rank-local block table through vLLM's existing block-pool
-reference accounting. It must occur only after all-worker restore completion
-and before leader reclamation.
+The implementation permits sixteen waiting followers per leader, retains at
+most two reusable leases, and expires a lease after fifteen seconds. Allocation
+pressure releases lease references before refusing ordinary serving blocks.
+Failure to create or attach a lease skips sharing; it does not make unverified
+state eligible.
 
-The first explicit hot-lease run (`d30cdea`) also rejected capture safely.
-GLM's Mamba manager carries internal checkpoint blocks, so its authoritative
-partial-tail tuple can name a different valid table slot than the simple
-`span // block_size` page. The initial assertion treated that valid topology
-as disagreement. All sixteen requests fell back to verified external restore
-and completed (p50 4.786 seconds, maximum 7.893 seconds); no lease became
-visible. The corrected implementation validates and follows vLLM's
-authoritative tuple when present, while retaining physical-page arithmetic as
-the fallback when no tuple exists. Optional lease rejections now emit one-line
-warnings rather than exception tracebacks.
+## Verified-or-recompute recovery
 
-The concise-log build (`599b65a`) confirmed the remaining normalization
-problem without traceback noise: `Lease pin skipped ... partial-page metadata
-is invalid`. The leader's raw Mamba table included internal checkpoint blocks
-outside the logical prefix slice. All sixteen requests again completed through
-verified external restore (p50 4.663 seconds, maximum 7.698 seconds). The
-corrected lease builder now first normalizes each group's logical source
-window, then substitutes an authenticated manager-provided checkpoint block at
-the partial boundary before hidden-request adoption and immutable-page copy.
+The pinned vLLM scheduler patch handles hybrid requests whose restored state is
+invalid in any KV-cache group. It discards the complete external prefix across
+all groups and computes the request normally. Partially verified hybrid state
+is never published.
 
-Diagnostic receipts:
+A live recovery canary removed rank 3's manifest for one advertised
+4,096-token entry. Ranks 0--2 verified their pages, rank 3 reported the missing
+entry, and the scheduler discarded all external blocks before recomputation.
+The request completed in 1.94 seconds, health remained 200, and no traceback or
+engine exit occurred. Evidence:
+`evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-recovery-canary.json`.
+
+The ten-file vLLM source contract and GPU-free patch tests cover single-group,
+multi-group, disjoint-group, and asynchronous recovery behavior.
+
+## Diagnostic records
+
+Several receipts document safe optimization rejection while shared HMA block
+ownership was being derived. They are historical diagnostics, not qualified
+performance results:
 
 - `evidence/glm53-flash-dflash7-bf16/singleflight-128k-c16-830a117.json`;
-- `evidence/glm53-flash-dflash7-bf16/post-singleflight-semantic-830a117.json`;
 - `evidence/glm53-flash-dflash7-bf16/singleflight-retention18432-128k-c16.json`;
-- `evidence/glm53-flash-dflash7-bf16/post-retention18432-semantic.json`;
 - `evidence/glm53-flash-dflash7-bf16/hotlease-d30cdea-128k-c16.json`;
-- `evidence/glm53-flash-dflash7-bf16/post-hotlease-d30cdea-semantic.json`;
-- `evidence/glm53-flash-dflash7-bf16/hotlease-599b65a-128k-c16.json`;
-- `evidence/glm53-flash-dflash7-bf16/post-hotlease-599b65a-semantic.json`.
+- `evidence/glm53-flash-dflash7-bf16/hotlease-599b65a-128k-c16.json`.
 
-## Verified shared-block result
-
-Build `2b86fb9` normalized the leader's raw hybrid tables before hot-lease
-capture and substituted vLLM's authoritative recurrent checkpoint block into
-the logical boundary slot. Every physically partial 2,304-token page was then
-copied into a dedicated immutable hot block before the lease became visible.
-
-The fresh chat C16 run completed all sixteen requests and recorded exactly one
-813,068,464-byte restore on every rank. Client p50 was 2.980 seconds and the
-maximum was 5.064 seconds, down from the no-sharing baseline's 3.363-second
-p50 and 5.335-second maximum. This chat measurement still includes sixteen
-large prompt-tokenization operations.
-
-The pretokenized matrix tokenized each unique chat prompt before the timed
-barrier. Each identical request contained 131,096 token IDs and reused the
-stored 131,072-token prefix:
-
-| Cohort | Restore count per rank | Client min | Client p50 | Client max |
-|---:|---:|---:|---:|---:|
-| C2 | 1 | 0.541 s | 0.541 s | 0.737 s |
-| C8, same live lease | 0 | 0.407 s | 1.211 s | 1.218 s |
-| C16 | 1 | 0.735 s | 2.698 s | 2.701 s |
-| C16, distinct tails | 1 | 2.407 s | 3.894 s | 3.896 s |
-
-For the pretokenized C16 restore, per-rank cache service was 104.2--165.3 ms;
-the restore queue waited at most 3.2 ms. The remaining client latency is model
-work: follower partial-page copy-on-write, the uncached 24-token tail, and the
-DFlash output step. No request failed, no engine exited, queues drained to
-zero, and the post-roll semantic canary matched.
-
-Qualified receipts:
-
-- `evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-128k-c16.json`;
-- `evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-128k-c16-pretokenized.json`;
-- `evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-128k-c2-pretokenized.json`;
-- `evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-128k-c8-pretokenized.json`;
-- `evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-128k-c16-shared-trunk-pretokenized.json`;
-- `evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-runtime.json`;
-- `evidence/glm53-flash-dflash7-bf16/post-hotlease-2b86fb9-semantic.json`.
+The retention-interval experiment did not produce all-group local-prefix hits
+and is not part of the deployment contract. The qualified implementation uses
+explicit vLLM block references instead of depending on ordinary hash
+rediscovery.
 
 ## Repository validation
 
-The exact source tree above passed:
+Source revision `2b86fb9d02fa3595cca5caa864b81aedce44b8bb` passed:
 
 - `python -m pytest sparkcache -q`: 678 passed, 4 skipped;
 - `python -m pytest deploy -q`: 99 passed, 1 skipped;
 - `python -m ruff check sparkcache deploy`: all checks passed.
 
-## Required concurrency qualification
+## Qualification limits
 
-The next live matrix records request latency, per-rank phase timing, restore
-queue depth, GPU-memory stability, preemptions, health, and continued unrelated
-decode progress for:
-
-1. C2, C8, and C16 requests sharing the same 128K prefix;
-2. C16 requests sharing several large trunks but having different tails;
-3. C16 hot host-resident prefixes;
-4. C16 unrelated cold 128K prefixes.
-
-Targets are below 500 ms for one shared 128K restore, 500--1,000 ms for mostly
-shared trunks, below 500 ms for hot host prefixes, and stable 2--5 second
-service for unrelated cold prefixes without OOMs or scheduler stalls.
-
-## Recovery correction
-
-The rejected first 128K attempt also exposed a pinned-vLLM recovery defect:
-`_update_requests_with_invalid_blocks` unpacks the result of
-`get_block_ids(req_id)` as though every request has one KV-cache group. GLM-5.3
-has multiple groups, so that recovery path raises `ValueError: too many values
-to unpack`.
-
-The da4d7be image recipe now applies an exact-preimage scheduler correction.
-When any HMA group contains an invalid restored block, it discards the complete
-external prefix for that request and recomputes it; partially verified hybrid
-state is never published. The expanded ten-file vLLM source contract pins
-both this scheduler behavior and `KVCacheManager.get_block_ids()`. GPU-free
-tests execute the patched method against multi-group, disjoint, asynchronous,
-and preserved single-group recovery cases.
-
-A live 4,096-token recovery canary temporarily removed rank 3's manifest after
-all four ranks had advertised it. Ranks 0--2 verified their restored pages;
-rank 3 reported an ordinary absent-entry miss. The patched scheduler discarded
-the complete external prefix, logged one request and 4,096 affected tokens,
-and recomputed. The request completed in 1.94 seconds, health remained 200,
-and no traceback or engine exit occurred. The displaced manifest was restored.
-The receipt is
-`evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-recovery-canary.json`.
+- The shared-prefix measurements establish C2, C8, and C16 behavior under a
+  C32 scheduler ceiling; they do not establish C24 or C32 performance.
+- The unrelated-cold C16 matrix and unrelated-decode interference measurement
+  remain outside the qualification evidence.
+- Sparse row-prefix aliases are implemented and GPU-free tested, but this GLM
+  record does not qualify them because GLM uses opaque page storage.
+- Growing conversations can still publish another complete snapshot.
+- No cross-TP canonical shard format or network storage backend is implemented.

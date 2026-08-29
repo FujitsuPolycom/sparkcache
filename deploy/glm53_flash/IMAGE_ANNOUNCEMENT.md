@@ -1,16 +1,19 @@
-# GLM-5.3 Flash SparkCache community-image announcement
+# GLM-5.3 Flash SparkCache community-image qualification record
 
-## Status
+## Artifact status
 
-**Community derivative.** This is not an official vLLM, Z.AI, Inco AI,
-NVIDIA, or B12X release. The exact TP4/DCP1 configuration below is
-**qualified**; configurations outside that record remain unsupported or
-unqualified as stated below.
+This document is a **qualified historical artifact record** for the four
+rank-local images listed below. It is not a release announcement for the
+repository's image builder and does not identify a published registry image.
 
-## Image and immutable identity
+The images are FujitsuPolycom community derivatives, not official vLLM, Z.AI,
+Inco AI, NVIDIA, B12X, or SparkCache release artifacts. Qualification applies
+only to the exact TP4/DCP1 configuration and 8,192-token restore recorded here.
 
-The qualification used one locally built image per Spark because each host had
-a different immutable parent image ID:
+## Immutable image identity
+
+Each NVIDIA DGX Spark used a different local parent image and therefore a
+different derived image:
 
 | Rank | Parent image ID | Derived image ID |
 |---:|---|---|
@@ -19,99 +22,85 @@ a different immutable parent image ID:
 | 2 | `sha256:9bd97e3d77de969ee0788aaac31b2888fd4c6a3d893ac5fc544ca85363927935` | `sha256:b969a49ec091157c686a3bc3f52816b6aa910e495af0c92780a321ea5fbd5324` |
 | 3 | `sha256:d592c83cc04106532adf7d8d410347062ac1b80fc1b6981deca414b5335efff4` | `sha256:c9f0be4dccfd8fdcec80a3edce1ad217604fa09afee0f14d13a2839fb97eed9f` |
 
-No registry image is published by this record. A publisher must report the
-resulting registry manifest digest; the tag
-`glm53-flash-sparkcache:da4d7be-glm53-hybrid` is not an immutable identity.
+No registry digest is associated with this record. The local tag
+`glm53-flash-sparkcache:da4d7be-glm53-hybrid` is a mutable build handle, not an
+artifact identity.
 
-## Based on
+## Source and dependency identity
 
-- Rank-local GLM-5.3 ARM64 parent images identified above. SparkCache does not
-  publish those parent images.
-- `local-inference-lab/vllm` branch `dev/jovian-judgement` at
-  `da4d7be6c97434f6942292ed8abbf4b32dc44355`.
-- `local-inference-lab/b12x@2fcf23a0ce269be27b2e03fece73d46e90e6aeea`.
+The images contain SparkCache source-tree SHA-256
+`6210f439c64e4079ed3304c9cc181174abb3e6045de740ba7b7c2546bcaf6ac2`
+from repository revision
+[`b635de0d8cf5278ea382f1bfd070f19e201460fc`](https://github.com/FujitsuPolycom/sparkcache/tree/b635de0d8cf5278ea382f1bfd070f19e201460fc).
+
+The exact builder and container recipe used for this artifact remain available
+at that immutable revision:
+
+- [`build_image.py`](https://github.com/FujitsuPolycom/sparkcache/blob/b635de0d8cf5278ea382f1bfd070f19e201460fc/deploy/glm53_flash/build_image.py);
+- [`Containerfile`](https://github.com/FujitsuPolycom/sparkcache/blob/b635de0d8cf5278ea382f1bfd070f19e201460fc/deploy/glm53_flash/Containerfile).
+
+The runtime dependencies were:
+
+- `local-inference-lab/vllm@da4d7be6c97434f6942292ed8abbf4b32dc44355`;
+- `local-inference-lab/b12x@2fcf23a0ce269be27b2e03fece73d46e90e6aeea`;
 - NCCL 2.30.7 binary SHA-256
   `ccd57342449c3f680befcb379329b935746e5299dc4de5f2516146e0411bd85f`.
-  The qualification record does not establish that binary's source commit.
 
-## Build recipe
+The NCCL checksum identifies the binary used in qualification. No source
+manifest binds that binary to an NCCL source commit.
 
-Use [`build_image.py`](build_image.py) and [`Containerfile`](Containerfile).
-The builder verifies the local parent image ID before invoking Docker. The
-container build verifies SparkCache source-tree SHA-256
-`6210f439c64e4079ed3304c9cc181174abb3e6045de740ba7b7c2546bcaf6ac2`,
-the VMM patch preimage/postimage, and seven coherent vLLM safety-contract files.
+The target checkpoint was
+`local-inference-lab/GLM-5.3-Flash-NVFP4@520de24eabf507659eaef7c70f14fd584527facc`.
+The draft checkpoint was
+`incoai/GLM-5.3-Flash-DFlash2@dc77ff1c99eeb2df044ee3d4f0094eb033fee410`
+with BF16 weights and seven draft tokens.
 
-## Source revisions, pull requests, and patches
+## Artifact behavior
 
-The complete target, draft, vLLM, B12X, and patch provenance is in
-[`README.md`](README.md). The vLLM runtime includes merged pull requests
-[#493](https://github.com/local-inference-lab/vllm/pull/493),
-[#494](https://github.com/local-inference-lab/vllm/pull/494),
-[#497](https://github.com/local-inference-lab/vllm/pull/497), and
-[#499](https://github.com/local-inference-lab/vllm/pull/499).
+The derivative added the `glm53-flash-hybrid` persistent context-cache profile,
+stored sparse-MLA/C4 pages and aligned KDA/GDN recurrent checkpoints on
+rank-local NVMe, bound target and draft identities into a distinct cache
+namespace, and applied an exact-input VMM compatibility exemption.
 
-## Inherited behavior
+The parent supplied GLM-5.3 execution, B12X kernels, FlashKDA prefill, DFlash2,
+CUDA graphs, InstantTensor, and SparkRing NCCL. Neither model checkpoint was
+embedded in the derived images.
 
-The parent image supplies GLM-5.3 model execution, B12X attention/MoE/linear
-kernels, FlashKDA prefill, DFlash2 execution, CUDA-graph support, InstantTensor,
-and SparkRing NCCL. Inherited OCI labels describe parent-image capabilities;
-the qualified service mounts the BF16 DFlash checkpoint named below rather
-than the parent's MXFP8 DFlash checkpoint.
+## Qualified configuration and result
 
-## Changes introduced by this derivative
-
-- Adds the `glm53-flash-hybrid` persistent context-cache profile.
-- Stores sparse-MLA/C4 pages and aligned KDA/GDN recurrent checkpoints on
-  rank-local NVMe.
-- Binds target and draft checkpoint identities into a distinct cache namespace.
-- Adds a SparkContextCacheConnector-specific VMM exemption with exact
-  preimage/postimage validation.
-- Verifies coherent vLLM block-lifetime and recurrent block-table semantics.
-
-## Tested configuration
-
-- Four NVIDIA DGX Sparks in a direct RoCE ring; TP4, DCP1, PP1.
-- Target:
-  `local-inference-lab/GLM-5.3-Flash-NVFP4@520de24eabf507659eaef7c70f14fd584527facc`.
-- Draft:
-  `incoai/GLM-5.3-Flash-DFlash2@dc77ff1c99eeb2df044ee3d4f0094eb033fee410`,
-  BF16, seven draft tokens.
-- 524,288-token model limit, 8,192-token scheduler budget, 32 sequences,
-  12 GiB FP8 KV cache per rank.
-- Async scheduling, chunked prefill, prefix caching, `FULL_AND_PIECEWISE`
-  target graphs, and DFlash FULL graphs.
-
-## Validation results
+- Four NVIDIA DGX Spark systems in a direct RoCE ring;
+- TP4, DCP1, and PP1;
+- 524,288-token model limit;
+- 8,192-token scheduler budget;
+- 32-sequence scheduler ceiling;
+- 12 GiB FP8 KV cache per rank;
+- asynchronous scheduling, chunked prefill, prefix caching,
+  `FULL_AND_PIECEWISE` target graphs, and DFlash FULL graphs.
 
 [`GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md`](../../GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md)
-records the commands and receipts. The exact artifact stored and restored
-8,192 tokens across a coordinated restart in 147.2–194.0 ms per rank. The
-post-restore request completed in 1.509 seconds. The semantic canary passed,
-DFlash produced exactly seven tokens per draft, and every rank remained free
-of OOMs, restarts, and fatal-log matches.
+contains the commands, source contract, and receipts. The four images stored
+and restored 8,192 tokens across a coordinated restart in 147.2--194.0 ms per
+rank. The restored request completed in 1.509 seconds. A semantic canary
+matched, DFlash produced seven tokens per draft, and all ranks remained free of
+OOMs, restarts, and fatal-log matches.
 
-## Known limitations
+## Qualification boundary
 
-- No throughput-neutrality claim or span larger than 8,192 tokens is qualified.
-- MTP, other topologies, other checkpoints, native restore, and streaming
-  snapshots are not qualified by this image record.
-- Parent images are not publicly reproducible from this repository.
-- The target quantization repository does not identify its unquantized source
-  checkpoint revision.
-- The NCCL binary is checksum-bound but not source-commit-bound.
-- The DFlash checkpoint is CC BY-NC-ND 4.0 and is not included in the image.
+This artifact record does not qualify native direct restore, shared GPU-prefix
+leases, a span larger than 8,192 tokens, another topology, another checkpoint,
+MTP, streaming snapshots, or throughput neutrality. Native restore and shared
+GPU-prefix behavior from source revision
+`2b86fb9d02fa3595cca5caa864b81aedce44b8bb` are described in
+[`GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md`](../../GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md).
 
-## Support owner and issue tracker
+The parent images are not publicly reproducible from this repository. The
+target quantization repository does not identify its unquantized source
+revision. The DFlash checkpoint uses CC BY-NC-ND 4.0 and is not included in the
+images.
 
-SparkCache-specific issues belong at
-<https://github.com/FujitsuPolycom/sparkcache/issues>. Reproduce a problem with
-the derivative and its parent image before assigning it to vLLM, B12X, Z.AI,
-Inco AI, or NVIDIA maintainers.
+## Support
 
-## Upstream contributions
-
-Generally useful cache behavior belongs in focused SparkCache pull requests.
-Changes to vLLM block ownership, recurrent-cache semantics, or model execution
-belong in focused `local-inference-lab/vllm` pull requests with their own
-source and validation contracts.
+Report SparkCache-specific defects at
+<https://github.com/FujitsuPolycom/sparkcache/issues>. Include the derived image
+ID, parent image ID, SparkCache source digest, vLLM revision, checkpoint
+identities, and topology.

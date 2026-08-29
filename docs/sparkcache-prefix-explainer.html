@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="An interactive explanation of SparkCache's implemented exact-prefix restore and planned prefix-storage work.">
+  <meta name="description" content="An interactive explanation of SparkCache exact-prefix discovery, row-prefix aliases, verified restore, and bounded shared GPU-prefix reuse.">
   <title>SparkCache · Context restore explorer</title>
   <style>
     :root {
@@ -73,7 +73,7 @@
     .status-pill .value { display: block; color: var(--ink); font-size: 1.05rem; font-weight: 800; }
     .status-pill .label { color: var(--faint); font-size: .78rem; }
     .status-tag { display: inline-block; margin-bottom: 5px; padding: 2px 7px; border: 1px solid #267365; border-radius: 999px; color: var(--cyan); font: 800 .62rem "SFMono-Regular", Consolas, monospace; letter-spacing: .05em; text-transform: uppercase; }
-    .status-tag.planned { border-color: #7a5a2d; color: var(--amber); }
+    .status-tag.limited { border-color: #7a5a2d; color: var(--amber); }
 
     section { margin-top: 30px; padding: clamp(20px, 4vw, 36px); border: 1px solid var(--line); border-radius: var(--radius); background: linear-gradient(145deg, rgba(14, 34, 53, .94), rgba(8, 24, 39, .96)); box-shadow: var(--shadow); }
     .section-head { display: flex; justify-content: space-between; gap: 30px; align-items: end; margin-bottom: 24px; }
@@ -271,7 +271,7 @@
       <div>
         <span class="eyebrow">SparkCache in SparkRing</span>
         <h1>How conversation context is <em>stored and restored</em></h1>
-        <p class="lede">SparkCache aligns cache identity and admission to 256-token boundaries. The current branch restores the longest exact snapshot already present on every rank; it does not yet make every 256-token boundary an independently stored prefix.</p>
+        <p class="lede">SparkCache aligns cache identity and admission to 256-token boundaries. It restores the longest compatible snapshot advertised by every rank, publishes sparse aliases for row-oriented storage, and coalesces concurrent requests for one persistent prefix.</p>
       </div>
       <aside class="hero-note">
         <strong>Example configuration</strong>
@@ -280,10 +280,10 @@
     </header>
 
     <div class="status-strip" aria-label="Request summary">
-      <div class="status-pill"><span class="status-tag">Current</span><span class="value">256 tokens</span><span class="label">logical identity and admission boundary</span></div>
-      <div class="status-pill"><span class="status-tag">Current</span><span class="value">Longest exact</span><span class="label">previously published snapshot found on every rank</span></div>
-      <div class="status-pill"><span class="status-tag">Current GLM</span><span class="value">Opaque pages</span><span class="label">whole-boundary HMA snapshot, byte-partitioned on disk</span></div>
-      <div class="status-pill"><span class="status-tag planned">Planned</span><span class="value">Aliases + tails</span><span class="label">sparse prefix descriptors and incremental publication</span></div>
+      <div class="status-pill"><span class="status-tag">Implemented</span><span class="value">256 tokens</span><span class="label">logical identity and admission boundary</span></div>
+      <div class="status-pill"><span class="status-tag">Implemented</span><span class="value">Longest stored</span><span class="label">compatible boundary advertised by every rank</span></div>
+      <div class="status-pill"><span class="status-tag">Implemented</span><span class="value">Row aliases</span><span class="label">sparse authenticated metadata over durable row chunks</span></div>
+      <div class="status-pill"><span class="status-tag limited">Qualified</span><span class="value">Shared restore</span><span class="label">one GLM restore reused through C16</span></div>
     </div>
 
     <section aria-labelledby="problem-title">
@@ -324,7 +324,7 @@
     <section class="lab" aria-labelledby="lab-title">
       <div class="lab-head">
         <div class="section-head" style="margin-bottom:0">
-          <h2 id="lab-title"><span class="num">02</span> Current exact-prefix restore</h2>
+          <h2 id="lab-title"><span class="num">02</span> Longest stored-prefix restore</h2>
           <p><span class="status-tag">Implemented</span> Switch scenarios, then step through boundary hashing, exact stored-entry discovery, all-rank availability, verification, restore, and tail prefill.</p>
         </div>
         <div class="scenario-tabs" role="tablist" aria-label="Cache scenarios">
@@ -379,13 +379,13 @@
       </div>
       <div class="alias-visual">
         <article class="payload-bank">
-          <h3><span class="status-tag">Current</span> <code>per_token_rows</code></h3>
+          <h3><span class="status-tag">Implemented</span> <code>per_token_rows</code></h3>
           <p class="mini-copy">Each encoded chunk contains the owned tensor rows for one logical token interval.</p>
           <div class="file-row"><div class="file">rows A<small>0–256</small></div><div class="file">rows B<small>256–512</small></div><div class="file">rows C<small>512–768</small></div><div class="file">rows D<small>768–1024</small></div></div>
-          <p class="alias-caption">The payloads have prefix meaning. This is the safe first target for descriptors that reference an existing immutable trunk without copying its bytes.</p>
+          <p class="alias-caption">The payloads have prefix meaning. SparkCache publishes bounded <code>sparkcache-prefix-alias/v1</code> records that reference authenticated descriptor segments and existing immutable chunks without copying payload bytes.</p>
         </article>
         <article class="aliases">
-          <h3><span class="status-tag">Current GLM</span> <code>block_pages_v1</code></h3>
+          <h3><span class="status-tag limited">Unsupported aliases</span> <code>block_pages_v1</code></h3>
           <p class="mini-copy">SparkCache first encodes one opaque, exact-boundary HMA page snapshot, then divides its bytes into as many files as there are 256-token logical intervals.</p>
           <div class="alias-row"><span class="alias-name">snapshot</span><div class="refs"><span class="ref">header</span><span class="ref">all layer pages</span><span class="ref">all groups</span></div></div>
           <div class="alias-row"><span class="alias-name">on disk</span><div class="refs"><span class="ref">byte 1/4</span><span class="ref">byte 2/4</span><span class="ref">byte 3/4</span><span class="ref">byte 4/4</span></div></div>
@@ -400,9 +400,9 @@
         <p><span class="status-tag">Implemented</span> The availability map carries tiny digest advertisements. KV payload stays local to each DGX Spark and never crosses the cache network during normal restore.</p>
       </div>
       <div class="flow">
-        <article class="flow-card"><div class="icon">1</div><h3>Scheduler</h3><p>Hashes the prompt once, snapshots the exact wire-compatible digest at each eligible boundary, and scans longest-first. A candidate exists only if that exact span was published by an earlier request.</p></article>
+        <article class="flow-card"><div class="icon">1</div><h3>Scheduler</h3><p>Hashes the prompt once, snapshots the exact wire-compatible digest at each eligible boundary, and scans longest-first. A candidate can be an exact manifest or an authenticated row-prefix alias.</p></article>
         <div class="arrow" aria-hidden="true">→</div>
-        <article class="flow-card"><div class="icon">4×</div><h3>All-rank availability</h3><p>A digest is eligible only when every expected physical TP rank advertises its compatible exact manifest in the current worker generation.</p><div class="ranks"><span class="rank">rank 0</span><span class="rank">rank 1</span><span class="rank">rank 2</span><span class="rank">rank 3</span></div></article>
+        <article class="flow-card"><div class="icon">4×</div><h3>All-rank availability</h3><p>A digest is eligible only when every expected physical TP rank advertises a compatible reusable entry from the same worker-process generation.</p><div class="ranks"><span class="rank">rank 0</span><span class="rank">rank 1</span><span class="rank">rank 2</span><span class="rank">rank 3</span></div></article>
         <div class="arrow" aria-hidden="true">→</div>
         <article class="flow-card"><div class="icon">✓</div><h3>Worker verification</h3><p>Each rank independently opens its manifest, checks identity and compatibility, verifies chunk hashes, and releases restored blocks only after coordinated success.</p></article>
       </div>
@@ -420,32 +420,32 @@
       </div>
     </section>
 
-    <section aria-labelledby="roadmap-title">
+    <section aria-labelledby="limits-title">
       <div class="section-head">
-        <h2 id="roadmap-title"><span class="num">06</span> What is planned, not implemented</h2>
-        <p>These improvements build on exact-prefix discovery, but none should be inferred from the current 256-token geometry alone.</p>
+        <h2 id="limits-title"><span class="num">06</span> Storage-mode boundaries</h2>
+        <p>Implemented prefix reuse depends on payload semantics. Logical 256-token geometry alone does not make every stored object independently reusable.</p>
       </div>
       <div class="safety-grid">
-        <article class="safety-card"><strong><span class="status-tag planned">Planned</span> Sparse prefix descriptors</strong><p>Publish bounded metadata for selected earlier prefixes that references already durable payload. The safe first implementation is <code>per_token_rows</code>; opaque GLM page snapshots cannot be shortened by manifest tricks.</p></article>
-        <article class="safety-card"><strong><span class="status-tag planned">Planned</span> Tail-only publication</strong><p>Write only state created after the longest verified prefix. Today, a growing conversation can publish another complete exact-boundary snapshot, including its existing trunk.</p></article>
-        <article class="safety-card"><strong><span class="status-tag planned">Planned</span> Single-flight restore</strong><p>Let one leader restore a shared digest, publish the resulting GPU blocks through vLLM, and let concurrent followers reuse those blocks. Today, concurrent same-prefix requests may each schedule external restore work.</p></article>
+        <article class="safety-card"><strong><span class="status-tag">Implemented</span> Sparse row-prefix aliases</strong><p>Each source manifest produces bounded descriptor chains and selected earlier-prefix aliases for <code>per_token_rows</code>. Exact manifests take precedence over aliases with the same digest.</p></article>
+        <article class="safety-card"><strong><span class="status-tag limited">Unsupported</span> Tail-only publication</strong><p>A grown conversation can publish another complete snapshot. Incremental row and HMA publication require a separately specified durable format and write-accounting contract.</p></article>
+        <article class="safety-card"><strong><span class="status-tag">Implemented</span> Shared GPU-prefix lease</strong><p>One leader restores a persistent digest. After every rank verifies completion, up to sixteen waiting followers attach through ordinary vLLM block references. Two leases may remain reusable for fifteen seconds.</p></article>
       </div>
     </section>
 
     <section aria-labelledby="deployment-title">
       <div class="section-head">
         <h2 id="deployment-title"><span class="num">07</span> GLM-5.3 TP4 evidence</h2>
-        <p>The native direct-restore result is experimental performance evidence, not yet a C16 concurrency qualification.</p>
+        <p><span class="status-tag limited">Qualified</span> The exact GLM-5.3 TP4/DCP1 runtime restored one 128K prefix per rank and reused its verified GPU blocks through C16.</p>
       </div>
       <div class="evidence-grid">
         <article class="evidence-card"><strong>Exact runtime</strong><p>Four DGX Spark systems, GLM-5.3 Flash, TP4/DCP1, two host restore workers, two native placement lanes, and two 256 MiB mapped-host arenas per rank.</p></article>
         <article class="evidence-card"><strong>Recorded 128K restore</strong><p>Each rank restored 813,068,464 bytes through four native slabs. Cache service was 131.3–250.1 ms per rank; end-to-end request latency was 0.907 s.</p></article>
-        <article class="evidence-card"><strong>Correctness and remaining work</strong><p>A post-restore semantic canary matched and health remained 200. C2/C8/C16 shared, mixed-trunk, unrelated-cold, and decode-interference tests remain.</p></article>
+        <article class="evidence-card"><strong>Concurrency result</strong><p>C16 issued one 813 MiB restore per rank instead of sixteen. Pretokenized C16 completed at 2.698 s p50; the post-run semantic canary matched. Unrelated-cold C16 and decode-interference measurements remain outside the qualification evidence.</p></article>
       </div>
     </section>
 
     <footer>
-      <p>Current behavior and explicitly separated design work · 2026-08-29.</p>
+      <p>Implemented behavior, qualification boundaries, and unsupported storage modes · 2026-08-29.</p>
       <div class="source-links">
         <a href="https://github.com/FujitsuPolycom/sparkcache/tree/main">main</a>
         <a href="../ROADMAP.md">research roadmap</a>
@@ -462,7 +462,7 @@
         { label: "Step 3 · availability", title: "Find the longest stored exact entry", copy: "The scheduler checks boundary digests longest-first. It selects the first exact snapshot advertised by every expected physical TP rank—without issuing a disk read for each absent candidate." },
         { label: "Step 4 · verification", title: "Probe and verify one exact snapshot", copy: "Workers independently open the selected manifest and verify identity, committed span, record compatibility, and every referenced object hash before restored blocks can be released." },
         { label: "Step 5 · coordinated outcome", title: "Restore together or recompute together", copy: "All ranks commit to the same outcome. If one shard cannot be verified, the external restore is cancelled everywhere; no rank continues with partially trusted KV state." },
-        { label: "Step 6 · continuation", title: "Prefill the uncached tail", copy: "After a successful restore, vLLM computes the new aligned tail plus the live remainder. If this grown request is published today, SparkCache stores another complete exact-boundary snapshot; tail-only publication remains planned." }
+        { label: "Step 6 · continuation", title: "Prefill the uncached tail", copy: "After a successful restore, vLLM computes the aligned tail plus the live remainder. Publishing the grown request writes another complete snapshot; tail-only publication is unsupported." }
       ];
 
       const scenarios = {
