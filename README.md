@@ -12,7 +12,8 @@ traffic does not cross the network.
 Version `0.1.0a3` is **implemented**. GPU-free validation covers bounded
 macro-batch chunk publication, event-driven capacity maintenance when TTL
 expiry is disabled, post-commit manifest-read avoidance, and low-allocation
-prompt digests. The package artifact has no live-qualified deployment lane.
+prompt digests. The package artifact has not been qualified in a live
+deployment.
 The source-tree `glm53-flash-hybrid` profile is qualified separately for the
 exact GLM-5.3 Flash TP4/DCP1 deployment with DFlash2 using seven draft tokens
 recorded in
@@ -24,13 +25,13 @@ SparkRing commit linked from that guide.
 
 ## Published release status
 
-| Package artifact | Qualified deployment lanes | Evidence |
+| Package artifact | Qualified deployments | Evidence |
 |---|---|---|
 | [`0.1.0a2`](https://pypi.org/project/sparkcache/0.1.0a2/) | GLM-5.2 EXL3 3.5-bpw TP4/DCP4 | [`GLM52_A2_LIVE_VALIDATION.md`](GLM52_A2_LIVE_VALIDATION.md) |
 | [`0.1.0a1`](https://pypi.org/project/sparkcache/0.1.0a1/) | DeepSeek-V4-Flash-0731 TP2/DCP1, DeepSeek-V4-Flash-0731 TP4/DCP1, and GLM-5.2 EXL3 3.5-bpw TP4/DCP4 | [`MULTI_MODEL_LIVE_VALIDATION.md`](MULTI_MODEL_LIVE_VALIDATION.md) |
 
-The `0.1.0a2` DeepSeek profiles are **implemented** but have not inherited
-`0.1.0a1`'s live qualification. Qualification does not transfer to another
+The DeepSeek profiles in `0.1.0a2` are **implemented** but **unqualified** for
+that package artifact. Qualification does not transfer to another
 package version, model, topology, or vLLM source contract. Other combinations
 are implemented, research-only, or unsupported as stated in the support table.
 The wheel and source distribution for each published version match the
@@ -45,7 +46,7 @@ from PyPI:
 python -m pip install sparkcache
 ```
 
-Select the exact artifact whose recorded lane matches the deployment:
+Select the exact artifact whose qualification evidence matches the deployment:
 
 ```bash
 # GLM-5.2 TP4/DCP4
