@@ -143,9 +143,9 @@ python deploy/glm53_flash/build_image.py \
   --output-image sparkring-glm53-sparkcache:e10536a-source-arm64
 ```
 
-The first cutover candidate retains the external BF16 DFlash2 checkpoint at
-depth five. This isolates the vLLM revision from a speculative-model change.
-The second candidate uses the target checkpoint's embedded MTP layer with a
+The external-draft configuration retains the BF16 DFlash2 checkpoint at depth
+five, isolating the vLLM revision from a speculative-model change. The
+embedded-draft configuration uses the target checkpoint's MTP layer with a
 maximum depth of five. Acceptance-length adaptation is opt-in and uses an
 initial depth of three with a 32-step window when enabled.
 

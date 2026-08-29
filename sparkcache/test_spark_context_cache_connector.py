@@ -1379,6 +1379,241 @@ def _drain_store(
     assert connector.wait_for_pending_stores(timeout=timeout)
 
 
+class IntegratedPublicationAndSharingTests(unittest.TestCase):
+    """Exercise publication graphs together with restore-flight sharing."""
+
+    @staticmethod
+    def _publish_divergent_row_extensions(root: Path):
+        connector = _make_connector(
+            root,
+            0,
+            64,
+            extra_config={"spark_cache_publication_schema": "tail-cow-v1"},
+        )
+        connector.register_kv_caches(_make_pools(24, 64))
+        common = tuple(range(1024))
+        tokens_a = common + tuple(range(10_000, 11_088))
+        tokens_b = common + tuple(range(20_000, 21_088))
+        base_digest = connector._digest(list(common), 1024)
+        digest_a = connector._digest(list(tokens_a), 2048)
+        digest_b = connector._digest(list(tokens_b), 2048)
+        connector._store_one(
+            _ReqPlan(
+                "row-base",
+                base_digest,
+                1024,
+                tuple(range(4)),
+                True,
+                token_ids=common,
+            )
+        )
+        connector._store_one(
+            _ReqPlan(
+                "row-tail-a",
+                digest_a,
+                2048,
+                tuple(range(8)),
+                True,
+                token_ids=tokens_a,
+                base_context_digest=base_digest,
+                base_span_tokens=1024,
+            )
+        )
+        for tensor in connector._layer_tensors.values():
+            tensor[4:8].bitwise_xor_(0x5A)
+        connector._store_one(
+            _ReqPlan(
+                "row-tail-b",
+                digest_b,
+                2048,
+                tuple(range(8)),
+                True,
+                token_ids=tokens_b,
+                base_context_digest=base_digest,
+                base_span_tokens=1024,
+            )
+        )
+        return connector, tokens_a, tokens_b, base_digest, digest_a, digest_b
+
+    def test_tail_published_roots_share_verified_trunk_in_arrival_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector, tokens_a, tokens_b, base_digest, digest_a, digest_b = (
+                self._publish_divergent_row_extensions(Path(directory))
+            )
+            for digest in (base_digest, digest_a, digest_b):
+                connector._quorum[digest] = {0, 1, 2, 3}
+            leader = types.SimpleNamespace(
+                request_id="tail-flight-leader", prompt_token_ids=tokens_a
+            )
+            distinct = types.SimpleNamespace(
+                request_id="tail-flight-distinct", prompt_token_ids=tokens_b
+            )
+            same_root = types.SimpleNamespace(
+                request_id="tail-flight-same-root", prompt_token_ids=tokens_a
+            )
+
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(leader, 0), (2048, True)
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(distinct, 0), (None, False)
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(same_root, 0), (None, False)
+            )
+            for request in (distinct, same_root):
+                binding = connector._restore_flight_followers[request.request_id]
+                self.assertEqual(
+                    (binding.lease_digest, binding.span_tokens),
+                    (base_digest, 1024),
+                )
+
+            destination = tuple(range(8, 16))
+            connector.update_state_after_alloc(
+                leader,
+                types.SimpleNamespace(get_block_ids=lambda: (list(destination),)),
+                2048,
+            )
+            metadata = connector.build_connector_meta(_empty_scheduler_output())
+            self.assertEqual(metadata.plans[0].shared_segments, ((base_digest, 1024),))
+            self.assertTrue(connector._load_one(metadata.plans[0]))
+
+    def test_corrupt_tail_root_rejects_restore_and_retires_exact_offer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector, _tokens_a, _tokens_b, base_digest, digest_a, _digest_b = (
+                self._publish_divergent_row_extensions(Path(directory))
+            )
+            lookup = connector._store.lookup(connector._identity(0), digest_a)
+            self.assertTrue(lookup.is_hit, lookup.reason)
+            tail_descriptor = lookup._manifest["chunks"][-1]
+            tail_path = Path(directory) / "chunks" / f"{tail_descriptor['sha256']}.spcc"
+            damaged = bytearray(tail_path.read_bytes())
+            damaged[-1] ^= 1
+            tail_path.write_bytes(damaged)
+
+            restored = connector._load_one(
+                _ReqPlan(
+                    "corrupt-tail-load",
+                    digest_a,
+                    2048,
+                    tuple(range(8, 16)),
+                    False,
+                    shared_segments=((base_digest, 1024),),
+                )
+            )
+
+            self.assertFalse(restored)
+            self.assertNotIn(digest_a, connector._held)
+            self.assertFalse(
+                connector._store.lookup(connector._identity(0), digest_a).is_hit
+            )
+
+    def test_clear_once_removes_tail_graph_and_remembers_success(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connector, *_ = self._publish_divergent_row_extensions(root)
+            self.assertTrue((root / "manifests").is_dir())
+            self.assertTrue((root / "chunks").is_dir())
+            self.assertTrue((root / "prefix-index").is_dir())
+
+            self.assertTrue(connector._store.clear_once("tail-graph-reset"))
+            self.assertFalse((root / "manifests").exists())
+            self.assertFalse((root / "chunks").exists())
+            self.assertFalse((root / "prefix-index").exists())
+            self.assertFalse(connector._store.clear_once("tail-graph-reset"))
+            self.assertTrue((root / ".sparkcache-clear-once").is_dir())
+
+    def test_page_delta_roots_start_independent_exact_restore_flights(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                extra_config={
+                    "spark_cache_model_profile": "deepseek-v4-fp8-hma",
+                    "spark_cache_publication_schema": "tail-cow-v1",
+                    "spark_cache_max_pending_restores": "2",
+                },
+                tp=2,
+                dcp=1,
+                kv_cache_config=_hybrid_kv_cache_config(),
+            )
+            pools = {
+                "full": torch.arange(20 * 64 * 8, dtype=torch.int64)
+                .reshape(20, 64, 8)
+                .to(torch.uint8),
+                "compressed": torch.arange(20 * 2 * 8, dtype=torch.int64)
+                .reshape(20, 2, 8)
+                .to(torch.uint8),
+                "state": torch.arange(20 * 4 * 16, dtype=torch.float32).reshape(
+                    20, 4, 16
+                ),
+            }
+            connector.register_kv_caches(pools)
+            common = tuple(range(512))
+            tokens_a = common + tuple(range(10_000, 10_576))
+            tokens_b = common + tuple(range(20_000, 20_576))
+            base_digest = connector._digest(list(common), 512)
+            digest_a = connector._digest(list(tokens_a), 1024)
+            digest_b = connector._digest(list(tokens_b), 1024)
+            base_groups = ((3,), (4,))
+            result_groups = ((3, 5), (4, 2))
+            connector._store_one(
+                _ReqPlan(
+                    "page-base",
+                    base_digest,
+                    512,
+                    base_groups[0],
+                    True,
+                    block_ids_by_group=base_groups,
+                    token_ids=common,
+                )
+            )
+            for request_id, digest, tokens in (
+                ("page-tail-a", digest_a, tokens_a),
+                ("page-tail-b", digest_b, tokens_b),
+            ):
+                connector._store_one(
+                    _ReqPlan(
+                        request_id,
+                        digest,
+                        1024,
+                        result_groups[0],
+                        True,
+                        block_ids_by_group=result_groups,
+                        token_ids=tokens,
+                        base_context_digest=base_digest,
+                        base_span_tokens=512,
+                    )
+                )
+            for digest in (base_digest, digest_a, digest_b):
+                connector._quorum[digest] = {0, 1}
+            leader = types.SimpleNamespace(
+                request_id="page-exact-a", prompt_token_ids=tokens_a
+            )
+            divergent = types.SimpleNamespace(
+                request_id="page-exact-b", prompt_token_ids=tokens_b
+            )
+
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(leader, 0), (1024, True)
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(divergent, 0), (1024, True)
+            )
+            self.assertEqual(len(connector._restore_flights), 2)
+            self.assertNotIn(
+                divergent.request_id, connector._restore_flight_followers
+            )
+            self.assertTrue(
+                connector._store.lookup(connector._identity(0), digest_a).is_hit
+            )
+            self.assertTrue(
+                connector._store.lookup(connector._identity(0), digest_b).is_hit
+            )
+
+
 class ConnectorRoundTripTests(unittest.TestCase):
     SPAN = 1024
     BLOCK_SIZE = 64

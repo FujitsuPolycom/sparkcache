@@ -54,6 +54,32 @@ def test_e105_overlay_has_exact_preimage_and_postimage_receipts() -> None:
     assert "patches/vllm-e10536a" in recipe
 
 
+def test_e105_patch_sequence_terminates_at_attested_contract_postimages() -> None:
+    receipts = json.loads(PREIMAGES.read_text(encoding="utf-8"))
+    contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
+    accepted = {
+        record["path"]: record["accepted_sha256"]["source_built_e105"]
+        for record in contract["files"]
+    }
+    scheduler_recovery = receipts["030-sparkcache-hma-load-failure.patch"]
+    scheduler_attach = receipts["041-sparkcache-shared-prefix-attach.patch"]
+    manager_lease = receipts["040-sparkcache-shared-prefix-lease.patch"]
+
+    assert scheduler_recovery["target_path"] == scheduler_attach["target_path"]
+    assert (
+        scheduler_recovery["accepted_postimage_sha256"]["source_built_e105"]
+        == scheduler_attach["accepted_preimage_sha256"]["source_built_e105"]
+    )
+    assert (
+        scheduler_attach["accepted_postimage_sha256"]["source_built_e105"]
+        == accepted[scheduler_attach["target_path"]]
+    )
+    assert (
+        manager_lease["accepted_postimage_sha256"]["source_built_e105"]
+        == accepted[manager_lease["target_path"]]
+    )
+
+
 def test_e105_overlay_preserves_verified_or_recompute_and_shared_leases() -> None:
     recovery = (PATCH_ROOT / "030-sparkcache-hma-load-failure.patch").read_text(
         encoding="utf-8"
