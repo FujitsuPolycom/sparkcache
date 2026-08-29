@@ -2172,6 +2172,15 @@ class ManifestStore:
         source_encoded = source_path.read_bytes()
         try:
             source_manifest = json.loads(source_encoded)
+            if (
+                isinstance(source_manifest, dict)
+                and source_manifest.get("schema") == _TAIL_MANIFEST_SCHEMA
+            ):
+                source_manifest, _segments = self._resolve_tail_manifest(
+                    source_manifest,
+                    identity=identity,
+                    context_digest=source_context_digest,
+                )
             descriptors = _validate_manifest_metadata(
                 source_manifest,
                 EntryKey(identity.storage_key, source_context_digest),

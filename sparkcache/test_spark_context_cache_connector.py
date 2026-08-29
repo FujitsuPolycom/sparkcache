@@ -240,8 +240,9 @@ class CodecTests(unittest.TestCase):
     def test_incremental_prefix_digest_boundaries_are_strict(self) -> None:
         tokens = list(range(1024))
         for boundaries in ((0,), (255,), (512, 256), (256, 256), (1280,)):
-            with self.subTest(boundaries=boundaries), self.assertRaises(
-                codec.CodecError
+            with (
+                self.subTest(boundaries=boundaries),
+                self.assertRaises(codec.CodecError),
             ):
                 codec.chunk_prefix_digests(
                     tokens,
@@ -494,9 +495,7 @@ def _deepseek_tp4_hma_config() -> types.SimpleNamespace:
                 block_size=block_size,
                 storage_block_size=block_size,
                 page_size_bytes=2,
-                kv_cache_specs={
-                    name: SlidingWindowSpec(window) for name in names
-                },
+                kv_cache_specs={name: SlidingWindowSpec(window) for name in names},
             )
         groups.append(
             types.SimpleNamespace(
@@ -526,8 +525,7 @@ def _deepseek_tp4_group_tables(
 ) -> tuple[tuple[int, ...], ...]:
     required = (4, 16, 16, 256, 128)
     return tuple(
-        tuple(range(base, base + count + 1))
-        for base, count in zip(bases, required)
+        tuple(range(base, base + count + 1)) for base, count in zip(bases, required)
     )
 
 
@@ -1194,6 +1192,42 @@ class ConnectorRoundTripTests(unittest.TestCase):
 
 
 class SchedulerChunkedPrefillTests(unittest.TestCase):
+    def test_tail_store_plan_selects_longest_all_rank_base(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                block_size=64,
+                extra_config={"spark_cache_publication_schema": "tail-cow-v1"},
+                role=KVConnectorRole.SCHEDULER,
+            )
+            token_ids = list(range(1100))
+            base_digest = connector._digest(token_ids, 512)
+            connector._quorum[base_digest] = {0, 1, 2, 3}
+            output = types.SimpleNamespace(
+                scheduled_new_reqs=[
+                    types.SimpleNamespace(
+                        req_id="tail-plan",
+                        prompt_token_ids=token_ids,
+                        num_computed_tokens=0,
+                        block_ids=([10, 11, 12, 13],),
+                    )
+                ],
+                num_scheduled_tokens={"tail-plan": 1024},
+                scheduled_cached_reqs=types.SimpleNamespace(
+                    req_ids=[],
+                    resumed_req_ids=set(),
+                    num_computed_tokens=[],
+                    new_block_ids=[],
+                ),
+            )
+
+            metadata = connector.build_connector_meta(output)
+
+            self.assertEqual(len(metadata.plans), 1)
+            self.assertEqual(metadata.plans[0].base_context_digest, base_digest)
+            self.assertEqual(metadata.plans[0].base_span_tokens, 512)
+
     def test_store_plan_accumulates_full_block_table(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(Path(directory), 0, block_size=64)
@@ -1336,16 +1370,12 @@ class PrefixAliasConnectorTests(unittest.TestCase):
                 token_ids=tuple(tokens[: self.SPAN]),
             )
 
-            connector.bind_connector_metadata(
-                SparkCacheConnectorMetadata(plans=[plan])
-            )
+            connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[plan]))
             connector.wait_for_save()
             _drain_store(connector)
 
             identity = connector._identity(0)
-            self.assertFalse(
-                connector._store.lookup(identity, prefix_digest).is_hit
-            )
+            self.assertFalse(connector._store.lookup(identity, prefix_digest).is_hit)
             with mock.patch.object(
                 connector._store,
                 "lookup",
@@ -1379,9 +1409,7 @@ class PrefixAliasConnectorTests(unittest.TestCase):
                 connector.get_num_new_matched_tokens(continued, 0),
                 (self.PREFIX, True),
             )
-            self.assertEqual(
-                connector.counters["prefix_alias_scheduler_probe_hit"], 1
-            )
+            self.assertEqual(connector.counters["prefix_alias_scheduler_probe_hit"], 1)
             connector._need_load.clear()
             connector._retire_restore_flight(
                 prefix_digest,
@@ -1420,9 +1448,7 @@ class PrefixAliasConnectorTests(unittest.TestCase):
             restarted.register_kv_caches(_make_pools(40, self.BLOCK_SIZE))
             self.assertIn(exact_digest, restarted._held)
             self.assertIn(prefix_digest, restarted._held)
-            self.assertEqual(
-                restarted.counters["prefix_aliases_discovered"], 1
-            )
+            self.assertEqual(restarted.counters["prefix_aliases_discovered"], 1)
 
     def test_alias_publication_failure_preserves_exact_entry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1442,9 +1468,7 @@ class PrefixAliasConnectorTests(unittest.TestCase):
                 side_effect=OSError("alias directory unavailable")
             )
 
-            connector.bind_connector_metadata(
-                SparkCacheConnectorMetadata(plans=[plan])
-            )
+            connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[plan]))
             connector.wait_for_save()
             _drain_store(connector)
 
@@ -1486,14 +1510,9 @@ class PrefixAliasConnectorTests(unittest.TestCase):
             connector = _make_connector(root, 0, self.BLOCK_SIZE)
             identity = connector._identity(0)
             digest = "a" * 64
-            exact_path = (
-                root / "manifests" / identity.storage_key / f"{digest}.json"
-            )
+            exact_path = root / "manifests" / identity.storage_key / f"{digest}.json"
             alias_path = (
-                root
-                / "prefix-aliases"
-                / identity.storage_key
-                / f"{digest}.json"
+                root / "prefix-aliases" / identity.storage_key / f"{digest}.json"
             )
             exact_path.parent.mkdir(parents=True)
             alias_path.parent.mkdir(parents=True)
@@ -1815,7 +1834,10 @@ class CapacityPolicyConnectorTests(unittest.TestCase):
                 "low_watermark_bytes",
             ),
         ):
-            with self.subTest(config=config), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(config=config),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 with self.assertRaisesRegex(RuntimeError, message):
                     _make_connector(Path(directory), 0, extra_config=config)
 
@@ -1935,7 +1957,9 @@ class CapacityPolicyConnectorTests(unittest.TestCase):
             self.assertEqual(connector._store.maintain.call_count, 1)
             connector.shutdown()
 
-    def test_expired_entry_fails_load_without_waiting_for_periodic_cleanup(self) -> None:
+    def test_expired_entry_fails_load_without_waiting_for_periodic_cleanup(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             connector = _make_connector(
@@ -1975,9 +1999,7 @@ class StreamingCapacityHandoffTests(unittest.TestCase):
             0,
             extra_config={
                 "spark_cache_max_bytes": str(max_bytes),
-                "spark_cache_low_watermark_bytes": str(
-                    low_watermark_bytes
-                ),
+                "spark_cache_low_watermark_bytes": str(low_watermark_bytes),
             },
         )
         connector.register_kv_caches(_make_pools(8, 64))
@@ -2023,14 +2045,10 @@ class StreamingCapacityHandoffTests(unittest.TestCase):
                 marker=1,
             )
 
-            advertised_inline = connector._handoff_streaming_commits(
-                {digest: receipt}
-            )
+            advertised_inline = connector._handoff_streaming_commits({digest: receipt})
 
             self.assertEqual(advertised_inline, set())
-            self.assertTrue(
-                connector.wait_for_pending_capacity_commits(timeout=5)
-            )
+            self.assertTrue(connector.wait_for_pending_capacity_commits(timeout=5))
             self.assertIn(digest, connector._held)
             self.assertEqual(
                 connector.counters["streaming_store_committed"],
@@ -2043,9 +2061,7 @@ class StreamingCapacityHandoffTests(unittest.TestCase):
             connector = _make_connector(Path(directory), 0)
             digest = "b" * 64
 
-            advertised = connector._handoff_streaming_commits(
-                {digest: object()}
-            )
+            advertised = connector._handoff_streaming_commits({digest: object()})
 
             self.assertEqual(advertised, {digest})
             self.assertEqual(connector._held, {digest})
@@ -2071,9 +2087,7 @@ class StreamingCapacityHandoffTests(unittest.TestCase):
 
             connector._handoff_streaming_commits({digest: receipt})
 
-            self.assertTrue(
-                connector.wait_for_pending_capacity_commits(timeout=5)
-            )
+            self.assertTrue(connector.wait_for_pending_capacity_commits(timeout=5))
             self.assertNotIn(digest, connector._held)
             self.assertFalse(
                 connector._store.lookup(
@@ -2103,9 +2117,7 @@ class StreamingCapacityHandoffTests(unittest.TestCase):
                 payload_bytes=8192,
             )
             connector._handoff_streaming_commits({first: first_receipt})
-            self.assertTrue(
-                connector.wait_for_pending_capacity_commits(timeout=5)
-            )
+            self.assertTrue(connector.wait_for_pending_capacity_commits(timeout=5))
             self.assertIn(first, connector._held)
             first_bytes = connector._store.maintain(
                 CapacityPolicy(
@@ -2132,9 +2144,7 @@ class StreamingCapacityHandoffTests(unittest.TestCase):
             )
             connector._handoff_streaming_commits({second: second_receipt})
 
-            self.assertTrue(
-                connector.wait_for_pending_capacity_commits(timeout=5)
-            )
+            self.assertTrue(connector.wait_for_pending_capacity_commits(timeout=5))
             self.assertNotIn(first, connector._held)
             self.assertIn(second, connector._held)
             self.assertGreaterEqual(
@@ -2182,9 +2192,7 @@ class StreamingCapacityHandoffTests(unittest.TestCase):
                 blocker.abort()
 
             connector._capacity_wakeup.set()
-            self.assertTrue(
-                connector.wait_for_pending_capacity_commits(timeout=5)
-            )
+            self.assertTrue(connector.wait_for_pending_capacity_commits(timeout=5))
             self.assertNotIn(digest, connector._held)
             self.assertGreaterEqual(
                 connector.counters["streaming_capacity_retries"],
@@ -2214,9 +2222,7 @@ class StreamingCapacityHandoffTests(unittest.TestCase):
                 succeeded.set()
                 return report
 
-            connector._store.maintain = mock.Mock(
-                side_effect=fail_then_succeed
-            )
+            connector._store.maintain = mock.Mock(side_effect=fail_then_succeed)
             with mock.patch.object(
                 connector_module,
                 "_CAPACITY_RETRY_SECONDS",
@@ -2284,9 +2290,7 @@ class StreamingCapacityHandoffTests(unittest.TestCase):
                 succeeded.set()
                 return report
 
-            connector._store.maintain = mock.Mock(
-                side_effect=unsatisfied_then_succeed
-            )
+            connector._store.maintain = mock.Mock(side_effect=unsatisfied_then_succeed)
             with mock.patch.object(
                 connector_module,
                 "_CAPACITY_RETRY_SECONDS",
@@ -2331,9 +2335,7 @@ class StreamingCapacityHandoffTests(unittest.TestCase):
 
             connector._store.maintain = record_maintenance_thread
 
-            advertised = connector._handoff_streaming_commits(
-                {digest: invalid}
-            )
+            advertised = connector._handoff_streaming_commits({digest: invalid})
 
             self.assertEqual(advertised, set())
             self.assertNotIn(digest, connector._held)
@@ -2390,9 +2392,7 @@ class StreamingCapacityHandoffTests(unittest.TestCase):
                 self.assertNotIn(digest, connector._held)
                 self.assertEqual(connector._streaming_capacity_pending, set())
                 self.assertEqual(
-                    connector.counters[
-                        "streaming_capacity_shutdown_dropped"
-                    ],
+                    connector.counters["streaming_capacity_shutdown_dropped"],
                     1,
                 )
             finally:
@@ -2412,9 +2412,7 @@ class StreamingCapacityHandoffTests(unittest.TestCase):
                 marker=7,
             )
             connector._handoff_streaming_commits({digest: receipt})
-            self.assertTrue(
-                connector.wait_for_pending_capacity_commits(timeout=5)
-            )
+            self.assertTrue(connector.wait_for_pending_capacity_commits(timeout=5))
 
             stats = connector.get_kv_connector_stats()
             capacity = stats.data["reports"][0]["capacity"]
@@ -2464,6 +2462,63 @@ class SweepTests(unittest.TestCase):
 
 
 class AsyncStoreTests(unittest.TestCase):
+    def test_tail_publication_snapshots_only_rows_after_verified_base(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connector = _make_connector(
+                root,
+                0,
+                64,
+                extra_config={"spark_cache_publication_schema": "tail-cow-v1"},
+            )
+            connector.register_kv_caches(_make_pools(8, 64))
+            tokens = tuple(range(2048))
+            base_digest = connector._digest(list(tokens), 1024)
+            result_digest = connector._digest(list(tokens), 2048)
+            base = _ReqPlan(
+                "base",
+                base_digest,
+                1024,
+                (0, 1, 2, 3),
+                True,
+                token_ids=tokens[:1024],
+            )
+            connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[base]))
+            connector.wait_for_save()
+            self.assertTrue(connector.wait_for_pending_stores(timeout=5))
+            base_chunk_paths = set((root / "chunks").glob("*.spcc"))
+
+            extension = _ReqPlan(
+                "extension",
+                result_digest,
+                2048,
+                tuple(range(8)),
+                True,
+                token_ids=tokens,
+                base_context_digest=base_digest,
+                base_span_tokens=1024,
+            )
+            snapshot = connector._snapshot_store(extension)
+            self.assertEqual(snapshot.logical_start, 1024)
+            self.assertEqual(snapshot.positions[0], 1024)
+            connector.bind_connector_metadata(
+                SparkCacheConnectorMetadata(plans=[extension])
+            )
+            connector.wait_for_save()
+            self.assertTrue(connector.wait_for_pending_stores(timeout=5))
+
+            self.assertTrue(
+                base_chunk_paths.issubset(set((root / "chunks").glob("*.spcc")))
+            )
+            lookup = connector._store.lookup(connector._identity(0), result_digest)
+            self.assertTrue(lookup.is_hit, lookup.reason)
+            self.assertEqual(len(connector._store.restore(lookup)), 8)
+            self.assertEqual(
+                connector.counters["prefix_alias_publication_failed"],
+                0,
+            )
+            connector.shutdown()
+
     def test_under_limit_commit_does_not_reread_its_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(
@@ -2483,9 +2538,7 @@ class AsyncStoreTests(unittest.TestCase):
                     "an under-limit commit must not reread its published manifest"
                 )
             )
-            connector.bind_connector_metadata(
-                SparkCacheConnectorMetadata(plans=[plan])
-            )
+            connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[plan]))
 
             connector.wait_for_save()
             self.assertTrue(connector.wait_for_pending_stores(timeout=5))
@@ -2493,9 +2546,7 @@ class AsyncStoreTests(unittest.TestCase):
 
             self.assertIn(plan.digest, connector._held)
             self.assertEqual(connector.counters["store_committed"], 1)
-            self.assertTrue(
-                original_lookup(connector._identity(0), plan.digest).is_hit
-            )
+            self.assertTrue(original_lookup(connector._identity(0), plan.digest).is_hit)
             connector.shutdown()
 
     def test_successful_maintenance_report_identifies_evicted_commit(self) -> None:
@@ -2523,9 +2574,7 @@ class AsyncStoreTests(unittest.TestCase):
                     "a successful maintenance report is authoritative"
                 )
             )
-            connector.bind_connector_metadata(
-                SparkCacheConnectorMetadata(plans=[plan])
-            )
+            connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[plan]))
 
             connector.wait_for_save()
             self.assertTrue(connector.wait_for_pending_stores(timeout=5))
@@ -2551,9 +2600,7 @@ class AsyncStoreTests(unittest.TestCase):
             )
             connector.register_kv_caches(_make_pools(8, 64))
             plan = _ReqPlan("partial", "4" * 64, 1024, (3, 0, 5, 1), True)
-            connector.bind_connector_metadata(
-                SparkCacheConnectorMetadata(plans=[plan])
-            )
+            connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[plan]))
 
             def unlink_then_fail(_policy):
                 manifest = next((root / "manifests").rglob("*.json"))
@@ -2582,9 +2629,7 @@ class AsyncStoreTests(unittest.TestCase):
             )
             connector.register_kv_caches(_make_pools(8, 64))
             plan = _ReqPlan("estimate", "3" * 64, 1024, (3, 0, 5, 1), True)
-            connector.bind_connector_metadata(
-                SparkCacheConnectorMetadata(plans=[plan])
-            )
+            connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[plan]))
             connector.wait_for_save()
             self.assertTrue(connector.wait_for_pending_stores(timeout=5))
             connector.shutdown()
@@ -3462,9 +3507,7 @@ class AsyncRestoreTests(unittest.TestCase):
             connector = self._cohort_connector(Path(directory))
             tokens = list(range(1100))
             digest = self._offer(connector, tokens)
-            leader = types.SimpleNamespace(
-                request_id="leader", prompt_token_ids=tokens
-            )
+            leader = types.SimpleNamespace(request_id="leader", prompt_token_ids=tokens)
             follower = types.SimpleNamespace(
                 request_id="follower", prompt_token_ids=tokens
             )
@@ -3481,9 +3524,7 @@ class AsyncRestoreTests(unittest.TestCase):
                 connector.get_num_new_matched_tokens(follower, 0),
                 (None, False),
             )
-            connector.update_state_after_alloc(
-                leader, self._blocks_stub(), self.SPAN
-            )
+            connector.update_state_after_alloc(leader, self._blocks_stub(), self.SPAN)
             metadata = connector.build_connector_meta(_empty_scheduler_output())
 
             self.assertEqual([plan.request_id for plan in metadata.plans], ["leader"])
@@ -3502,9 +3543,7 @@ class AsyncRestoreTests(unittest.TestCase):
             )
             leader.status = types.SimpleNamespace(name="FINISHED_LENGTH_CAPPED")
             connector.request_finished(leader, list(self.BLOCKS))
-            self.assertEqual(
-                connector.counters["restore_flights_completed"], 1
-            )
+            self.assertEqual(connector.counters["restore_flights_completed"], 1)
             self.assertNotIn(digest, connector._restore_flights)
             # vLLM supplies the newly published local-prefix length on the
             # follower's next lookup; no second external restore is planned.
@@ -3513,7 +3552,9 @@ class AsyncRestoreTests(unittest.TestCase):
                 (0, False),
             )
 
-    def test_partially_computed_request_does_not_wait_for_zero_token_lease(self) -> None:
+    def test_partially_computed_request_does_not_wait_for_zero_token_lease(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = self._cohort_connector(Path(directory))
             tokens = list(range(1100))
@@ -3536,9 +3577,7 @@ class AsyncRestoreTests(unittest.TestCase):
                 connector.get_num_new_matched_tokens(partial, 256),
                 (0, False),
             )
-            self.assertNotIn(
-                partial.request_id, connector._restore_flight_followers
-            )
+            self.assertNotIn(partial.request_id, connector._restore_flight_followers)
 
             self.assertEqual(
                 connector.get_num_new_matched_tokens(joined_then_local, 0),
@@ -3556,7 +3595,9 @@ class AsyncRestoreTests(unittest.TestCase):
                 connector._restore_flights[digest].followers,
             )
 
-    def test_verified_flight_publishes_lease_for_joined_and_late_followers(self) -> None:
+    def test_verified_flight_publishes_lease_for_joined_and_late_followers(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = self._cohort_connector(Path(directory))
             tokens = list(range(1100))
@@ -3573,9 +3614,7 @@ class AsyncRestoreTests(unittest.TestCase):
 
             connector.get_num_new_matched_tokens(leader, 0)
             connector.get_num_new_matched_tokens(early, 0)
-            connector.update_state_after_alloc(
-                leader, self._blocks_stub(), self.SPAN
-            )
+            connector.update_state_after_alloc(leader, self._blocks_stub(), self.SPAN)
             connector.build_connector_meta(_empty_scheduler_output())
             self.assertIsNone(connector.get_shared_prefix_lease_to_publish(leader))
 
@@ -3602,7 +3641,9 @@ class AsyncRestoreTests(unittest.TestCase):
             connector.shared_prefix_lease_attached(late.request_id, digest)
             self.assertEqual(connector.counters["shared_prefix_leases_attached"], 2)
 
-    def test_shared_prefix_lease_expires_and_late_request_can_restore_again(self) -> None:
+    def test_shared_prefix_lease_expires_and_late_request_can_restore_again(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = self._cohort_connector(Path(directory))
             tokens = list(range(1100))
@@ -3611,9 +3652,7 @@ class AsyncRestoreTests(unittest.TestCase):
                 request_id="expiring-leader", prompt_token_ids=tokens
             )
             connector.get_num_new_matched_tokens(leader, 0)
-            connector.update_state_after_alloc(
-                leader, self._blocks_stub(), self.SPAN
-            )
+            connector.update_state_after_alloc(leader, self._blocks_stub(), self.SPAN)
             connector.build_connector_meta(_empty_scheduler_output())
             connector.update_connector_output(
                 types.SimpleNamespace(
@@ -3633,9 +3672,7 @@ class AsyncRestoreTests(unittest.TestCase):
                 "sparkcache.spark_context_cache_connector.time.monotonic",
                 return_value=25.001,
             ):
-                self.assertIsNone(
-                    connector.get_shared_prefix_lease_candidate(late)
-                )
+                self.assertIsNone(connector.get_shared_prefix_lease_candidate(late))
             self.assertNotIn(digest, connector._restore_flights)
             self.assertEqual(connector.counters["shared_prefix_leases_expired"], 1)
             self.assertEqual(
@@ -3652,9 +3689,7 @@ class AsyncRestoreTests(unittest.TestCase):
                 request_id="bounded-leader", prompt_token_ids=tokens
             )
             connector.get_num_new_matched_tokens(leader, 0)
-            connector.update_state_after_alloc(
-                leader, self._blocks_stub(), self.SPAN
-            )
+            connector.update_state_after_alloc(leader, self._blocks_stub(), self.SPAN)
             connector.build_connector_meta(_empty_scheduler_output())
             connector.update_connector_output(
                 types.SimpleNamespace(
@@ -3676,9 +3711,7 @@ class AsyncRestoreTests(unittest.TestCase):
                 request_id="bounded-overflow", prompt_token_ids=tokens
             )
             self.assertIsNone(connector.get_shared_prefix_lease_candidate(overflow))
-            self.assertEqual(
-                connector.counters["restore_flight_follower_overflow"], 1
-            )
+            self.assertEqual(connector.counters["restore_flight_follower_overflow"], 1)
 
     def test_shared_prefix_hot_flights_are_bounded_to_two_digests(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3706,9 +3739,7 @@ class AsyncRestoreTests(unittest.TestCase):
                     )
                 )
                 self.assertTrue(
-                    connector.shared_prefix_lease_published(
-                        leader.request_id, digest
-                    )
+                    connector.shared_prefix_lease_published(leader.request_id, digest)
                 )
 
             self.assertEqual(set(connector._restore_flights), set(digests[1:]))
@@ -3727,9 +3758,7 @@ class AsyncRestoreTests(unittest.TestCase):
             )
             connector.get_num_new_matched_tokens(leader, 0)
             connector.get_num_new_matched_tokens(follower, 0)
-            connector.update_state_after_alloc(
-                leader, self._blocks_stub(), self.SPAN
-            )
+            connector.update_state_after_alloc(leader, self._blocks_stub(), self.SPAN)
             connector.build_connector_meta(_empty_scheduler_output())
             connector.update_connector_output(
                 types.SimpleNamespace(
@@ -3740,15 +3769,15 @@ class AsyncRestoreTests(unittest.TestCase):
             connector.shared_prefix_lease_rejected(leader.request_id, digest)
 
             self.assertNotIn(digest, connector._restore_flights)
-            self.assertNotIn(
-                follower.request_id, connector._restore_flight_followers
-            )
+            self.assertNotIn(follower.request_id, connector._restore_flight_followers)
             self.assertEqual(
                 connector.get_num_new_matched_tokens(follower, 0),
                 (self.SPAN, True),
             )
 
-    def test_aborted_leader_retires_immediately_when_worker_writes_already_drained(self) -> None:
+    def test_aborted_leader_retires_immediately_when_worker_writes_already_drained(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = self._cohort_connector(Path(directory))
             tokens = list(range(1100))
@@ -3757,9 +3786,7 @@ class AsyncRestoreTests(unittest.TestCase):
                 request_id="drained-abort", prompt_token_ids=tokens
             )
             connector.get_num_new_matched_tokens(leader, 0)
-            connector.update_state_after_alloc(
-                leader, self._blocks_stub(), self.SPAN
-            )
+            connector.update_state_after_alloc(leader, self._blocks_stub(), self.SPAN)
             connector.build_connector_meta(_empty_scheduler_output())
             connector.update_connector_output(
                 types.SimpleNamespace(
@@ -3825,9 +3852,7 @@ class AsyncRestoreTests(unittest.TestCase):
                 connector.get_num_new_matched_tokens(follower, 0),
                 (None, False),
             )
-            connector.update_state_after_alloc(
-                leader, self._blocks_stub(), self.SPAN
-            )
+            connector.update_state_after_alloc(leader, self._blocks_stub(), self.SPAN)
             connector.build_connector_meta(_empty_scheduler_output())
             connector.update_connector_output(
                 types.SimpleNamespace(
@@ -3856,9 +3881,7 @@ class AsyncRestoreTests(unittest.TestCase):
             )
             connector.get_num_new_matched_tokens(leader, 0)
             connector.get_num_new_matched_tokens(follower, 0)
-            connector.update_state_after_alloc(
-                leader, self._blocks_stub(), self.SPAN
-            )
+            connector.update_state_after_alloc(leader, self._blocks_stub(), self.SPAN)
             connector.build_connector_meta(_empty_scheduler_output())
 
             connector.request_finished(leader, list(self.BLOCKS))
@@ -4316,20 +4339,10 @@ class QuorumStatsAggregationTests(unittest.TestCase):
     def test_later_report_replaces_same_rank(self) -> None:
         cls = connector_module.SparkCacheStats
         acc = cls(
-            data={
-                "reports": [
-                    {"rank": 2, "held": ["b" * 64], "generation": "first"}
-                ]
-            }
+            data={"reports": [{"rank": 2, "held": ["b" * 64], "generation": "first"}]}
         )
         acc = acc.aggregate(
-            cls(
-                data={
-                    "reports": [
-                        {"rank": 2, "held": [], "generation": "second"}
-                    ]
-                }
-            )
+            cls(data={"reports": [{"rank": 2, "held": [], "generation": "second"}]})
         )
         report = {r["rank"]: r for r in acc.data["reports"]}[2]
         self.assertEqual(report["held"], [])
@@ -4400,9 +4413,7 @@ class QuorumStatsAggregationTests(unittest.TestCase):
 
             self.assertRegex(first_report["generation"], r"[0-9a-f]{32}")
             self.assertRegex(second_report["generation"], r"[0-9a-f]{32}")
-            self.assertNotEqual(
-                first_report["generation"], second_report["generation"]
-            )
+            self.assertNotEqual(first_report["generation"], second_report["generation"])
 
     def test_duplicate_or_out_of_range_rank_reports_cannot_form_quorum(
         self,
@@ -4759,7 +4770,9 @@ class StreamingSnapshotConnectorSeamTests(unittest.TestCase):
             )
             connector.bind_connector_metadata(
                 SparkCacheConnectorMetadata(
-                    plans=[_ReqPlan("end-of-prefill", "b" * 64, 1024, (3, 0, 5, 1), True)],
+                    plans=[
+                        _ReqPlan("end-of-prefill", "b" * 64, 1024, (3, 0, 5, 1), True)
+                    ],
                     streaming_snapshot_offers=[offer],
                 )
             )
@@ -5641,9 +5654,7 @@ class DeepSeekTP4HMAPageTests(unittest.TestCase):
                 170,
             )
             source_tables = _deepseek_tp4_group_tables((1, 20, 60, 100, 500))
-            destination_tables = _deepseek_tp4_group_tables(
-                (10, 50, 100, 400, 700)
-            )
+            destination_tables = _deepseek_tp4_group_tables((10, 50, 100, 400, 700))
             for rank in range(4):
                 connector = _make_connector(
                     Path(directory) / f"rank{rank}",
@@ -5768,9 +5779,7 @@ class DeepSeekTP4HMAPageTests(unittest.TestCase):
                 dcp=1,
                 kv_cache_config=config,
             )
-            scheduler._absorb_quorum(
-                types.SimpleNamespace(kv_connector_stats=stats)
-            )
+            scheduler._absorb_quorum(types.SimpleNamespace(kv_connector_stats=stats))
             self.assertTrue(scheduler._has_full_quorum(digest))
             scheduler._quorum[digest].discard(3)
             self.assertFalse(scheduler._has_full_quorum(digest))

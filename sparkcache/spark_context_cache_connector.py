@@ -166,12 +166,11 @@ def _load_native_components() -> SimpleNamespace:
         ArenaMode=placement.ArenaMode,
         RecordKind=placement.RecordKind,
         execute_native_restore=restore.execute_native_restore,
-        execute_native_hybrid_placement=(
-            hybrid_restore.execute_native_hybrid_restore
-        ),
+        execute_native_hybrid_placement=(hybrid_restore.execute_native_hybrid_restore),
         bind_page_reference=binding.bind_page_reference,
         hybrid_page_cuda_capability=binding.CAP_HYBRID_PAGE_CUDA,
     )
+
 
 @dataclass
 class _ReqPlan:
@@ -186,6 +185,10 @@ class _ReqPlan:
     # commit, when ManifestStore derives authenticated sparse prefix aliases.
     # Restore plans and opaque block-page snapshots leave this empty.
     token_ids: tuple[int, ...] = ()
+    # Tail publication reuses the authenticated chunks ending at this exact
+    # stored prefix. Empty fields select ordinary full-snapshot publication.
+    base_context_digest: str = ""
+    base_span_tokens: int = 0
 
     @property
     def group_block_ids(self) -> tuple[tuple[int, ...], ...]:
@@ -271,6 +274,7 @@ class _StoreSnapshot:
     layer_bytes: dict[str, bytes]
     layer_plans: tuple[Any, ...]
     record_kinds: tuple[str, ...]
+    logical_start: int = 0
 
 
 @dataclass(frozen=True)
@@ -331,6 +335,8 @@ class _SnapshotChunks(Sequence[ContextChunk]):
         self._dcp_degree = dcp_degree
         self._chunk_tokens = chunk_tokens
         self._count = chunk_count(snapshot.plan.span_tokens, chunk_tokens)
+        if snapshot.logical_start:
+            self._count -= chunk_count(snapshot.logical_start, chunk_tokens)
         self._rows_per_chunk = chunk_tokens // dcp_degree
 
     def __len__(self) -> int:
@@ -371,8 +377,10 @@ class _SnapshotChunks(Sequence[ContextChunk]):
                 self._rows_per_chunk,
             )
         return ContextChunk(
-            logical_start=index * self._chunk_tokens,
-            logical_end=(index + 1) * self._chunk_tokens,
+            logical_start=self._snapshot.logical_start + index * self._chunk_tokens,
+            logical_end=(
+                self._snapshot.logical_start + (index + 1) * self._chunk_tokens
+            ),
             records=records,
         )
 
@@ -461,8 +469,7 @@ class SparkCacheStats(KVConnectorStats):
                     int(status.get("max_bytes", 0)) for status in capacity
                 ),
                 spark_cache_capacity_manifests_evicted=sum(
-                    int(status.get("manifests_evicted", 0))
-                    for status in capacity
+                    int(status.get("manifests_evicted", 0)) for status in capacity
                 ),
                 spark_cache_capacity_bytes_reclaimed=sum(
                     int(status.get("bytes_reclaimed", 0)) for status in capacity
@@ -472,8 +479,7 @@ class SparkCacheStats(KVConnectorStats):
                     for status in capacity
                 ),
                 spark_cache_streaming_store_evicted=sum(
-                    int(status.get("streaming_store_evicted", 0))
-                    for status in capacity
+                    int(status.get("streaming_store_evicted", 0)) for status in capacity
                 ),
                 spark_cache_capacity_invalid_streaming_receipts=sum(
                     int(status.get("invalid_streaming_receipts", 0))
@@ -524,6 +530,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._dcp_degree = config.dcp_degree
         self._profile = config.profile
         self._storage_mode = config.storage_mode
+        self._publication_schema = config.publication_schema
         self._group_topology = config.group_topology
         self._chunk_tokens = config.chunk_tokens
         self._root = config.root
@@ -570,8 +577,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     make_model_serving_runtime_factory,
                 )
 
-                _STREAMING_RUNTIME_FACTORIES[role] = (
-                    make_model_serving_runtime_factory(role.name)
+                _STREAMING_RUNTIME_FACTORIES[role] = make_model_serving_runtime_factory(
+                    role.name
                 )
             # Resolve the adapter before native import/allocation so a
             # partially configured deployment fails closed at startup.
@@ -706,6 +713,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         # Kept separate from the long-standing progress tuple so scheduler
         # checkpoint/test adapters that seed that tuple remain compatible.
         self._store_token_ids: dict[str, tuple[int, ...]] = {}
+        self._store_bases: dict[str, tuple[str, int]] = {}
         self.counters: dict[str, int] = {
             "store_committed": 0,
             "store_failed": 0,
@@ -852,6 +860,35 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             token_count=span,
         )
 
+    def _publication_base(
+        self,
+        token_ids: Sequence[int],
+        span_tokens: int,
+    ) -> tuple[str, int]:
+        """Select the longest all-rank prefix eligible for tail publication."""
+
+        if self._publication_schema != "tail-cow-v1":
+            return "", 0
+        first = (
+            (self._min_span + self._chunk_tokens - 1) // self._chunk_tokens
+        ) * self._chunk_tokens
+        if span_tokens - self._chunk_tokens < first:
+            return "", 0
+        candidates = chunk_prefix_digests(
+            token_ids,
+            self._context_digest_salt,
+            boundaries=range(first, span_tokens, self._chunk_tokens),
+        )
+        selected = next(
+            (
+                (digest, boundary)
+                for boundary, digest in reversed(candidates)
+                if self._has_full_quorum(digest)
+            ),
+            None,
+        )
+        return selected or ("", 0)
+
     def _lookup_reusable(
         self,
         identity: CacheIdentity,
@@ -922,7 +959,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         allow_empty_groups: bool = False,
     ) -> tuple[tuple[int, ...], ...]:
         groups = tuple(tuple(int(block) for block in group) for group in block_ids)
-        if not groups or (not allow_empty_groups and any(not group for group in groups)):
+        if not groups or (
+            not allow_empty_groups and any(not group for group in groups)
+        ):
             raise RuntimeError("spark-context-cache: KV-cache block table is empty")
         return groups
 
@@ -1174,9 +1213,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     # vLLM has promoted the leader and published its verified
                     # blocks into the local prefix cache. Only now may peers
                     # leave the flight and attach through ordinary lookup.
-                    self._retire_restore_flight(
-                        leader_digest, outcome="completed"
-                    )
+                    self._retire_restore_flight(leader_digest, outcome="completed")
                     return 0, False
                 if flight.dispatched:
                     # The leader cannot legitimately re-enter lookup before
@@ -1249,15 +1286,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self.counters["restore_flights_joined"] += 1
             return None, False
         active_restore_flights = sum(
-            not existing.lease_published
-            for existing in self._restore_flights.values()
+            not existing.lease_published for existing in self._restore_flights.values()
         )
-        if (
-            active_restore_flights >= self._max_pending_restores
-            or (
-                request_id not in self._need_load
-                and len(self._need_load) >= self._max_pending_restores
-            )
+        if active_restore_flights >= self._max_pending_restores or (
+            request_id not in self._need_load
+            and len(self._need_load) >= self._max_pending_restores
         ):
             self.counters["restore_skip_backlog"] = (
                 self.counters.get("restore_skip_backlog", 0) + 1
@@ -1384,6 +1417,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             if self._store_enabled and self._min_span <= span <= self._max_span:
                 digest = self._digest(token_ids, span)
                 exact_token_ids = tuple(token_ids[:span])
+                base_digest, base_span = self._publication_base(token_ids, span)
                 admitted = self._admitted.get(req_id)
                 if admitted is not None and admitted[0] == digest:
                     # The restored entry already exists on every rank. A
@@ -1425,6 +1459,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                             True,
                             block_ids_by_group=group_blocks,
                             token_ids=exact_token_ids,
+                            base_context_digest=base_digest,
+                            base_span_tokens=base_span,
                         )
                     )
                 else:
@@ -1438,12 +1474,15 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         [list(group) for group in group_blocks],
                     )
                     self._store_token_ids[req_id] = exact_token_ids
+                    if base_digest:
+                        self._store_bases[req_id] = (base_digest, base_span)
         cached = scheduler_output.scheduled_cached_reqs
         for index, req_id in enumerate(cached.req_ids):
             if req_id not in self._store_progress:
                 continue
             digest, span, done, blocks_by_group = self._store_progress[req_id]
             exact_token_ids = self._store_token_ids.get(req_id, ())
+            base_digest, base_span = self._store_bases.get(req_id, ("", 0))
             new_block_ids = cached.new_block_ids[index]
             appended = (
                 [
@@ -1476,6 +1515,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 if done >= span:
                     del self._store_progress[req_id]
                     self._store_token_ids.pop(req_id, None)
+                    self._store_bases.pop(req_id, None)
                     if self._has_full_quorum(digest):
                         self.counters["store_skipped_quorum"] += 1
                         continue
@@ -1497,6 +1537,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             elif done >= span:
                 del self._store_progress[req_id]
                 self._store_token_ids.pop(req_id, None)
+                self._store_bases.pop(req_id, None)
                 if self._has_full_quorum(digest):
                     self.counters["store_skipped_quorum"] += 1
                     continue
@@ -1510,6 +1551,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         True,
                         block_ids_by_group=normalized,
                         token_ids=exact_token_ids,
+                        base_context_digest=base_digest,
+                        base_span_tokens=base_span,
                     )
                 )
             else:
@@ -1652,9 +1695,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         ):
             report = self._maintain_capacity(force=True)
             self._ensure_capacity_thread()
-            if (
-                (report is not None and report.skipped_busy)
-                or not bool(self._capacity_status["capacity_satisfied"])
+            if (report is not None and report.skipped_busy) or not bool(
+                self._capacity_status["capacity_satisfied"]
             ):
                 self._capacity_wakeup.set()
         if self._restore_enabled:
@@ -1794,8 +1836,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         max_slots = 0
         for group in layout.groups:
             capacities = {
-                int(self._layer_tensors[layer.name].shape[0])
-                for layer in group.layers
+                int(self._layer_tensors[layer.name].shape[0]) for layer in group.layers
             }
             if len(capacities) != 1:
                 raise RuntimeError(
@@ -1875,8 +1916,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         if not policy.enabled:
             return None
         if not force and (
-            policy.max_bytes == 0
-            or self._capacity_estimated_bytes <= policy.max_bytes
+            policy.max_bytes == 0 or self._capacity_estimated_bytes <= policy.max_bytes
         ):
             return None
         try:
@@ -1891,7 +1931,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self._reconcile_held_capacity()
             if wake_worker_on_unsatisfied:
                 self._capacity_wakeup.set()
-            logger.warning("spark-context-cache: capacity maintenance failed: %s", error)
+            logger.warning(
+                "spark-context-cache: capacity maintenance failed: %s", error
+            )
             return None
         if report.skipped_busy:
             self.counters["capacity_skipped_busy"] += 1
@@ -1931,12 +1973,15 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     getattr(entry, "root_kind", "manifest")
                 )
             for digest, evicted_roots in candidates.items():
-                exact_exists = "manifest" not in evicted_roots and (
-                    Path(self._root)
-                    / "manifests"
-                    / identity.storage_key
-                    / f"{digest}.json"
-                ).exists()
+                exact_exists = (
+                    "manifest" not in evicted_roots
+                    and (
+                        Path(self._root)
+                        / "manifests"
+                        / identity.storage_key
+                        / f"{digest}.json"
+                    ).exists()
+                )
                 alias_exists = (
                     self._storage_mode == "per_token_rows"
                     and "prefix_alias" not in evicted_roots
@@ -1990,14 +2035,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         """Maintain capacity; read back only when the outcome is ambiguous."""
 
         policy = self._capacity_policy
-        maintenance_required = (
-            policy.enabled
-            and (
-                force_maintenance
-                or (
-                    policy.max_bytes > 0
-                    and self._capacity_estimated_bytes > policy.max_bytes
-                )
+        maintenance_required = policy.enabled and (
+            force_maintenance
+            or (
+                policy.max_bytes > 0
+                and self._capacity_estimated_bytes > policy.max_bytes
             )
         )
         report = self._maintain_capacity_locked(
@@ -2005,17 +2047,23 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             wake_worker_on_unsatisfied=True,
         )
         if report is not None and not report.skipped_busy:
-            exact_evicted = EntryKey(
-                identity.storage_key,
-                context_digest,
-            ) in report.evicted_entries
+            exact_evicted = (
+                EntryKey(
+                    identity.storage_key,
+                    context_digest,
+                )
+                in report.evicted_entries
+            )
             if not exact_evicted:
                 return False
-            alias_evicted = EntryKey(
-                identity.storage_key,
-                context_digest,
-                "prefix_alias",
-            ) in report.evicted_entries
+            alias_evicted = (
+                EntryKey(
+                    identity.storage_key,
+                    context_digest,
+                    "prefix_alias",
+                )
+                in report.evicted_entries
+            )
             alias_path = (
                 Path(self._root)
                 / "prefix-aliases"
@@ -2056,18 +2104,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             raise ValueError("capacity commit bytes must be a non-negative integer")
         self._capacity_estimated_bytes += encoded_bytes
         max_bytes = self._capacity_policy.max_bytes
-        previously_satisfied = bool(
-            self._capacity_status["capacity_satisfied"]
-        )
+        previously_satisfied = bool(self._capacity_status["capacity_satisfied"])
         self._capacity_status.update(
             bytes=self._capacity_estimated_bytes,
             bytes_exact=False,
             capacity_satisfied=(
                 previously_satisfied
-                and (
-                    max_bytes == 0
-                    or self._capacity_estimated_bytes <= max_bytes
-                )
+                and (max_bytes == 0 or self._capacity_estimated_bytes <= max_bytes)
             ),
         )
 
@@ -2168,16 +2211,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
 
         with self._store_cv:
             already_advertised = {
-                digest
-                for digest, _receipt, _bytes in staged
-                if digest in self._held
+                digest for digest, _receipt, _bytes in staged if digest in self._held
             }
         queued = 0
         with self._capacity_handoff_cv:
             if self._capacity_stop.is_set():
                 self.counters["streaming_capacity_shutdown_dropped"] += len(
-                    {digest for digest, _receipt, _bytes in staged}
-                    - already_advertised
+                    {digest for digest, _receipt, _bytes in staged} - already_advertised
                 )
                 return already_advertised
             for digest, receipt, _allocated_bytes in staged:
@@ -2224,12 +2264,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 entry.accounted = True
 
             policy = self._capacity_policy
-            maintenance_required = (
-                not bool(self._capacity_status["capacity_satisfied"])
-                or (
-                    policy.max_bytes > 0
-                    and self._capacity_estimated_bytes > policy.max_bytes
-                )
+            maintenance_required = not bool(
+                self._capacity_status["capacity_satisfied"]
+            ) or (
+                policy.max_bytes > 0
+                and self._capacity_estimated_bytes > policy.max_bytes
             )
             if maintenance_required:
                 report = self._maintain_capacity_locked(force=True)
@@ -2319,18 +2358,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         # TTL expiry needs a clock-driven pass. With TTL disabled, startup
         # performs one exact scan and commit accounting wakes this worker on
         # pressure or retry; an idle timer would only rescan an unchanged tree.
-        interval = (
-            min(60, max(1, ttl_seconds // 2))
-            if ttl_seconds
-            else None
-        )
+        interval = min(60, max(1, ttl_seconds // 2)) if ttl_seconds else None
         pending: dict[str, _PendingStreamingCommit] = {}
         retry_unsatisfied = False
         while not self._capacity_stop.is_set():
             timeout = (
-                _CAPACITY_RETRY_SECONDS
-                if pending or retry_unsatisfied
-                else interval
+                _CAPACITY_RETRY_SECONDS if pending or retry_unsatisfied else interval
             )
             self._capacity_wakeup.wait(timeout=timeout)
             self._capacity_wakeup.clear()
@@ -2351,9 +2384,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     resolved = set(pending)
                     pending.clear()
                     with self._capacity_handoff_cv:
-                        self._streaming_capacity_pending.difference_update(
-                            resolved
-                        )
+                        self._streaming_capacity_pending.difference_update(resolved)
                         self._capacity_handoff_cv.notify_all()
                     retry_unsatisfied = False
                 else:
@@ -2402,9 +2433,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 if self._storage_mode == "per_token_rows":
                     roots.append(
                         (
-                            Path(self._root)
-                            / "prefix-aliases"
-                            / identity.storage_key,
+                            Path(self._root) / "prefix-aliases" / identity.storage_key,
                             True,
                         )
                     )
@@ -2919,9 +2948,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         if len(groups) != len(layout.groups):
             raise HybridCodecError("request block tables disagree with page groups")
         if self._native_restore_enabled:
-            if not self._native_adapters or not callable(
-                self._native_execute_hybrid
-            ):
+            if not self._native_adapters or not callable(self._native_execute_hybrid):
                 raise RuntimeError(
                     "native hybrid restore selected without a configured adapter"
                 )
@@ -3007,9 +3034,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 time.perf_counter_ns() - reassembly_started,
             )
         if self._native_restore_enabled:
-            if not self._native_adapters or not callable(
-                self._native_execute_hybrid
-            ):
+            if not self._native_adapters or not callable(self._native_execute_hybrid):
                 raise RuntimeError(
                     "native hybrid restore selected without a configured adapter"
                 )
@@ -3145,16 +3170,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         # The leader could only generate after vLLM published
                         # its verified external blocks. Retiring here also
                         # wakes an otherwise all-deferred follower cohort.
-                        self._retire_restore_flight(
-                            leader_digest, outcome="completed"
-                        )
+                        self._retire_restore_flight(leader_digest, outcome="completed")
                     elif flight.workers_finished:
                         # The worker writes have already drained, so an abort
                         # needs no later completion edge to release followers.
                         self.counters["restore_flight_leader_aborted"] += 1
-                        self._retire_restore_flight(
-                            leader_digest, outcome="cancelled"
-                        )
+                        self._retire_restore_flight(leader_digest, outcome="cancelled")
                     else:
                         # Worker completion owns the drain edge. Keep aborted
                         # or errored leaders reserved until that signal arrives
@@ -3168,6 +3189,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._admitted.pop(request_id, None)
         self._store_progress.pop(request_id, None)
         self._store_token_ids.pop(request_id, None)
+        self._store_bases.pop(request_id, None)
         runtime = self._streaming_runtime
         if runtime is None:
             return False, None
@@ -3389,7 +3411,14 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
 
         rank = self._worker_rank()
         identity = self._identity(rank)
-        positions = owned_positions(plan.span_tokens, self._dcp_degree, rank)
+        logical_start = plan.base_span_tokens if plan.base_context_digest else 0
+        if logical_start % self._chunk_tokens:
+            raise RuntimeError("tail publication base is not chunk-aligned")
+        positions = tuple(
+            position
+            for position in owned_positions(plan.span_tokens, self._dcp_degree, rank)
+            if position >= logical_start
+        )
         slots = local_slots_for_positions(
             positions, plan.block_ids, self._block_size, self._dcp_degree
         )
@@ -3409,6 +3438,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             layer_bytes=layer_bytes,
             layer_plans=tuple(self._plans),
             record_kinds=self._record_kinds,
+            logical_start=logical_start,
         )
 
     def _snapshot_hybrid_store(self, plan: _ReqPlan) -> _HybridStoreSnapshot:
@@ -3473,12 +3503,31 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     chunks = _SnapshotChunks(
                         snapshot, self._dcp_degree, self._chunk_tokens
                     )
-                receipt = self._store.commit(
-                    identity=snapshot.identity,
-                    context_digest=snapshot.plan.digest,
-                    chunks=chunks,
-                    span_tokens=snapshot.plan.span_tokens,
-                )
+                if snapshot.plan.base_context_digest:
+                    receipt = self._store.commit_extension(
+                        identity=snapshot.identity,
+                        base_context_digest=snapshot.plan.base_context_digest,
+                        token_ids=snapshot.plan.token_ids,
+                        identity_salt=self._context_digest_salt,
+                        tail_chunks=chunks,
+                    )
+                    if receipt.manifest_digest and (
+                        snapshot.plan.digest
+                        != self._digest(
+                            list(snapshot.plan.token_ids),
+                            snapshot.plan.span_tokens,
+                        )
+                    ):
+                        raise RuntimeError(
+                            "tail publication result digest differs from request"
+                        )
+                else:
+                    receipt = self._store.commit(
+                        identity=snapshot.identity,
+                        context_digest=snapshot.plan.digest,
+                        chunks=chunks,
+                        span_tokens=snapshot.plan.span_tokens,
+                    )
                 alias_digests = self._publish_row_prefix_aliases(snapshot)
                 with self._capacity_lock:
                     self._note_capacity_commit_locked(
@@ -3555,9 +3604,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 error,
             )
             return set()
-        self.counters["prefix_aliases_published"] += int(
-            receipt.aliases_published
-        )
+        self.counters["prefix_aliases_published"] += int(receipt.aliases_published)
         self.counters["prefix_alias_segments_published"] += int(
             receipt.segments_published
         )
@@ -3582,8 +3629,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             except Exception as error:  # noqa: BLE001 - exact commit stands
                 self.counters["prefix_alias_advertisement_failed"] += 1
                 logger.warning(
-                    "spark-context-cache: prefix alias not advertised"
-                    " digest=%s: %s",
+                    "spark-context-cache: prefix alias not advertised digest=%s: %s",
                     digest[:12],
                     error,
                 )
@@ -3648,9 +3694,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         )
         alias_digests = self._publish_row_prefix_aliases(snapshot)
         with self._capacity_lock:
-            self._note_capacity_commit_locked(
-                receipt.allocated_bytes_upper_bound
-            )
+            self._note_capacity_commit_locked(receipt.allocated_bytes_upper_bound)
             evicted = self._post_commit_was_evicted_locked(
                 snapshot.identity,
                 plan.digest,
@@ -3863,9 +3907,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             or len(held) > _QUORUM_REPORT_BATCH_SIZE
         ):
             return
-        expected_count = max(
-            1, math.ceil(held_count / _QUORUM_REPORT_BATCH_SIZE)
-        )
+        expected_count = max(1, math.ceil(held_count / _QUORUM_REPORT_BATCH_SIZE))
         expected_chunk_size = min(
             _QUORUM_REPORT_BATCH_SIZE,
             max(0, held_count - index * _QUORUM_REPORT_BATCH_SIZE),
@@ -3922,9 +3964,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         if len(chunks) != count:
             return
         reconstructed = {
-            digest
-            for chunk_index in range(count)
-            for digest in chunks[chunk_index]
+            digest for chunk_index in range(count) for digest in chunks[chunk_index]
         }
         if len(reconstructed) != held_count:
             self._worker_requires_checkpoint.add(rank)
@@ -3977,9 +4017,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             held = report.get("held")
             if not isinstance(held, list):
                 continue
-            if not self._accept_worker_generation(
-                rank, generation, generation_epoch
-            ):
+            if not self._accept_worker_generation(rank, generation, generation_epoch):
                 continue
             held_set = {digest for digest in held if isinstance(digest, str)}
             self._worker_pending_deltas.pop(rank, None)
@@ -4088,9 +4126,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
 
         checkpoint_count = max(
             1,
-            math.ceil(
-                len(self._stats_checkpoint_items) / _QUORUM_REPORT_BATCH_SIZE
-            ),
+            math.ceil(len(self._stats_checkpoint_items) / _QUORUM_REPORT_BATCH_SIZE),
         )
         checkpoint_index = self._stats_checkpoint_index
         checkpoint_start = checkpoint_index * _QUORUM_REPORT_BATCH_SIZE
@@ -4124,13 +4160,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             "checkpoint": checkpoint,
         }
         if self._stats_delta_history:
-            delta_index = self._stats_delta_cursor % len(
+            delta_index = self._stats_delta_cursor % len(self._stats_delta_history)
+            report["delta"] = dict(self._stats_delta_history[delta_index])
+            self._stats_delta_cursor = (delta_index + 1) % len(
                 self._stats_delta_history
             )
-            report["delta"] = dict(self._stats_delta_history[delta_index])
-            self._stats_delta_cursor = (
-                delta_index + 1
-            ) % len(self._stats_delta_history)
         return report
 
     def get_kv_connector_stats(self):
@@ -4161,20 +4195,14 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         if self._capacity_policy.enabled:
             capacity = dict(self._capacity_status)
             with self._capacity_handoff_cv:
-                pending_streaming_commits = len(
-                    self._streaming_capacity_pending
-                )
+                pending_streaming_commits = len(self._streaming_capacity_pending)
             capacity.update(
                 manifests_evicted=self.counters["capacity_manifests_evicted"],
                 chunks_deleted=self.counters["capacity_chunks_deleted"],
                 bytes_reclaimed=self.counters["capacity_bytes_reclaimed"],
                 pending_streaming_commits=pending_streaming_commits,
-                streaming_store_committed=self.counters[
-                    "streaming_store_committed"
-                ],
-                streaming_store_evicted=self.counters[
-                    "streaming_store_evicted"
-                ],
+                streaming_store_committed=self.counters["streaming_store_committed"],
+                streaming_store_evicted=self.counters["streaming_store_evicted"],
                 invalid_streaming_receipts=self.counters[
                     "streaming_capacity_invalid_receipts"
                 ],

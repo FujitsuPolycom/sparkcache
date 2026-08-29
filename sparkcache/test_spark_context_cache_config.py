@@ -23,6 +23,7 @@ from sparkcache.spark_context_cache_store import CacheIdentity  # noqa: E402
 
 _ABS_LIB = str((Path.cwd() / "lib.so").resolve())
 
+
 def _make_vllm_config(
     extra_config: dict[str, object] | None = None,
     tp: int = 4,
@@ -114,8 +115,8 @@ class ParseConnectorConfigTests(unittest.TestCase):
 
     def test_default_root_and_profile(self) -> None:
         vllm, _ = _make_vllm_config({"spark_cache_root": None})
-        vllm.kv_transfer_config.get_from_extra_config = (
-            lambda key, default=None: default
+        vllm.kv_transfer_config.get_from_extra_config = lambda key, default=None: (
+            default
         )
         with mock.patch.dict(
             os.environ,
@@ -131,8 +132,8 @@ class ParseConnectorConfigTests(unittest.TestCase):
 
     def test_capacity_policy_from_env(self) -> None:
         vllm, _ = _make_vllm_config()
-        vllm.kv_transfer_config.get_from_extra_config = (
-            lambda key, default=None: default
+        vllm.kv_transfer_config.get_from_extra_config = lambda key, default=None: (
+            default
         )
         with mock.patch.dict(
             os.environ,
@@ -183,6 +184,34 @@ class ParseConnectorConfigTests(unittest.TestCase):
         vllm, _ = _make_vllm_config()
         config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
         self.assertFalse(config.streaming_snapshots_enabled)
+
+    def test_tail_publication_is_opt_in_and_namespace_bound(self) -> None:
+        default_vllm, _ = _make_vllm_config()
+        tail_vllm, _ = _make_vllm_config(
+            {"spark_cache_publication_schema": "tail-cow-v1"}
+        )
+        default = cfg.parse_connector_config(
+            default_vllm,
+            default_vllm.kv_transfer_config,
+            None,
+        )
+        tail = cfg.parse_connector_config(
+            tail_vllm,
+            tail_vllm.kv_transfer_config,
+            None,
+        )
+
+        self.assertEqual(default.publication_schema, "")
+        self.assertNotIn("publication_schema", default.identity_base)
+        self.assertEqual(tail.publication_schema, "tail-cow-v1")
+        self.assertEqual(
+            tail.identity_base["publication_schema"],
+            "tail-cow-v1",
+        )
+        self.assertNotEqual(
+            default.build_identity(0, 0).storage_key,
+            tail.build_identity(0, 0).storage_key,
+        )
 
 
 class IdentityBaseTests(unittest.TestCase):
@@ -243,9 +272,7 @@ class IdentityBaseTests(unittest.TestCase):
             "chunk_tokens": config.identity_base["chunk_tokens"],
             "dcp_shard_rank": 0,
             "tp_shard_rank": 0,
-            "boundary_hidden_policy": config.identity_base[
-                "boundary_hidden_policy"
-            ],
+            "boundary_hidden_policy": config.identity_base["boundary_hidden_policy"],
             "draft_kv_policy": "separate",
         }
         expected_key = hashlib.sha256(
@@ -288,9 +315,7 @@ class IdentityBaseTests(unittest.TestCase):
         # quantization_layout must end with the topology digest
         topology_digest = cfg.kv_group_topology_digest(kv_cache_config)
         self.assertTrue(
-            config.identity_base["quantization_layout"].endswith(
-                ":" + topology_digest
-            )
+            config.identity_base["quantization_layout"].endswith(":" + topology_digest)
         )
         with self.assertRaises(TypeError):
             config.group_topology[0]["group"] = 9  # type: ignore[index]
@@ -366,9 +391,7 @@ class ErrorPathTests(unittest.TestCase):
         self.assertIn("kv_load_failure_policy must be 'recompute'", str(ctx.exception))
 
     def test_target_checkpoint_must_be_sha256(self) -> None:
-        vllm, _ = _make_vllm_config(
-            {"spark_cache_target_checkpoint_sha256": "short"}
-        )
+        vllm, _ = _make_vllm_config({"spark_cache_target_checkpoint_sha256": "short"})
         with self.assertRaises(RuntimeError) as ctx:
             cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
         self.assertIn(
@@ -377,9 +400,7 @@ class ErrorPathTests(unittest.TestCase):
         )
 
     def test_separate_draft_needs_sha256(self) -> None:
-        vllm, _ = _make_vllm_config(
-            {"spark_cache_draft_checkpoint_sha256": "short"}
-        )
+        vllm, _ = _make_vllm_config({"spark_cache_draft_checkpoint_sha256": "short"})
         with self.assertRaises(RuntimeError) as ctx:
             cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
         self.assertIn(
@@ -388,9 +409,7 @@ class ErrorPathTests(unittest.TestCase):
         )
 
     def test_colocated_draft_must_match_target(self) -> None:
-        vllm, _ = _make_vllm_config(
-            {"spark_cache_draft_policy": "colocated_target"}
-        )
+        vllm, _ = _make_vllm_config({"spark_cache_draft_policy": "colocated_target"})
         # draft_id is "2"*64 but target is "1"*64 → mismatch
         with self.assertRaises(RuntimeError) as ctx:
             cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
@@ -400,25 +419,19 @@ class ErrorPathTests(unittest.TestCase):
         )
 
     def test_scheduler_probe_must_be_valid(self) -> None:
-        vllm, _ = _make_vllm_config(
-            {"spark_cache_scheduler_probe": "invalid"}
-        )
+        vllm, _ = _make_vllm_config({"spark_cache_scheduler_probe": "invalid"})
         with self.assertRaises(RuntimeError) as ctx:
             cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
         self.assertIn("must be 'tp0' or 'none'", str(ctx.exception))
 
     def test_max_pending_restores_must_be_positive(self) -> None:
-        vllm, _ = _make_vllm_config(
-            {"spark_cache_max_pending_restores": "0"}
-        )
+        vllm, _ = _make_vllm_config({"spark_cache_max_pending_restores": "0"})
         with self.assertRaises(RuntimeError) as ctx:
             cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
         self.assertIn("must be at least 1", str(ctx.exception))
 
     def test_max_pending_restores_must_be_integer(self) -> None:
-        vllm, _ = _make_vllm_config(
-            {"spark_cache_max_pending_restores": True}
-        )
+        vllm, _ = _make_vllm_config({"spark_cache_max_pending_restores": True})
         with self.assertRaises(RuntimeError) as ctx:
             cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
         self.assertIn("must be an integer", str(ctx.exception))
@@ -511,9 +524,7 @@ class ErrorPathTests(unittest.TestCase):
             }
         )
         with self.assertRaises(RuntimeError) as ctx:
-            cfg.parse_connector_config(
-                vllm, vllm.kv_transfer_config, kv_cache_config
-            )
+            cfg.parse_connector_config(vllm, vllm.kv_transfer_config, kv_cache_config)
         self.assertIn(
             "block-page storage does not support streaming snapshots",
             str(ctx.exception),
@@ -647,9 +658,7 @@ class KvGroupTopologyTests(unittest.TestCase):
         digest = cfg.kv_group_topology_digest(kv_cache_config)
         self.assertEqual(len(digest), 64)
         # Same input → same digest
-        self.assertEqual(
-            cfg.kv_group_topology_digest(kv_cache_config), digest
-        )
+        self.assertEqual(cfg.kv_group_topology_digest(kv_cache_config), digest)
 
     def test_digest_changes_with_topology(self) -> None:
         class FullAttentionSpec:
