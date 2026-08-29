@@ -194,6 +194,7 @@ Qualified receipts:
 - `evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-128k-c2-pretokenized.json`;
 - `evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-128k-c8-pretokenized.json`;
 - `evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-128k-c16-shared-trunk-pretokenized.json`;
+- `evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-runtime.json`;
 - `evidence/glm53-flash-dflash7-bf16/post-hotlease-2b86fb9-semantic.json`.
 
 ## Repository validation
