@@ -125,10 +125,10 @@ SparkCache provides these invariants:
 | `sparkcache/streaming/` | bounded write-behind planner, block leases, native gather ring, journal, and progress runtime |
 | `sparkcache/replication/` | carrier-independent buddy-replication protocol and receiver state machine |
 | `sparkcache/runtime_patches/` | exact-hash vLLM ownership contracts |
-| `deploy/deepseek_v4/` | DeepSeek-V4 checkpoint, overlay, launch, semantic, capacity, and corruption gates |
+| `deploy/deepseek_v4/` | DeepSeek-V4 checkpoint, overlay, launch, semantic, capacity, and corruption checks |
 | `deploy/glm52_35bpw/` | GLM-5.2 EXL3 3.5-bpw TP4/DCP4 inspection-to-launch tooling |
 | `deploy/glm53_flash/` | GLM-5.3 Flash hybrid-page image and connector configuration contract |
-| `deploy/deployment_contract/` | model-neutral inspection, command, port, source identity, overlay receipt, container launch, and semantic-gate mechanics |
+| `deploy/deployment_contract/` | model-neutral inspection, command, port, source identity, overlay receipt, container launch, and semantic-check mechanics |
 
 ## Support status
 
@@ -140,7 +140,7 @@ SparkCache provides these invariants:
 | DeepSeek-V4 HMA pages at DCP2/DCP4 | **unsupported** | opaque page ownership and DSpark rolling-state sharding are undefined; see `deploy/deepseek_v4/DCP_SUPPORT.md` |
 | GLM-5.2 EXL3 3.5-bpw per-token rows at TP4/DCP4 | **qualified** | `0.1.0a1`: `MULTI_MODEL_LIVE_VALIDATION.md`, 3.39–3.95 seconds per rank; `0.1.0a2`: `GLM52_A2_LIVE_VALIDATION.md`, 3.17–4.17 seconds per rank; 225,536 restored tokens |
 | GLM-5.3 Flash hybrid pages with BF16 DFlash2 using seven draft tokens at TP4/DCP1 | **qualified** | Source-tree deployment only; `GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md`; 8,192 restored tokens in 147.2–194.0 ms per rank |
-| Native direct restore | **implemented** | checksum-attested adapter and CPU-testable ABI/layout gates; disabled in qualified DeepSeek profiles |
+| Native direct restore | **implemented** | checksum-attested adapter and CPU-testable ABI/layout checks; disabled in qualified DeepSeek profiles |
 | Streaming snapshots | **research-only** | GLM-5.2 DCP4 inventory only; not profile-general and disabled for opaque block pages |
 | Buddy replication | **research-only** | protocol/state machines implemented; network carrier absent |
 | Qwen recurrent-state persistence | **unsupported** | no profile, record schema, or live qualification |
