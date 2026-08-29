@@ -303,6 +303,9 @@ class LookupResult:
     reason: str
     manifest_digest: str = ""
     _manifest: Mapping[str, Any] | None = None
+    # Identifies the root whose authenticated metadata produced this result.
+    # It is process-local lookup state, not part of any persisted schema.
+    root_kind: str = "manifest"
 
 
 @dataclass(frozen=True, order=True)
@@ -2074,6 +2077,7 @@ class ManifestStore:
                 "hit",
                 manifest_digest=_sha256(alias_encoded),
                 _manifest=manifest,
+                root_kind="prefix_alias",
             )
         except _IncompatibleManifestError:
             return LookupResult(False, "incompatible")

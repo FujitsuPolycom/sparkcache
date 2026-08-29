@@ -1304,14 +1304,21 @@ class PrefixAliasConnectorTests(unittest.TestCase):
             self.assertFalse(
                 connector._store.lookup(identity, prefix_digest).is_hit
             )
-            alias_lookup, is_alias = connector._lookup_reusable(
-                identity,
-                prefix_digest,
-                verify_chunks=False,
-                verify_chunk_metadata=True,
-            )
+            with mock.patch.object(
+                connector._store,
+                "lookup",
+                wraps=connector._store.lookup,
+            ) as lookup:
+                alias_lookup, is_alias = connector._lookup_reusable(
+                    identity,
+                    prefix_digest,
+                    verify_chunks=False,
+                    verify_chunk_metadata=True,
+                )
+            lookup.assert_called_once()
             self.assertTrue(alias_lookup.is_hit)
             self.assertTrue(is_alias)
+            self.assertEqual(alias_lookup.root_kind, "prefix_alias")
             self.assertEqual(
                 connector._held,
                 {exact_digest, prefix_digest},

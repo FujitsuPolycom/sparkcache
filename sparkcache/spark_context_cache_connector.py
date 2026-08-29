@@ -833,11 +833,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         verify_chunks: bool = True,
         verify_chunk_metadata: bool = False,
     ) -> tuple[LookupResult, bool]:
-        """Look up an exact manifest, then a safe row-prefix alias.
+        """Look up one exact manifest or safe row-prefix alias.
 
         Exact metadata always wins, including an exact entry that is corrupt
         or incompatible. Prefix aliases are never consulted for opaque
-        block-page state or an unqualified future storage mode.
+        block-page state or any storage mode other than ``per_token_rows``.
         """
 
         lookup = self._store.lookup(
@@ -845,21 +845,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             digest,
             verify_chunks=verify_chunks,
             verify_chunk_metadata=verify_chunk_metadata,
+            storage_mode=(
+                "per_token_rows" if self._storage_mode == "per_token_rows" else None
+            ),
         )
-        if (
-            lookup.is_hit
-            or lookup.reason != "absent"
-            or self._storage_mode != "per_token_rows"
-        ):
-            return lookup, False
-        reusable = self._store.lookup(
-            identity,
-            digest,
-            verify_chunks=verify_chunks,
-            verify_chunk_metadata=verify_chunk_metadata,
-            storage_mode="per_token_rows",
-        )
-        return reusable, True
+        return lookup, lookup.root_kind == "prefix_alias"
 
     def _invalidate_reusable(
         self,
