@@ -17,6 +17,10 @@ The source-tree `glm53-flash-hybrid` profile is qualified separately for the
 exact GLM-5.3 Flash TP4/DCP1 deployment with DFlash2 using seven draft tokens
 recorded in
 [`GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md`](GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md).
+Build and connector configuration are documented in
+[`deploy/glm53_flash/README.md`](deploy/glm53_flash/README.md); the corresponding
+four-Spark cached and cache-disabled quickstarts are pinned through the
+SparkRing commit linked from that guide.
 
 ## Published release status
 
@@ -135,7 +139,7 @@ SparkCache provides these invariants:
 | DeepSeek-V4-Flash-0731 opaque HMA pages at TP4/DCP1 | **qualified** | `0.1.0a1`; `MULTI_MODEL_LIVE_VALIDATION.md`; 73,728 restored tokens in 413.9–494.6 ms per rank |
 | DeepSeek-V4 HMA pages at DCP2/DCP4 | **unsupported** | opaque page ownership and DSpark rolling-state sharding are undefined; see `deploy/deepseek_v4/DCP_SUPPORT.md` |
 | GLM-5.2 EXL3 3.5-bpw per-token rows at TP4/DCP4 | **qualified** | `0.1.0a1`: `MULTI_MODEL_LIVE_VALIDATION.md`, 3.39–3.95 seconds per rank; `0.1.0a2`: `GLM52_A2_LIVE_VALIDATION.md`, 3.17–4.17 seconds per rank; 225,536 restored tokens |
-| GLM-5.3 Flash hybrid pages with BF16 DFlash2 using seven draft tokens at TP4/DCP1 | **qualified** | Source-tree deployment only; `GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md`; 8,192 restored tokens in 142.1–165.1 ms per rank |
+| GLM-5.3 Flash hybrid pages with BF16 DFlash2 using seven draft tokens at TP4/DCP1 | **qualified** | Source-tree deployment only; `GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md`; 8,192 restored tokens in 147.2–194.0 ms per rank |
 | Native direct restore | **implemented** | checksum-attested adapter and CPU-testable ABI/layout gates; disabled in qualified DeepSeek profiles |
 | Streaming snapshots | **research-only** | GLM-5.2 DCP4 inventory only; not profile-general and disabled for opaque block pages |
 | Buddy replication | **research-only** | protocol/state machines implemented; network carrier absent |
