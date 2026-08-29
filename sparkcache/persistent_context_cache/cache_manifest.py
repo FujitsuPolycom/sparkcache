@@ -35,6 +35,10 @@ _CHUNK_MAGIC = b"SPCKV001"
 _CHUNK_PREFIX = struct.Struct("<8sII")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _COMMIT_CHUNK_BATCH_SIZE = 8
+_PREFIX_SEGMENT_DESCRIPTORS = 16
+_MAX_PREFIX_ALIASES = 64
+_PREFIX_SEGMENT_SCHEMA = "sparkcache-prefix-descriptor-segment/v1"
+_PREFIX_ALIAS_SCHEMA = "sparkcache-prefix-alias/v1"
 
 
 class _ProcessRootLock:
@@ -283,6 +287,14 @@ class ChunkReceipt:
     encoded_bytes: int
     logical_start: int
     logical_end: int
+
+
+@dataclass(frozen=True)
+class PrefixAliasReceipt:
+    source_manifest_digest: str
+    aliases_published: int
+    segments_published: int
+    alias_keys: tuple["EntryKey", ...]
 
 
 @dataclass(frozen=True)
@@ -542,7 +554,7 @@ def _publish_immutable_batch(
                         f"cannot verify existing immutable object {path}"
                     ) from error
                 if existing != payload:
-                    expected_name = f"{_sha256(payload)}.spcc"
+                    expected_name = f"{_sha256(payload)}{path.suffix}"
                     if path.name != expected_name:
                         raise CommitConflict(
                             f"different immutable object already committed at {path}"
@@ -705,6 +717,111 @@ def _validate_manifest_metadata(
     if expected_start != committed_tokens:
         raise CacheFormatError("committed token count mismatch")
     return tuple(chunks)
+
+
+def _validate_prefix_segment(
+    segment: Any,
+    *,
+    storage_key: str,
+    expected_first_chunk: int,
+) -> tuple[Mapping[str, Any], ...]:
+    if not isinstance(segment, dict):
+        raise CacheFormatError("prefix descriptor segment is not an object")
+    _strict_keys(
+        segment,
+        {
+            "schema",
+            "storage_key",
+            "parent_sha256",
+            "first_chunk_index",
+            "descriptors",
+        },
+        "prefix descriptor segment",
+    )
+    if (
+        segment["schema"] != _PREFIX_SEGMENT_SCHEMA
+        or segment["storage_key"] != storage_key
+        or type(segment["first_chunk_index"]) is not int
+        or segment["first_chunk_index"] != expected_first_chunk
+    ):
+        raise CacheFormatError("prefix descriptor segment identity differs")
+    parent = segment["parent_sha256"]
+    if parent is not None:
+        try:
+            _validate_digest(parent, "prefix segment parent_sha256")
+        except ValueError as error:
+            raise CacheFormatError(str(error)) from error
+    descriptors = segment["descriptors"]
+    if (
+        not isinstance(descriptors, list)
+        or not descriptors
+        or len(descriptors) > _PREFIX_SEGMENT_DESCRIPTORS
+    ):
+        raise CacheFormatError("prefix descriptor segment size is invalid")
+    for descriptor in descriptors:
+        if not isinstance(descriptor, dict):
+            raise CacheFormatError("prefix chunk descriptor is not an object")
+        _strict_keys(
+            descriptor,
+            {"sha256", "bytes", "logical_start", "logical_end"},
+            "prefix chunk descriptor",
+        )
+    return tuple(descriptors)
+
+
+def _validate_prefix_alias(
+    alias: Any,
+    *,
+    identity: CacheIdentity,
+    context_digest: str,
+) -> tuple[int, int, str]:
+    if not isinstance(alias, dict):
+        raise CacheFormatError("prefix alias is not an object")
+    _strict_keys(
+        alias,
+        {
+            "schema",
+            "format_abi",
+            "storage_mode",
+            "identity",
+            "context_digest",
+            "committed_tokens",
+            "chunk_count",
+            "tail_segment_sha256",
+            "source_manifest_digest",
+            "metadata_sha256",
+        },
+        "prefix alias",
+    )
+    if (
+        alias["schema"] != _PREFIX_ALIAS_SCHEMA
+        or type(alias["format_abi"]) is not int
+        or alias["format_abi"] != FORMAT_ABI
+        or alias["storage_mode"] != "per_token_rows"
+        or alias["identity"] != identity.to_wire()
+        or alias["context_digest"] != context_digest
+    ):
+        raise _IncompatibleManifestError("prefix alias identity differs")
+    committed_tokens = alias["committed_tokens"]
+    chunk_count = alias["chunk_count"]
+    if (
+        type(committed_tokens) is not int
+        or committed_tokens <= 0
+        or type(chunk_count) is not int
+        or chunk_count <= 0
+    ):
+        raise CacheFormatError("prefix alias geometry is invalid")
+    try:
+        _validate_digest(alias["tail_segment_sha256"], "tail_segment_sha256")
+        _validate_digest(alias["source_manifest_digest"], "source_manifest_digest")
+        _validate_digest(alias["metadata_sha256"], "metadata_sha256")
+    except ValueError as error:
+        raise CacheFormatError(str(error)) from error
+    authenticated = dict(alias)
+    metadata_digest = authenticated.pop("metadata_sha256")
+    if _sha256(_canonical_json(authenticated)) != metadata_digest:
+        raise CacheFormatError("prefix alias metadata checksum mismatch")
+    return committed_tokens, chunk_count, alias["tail_segment_sha256"]
 
 
 def _decode_chunk(
@@ -1269,6 +1386,185 @@ class ManifestStore:
     def _manifest_path(self, identity: CacheIdentity, context_digest: str) -> Path:
         return self.root / "manifests" / identity.storage_key / f"{context_digest}.json"
 
+    def _prefix_segment_path(
+        self, identity: CacheIdentity, segment_digest: str
+    ) -> Path:
+        return (
+            self.root
+            / "prefix-index"
+            / identity.storage_key
+            / f"{segment_digest}.spix"
+        )
+
+    def _prefix_alias_path(
+        self, identity: CacheIdentity, context_digest: str
+    ) -> Path:
+        return (
+            self.root
+            / "prefix-aliases"
+            / identity.storage_key
+            / f"{context_digest}.json"
+        )
+
+    def publish_prefix_aliases(
+        self,
+        *,
+        identity: CacheIdentity,
+        source_context_digest: str,
+        token_ids: Sequence[int],
+        identity_salt: str,
+        prefix_tokens: Sequence[int] | None = None,
+        storage_mode: str,
+    ) -> PrefixAliasReceipt:
+        """Publish aliases while preventing concurrent capacity maintenance."""
+
+        with _RootGuard(self.root, shared=True, blocking=True):
+            return self._publish_prefix_aliases(
+                identity=identity,
+                source_context_digest=source_context_digest,
+                token_ids=token_ids,
+                identity_salt=identity_salt,
+                prefix_tokens=prefix_tokens,
+                storage_mode=storage_mode,
+            )
+
+    def _publish_prefix_aliases(
+        self,
+        *,
+        identity: CacheIdentity,
+        source_context_digest: str,
+        token_ids: Sequence[int],
+        identity_salt: str,
+        prefix_tokens: Sequence[int] | None,
+        storage_mode: str,
+    ) -> PrefixAliasReceipt:
+        """Publish sparse, authenticated aliases over one exact row manifest.
+
+        Descriptor segments contain at most sixteen chunk descriptors and form
+        one content-addressed parent chain. Alias files select a token boundary
+        and a tail segment. They never rewrite chunk payloads or exact manifests.
+
+        Prefix aliases are intentionally restricted to ``per_token_rows``.
+        Opaque block-page snapshots can contain recurrent state whose validity
+        is tied to the exact snapshot boundary and therefore cannot be safely
+        shortened by metadata alone.
+        """
+
+        if storage_mode != "per_token_rows":
+            raise ValueError("prefix aliases require per_token_rows storage")
+        _validate_digest(source_context_digest, "source_context_digest")
+        source_path = self._manifest_path(identity, source_context_digest)
+        source_encoded = source_path.read_bytes()
+        try:
+            source_manifest = json.loads(source_encoded)
+            descriptors = _validate_manifest_metadata(
+                source_manifest,
+                EntryKey(identity.storage_key, source_context_digest),
+                expected_identity=identity,
+            )
+        except (json.JSONDecodeError, CacheFormatError) as error:
+            raise CacheFormatError("source manifest is not publishable") from error
+        committed_tokens = int(source_manifest["committed_tokens"])
+        if committed_tokens % identity.chunk_tokens:
+            raise ValueError("prefix alias source must end on chunk geometry")
+        if prefix_tokens is None:
+            stride = _PREFIX_SEGMENT_DESCRIPTORS * identity.chunk_tokens
+            boundaries = tuple(range(stride, committed_tokens + 1, stride))
+            if not boundaries or boundaries[-1] != committed_tokens:
+                boundaries = (*boundaries, committed_tokens)
+            boundaries = boundaries[-_MAX_PREFIX_ALIASES:]
+        else:
+            boundaries = tuple(prefix_tokens)
+            if not boundaries:
+                raise ValueError("prefix_tokens must not be empty")
+            if len(boundaries) > _MAX_PREFIX_ALIASES:
+                raise ValueError(
+                    f"at most {_MAX_PREFIX_ALIASES} prefix aliases may be published"
+                )
+            if tuple(sorted(set(boundaries))) != boundaries:
+                raise ValueError("prefix_tokens must be strictly increasing and unique")
+
+        # Digest every requested boundary and the exact source boundary in one
+        # incremental pass. This prevents a caller from pairing descriptors
+        # with unrelated tokens or supplying a forged (span, digest) tuple.
+        digest_boundaries = tuple(sorted(set((*boundaries, committed_tokens))))
+        from sparkcache.spark_context_cache_codec import chunk_prefix_digests
+
+        digests = dict(
+            chunk_prefix_digests(
+                token_ids,
+                identity_salt,
+                boundaries=digest_boundaries,
+            )
+        )
+        if digests[committed_tokens] != source_context_digest:
+            raise CommitConflict("source digest disagrees with supplied token sequence")
+        descriptor_ends = {
+            int(descriptor["logical_end"]): index + 1
+            for index, descriptor in enumerate(descriptors)
+        }
+        for boundary in boundaries:
+            if boundary not in descriptor_ends:
+                raise ValueError("prefix token boundary is not a source chunk boundary")
+
+        maximum_chunks = max(descriptor_ends[boundary] for boundary in boundaries)
+        segment_digests: list[str] = []
+        segment_objects: list[tuple[Path, bytes]] = []
+        parent_digest: str | None = None
+        for first in range(0, maximum_chunks, _PREFIX_SEGMENT_DESCRIPTORS):
+            segment = {
+                "schema": _PREFIX_SEGMENT_SCHEMA,
+                "storage_key": identity.storage_key,
+                "parent_sha256": parent_digest,
+                "first_chunk_index": first,
+                "descriptors": list(
+                    descriptors[first : first + _PREFIX_SEGMENT_DESCRIPTORS]
+                ),
+            }
+            encoded_segment = _canonical_json(segment)
+            segment_digest = _sha256(encoded_segment)
+            segment_objects.append(
+                (
+                    self._prefix_segment_path(identity, segment_digest),
+                    encoded_segment,
+                )
+            )
+            segment_digests.append(segment_digest)
+            parent_digest = segment_digest
+        _publish_immutable_batch(segment_objects)
+
+        source_manifest_digest = _sha256(source_encoded)
+        alias_keys: list[EntryKey] = []
+        for boundary in boundaries:
+            chunk_count = descriptor_ends[boundary]
+            tail_segment = segment_digests[
+                (chunk_count - 1) // _PREFIX_SEGMENT_DESCRIPTORS
+            ]
+            context_digest = digests[boundary]
+            alias = {
+                "schema": _PREFIX_ALIAS_SCHEMA,
+                "format_abi": FORMAT_ABI,
+                "storage_mode": storage_mode,
+                "identity": identity.to_wire(),
+                "context_digest": context_digest,
+                "committed_tokens": boundary,
+                "chunk_count": chunk_count,
+                "tail_segment_sha256": tail_segment,
+                "source_manifest_digest": source_manifest_digest,
+            }
+            alias["metadata_sha256"] = _sha256(_canonical_json(alias))
+            _publish_immutable(
+                self._prefix_alias_path(identity, context_digest),
+                _canonical_json(alias),
+            )
+            alias_keys.append(EntryKey(identity.storage_key, context_digest))
+        return PrefixAliasReceipt(
+            source_manifest_digest=source_manifest_digest,
+            aliases_published=len(alias_keys),
+            segments_published=len(segment_digests),
+            alias_keys=tuple(alias_keys),
+        )
+
     def begin(
         self,
         *,
@@ -1339,16 +1635,38 @@ class ManifestStore:
         *,
         verify_chunks: bool = True,
         verify_chunk_metadata: bool = False,
+        storage_mode: str | None = None,
     ) -> LookupResult:
         """With verify_chunks=False only the manifest itself is validated
         (existence, identity, descriptor structure). Setting
         verify_chunk_metadata also requires each referenced chunk file to
         exist at its declared size, but still does not read payload bytes.
         Restore always re-reads and re-hashes every chunk, so a probe-mode hit
-        can still degrade to a clean miss at restore."""
+        can still degrade to a clean miss at restore.
+
+        An exact manifest always takes precedence. When no exact manifest
+        exists, callers may explicitly select ``per_token_rows`` to consult a
+        compact prefix alias. No other storage mode can consume aliases.
+        """
         try:
             _validate_digest(context_digest, "context_digest")
-            encoded = self._manifest_path(identity, context_digest).read_bytes()
+        except ValueError:
+            return LookupResult(False, "corrupt")
+        manifest_path = self._manifest_path(identity, context_digest)
+        try:
+            encoded = manifest_path.read_bytes()
+        except FileNotFoundError:
+            if storage_mode != "per_token_rows":
+                return LookupResult(False, "absent")
+            return self._lookup_prefix_alias(
+                identity,
+                context_digest,
+                verify_chunks=verify_chunks,
+                verify_chunk_metadata=verify_chunk_metadata,
+            )
+        except OSError:
+            return LookupResult(False, "corrupt")
+        try:
             manifest = json.loads(encoded)
             chunks = _validate_manifest_metadata(
                 manifest,
@@ -1399,6 +1717,121 @@ class ManifestStore:
             )
         except _IncompatibleManifestError:
             return LookupResult(False, "incompatible")
+        except (CacheFormatError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            return LookupResult(False, "corrupt")
+
+    def _lookup_prefix_alias(
+        self,
+        identity: CacheIdentity,
+        context_digest: str,
+        *,
+        verify_chunks: bool,
+        verify_chunk_metadata: bool,
+    ) -> LookupResult:
+        try:
+            alias_encoded = self._prefix_alias_path(
+                identity, context_digest
+            ).read_bytes()
+            alias = json.loads(alias_encoded)
+            committed_tokens, chunk_count, segment_digest = _validate_prefix_alias(
+                alias,
+                identity=identity,
+                context_digest=context_digest,
+            )
+            segment_count = (
+                chunk_count + _PREFIX_SEGMENT_DESCRIPTORS - 1
+            ) // _PREFIX_SEGMENT_DESCRIPTORS
+            visited: set[str] = set()
+            reversed_segments: list[tuple[Mapping[str, Any], ...]] = []
+            for segment_index in range(segment_count - 1, -1, -1):
+                if segment_digest in visited:
+                    raise CacheFormatError("prefix descriptor chain contains a cycle")
+                visited.add(segment_digest)
+                segment_encoded = self._prefix_segment_path(
+                    identity, segment_digest
+                ).read_bytes()
+                if _sha256(segment_encoded) != segment_digest:
+                    raise CacheFormatError("prefix descriptor segment checksum mismatch")
+                segment = json.loads(segment_encoded)
+                descriptors = _validate_prefix_segment(
+                    segment,
+                    storage_key=identity.storage_key,
+                    expected_first_chunk=(
+                        segment_index * _PREFIX_SEGMENT_DESCRIPTORS
+                    ),
+                )
+                if segment_index < segment_count - 1 and (
+                    len(descriptors) != _PREFIX_SEGMENT_DESCRIPTORS
+                ):
+                    raise CacheFormatError("non-tail prefix segment is incomplete")
+                reversed_segments.append(descriptors)
+                parent = segment["parent_sha256"]
+                if segment_index == 0:
+                    if parent is not None:
+                        raise CacheFormatError("prefix descriptor chain has extra parent")
+                elif parent is None:
+                    raise CacheFormatError("prefix descriptor chain is truncated")
+                else:
+                    segment_digest = parent
+
+            ordered_segments = list(reversed(reversed_segments))
+            descriptors: list[Mapping[str, Any]] = []
+            for index, segment_descriptors in enumerate(ordered_segments):
+                remaining = chunk_count - len(descriptors)
+                take = min(len(segment_descriptors), remaining)
+                if index < len(ordered_segments) - 1:
+                    take = len(segment_descriptors)
+                descriptors.extend(segment_descriptors[:take])
+            if len(descriptors) != chunk_count:
+                raise CacheFormatError("prefix descriptor chain length differs")
+            manifest = {
+                "format_abi": FORMAT_ABI,
+                "identity": identity.to_wire(),
+                "context_digest": context_digest,
+                "committed_tokens": committed_tokens,
+                "chunks": descriptors,
+            }
+            chunks = _validate_manifest_metadata(
+                manifest,
+                EntryKey(identity.storage_key, context_digest),
+                expected_identity=identity,
+            )
+            for descriptor in chunks:
+                digest = descriptor["sha256"]
+                encoded_bytes = descriptor["bytes"]
+                logical_start = descriptor["logical_start"]
+                logical_end = descriptor["logical_end"]
+                chunk_path = self.root / "chunks" / f"{digest}.spcc"
+                if verify_chunks:
+                    encoded_chunk = chunk_path.read_bytes()
+                    if (
+                        len(encoded_chunk) != encoded_bytes
+                        or _sha256(encoded_chunk) != digest
+                    ):
+                        raise CacheFormatError("chunk checksum mismatch")
+                    chunk = _decode_chunk(encoded_chunk, verify_record_checksums=False)
+                    try:
+                        _require_complete_chunk(chunk, identity.required_records)
+                    except IncompleteEntry as error:
+                        raise CacheFormatError(str(error)) from error
+                    if (
+                        chunk.logical_start != logical_start
+                        or chunk.logical_end != logical_end
+                    ):
+                        raise CacheFormatError("chunk range disagrees with descriptor")
+                elif verify_chunk_metadata:
+                    if chunk_path.stat().st_size != encoded_bytes:
+                        raise CacheFormatError(
+                            "chunk file size disagrees with descriptor"
+                        )
+            return LookupResult(
+                True,
+                "hit",
+                manifest_digest=_sha256(alias_encoded),
+                _manifest=manifest,
+            )
+        except _IncompatibleManifestError:
+            return LookupResult(False, "incompatible")
         except FileNotFoundError:
             return LookupResult(False, "absent")
         except (CacheFormatError, OSError, TypeError, ValueError, json.JSONDecodeError):
@@ -1426,18 +1859,26 @@ class ManifestStore:
         shared by another healthy manifest.
         """
         manifest_path = self._manifest_path(identity, context_digest)
+        is_prefix_alias = False
         try:
             _validate_digest(context_digest, "context_digest")
             raw = manifest_path.read_bytes()
         except FileNotFoundError:
-            return False
+            manifest_path = self._prefix_alias_path(identity, context_digest)
+            is_prefix_alias = True
+            try:
+                raw = manifest_path.read_bytes()
+            except (OSError, ValueError):
+                return False
         except (OSError, ValueError):
             return False
-        try:
-            manifest = json.loads(raw)
-            descriptors = manifest.get("chunks", [])
-        except (json.JSONDecodeError, AttributeError):
-            descriptors = []
+        descriptors: Any = []
+        if not is_prefix_alias:
+            try:
+                manifest = json.loads(raw)
+                descriptors = manifest.get("chunks", [])
+            except (json.JSONDecodeError, AttributeError):
+                descriptors = []
         for descriptor in descriptors:
             if not isinstance(descriptor, dict):
                 continue
