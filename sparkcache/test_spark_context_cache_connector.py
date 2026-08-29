@@ -3246,6 +3246,16 @@ class AsyncRestoreTests(unittest.TestCase):
                     invalid_block_ids=set(), finished_recving={"leader"}
                 )
             )
+            self.assertIn(digest, connector._restore_flights)
+            self.assertTrue(connector._restore_flights[digest].workers_finished)
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(follower, 0),
+                (None, False),
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(leader, self.SPAN),
+                (0, False),
+            )
             self.assertNotIn(digest, connector._restore_flights)
             # vLLM supplies the newly published local-prefix length on the
             # follower's next lookup; no second external restore is planned.

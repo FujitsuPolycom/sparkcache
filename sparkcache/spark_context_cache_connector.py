@@ -193,6 +193,7 @@ class _RestoreFlight:
     followers: set[str] = field(default_factory=set)
     restored_block_ids: frozenset[int] = frozenset()
     dispatched: bool = False
+    workers_finished: bool = False
     leader_finished: bool = False
 
 
@@ -915,6 +916,17 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         if leader_digest is not None:
             flight = self._restore_flights.get(leader_digest)
             if flight is not None:
+                if (
+                    flight.workers_finished
+                    and num_computed_tokens >= flight.span_tokens
+                ):
+                    # vLLM has promoted the leader and published its verified
+                    # blocks into the local prefix cache. Only now may peers
+                    # leave the flight and attach through ordinary lookup.
+                    self._retire_restore_flight(
+                        leader_digest, outcome="completed"
+                    )
+                    return 0, False
                 if flight.dispatched:
                     # The leader cannot legitimately re-enter lookup before
                     # worker completion, but waiting is safer than creating a
@@ -3490,7 +3502,16 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         for request_id in getattr(connector_output, "finished_recving", None) or ():
             digest = self._restore_flight_leaders.get(request_id)
             if digest is not None:
-                self._retire_restore_flight(digest, outcome="completed")
+                flight = self._restore_flights.get(digest)
+                if flight is None:
+                    continue
+                if flight.leader_finished:
+                    # A finished/aborted leader is never published. Worker
+                    # completion merely proves its destination blocks are no
+                    # longer being written, so followers may recompute.
+                    self._retire_restore_flight(digest, outcome="cancelled")
+                else:
+                    flight.workers_finished = True
 
     @classmethod
     def build_kv_connector_stats(cls, data=None):
