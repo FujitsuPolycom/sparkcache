@@ -91,6 +91,7 @@ from sparkcache.spark_context_cache_store import (
     CacheIdentity,
     ContextChunk,
     EntryKey,
+    LookupResult,
     MaintenanceReport,
     ManifestStore,
     StateRecord,
@@ -177,6 +178,11 @@ class _ReqPlan:
     block_ids: tuple[int, ...]
     is_store: bool
     block_ids_by_group: tuple[tuple[int, ...], ...] = ()
+    # Store plans retain the exact token prefix whose digest names the
+    # manifest. Workers need these tokens only after a durable row snapshot
+    # commit, when ManifestStore derives authenticated sparse prefix aliases.
+    # Restore plans and opaque block-page snapshots leave this empty.
+    token_ids: tuple[int, ...] = ()
 
     @property
     def group_block_ids(self) -> tuple[tuple[int, ...], ...]:
@@ -662,6 +668,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._worker_desynchronized: set[int] = set()
         self._worker_requires_checkpoint: set[int] = set()
         self._store_progress: dict[str, tuple[str, int, int, list[list[int]]]] = {}
+        # Kept separate from the long-standing progress tuple so scheduler
+        # checkpoint/test adapters that seed that tuple remain compatible.
+        self._store_token_ids: dict[str, tuple[int, ...]] = {}
         self.counters: dict[str, int] = {
             "store_committed": 0,
             "store_failed": 0,
@@ -669,6 +678,16 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             "store_skipped_busy": 0,
             "store_skipped_present": 0,
             "store_skipped_quorum": 0,
+            "prefix_alias_publication_attempted": 0,
+            "prefix_alias_publication_failed": 0,
+            "prefix_aliases_published": 0,
+            "prefix_alias_segments_published": 0,
+            "prefix_aliases_discovered": 0,
+            "prefix_alias_scheduler_probe_hit": 0,
+            "prefix_alias_restore_hit": 0,
+            "prefix_alias_advertisement_failed": 0,
+            "prefix_alias_capacity_evicted": 0,
+            "prefix_alias_segments_deleted": 0,
             "restore_hit": 0,
             "restore_miss_absent": 0,
             "restore_miss_corrupt": 0,
@@ -792,6 +811,75 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self._context_digest_salt,
             token_count=span,
         )
+
+    def _lookup_reusable(
+        self,
+        identity: CacheIdentity,
+        digest: str,
+        *,
+        verify_chunks: bool = True,
+        verify_chunk_metadata: bool = False,
+    ) -> tuple[LookupResult, bool]:
+        """Look up an exact manifest, then a safe row-prefix alias.
+
+        Exact metadata always wins, including an exact entry that is corrupt
+        or incompatible. Prefix aliases are never consulted for opaque
+        block-page state or an unqualified future storage mode.
+        """
+
+        lookup = self._store.lookup(
+            identity,
+            digest,
+            verify_chunks=verify_chunks,
+            verify_chunk_metadata=verify_chunk_metadata,
+        )
+        if (
+            lookup.is_hit
+            or lookup.reason != "absent"
+            or self._storage_mode != "per_token_rows"
+        ):
+            return lookup, False
+        reusable = self._store.lookup(
+            identity,
+            digest,
+            verify_chunks=verify_chunks,
+            verify_chunk_metadata=verify_chunk_metadata,
+            storage_mode="per_token_rows",
+        )
+        return reusable, True
+
+    def _invalidate_reusable(
+        self,
+        identity: CacheIdentity,
+        digest: str,
+        *,
+        is_alias: bool,
+        verify_chunk_payloads: bool = False,
+    ) -> bool:
+        """Remove exactly the root selected by the preceding lookup.
+
+        ManifestStore invalidation is exact-first. Once lookup selected an
+        alias, deleting its path directly avoids a concurrent exact commit
+        with the same digest being mistaken for the failed alias.
+        """
+
+        if not is_alias:
+            return self._store.invalidate(
+                identity,
+                digest,
+                verify_chunk_payloads=verify_chunk_payloads,
+            )
+        alias_path = (
+            Path(self._root)
+            / "prefix-aliases"
+            / identity.storage_key
+            / f"{digest}.json"
+        )
+        try:
+            alias_path.unlink()
+            return True
+        except OSError:
+            return False
 
     def _aligned_span(self, prompt_len: int) -> int:
         span = (prompt_len - 1) // self._block_size * self._block_size
@@ -1007,14 +1095,18 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             )
             return 0, False
         if self._scheduler_probe == "tp0":
-            lookup = self._store.lookup(
-                self._identity(self._shard_rank), digest, verify_chunks=False
+            lookup, is_alias = self._lookup_reusable(
+                self._identity(self._shard_rank),
+                digest,
+                verify_chunks=False,
             )
             if not lookup.is_hit:
                 self.counters[f"restore_miss_{lookup.reason}"] = (
                     self.counters.get(f"restore_miss_{lookup.reason}", 0) + 1
                 )
                 return 0, False
+            if is_alias:
+                self.counters["prefix_alias_scheduler_probe_hit"] += 1
         # probe mode "none": quorum alone gates admission; every worker
         # validated its own manifest at discovery or commit time, and any
         # rank's load failure still degrades to a clean recompute.
@@ -1122,6 +1214,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             span = self._aligned_span(len(token_ids))
             if self._store_enabled and self._min_span <= span <= self._max_span:
                 digest = self._digest(token_ids, span)
+                exact_token_ids = tuple(token_ids[:span])
                 admitted = self._admitted.get(req_id)
                 if admitted is not None and admitted[0] == digest:
                     # The restored entry already exists on every rank. A
@@ -1152,6 +1245,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                             already,
                             [list(group) for group in group_blocks],
                         )
+                        self._store_token_ids[req_id] = exact_token_ids
                 elif already >= span:
                     meta.plans.append(
                         _ReqPlan(
@@ -1161,6 +1255,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                             block_ids,
                             True,
                             block_ids_by_group=group_blocks,
+                            token_ids=exact_token_ids,
                         )
                     )
                 else:
@@ -1173,11 +1268,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         already,
                         [list(group) for group in group_blocks],
                     )
+                    self._store_token_ids[req_id] = exact_token_ids
         cached = scheduler_output.scheduled_cached_reqs
         for index, req_id in enumerate(cached.req_ids):
             if req_id not in self._store_progress:
                 continue
             digest, span, done, blocks_by_group = self._store_progress[req_id]
+            exact_token_ids = self._store_token_ids.get(req_id, ())
             new_block_ids = cached.new_block_ids[index]
             appended = (
                 [
@@ -1209,6 +1306,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             if self._streaming_snapshots_enabled:
                 if done >= span:
                     del self._store_progress[req_id]
+                    self._store_token_ids.pop(req_id, None)
                     if self._has_full_quorum(digest):
                         self.counters["store_skipped_quorum"] += 1
                         continue
@@ -1229,6 +1327,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 )
             elif done >= span:
                 del self._store_progress[req_id]
+                self._store_token_ids.pop(req_id, None)
                 if self._has_full_quorum(digest):
                     self.counters["store_skipped_quorum"] += 1
                     continue
@@ -1241,6 +1340,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         normalized[0],
                         True,
                         block_ids_by_group=normalized,
+                        token_ids=exact_token_ids,
                     )
                 )
             else:
@@ -1641,16 +1741,55 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self.counters["capacity_manifests_evicted"] += report.manifests_evicted
         self.counters["capacity_chunks_deleted"] += report.chunks_deleted
         self.counters["capacity_bytes_reclaimed"] += report.bytes_reclaimed
+        self.counters["prefix_alias_capacity_evicted"] += int(
+            getattr(report, "aliases_evicted", 0)
+        )
+        self.counters["prefix_alias_segments_deleted"] += int(
+            getattr(report, "segments_deleted", 0)
+        )
         if report.evicted_entries:
-            rank = self._worker_rank()
-            storage_key = self._identity(rank).storage_key
-            evicted = {
-                entry.context_digest
-                for entry in report.evicted_entries
-                if entry.storage_key == storage_key
-            }
+            identity = self._identity(self._worker_rank())
+            withdrawn = set()
+            candidates: dict[str, set[str]] = {}
+            for entry in report.evicted_entries:
+                if entry.storage_key != identity.storage_key:
+                    continue
+                candidates.setdefault(entry.context_digest, set()).add(
+                    getattr(entry, "root_kind", "manifest")
+                )
+            for digest, evicted_roots in candidates.items():
+                exact_exists = "manifest" not in evicted_roots and (
+                    Path(self._root)
+                    / "manifests"
+                    / identity.storage_key
+                    / f"{digest}.json"
+                ).exists()
+                alias_exists = (
+                    self._storage_mode == "per_token_rows"
+                    and "prefix_alias" not in evicted_roots
+                    and (
+                        Path(self._root)
+                        / "prefix-aliases"
+                        / identity.storage_key
+                        / f"{digest}.json"
+                    ).exists()
+                )
+                if not exact_exists and not alias_exists:
+                    withdrawn.add(digest)
+                    continue
+                lookup, _is_alias = self._lookup_reusable(
+                    identity,
+                    digest,
+                    verify_chunks=False,
+                    verify_chunk_metadata=True,
+                )
+                if not lookup.is_hit:
+                    withdrawn.add(digest)
             with self._store_cv:
-                self._held.difference_update(evicted)
+                self._held.difference_update(withdrawn)
+        # One digest can name both an exact manifest and its source-boundary
+        # alias. The targeted checks above retain the offer when either root
+        # remains; this complete pass also catches entries removed as debris.
         self._reconcile_held_capacity()
         if not report.capacity_satisfied and wake_worker_on_unsatisfied:
             self._capacity_wakeup.set()
@@ -1672,20 +1811,57 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self,
         identity: CacheIdentity,
         context_digest: str,
+        *,
+        force_maintenance: bool = False,
     ) -> bool:
         """Maintain capacity; read back only when the outcome is ambiguous."""
 
         policy = self._capacity_policy
         maintenance_required = (
             policy.enabled
-            and policy.max_bytes > 0
-            and self._capacity_estimated_bytes > policy.max_bytes
-        )
-        report = self._maintain_capacity_locked(wake_worker_on_unsatisfied=True)
-        if report is not None and not report.skipped_busy:
-            return EntryKey(identity.storage_key, context_digest) in (
-                report.evicted_entries
+            and (
+                force_maintenance
+                or (
+                    policy.max_bytes > 0
+                    and self._capacity_estimated_bytes > policy.max_bytes
+                )
             )
+        )
+        report = self._maintain_capacity_locked(
+            force=force_maintenance,
+            wake_worker_on_unsatisfied=True,
+        )
+        if report is not None and not report.skipped_busy:
+            exact_evicted = EntryKey(
+                identity.storage_key,
+                context_digest,
+            ) in report.evicted_entries
+            if not exact_evicted:
+                return False
+            alias_evicted = EntryKey(
+                identity.storage_key,
+                context_digest,
+                "prefix_alias",
+            ) in report.evicted_entries
+            alias_path = (
+                Path(self._root)
+                / "prefix-aliases"
+                / identity.storage_key
+                / f"{context_digest}.json"
+            )
+            if (
+                self._storage_mode == "per_token_rows"
+                and not alias_evicted
+                and alias_path.exists()
+            ):
+                lookup, _is_alias = self._lookup_reusable(
+                    identity,
+                    context_digest,
+                    verify_chunks=False,
+                    verify_chunk_metadata=True,
+                )
+                return not lookup.is_hit
+            return True
         if not maintenance_required:
             return False
 
@@ -1937,16 +2113,16 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         identity = self._identity(rank)
         with self._store_cv:
             held = set(self._held)
-        surviving = {
-            digest
-            for digest in held
-            if self._store.lookup(
+        surviving = set()
+        for digest in held:
+            lookup, _is_alias = self._lookup_reusable(
                 identity,
                 digest,
                 verify_chunks=False,
                 verify_chunk_metadata=True,
-            ).is_hit
-        }
+            )
+            if lookup.is_hit:
+                surviving.add(digest)
         with self._store_cv:
             self._held.intersection_update(surviving)
 
@@ -2025,7 +2201,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self.counters["capacity_retries"] += 1
 
     def discover_manifests(self) -> dict[str, int]:
-        """Offer structurally valid manifests without reading chunk payloads.
+        """Offer structurally valid exact entries and safe row aliases.
 
         Referenced chunks must exist at their declared sizes; that metadata
         check does not fault payload pages into memory. Restore remains the
@@ -2044,12 +2220,32 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             try:
                 rank = self._worker_rank()
                 identity = self._identity(rank)
-                root = Path(self._root) / "manifests" / identity.storage_key
-                if root.is_dir():
+                roots = [
+                    (
+                        Path(self._root) / "manifests" / identity.storage_key,
+                        False,
+                    )
+                ]
+                if self._storage_mode == "per_token_rows":
+                    roots.append(
+                        (
+                            Path(self._root)
+                            / "prefix-aliases"
+                            / identity.storage_key,
+                            True,
+                        )
+                    )
+                for root, candidate_is_alias in roots:
+                    if not root.is_dir():
+                        continue
                     for manifest_path in root.glob("*.json"):
                         digest = manifest_path.stem
+                        # An exact manifest with this digest was already
+                        # considered and always shadows a same-key alias.
+                        if candidate_is_alias and digest in discovered:
+                            continue
                         checked += 1
-                        lookup = self._store.lookup(
+                        lookup, is_alias = self._lookup_reusable(
                             identity,
                             digest,
                             verify_chunks=False,
@@ -2057,15 +2253,18 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         )
                         if lookup.is_hit:
                             discovered.add(digest)
+                            if is_alias:
+                                self.counters["prefix_aliases_discovered"] += 1
                         else:
                             rejected += 1
                             # A rejected manifest is not an authority for
                             # deleting content-addressed chunks. Its
                             # descriptors may be corrupt, malicious, or name
                             # chunks shared by a healthy manifest.
-                            removed = self._store.invalidate(
+                            removed = self._invalidate_reusable(
                                 identity,
                                 digest,
+                                is_alias=(candidate_is_alias or is_alias),
                                 verify_chunk_payloads=False,
                             )
                             if not removed:
@@ -2115,22 +2314,29 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         try:
             rank = self._worker_rank()
             identity = self._identity(rank)
-            root = Path(self._root) / "manifests" / identity.storage_key
-            if not root.is_dir():
+            if not held_at_start:
                 with self._load_lock:
                     self._held.difference_update(held_at_start)
                 return {"checked": 0, "invalidated": 0}
-            for manifest_path in sorted(root.glob("*.json")):
-                digest = manifest_path.stem
+            for digest in sorted(held_at_start):
                 checked += 1
                 # restore() is the single parallel read/hash/decode pass.
-                lookup = self._store.lookup(identity, digest, verify_chunks=False)
+                lookup, is_alias = self._lookup_reusable(
+                    identity,
+                    digest,
+                    verify_chunks=False,
+                )
                 if lookup.is_hit and self._store.restore(lookup) is not None:
                     verified.add(digest)
                     continue
                 with self._load_lock:
                     self._held.discard(digest)
-                if self._store.invalidate(identity, digest):
+                if self._invalidate_reusable(
+                    identity,
+                    digest,
+                    is_alias=is_alias,
+                    verify_chunk_payloads=True,
+                ):
                     invalidated += 1
                     logger.warning(
                         "spark-context-cache: sweep invalidated %s (%s)",
@@ -2299,6 +2505,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         timing: RestoreTiming | None = None,
         native_lane: int = 0,
     ) -> bool:
+        is_alias = False
         try:
             rank = self._worker_rank()
             identity = self._identity(rank)
@@ -2321,7 +2528,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 # Restore is the integrity boundary and re-hashes every chunk in
                 # parallel. A full lookup verification here would read/hash/decode
                 # the complete context twice before installation.
-                lookup = self._store.lookup(
+                lookup, is_alias = self._lookup_reusable(
                     identity,
                     plan.digest,
                     verify_chunks=False,
@@ -2340,8 +2547,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     plan.digest[:12],
                 )
                 if lookup.reason == "corrupt":
-                    self._invalidate_after_failure(plan.digest)
+                    self._invalidate_after_failure(
+                        plan.digest,
+                        is_alias=is_alias,
+                    )
                 return False
+            if is_alias:
+                self.counters["prefix_alias_restore_hit"] += 1
             if self._storage_mode == "block_pages_v1":
                 return self._load_hybrid_pages(
                     lookup,
@@ -2388,7 +2600,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         "spark-context-cache: native load failed closed: %s",
                         error,
                     )
-                    self._invalidate_after_failure(plan.digest)
+                    self._invalidate_after_failure(
+                        plan.digest,
+                        is_alias=is_alias,
+                    )
                     return False
                 if timing is not None:
                     timing.observe(
@@ -2431,7 +2646,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             if chunks is None or len(chunks) != chunk_count(
                 plan.span_tokens, self._chunk_tokens
             ):
-                self._invalidate_after_failure(plan.digest)
+                self._invalidate_after_failure(
+                    plan.digest,
+                    is_alias=is_alias,
+                )
                 return False
             reassembly_started = time.perf_counter_ns()
             positions = owned_positions(plan.span_tokens, self._dcp_degree, rank)
@@ -2490,7 +2708,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             return True
         except (CodecError, KeyError, RuntimeError, ValueError) as error:
             logger.warning("spark-context-cache: load failed fail-closed: %s", error)
-            self._invalidate_after_failure(plan.digest)
+            self._invalidate_after_failure(
+                plan.digest,
+                is_alias=is_alias,
+            )
             return False
 
     def _load_hybrid_pages(
@@ -2673,7 +2894,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 )
         return True
 
-    def _invalidate_after_failure(self, digest: str) -> None:
+    def _invalidate_after_failure(
+        self,
+        digest: str,
+        *,
+        is_alias: bool = False,
+    ) -> None:
         """Withdraw a failed entry without re-reading payloads inline.
 
         The current request already fell back to recompute. A later publisher
@@ -2683,9 +2909,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         """
         with self._load_lock:
             self._held.discard(digest)
-        removed = self._store.invalidate(
+        removed = self._invalidate_reusable(
             self._identity(self._worker_rank()),
             digest,
+            is_alias=is_alias,
             verify_chunk_payloads=False,
         )
         if removed:
@@ -2739,6 +2966,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._pending_async_loads.pop(request_id, None)
         self._admitted.pop(request_id, None)
         self._store_progress.pop(request_id, None)
+        self._store_token_ids.pop(request_id, None)
         runtime = self._streaming_runtime
         if runtime is None:
             return False, None
@@ -3050,6 +3278,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     chunks=chunks,
                     span_tokens=snapshot.plan.span_tokens,
                 )
+                alias_digests = self._publish_row_prefix_aliases(snapshot)
                 with self._capacity_lock:
                     self._note_capacity_commit_locked(
                         receipt.allocated_bytes_upper_bound
@@ -3057,6 +3286,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     evicted = self._post_commit_was_evicted_locked(
                         snapshot.identity,
                         snapshot.plan.digest,
+                        force_maintenance=bool(alias_digests),
                     )
                     logger.info(
                         "spark-context-cache: rank %d committed %d tokens"
@@ -3071,6 +3301,14 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         snapshot.plan.digest,
                         committed=not evicted,
                         evicted=evicted,
+                        additional_digests=(
+                            self._surviving_alias_digests(
+                                snapshot.identity,
+                                alias_digests,
+                            )
+                            if not evicted
+                            else ()
+                        ),
                     )
             except Exception as error:  # noqa: BLE001 - never kill serving
                 self._finish_store(
@@ -3080,12 +3318,88 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 )
                 continue
 
+    def _publish_row_prefix_aliases(
+        self,
+        snapshot: _StoreSnapshot | _HybridStoreSnapshot,
+    ) -> set[str]:
+        """Publish sparse aliases without changing exact commit success.
+
+        Alias derivation is intentionally post-commit: its source must be a
+        durable exact row manifest. Any alias-side error is isolated and the
+        exact digest remains eligible for ordinary restore.
+        """
+
+        plan = snapshot.plan
+        if (
+            self._storage_mode != "per_token_rows"
+            or self._streaming_snapshots_enabled
+            or not plan.token_ids
+        ):
+            return set()
+        self.counters["prefix_alias_publication_attempted"] += 1
+        try:
+            receipt = self._store.publish_prefix_aliases(
+                identity=snapshot.identity,
+                source_context_digest=plan.digest,
+                token_ids=plan.token_ids,
+                identity_salt=self._context_digest_salt,
+                storage_mode="per_token_rows",
+            )
+        except Exception as error:  # noqa: BLE001 - exact entry remains usable
+            self.counters["prefix_alias_publication_failed"] += 1
+            logger.warning(
+                "spark-context-cache: prefix alias publication skipped for"
+                " exact digest=%s: %s",
+                plan.digest[:12],
+                error,
+            )
+            return set()
+        self.counters["prefix_aliases_published"] += int(
+            receipt.aliases_published
+        )
+        self.counters["prefix_alias_segments_published"] += int(
+            receipt.segments_published
+        )
+        return {entry.context_digest for entry in receipt.alias_keys}
+
+    def _surviving_alias_digests(
+        self,
+        identity: CacheIdentity,
+        digests: set[str],
+    ) -> tuple[str, ...]:
+        """Return aliases still structurally reusable after maintenance."""
+
+        surviving: list[str] = []
+        for digest in sorted(digests):
+            try:
+                lookup, _is_alias = self._lookup_reusable(
+                    identity,
+                    digest,
+                    verify_chunks=False,
+                    verify_chunk_metadata=True,
+                )
+            except Exception as error:  # noqa: BLE001 - exact commit stands
+                self.counters["prefix_alias_advertisement_failed"] += 1
+                logger.warning(
+                    "spark-context-cache: prefix alias not advertised"
+                    " digest=%s: %s",
+                    digest[:12],
+                    error,
+                )
+                continue
+            # The source-boundary alias shares the exact digest and is hidden
+            # by that exact manifest. It remains safe to advertise that key.
+            if lookup.is_hit:
+                surviving.append(digest)
+        return tuple(surviving)
+
     def _finish_store(
         self,
         digest: str,
         *,
         committed: bool,
         evicted: bool = False,
+        additional_digests: Sequence[str] = (),
         error: BaseException | None = None,
     ) -> None:
         with self._store_cv:
@@ -3095,9 +3409,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 # every byte, so no completion-time readback or global sweep
                 # is needed to make this digest eligible for quorum.
                 self._held.add(digest)
+                self._held.update(additional_digests)
                 self.counters["store_committed"] += 1
             else:
                 self._held.discard(digest)
+                self._held.difference_update(additional_digests)
                 self.counters["store_evicted" if evicted else "store_failed"] += 1
             self._store_inflight = 0
             self._store_cv.notify_all()
@@ -3129,6 +3445,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             chunks=chunks,
             span_tokens=plan.span_tokens,
         )
+        alias_digests = self._publish_row_prefix_aliases(snapshot)
         with self._capacity_lock:
             self._note_capacity_commit_locked(
                 receipt.allocated_bytes_upper_bound
@@ -3136,10 +3453,20 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             evicted = self._post_commit_was_evicted_locked(
                 snapshot.identity,
                 plan.digest,
+                force_maintenance=bool(alias_digests),
             )
             if evicted:
                 with self._store_cv:
                     self._held.discard(plan.digest)
+                    self._held.difference_update(alias_digests)
+            else:
+                surviving_aliases = self._surviving_alias_digests(
+                    snapshot.identity,
+                    alias_digests,
+                )
+                with self._store_cv:
+                    self._held.add(plan.digest)
+                    self._held.update(surviving_aliases)
         logger.info(
             "spark-context-cache: rank %d committed %d tokens digest=%s manifest=%s",
             snapshot.rank,

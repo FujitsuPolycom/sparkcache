@@ -344,8 +344,13 @@ class HybridPageRoundTripTests(unittest.TestCase):
                 source_groups[0],
                 True,
                 block_ids_by_group=source_groups,
+                token_ids=tuple(range(1024)),
             )
             connector._store_one(store_plan)
+            self.assertEqual(
+                connector.counters["prefix_alias_publication_attempted"], 0
+            )
+            self.assertFalse((Path(directory) / "prefix-aliases").exists())
             for tensor in pools.values():
                 tensor.zero_()
             state[4].fill_(777)
@@ -1187,8 +1192,10 @@ class SchedulerChunkedPrefillTests(unittest.TestCase):
             self.assertTrue(plan.is_store)
             self.assertEqual(plan.span_tokens, 1024)
             self.assertEqual(plan.block_ids, (10, 11, 12, 13))
+            self.assertEqual(plan.token_ids, tuple(token_ids[:1024]))
             self.assertEqual(meta2.offers, [])
             self.assertEqual(connector._store_progress, {})
+            self.assertEqual(connector._store_token_ids, {})
 
     def test_full_quorum_suppresses_store_before_progress_is_created(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1261,6 +1268,198 @@ class SchedulerChunkedPrefillTests(unittest.TestCase):
             self.assertEqual(metadata.plans, [])
             self.assertEqual(connector._store_progress, {})
             self.assertEqual(connector.counters["store_skipped_quorum"], 1)
+
+
+class PrefixAliasConnectorTests(unittest.TestCase):
+    SPAN = 8192
+    PREFIX = 4096
+    BLOCK_SIZE = 64
+
+    def test_row_store_advertises_and_restores_sparse_prefix_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connector = _make_connector(root, 0, self.BLOCK_SIZE)
+            pool = _make_pools(40, self.BLOCK_SIZE)
+            original = {name: tensor.clone() for name, tensor in pool.items()}
+            connector.register_kv_caches(pool)
+            tokens = list(range(self.SPAN + 100))
+            exact_digest = connector._digest(tokens, self.SPAN)
+            prefix_digest = connector._digest(tokens, self.PREFIX)
+            plan = _ReqPlan(
+                "long-turn",
+                exact_digest,
+                self.SPAN,
+                tuple(range(32)),
+                True,
+                token_ids=tuple(tokens[: self.SPAN]),
+            )
+
+            connector.bind_connector_metadata(
+                SparkCacheConnectorMetadata(plans=[plan])
+            )
+            connector.wait_for_save()
+            _drain_store(connector)
+
+            identity = connector._identity(0)
+            self.assertFalse(
+                connector._store.lookup(identity, prefix_digest).is_hit
+            )
+            alias_lookup, is_alias = connector._lookup_reusable(
+                identity,
+                prefix_digest,
+                verify_chunks=False,
+                verify_chunk_metadata=True,
+            )
+            self.assertTrue(alias_lookup.is_hit)
+            self.assertTrue(is_alias)
+            self.assertEqual(
+                connector._held,
+                {exact_digest, prefix_digest},
+            )
+            self.assertEqual(
+                connector.counters["prefix_alias_publication_attempted"], 1
+            )
+            self.assertEqual(connector.counters["prefix_aliases_published"], 2)
+
+            connector._quorum[prefix_digest] = {0, 1, 2, 3}
+            continued = types.SimpleNamespace(
+                request_id="scheduler-alias-probe",
+                prompt_token_ids=tokens[: self.PREFIX + 100],
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(continued, 0),
+                (self.PREFIX, True),
+            )
+            self.assertEqual(
+                connector.counters["prefix_alias_scheduler_probe_hit"], 1
+            )
+            connector._need_load.clear()
+            connector._retire_restore_flight(
+                prefix_digest,
+                outcome="cancelled",
+            )
+
+            for tensor in pool.values():
+                tensor.zero_()
+            load_plan = _ReqPlan(
+                "continued-turn",
+                prefix_digest,
+                self.PREFIX,
+                tuple(range(16)),
+                False,
+            )
+            self.assertTrue(connector._load_one(load_plan))
+            self.assertEqual(connector.counters["prefix_alias_restore_hit"], 1)
+            slots = codec.local_slots_for_positions(
+                codec.owned_positions(self.PREFIX, 4, 0),
+                load_plan.block_ids,
+                self.BLOCK_SIZE,
+                4,
+            )
+            slot_tensor = torch.tensor(slots, dtype=torch.long)
+            for name, width in _LAYERS.items():
+                actual = pool[name].reshape(-1, width)
+                expected = original[name].reshape(-1, width)
+                torch.testing.assert_close(
+                    actual[slot_tensor],
+                    expected[slot_tensor],
+                    rtol=0,
+                    atol=0,
+                )
+
+            restarted = _make_connector(root, 0, self.BLOCK_SIZE)
+            restarted.register_kv_caches(_make_pools(40, self.BLOCK_SIZE))
+            self.assertIn(exact_digest, restarted._held)
+            self.assertIn(prefix_digest, restarted._held)
+            self.assertEqual(
+                restarted.counters["prefix_aliases_discovered"], 1
+            )
+
+    def test_alias_publication_failure_preserves_exact_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(Path(directory), 0, self.BLOCK_SIZE)
+            connector.register_kv_caches(_make_pools(8, self.BLOCK_SIZE))
+            tokens = list(range(1024))
+            digest = connector._digest(tokens, 1024)
+            plan = _ReqPlan(
+                "exact-survives",
+                digest,
+                1024,
+                (3, 0, 5, 1),
+                True,
+                token_ids=tuple(tokens),
+            )
+            connector._store.publish_prefix_aliases = mock.Mock(
+                side_effect=OSError("alias directory unavailable")
+            )
+
+            connector.bind_connector_metadata(
+                SparkCacheConnectorMetadata(plans=[plan])
+            )
+            connector.wait_for_save()
+            _drain_store(connector)
+
+            self.assertTrue(
+                connector._store.lookup(connector._identity(0), digest).is_hit
+            )
+            self.assertIn(digest, connector._held)
+            self.assertEqual(connector.counters["store_committed"], 1)
+            self.assertEqual(connector.counters["store_failed"], 0)
+            self.assertEqual(connector.counters["prefix_alias_publication_failed"], 1)
+            self.assertEqual(connector.counters["prefix_aliases_published"], 0)
+
+    def test_streaming_snapshot_never_publishes_row_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(Path(directory), 0, self.BLOCK_SIZE)
+            connector.register_kv_caches(_make_pools(8, self.BLOCK_SIZE))
+            tokens = tuple(range(1024))
+            plan = _ReqPlan(
+                "streaming",
+                connector._digest(list(tokens), 1024),
+                1024,
+                (3, 0, 5, 1),
+                True,
+                token_ids=tokens,
+            )
+            snapshot = connector._snapshot_store(plan)
+            connector._streaming_snapshots_enabled = True
+            connector._store.publish_prefix_aliases = mock.Mock()
+
+            self.assertEqual(connector._publish_row_prefix_aliases(snapshot), set())
+            connector._store.publish_prefix_aliases.assert_not_called()
+            self.assertEqual(
+                connector.counters["prefix_alias_publication_attempted"], 0
+            )
+
+    def test_alias_invalidation_cannot_delete_same_digest_exact_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connector = _make_connector(root, 0, self.BLOCK_SIZE)
+            identity = connector._identity(0)
+            digest = "a" * 64
+            exact_path = (
+                root / "manifests" / identity.storage_key / f"{digest}.json"
+            )
+            alias_path = (
+                root
+                / "prefix-aliases"
+                / identity.storage_key
+                / f"{digest}.json"
+            )
+            exact_path.parent.mkdir(parents=True)
+            alias_path.parent.mkdir(parents=True)
+            exact_path.write_bytes(b"exact")
+            alias_path.write_bytes(b"alias")
+
+            self.assertTrue(
+                connector._invalidate_reusable(
+                    identity,
+                    digest,
+                    is_alias=True,
+                )
+            )
+            self.assertEqual(exact_path.read_bytes(), b"exact")
+            self.assertFalse(alias_path.exists())
 
 
 class StartupDiscoveryTests(unittest.TestCase):
