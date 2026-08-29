@@ -279,6 +279,51 @@ class ManifestStoreTests(unittest.TestCase):
             finally:
                 guard.__exit__(None, None, None)
 
+    def test_root_lock_timeout_is_one_budget_across_both_lock_layers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "cache" / "rank-0"
+            guard = cache_manifest._RootGuard(
+                root,
+                shared=False,
+                blocking=True,
+                timeout_seconds=30.0,
+            )
+            clock = [100.0]
+            process_lock = mock.Mock()
+
+            def acquire(**kwargs: Any) -> bool:
+                self.assertEqual(kwargs["timeout_seconds"], 30.0)
+                # Simulate process-local contention consuming more than the
+                # complete acquisition deadline before returning ownership.
+                clock[0] = 131.0
+                return True
+
+            process_lock.acquire.side_effect = acquire
+            guard._process_lock = process_lock
+            file_lock = mock.Mock()
+            file_lock.LOCK_SH = 1
+            file_lock.LOCK_EX = 2
+            file_lock.LOCK_NB = 4
+
+            with (
+                mock.patch.object(
+                    cache_manifest.time,
+                    "monotonic",
+                    side_effect=lambda: clock[0],
+                ),
+                mock.patch.object(cache_manifest.time, "sleep") as sleep,
+                mock.patch.object(cache_manifest, "_fcntl", file_lock),
+            ):
+                with self.assertRaisesRegex(
+                    BlockingIOError,
+                    "manifest root is busy",
+                ):
+                    guard.__enter__()
+
+            file_lock.flock.assert_not_called()
+            sleep.assert_not_called()
+            process_lock.release.assert_called_once_with(shared=False)
+
     def test_capacity_policy_rejects_invalid_geometry(self) -> None:
         for kwargs in (
             {"max_bytes": True},

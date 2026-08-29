@@ -148,11 +148,11 @@ with the same token is a no-op, even if cache entries were published after the
 clear. A different token requests another clear and preserves every earlier
 completion marker.
 
-Root-lock waiting is bounded to 30 seconds. A lock timeout or filesystem error
-leaves the requested token incomplete and disables persistent store, restore,
-streaming publication, and native restore for that connector process. Model
-serving can continue without persistent cache use, and a later startup retries
-the same token.
+Process-local and file-lock acquisition share one 30-second budget. A lock
+timeout or filesystem error leaves the requested token incomplete and disables
+persistent store, restore, streaming publication, and native restore for that
+connector process. Model serving can continue without persistent cache use,
+and a later startup retries the same token.
 
 The option does not change `CacheIdentity`, digest values, chunk geometry, or
 storage schemas. It is a destructive operator action scoped to the configured

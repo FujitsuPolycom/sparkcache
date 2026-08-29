@@ -418,10 +418,20 @@ class _RootGuard(AbstractContextManager["_RootGuard"]):
         self._entered = False
 
     def __enter__(self) -> "_RootGuard":
+        deadline = (
+            time.monotonic() + self._timeout_seconds
+            if self._blocking and self._timeout_seconds is not None
+            else None
+        )
+        process_timeout = (
+            max(0.0, deadline - time.monotonic())
+            if deadline is not None
+            else None
+        )
         if not self._process_lock.acquire(
             shared=self._shared,
             blocking=self._blocking,
-            timeout_seconds=self._timeout_seconds,
+            timeout_seconds=process_timeout,
         ):
             raise BlockingIOError("manifest root is busy")
         try:
@@ -432,8 +442,11 @@ class _RootGuard(AbstractContextManager["_RootGuard"]):
                 if not self._blocking or self._timeout_seconds is not None:
                     operation |= _fcntl.LOCK_NB
                 if self._blocking and self._timeout_seconds is not None:
-                    deadline = time.monotonic() + self._timeout_seconds
+                    assert deadline is not None
                     while True:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise BlockingIOError("manifest root is busy")
                         try:
                             _fcntl.flock(self._stream.fileno(), operation)
                             break
