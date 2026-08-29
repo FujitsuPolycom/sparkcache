@@ -1,7 +1,7 @@
 """SparkCache persistent NVMe context-cache connector.
 
 KVConnectorBase_V1 implementation that persists each DCP rank's token shard
-of every registered cache layer to rank-local NVMe through the fail-closed
+of every registered cache layer to rank-local NVMe through a verified-or-recompute
 ManifestStore, and restores it after a runtime restart. Supported degrees:
 any tensor-parallel size and any decode-context-parallel size that divides
 the profile's chunk length (DCP1 stores each rank's full span). The mapping
@@ -2570,7 +2570,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 )
             except Exception as error:  # noqa: BLE001
                 logger.warning(
-                    "spark-context-cache: load crashed fail-closed: %s", error
+                    "spark-context-cache: restore rejected; recomputing"
+                    " request=%s reason=%s",
+                    queued.plan.request_id,
+                    error,
                 )
                 verified = False
             with contextlib.suppress(Exception):
@@ -2850,7 +2853,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     )
             return True
         except (CodecError, KeyError, RuntimeError, ValueError) as error:
-            logger.warning("spark-context-cache: load failed fail-closed: %s", error)
+            logger.warning(
+                "spark-context-cache: restore rejected; recomputing reason=%s",
+                error,
+            )
             self._invalidate_after_failure(
                 plan.digest,
                 is_alias=is_alias,

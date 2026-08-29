@@ -126,12 +126,25 @@ verified leader's rank-local block table through vLLM's existing block-pool
 reference accounting. It must occur only after all-worker restore completion
 and before leader reclamation.
 
+The first explicit hot-lease run (`d30cdea`) also rejected capture safely.
+GLM's Mamba manager carries internal checkpoint blocks, so its authoritative
+partial-tail tuple can name a different valid table slot than the simple
+`span // block_size` page. The initial assertion treated that valid topology
+as disagreement. All sixteen requests fell back to verified external restore
+and completed (p50 4.786 seconds, maximum 7.893 seconds); no lease became
+visible. The corrected implementation validates and follows vLLM's
+authoritative tuple when present, while retaining physical-page arithmetic as
+the fallback when no tuple exists. Optional lease rejections now emit one-line
+warnings rather than exception tracebacks.
+
 Diagnostic receipts:
 
 - `evidence/glm53-flash-dflash7-bf16/singleflight-128k-c16-830a117.json`;
 - `evidence/glm53-flash-dflash7-bf16/post-singleflight-semantic-830a117.json`;
 - `evidence/glm53-flash-dflash7-bf16/singleflight-retention18432-128k-c16.json`;
-- `evidence/glm53-flash-dflash7-bf16/post-retention18432-semantic.json`.
+- `evidence/glm53-flash-dflash7-bf16/post-retention18432-semantic.json`;
+- `evidence/glm53-flash-dflash7-bf16/hotlease-d30cdea-128k-c16.json`;
+- `evidence/glm53-flash-dflash7-bf16/post-hotlease-d30cdea-semantic.json`.
 
 ## Repository validation
 
