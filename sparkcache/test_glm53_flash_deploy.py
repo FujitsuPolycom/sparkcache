@@ -6,10 +6,12 @@ from pathlib import Path
 import pytest
 
 from deploy.glm53_flash.profile import (
+    PREFIX_CACHE_RETENTION_INTERVAL,
     ProfileError,
     build_kv_transfer_config,
     compact_json,
     immutable_revision_identity,
+    required_hybrid_prefix_arguments,
 )
 
 
@@ -23,6 +25,16 @@ def test_target_revision_identity_is_deterministic() -> None:
         "local-inference-lab/GLM-5.3-Flash-NVFP4",
         "520de24eabf507659eaef7c70f14fd584527facc",
     ) == TARGET_ID
+
+
+def test_hybrid_prefix_arguments_retain_reusable_mamba_boundaries() -> None:
+    assert PREFIX_CACHE_RETENTION_INTERVAL == 18_432
+    assert required_hybrid_prefix_arguments() == (
+        "--mamba-cache-mode",
+        "align",
+        "--prefix-cache-retention-interval",
+        "18432",
+    )
 
 
 def test_connector_config_binds_target_and_draft_without_optional_native_paths() -> None:

@@ -101,6 +101,34 @@ Committed receipts:
 - `evidence/glm53-flash-dflash7-bf16/native-128k-c16-hot-b00c6d4.json`;
 - `evidence/glm53-flash-dflash7-bf16/post-b00c6d4-semantic.json`.
 
+### Initial single-flight result and retention diagnosis
+
+The first single-flight tracer bullet proved restore coalescing but initially
+left fifteen requests deferred because no runnable request remained to wake the
+scheduler. After adding a verified-leader completion wake edge, C16 completed,
+but each follower started another external restore: p50 was 4.740 seconds and
+the maximum was 8.252 seconds. The run was correct but slower than the baseline
+and is not a qualification result.
+
+vLLM metrics showed zero local-prefix hit tokens and 100% external-prefix hits.
+A CPU differential probe isolated the cause to the GLM hybrid-cache retention
+policy. With Mamba `align`, EAGLE/DFlash, and
+`prefix_cache_retention_interval=0`, computing the leader's tail discards the
+restored recurrent replay boundary, so the all-group local hit collapses to
+zero. The same external allocation and publication with a positive aligned
+retention interval remains locally reusable.
+
+The qualified candidate uses `--prefix-cache-retention-interval 18432`, eight
+times the resolved 2,304-token hybrid page. This retains the 129,024-token
+cacheable boundary underlying the recorded 128K entry with bounded recurrent
+metadata. The source-level CPU probe is
+`deploy/glm53_flash/probe_hma_external_reuse.py`.
+
+Diagnostic receipts:
+
+- `evidence/glm53-flash-dflash7-bf16/singleflight-128k-c16-830a117.json`;
+- `evidence/glm53-flash-dflash7-bf16/post-singleflight-semantic-830a117.json`.
+
 ## Repository validation
 
 The exact source tree above passed:
