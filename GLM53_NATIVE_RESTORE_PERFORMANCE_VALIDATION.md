@@ -96,12 +96,19 @@ Targets are below 500 ms for one shared 128K restore, 500--1,000 ms for mostly
 shared trunks, below 500 ms for hot host prefixes, and stable 2--5 second
 service for unrelated cold prefixes without OOMs or scheduler stalls.
 
-## Known recovery defect
+## Recovery correction
 
 The rejected first 128K attempt also exposed a pinned-vLLM recovery defect:
 `_update_requests_with_invalid_blocks` unpacks the result of
 `get_block_ids(req_id)` as though every request has one KV-cache group. GLM-5.3
 has multiple groups, so that recovery path raises `ValueError: too many values
-to unpack`. The 4,096-span correction prevents the observed adapter rejection,
-but the general multi-group recovery path still needs a source-contract patch
-and GPU-free regression test before this work is production-qualified.
+to unpack`.
+
+The da4d7be image recipe now applies an exact-preimage scheduler correction.
+When any HMA group contains an invalid restored block, it discards the complete
+external prefix for that request and recomputes it; partially verified hybrid
+state is never published. The expanded eight-file vLLM source contract pins
+both this scheduler behavior and `KVCacheManager.get_block_ids()`. GPU-free
+tests execute the patched method against multi-group, disjoint, asynchronous,
+and preserved single-group recovery cases. A rebuilt thin image and an injected
+live restore rejection are still required before production qualification.

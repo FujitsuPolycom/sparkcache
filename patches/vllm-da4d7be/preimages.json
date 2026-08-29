@@ -9,5 +9,16 @@
       "source_checkout": "1169e49ff4199d24261fbeff8195335514da38f98a636b9c3fbed1897da5c20e",
       "jovian_glm53_runtime": "b97316bf3c8ba7ba575cc8d4d2ded62bc3ae24f160e6e2aee4cabe34f9444671"
     }
+  },
+  "030-sparkcache-hma-load-failure.patch": {
+    "target_path": "vllm/v1/core/sched/scheduler.py",
+    "accepted_preimage_sha256": {
+      "source_checkout": "edfa3af964698cd17d62188acfeacc7b8985aab5b4dcb672944a3c2ea77990ba",
+      "jovian_glm53_runtime": "98bfb14fa37e8c2a2db5aba96bf8a6f0e6d1c0393ef686b075208889a2e46ab3"
+    },
+    "accepted_postimage_sha256": {
+      "source_checkout": "4981ca1de8a57c7fe4d258cfeeb103563b1cbe77b02868d210127d891b29140c",
+      "jovian_glm53_runtime": "9d2b2d52c2634c3f9b7dffdb631d60e1925f579dc63273df8166e973f04386a9"
+    }
   }
 }

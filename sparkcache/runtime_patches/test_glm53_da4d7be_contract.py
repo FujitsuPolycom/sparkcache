@@ -7,6 +7,10 @@ from sparkcache.runtime_patches.verify_lease_contract import ContractError
 
 
 CONTRACT = Path(__file__).with_name("vllm-kv-block-lease-contract-da4d7be.json")
+ROOT = Path(__file__).parents[2]
+PATCH_NAME = "030-sparkcache-hma-load-failure.patch"
+PATCH = ROOT / "patches" / "vllm-da4d7be" / PATCH_NAME
+PREIMAGES = PATCH.with_name("preimages.json")
 
 
 def test_glm53_contract_is_full_commit_bound_and_complete() -> None:
@@ -18,6 +22,7 @@ def test_glm53_contract_is_full_commit_bound_and_complete() -> None:
         "vllm/distributed/kv_transfer/kv_connector/v1/base.py",
         "vllm/distributed/kv_transfer/kv_connector/utils.py",
         "vllm/v1/core/sched/scheduler.py",
+        "vllm/v1/core/kv_cache_manager.py",
         "vllm/v1/core/sched/output.py",
         "vllm/v1/worker/gpu_model_runner.py",
         "vllm/v1/core/single_type_kv_cache_manager.py",
@@ -38,5 +43,31 @@ def test_glm53_contract_is_full_commit_bound_and_complete() -> None:
     assert all(record["required_symbols"] for record in contract["files"])
 
 
-def test_contract_error_remains_public_for_fail_closed_launchers() -> None:
+def test_contract_error_remains_public_for_verified_only_launchers() -> None:
     assert issubclass(ContractError, RuntimeError)
+
+
+def test_glm53_image_applies_exact_hma_load_failure_recovery_patch() -> None:
+    receipts = json.loads(PREIMAGES.read_text(encoding="utf-8"))
+    receipt = receipts[PATCH_NAME]
+    assert receipt["target_path"] == "vllm/v1/core/sched/scheduler.py"
+    assert set(receipt["accepted_preimage_sha256"]) == {
+        "source_checkout",
+        "jovian_glm53_runtime",
+    }
+    assert set(receipt["accepted_postimage_sha256"]) == {
+        "source_checkout",
+        "jovian_glm53_runtime",
+    }
+
+    patch = PATCH.read_text(encoding="utf-8")
+    assert "req_block_groups = self.kv_cache_manager.get_block_ids(req_id)" in patch
+    assert "for group_block_ids in req_block_groups" in patch
+    assert "request_block_ids.isdisjoint(invalid_block_ids)" in patch
+    assert "request.num_computed_tokens = 0" in patch
+    assert "blocks_to_evict.update(request_block_ids)" in patch
+
+    recipe = (ROOT / "deploy/glm53_flash/Containerfile").read_text("utf-8")
+    assert PATCH_NAME in recipe
+    assert receipt["accepted_preimage_sha256"]["jovian_glm53_runtime"] in recipe
+    assert receipt["accepted_postimage_sha256"]["jovian_glm53_runtime"] in recipe

@@ -28,13 +28,24 @@
     {
       "path": "vllm/v1/core/sched/scheduler.py",
       "accepted_sha256": {
-        "source_checkout": "edfa3af964698cd17d62188acfeacc7b8985aab5b4dcb672944a3c2ea77990ba",
-        "jovian_glm53_runtime": "98bfb14fa37e8c2a2db5aba96bf8a6f0e6d1c0393ef686b075208889a2e46ab3"
+        "source_checkout": "4981ca1de8a57c7fe4d258cfeeb103563b1cbe77b02868d210127d891b29140c",
+        "jovian_glm53_runtime": "9d2b2d52c2634c3f9b7dffdb631d60e1925f579dc63273df8166e973f04386a9"
       },
       "required_symbols": [
         "Scheduler._connector_finished",
         "Scheduler._update_from_kv_xfer_finished",
+        "Scheduler._update_requests_with_invalid_blocks",
         "Scheduler._free_blocks"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_manager.py",
+      "accepted_sha256": {
+        "source_checkout": "5cd0c497e7eb11e80d60fcf5690a963137cbc6a29c7ae5efdff18dc4e94b5d1e",
+        "jovian_glm53_runtime": "02c71da26bbac81629248ee42b0a71bd2db817d339894d647d2ff6b66fd5ad19"
+      },
+      "required_symbols": [
+        "KVCacheManager.get_block_ids"
       ]
     },
     {
