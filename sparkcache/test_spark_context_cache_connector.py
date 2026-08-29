@@ -3877,6 +3877,88 @@ class AsyncRestoreTests(unittest.TestCase):
             self.assertEqual(connector.counters["restore_flights_started"], 1)
             self.assertEqual(connector.counters["restore_segment_flights_joined"], 16)
 
+    def test_same_root_follower_after_distinct_root_uses_selected_trunk(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            common = list(range(768))
+            leader_tokens = common + list(range(10_000, 10_332))
+            distinct_tokens = common + list(range(20_000, 20_332))
+            leader_digest = connector._digest(leader_tokens, self.SPAN)
+            distinct_digest = connector._digest(distinct_tokens, self.SPAN)
+            trunk_digest = connector._digest(leader_tokens, 768)
+            for digest in (leader_digest, distinct_digest, trunk_digest):
+                connector._quorum[digest] = {0, 1, 2, 3}
+            leader = types.SimpleNamespace(
+                request_id="ordered-segment-leader", prompt_token_ids=leader_tokens
+            )
+            distinct = types.SimpleNamespace(
+                request_id="ordered-distinct-follower",
+                prompt_token_ids=distinct_tokens,
+            )
+            same_root = types.SimpleNamespace(
+                request_id="ordered-same-root-follower",
+                prompt_token_ids=leader_tokens,
+            )
+
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(leader, 0),
+                (self.SPAN, True),
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(distinct, 0),
+                (None, False),
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(same_root, 0),
+                (None, False),
+            )
+            same_binding = connector._restore_flight_followers[same_root.request_id]
+            self.assertEqual(
+                (same_binding.lease_digest, same_binding.span_tokens),
+                (trunk_digest, 768),
+            )
+
+            connector.update_state_after_alloc(
+                leader, self._blocks_stub(), self.SPAN
+            )
+            connector.build_connector_meta(_empty_scheduler_output())
+            connector.update_connector_output(
+                types.SimpleNamespace(
+                    invalid_block_ids=set(), finished_recving={leader.request_id}
+                )
+            )
+            with mock.patch(
+                "sparkcache.spark_context_cache_connector.time.monotonic",
+                return_value=10.0,
+            ):
+                self.assertTrue(
+                    connector.shared_prefix_lease_published(
+                        leader.request_id, trunk_digest
+                    )
+                )
+            with mock.patch(
+                "sparkcache.spark_context_cache_connector.time.monotonic",
+                return_value=11.0,
+            ):
+                for follower in (distinct, same_root):
+                    self.assertEqual(
+                        connector.get_shared_prefix_lease_candidate(follower),
+                        (trunk_digest, 768),
+                    )
+                    connector.shared_prefix_lease_attached(
+                        follower.request_id, trunk_digest
+                    )
+                    connector.request_finished(follower, [])
+                    self.assertNotIn(
+                        follower.request_id, connector._restore_flight_followers
+                    )
+
+            leader.status = types.SimpleNamespace(name="FINISHED_STOPPED")
+            connector.request_finished(leader, list(self.BLOCKS))
+            self.assertIn(leader_digest, connector._restore_flights)
+            connector._expire_shared_prefix_flights(now=25.001)
+            self.assertNotIn(leader_digest, connector._restore_flights)
+
     def test_distinct_root_trunk_join_does_not_adopt_partial_local_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = self._cohort_connector(Path(directory))

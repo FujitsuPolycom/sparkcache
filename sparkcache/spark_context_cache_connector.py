@@ -1432,10 +1432,14 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self.counters["restore_flight_follower_overflow"] += 1
                 return 0, False
             flight.followers.add(request_id)
+            lease_digest = flight.segment_digest or digest
+            lease_span = flight.segment_span_tokens or span
             self._restore_flight_followers[request_id] = _RestoreFollower(
-                digest, digest, span
+                digest, lease_digest, lease_span
             )
             self.counters["restore_flights_joined"] += 1
+            if lease_digest != digest:
+                self.counters["restore_segment_flights_joined"] += 1
             return None, False
         if num_computed_tokens == 0 and self._join_segment_restore_flight(
             request_id,
