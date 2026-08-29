@@ -1,0 +1,613 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="An interactive explanation of SparkCache's implemented exact-prefix restore and planned prefix-storage work.">
+  <title>SparkCache · Context restore explorer</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --ink: #f4f8fb;
+      --muted: #9fb0c2;
+      --faint: #718398;
+      --bg: #06111c;
+      --panel: #0b1b2b;
+      --panel-2: #0e2235;
+      --line: #1c3a52;
+      --cyan: #30dfc4;
+      --cyan-dim: #123f45;
+      --blue: #6cb5ff;
+      --amber: #ffc369;
+      --amber-dim: #49371d;
+      --red: #ff6f78;
+      --red-dim: #4b222b;
+      --green: #8ce49c;
+      --shadow: 0 22px 70px rgba(0, 0, 0, .28);
+      --radius: 18px;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      min-width: 320px;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 12% 0%, rgba(39, 113, 167, .23), transparent 32rem),
+        radial-gradient(circle at 95% 22%, rgba(24, 159, 143, .10), transparent 28rem),
+        var(--bg);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.55;
+    }
+
+    button, input { font: inherit; }
+    button { color: inherit; }
+    a { color: var(--blue); }
+    code, .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+    code { color: #c7e7ff; }
+
+    .shell { width: min(1180px, calc(100% - 32px)); margin: 0 auto; padding: 62px 0 80px; }
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      color: var(--cyan);
+      font-size: .75rem;
+      font-weight: 800;
+      letter-spacing: .15em;
+      text-transform: uppercase;
+    }
+    .eyebrow::before { content: ""; width: 24px; height: 2px; background: currentColor; }
+
+    .hero { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(280px, .65fr); gap: 42px; align-items: end; }
+    h1 { margin: 12px 0 16px; max-width: 820px; font-size: clamp(2.45rem, 6vw, 5.4rem); line-height: .98; letter-spacing: -.055em; }
+    h1 em { color: var(--cyan); font-style: normal; }
+    .lede { max-width: 760px; margin: 0; color: #bfd0de; font-size: clamp(1.02rem, 2vw, 1.26rem); }
+    .hero-note { padding: 20px; border: 1px solid var(--line); border-radius: var(--radius); background: rgba(11, 27, 43, .78); box-shadow: var(--shadow); }
+    .hero-note strong { display: block; margin-bottom: 6px; color: var(--amber); font-size: .76rem; letter-spacing: .1em; text-transform: uppercase; }
+    .hero-note p { margin: 0; color: var(--muted); font-size: .91rem; }
+
+    .status-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 36px 0 64px; }
+    .status-pill { min-height: 82px; padding: 15px 16px; border: 1px solid var(--line); border-radius: 14px; background: rgba(7, 21, 34, .72); }
+    .status-pill .value { display: block; color: var(--ink); font-size: 1.05rem; font-weight: 800; }
+    .status-pill .label { color: var(--faint); font-size: .78rem; }
+    .status-tag { display: inline-block; margin-bottom: 5px; padding: 2px 7px; border: 1px solid #267365; border-radius: 999px; color: var(--cyan); font: 800 .62rem "SFMono-Regular", Consolas, monospace; letter-spacing: .05em; text-transform: uppercase; }
+    .status-tag.planned { border-color: #7a5a2d; color: var(--amber); }
+
+    section { margin-top: 30px; padding: clamp(20px, 4vw, 36px); border: 1px solid var(--line); border-radius: var(--radius); background: linear-gradient(145deg, rgba(14, 34, 53, .94), rgba(8, 24, 39, .96)); box-shadow: var(--shadow); }
+    .section-head { display: flex; justify-content: space-between; gap: 30px; align-items: end; margin-bottom: 24px; }
+    .section-head h2 { margin: 0; font-size: clamp(1.45rem, 3vw, 2.2rem); letter-spacing: -.035em; }
+    .section-head p { max-width: 570px; margin: 0; color: var(--muted); font-size: .94rem; }
+    .num { color: var(--cyan); font-family: "SFMono-Regular", Consolas, monospace; font-size: .78em; }
+
+    .token-row { display: flex; gap: 7px; margin: 18px 0; }
+    .token {
+      display: grid;
+      flex: 1;
+      min-width: 0;
+      min-height: 58px;
+      place-items: center;
+      border: 1px solid #346480;
+      border-radius: 9px;
+      background: #11334a;
+      color: #d8efff;
+      font-weight: 900;
+      box-shadow: inset 0 -12px 20px rgba(3, 14, 24, .22);
+    }
+    .token small { display: block; color: #89a7bb; font-size: .6rem; font-weight: 600; }
+    .token.new { border-color: #86602f; background: #3a2e1c; color: var(--amber); }
+    .token.live { flex: .23; border-style: dashed; color: var(--faint); background: transparent; }
+    .context-example { display: grid; grid-template-columns: minmax(245px, .7fr) minmax(0, 1.3fr); gap: 18px; }
+    .messages, .serialized { padding: 20px; border: 1px solid var(--line); border-radius: 14px; background: rgba(3, 14, 24, .55); }
+    .messages h3, .serialized h3 { margin: 0 0 4px; font-size: 1rem; }
+    .messages > p, .serialized > p { margin: 0 0 16px; color: var(--faint); font-size: .78rem; }
+    .message { display: grid; grid-template-columns: 70px 1fr auto; gap: 10px; align-items: center; margin-top: 7px; padding: 10px 11px; border: 1px solid #29465a; border-radius: 9px; background: #081a28; }
+    .message-role { color: var(--blue); font: 800 .68rem "SFMono-Regular", Consolas, monospace; text-transform: uppercase; }
+    .message:nth-of-type(3) .message-role { color: var(--amber); }
+    .message:nth-of-type(4) .message-role { color: var(--cyan); }
+    .message:nth-of-type(5) .message-role { color: #cf9cff; }
+    .message-text { overflow: hidden; color: #c5d2dc; font-size: .75rem; text-overflow: ellipsis; white-space: nowrap; }
+    .message-count { color: var(--faint); font: .65rem "SFMono-Regular", Consolas, monospace; white-space: nowrap; }
+    .context-track { position: relative; display: grid; grid-template-columns: 384fr 148fr 430fr 385fr; height: 76px; overflow: hidden; border: 1px solid #31536a; border-radius: 10px; background: #061522; }
+    .message-segment { display: grid; min-width: 0; place-items: center; border-right: 1px solid rgba(255,255,255,.12); color: white; font: 800 .68rem "SFMono-Regular", Consolas, monospace; text-align: center; }
+    .message-segment small { display: block; opacity: .65; font-size: .58rem; font-weight: 600; }
+    .message-segment.system { background: #18466a; }
+    .message-segment.user-one { background: #765323; }
+    .message-segment.assistant { background: #176a5c; }
+    .message-segment.user-two { background: #624378; }
+    .boundary-line { position: absolute; top: 0; bottom: 0; z-index: 2; width: 1px; background: rgba(255,255,255,.72); box-shadow: 0 0 0 1px rgba(0,0,0,.2); }
+    .boundary-line::after { content: attr(data-at); position: absolute; top: 3px; left: 4px; color: rgba(255,255,255,.78); font: .55rem "SFMono-Regular", Consolas, monospace; }
+    .chunk-grid { display: grid; grid-template-columns: repeat(5, 256fr) 67fr; gap: 4px; margin-top: 8px; }
+    .chunk-cell { min-width: 0; padding: 8px 2px; border: 1px solid #2c5d70; border-radius: 6px; background: #0c2c3e; color: #cae8f6; text-align: center; font: 800 .65rem "SFMono-Regular", Consolas, monospace; }
+    .chunk-cell small { display: block; margin-top: 2px; color: var(--faint); font-size: .52rem; font-weight: 600; }
+    .chunk-cell.remainder { border-style: dashed; border-color: #685276; background: #211b2b; color: #cf9cff; }
+    .span-summary { display: grid; grid-template-columns: 1280fr 67fr; gap: 4px; margin-top: 9px; }
+    .safe-span, .remainder-span { padding: 6px; border-radius: 5px; text-align: center; font-size: .62rem; }
+    .safe-span { border: 1px solid #267365; background: var(--cyan-dim); color: var(--cyan); }
+    .remainder-span { border: 1px dashed #685276; color: #cf9cff; }
+    .context-note { margin: 16px 0 0; padding: 11px 13px; border-left: 3px solid var(--cyan); background: rgba(18, 63, 69, .35); color: var(--muted); font-size: .79rem; }
+
+    .lab { padding: 0; overflow: hidden; }
+    .lab-head { padding: clamp(20px, 4vw, 34px); border-bottom: 1px solid var(--line); background: rgba(6, 17, 28, .45); }
+    .scenario-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 20px; }
+    .scenario-tab, .step-button {
+      border: 1px solid #2a506b;
+      border-radius: 9px;
+      background: #102b41;
+      cursor: pointer;
+      font-size: .8rem;
+      font-weight: 760;
+      transition: transform .15s ease, border-color .15s ease, background .15s ease;
+    }
+    .scenario-tab { padding: 8px 12px; }
+    .scenario-tab:hover, .step-button:hover { transform: translateY(-1px); border-color: var(--cyan); }
+    .scenario-tab[aria-selected="true"] { border-color: var(--cyan); background: var(--cyan); color: #03201e; }
+
+    .controls { display: grid; grid-template-columns: auto 1fr auto; gap: 18px; align-items: center; padding: 16px clamp(20px, 4vw, 34px); border-bottom: 1px solid var(--line); }
+    .button-group { display: flex; gap: 8px; }
+    .step-button { min-width: 42px; padding: 8px 11px; }
+    .step-button:disabled { cursor: default; opacity: .35; transform: none; }
+    .step-button.playing { border-color: var(--cyan); color: var(--cyan); }
+    .slider-wrap { display: flex; gap: 12px; align-items: center; color: var(--muted); font-size: .8rem; }
+    input[type="range"] { width: 100%; accent-color: var(--cyan); }
+    .step-count { min-width: 94px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; background: #061522; color: var(--cyan); text-align: center; font: 800 .78rem "SFMono-Regular", Consolas, monospace; }
+
+    .lab-grid { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(290px, .75fr); }
+    .stage { min-height: 470px; padding: clamp(20px, 4vw, 34px); border-right: 1px solid var(--line); }
+    .stage-label { color: var(--cyan); font-size: .72rem; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+    .stage h3 { margin: 6px 0 7px; font-size: 1.35rem; }
+    .stage-copy { min-height: 46px; margin: 0 0 22px; color: var(--muted); font-size: .9rem; }
+    .prompt-viz { margin-bottom: 24px; }
+    .prompt-viz .token { transition: opacity .25s ease, border-color .25s ease, background .25s ease, transform .25s ease; }
+    .token.inactive { opacity: .26; }
+    .token.chosen { border-color: var(--cyan); background: #10493f; color: #bffff2; transform: translateY(-3px); }
+    .token.compute { border-color: var(--amber); background: var(--amber-dim); color: var(--amber); transform: translateY(-3px); }
+    .token.fail { border-color: var(--red); background: var(--red-dim); color: #ffd8dc; }
+
+    .candidate-layout { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 15px; align-items: start; }
+    .candidate-list { display: grid; gap: 6px; }
+    .candidate { display: flex; justify-content: space-between; align-items: center; min-height: 34px; padding: 7px 9px; border: 1px solid #223f55; border-radius: 7px; background: #071725; color: var(--faint); font: .73rem "SFMono-Regular", Consolas, monospace; transition: .2s ease; }
+    .candidate::after { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #355066; }
+    .candidate.checked { border-color: #506777; color: #c3d1da; }
+    .candidate.selected { border-color: var(--cyan); background: var(--cyan-dim); color: var(--cyan); transform: translateX(4px); }
+    .candidate.selected::after { background: var(--cyan); box-shadow: 0 0 0 4px rgba(48, 223, 196, .12); }
+    .candidate.failed { border-color: var(--red); color: var(--red); }
+    .candidate.failed::after { background: var(--red); }
+
+    .quorum { display: grid; grid-template-columns: 48px repeat(5, 1fr); gap: 5px; text-align: center; }
+    .q-head { color: var(--faint); font: .67rem "SFMono-Regular", Consolas, monospace; }
+    .rank-label { display: flex; align-items: center; color: #b7c7d3; font: .71rem "SFMono-Regular", Consolas, monospace; }
+    .q-cell { min-height: 31px; border: 1px solid #263f52; border-radius: 6px; background: #091927; position: relative; }
+    .q-cell.hit::after, .q-cell.miss::after, .q-cell.corrupt::after { position: absolute; inset: 0; display: grid; place-items: center; font-size: .72rem; font-weight: 900; }
+    .q-cell.hit { border-color: #246a61; background: #10382f; }
+    .q-cell.hit::after { content: "✓"; color: var(--cyan); }
+    .q-cell.miss::after { content: "—"; color: #4b6476; }
+    .q-cell.corrupt { border-color: var(--red); background: var(--red-dim); }
+    .q-cell.corrupt::after { content: "!"; color: var(--red); }
+    .q-cell.focus { outline: 2px solid var(--amber); outline-offset: 1px; }
+    .matrix-note { grid-column: 2 / -1; margin-top: 5px; color: var(--faint); font-size: .71rem; text-align: left; }
+
+    .result { padding: clamp(20px, 4vw, 30px); background: rgba(4, 16, 26, .46); }
+    .result-kicker { color: var(--faint); font-size: .7rem; font-weight: 800; letter-spacing: .13em; text-transform: uppercase; }
+    .result-value { margin: 4px 0 0; font-size: clamp(2.4rem, 6vw, 4.6rem); font-weight: 900; line-height: 1; letter-spacing: -.06em; }
+    .result-value span { color: var(--cyan); }
+    .result-unit { color: var(--muted); font-size: .78rem; }
+    .meter { height: 11px; margin: 22px 0 8px; overflow: hidden; border-radius: 999px; background: #1c2934; }
+    .meter-fill { width: 0; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #1ba991, var(--cyan)); transition: width .35s ease; }
+    .meter.fail .meter-fill { background: var(--red); }
+    .result-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 18px 0; }
+    .stat { padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: #071725; }
+    .stat b { display: block; font: 800 1.08rem "SFMono-Regular", Consolas, monospace; }
+    .stat small { color: var(--faint); font-size: .7rem; }
+    .verdict { margin-top: 16px; padding: 12px; border: 1px solid #235e58; border-radius: 9px; background: var(--cyan-dim); color: #bffff2; font-size: .8rem; }
+    .verdict.fail { border-color: #74333c; background: var(--red-dim); color: #ffd3d7; }
+
+    .alias-visual { display: grid; grid-template-columns: .8fr 1.2fr; gap: 18px; }
+    .payload-bank, .aliases { padding: 20px; border: 1px solid var(--line); border-radius: 14px; background: rgba(4, 16, 26, .5); }
+    .payload-bank h3, .aliases h3 { margin: 0 0 4px; font-size: 1rem; }
+    .mini-copy { margin: 0 0 18px; color: var(--faint); font-size: .8rem; }
+    .file-row { display: flex; gap: 7px; }
+    .file { flex: 1; padding: 22px 4px 9px; border: 1px solid #2b6279; border-radius: 7px; background: #0c2d40; text-align: center; font: 800 .74rem "SFMono-Regular", Consolas, monospace; }
+    .file small { display: block; margin-top: 4px; color: var(--faint); font-size: .58rem; }
+    .alias-row { display: grid; grid-template-columns: 92px 1fr; gap: 8px; align-items: center; margin-top: 7px; }
+    .alias-name { color: var(--cyan); font: .7rem "SFMono-Regular", Consolas, monospace; }
+    .refs { display: flex; gap: 4px; }
+    .ref { flex: 1; height: 24px; border: 1px solid #36556a; border-radius: 5px; background: #102c3e; color: #aac1d1; text-align: center; font: 700 .64rem/22px "SFMono-Regular", Consolas, monospace; }
+    .alias-caption { margin: 17px 0 0; padding-top: 13px; border-top: 1px solid var(--line); color: var(--muted); font-size: .83rem; }
+
+    .flow { display: grid; grid-template-columns: 1fr auto 1.15fr auto 1fr; gap: 12px; align-items: stretch; }
+    .flow-card { padding: 18px; border: 1px solid var(--line); border-radius: 12px; background: rgba(4, 16, 26, .52); }
+    .flow-card .icon { display: grid; width: 34px; height: 34px; margin-bottom: 12px; place-items: center; border-radius: 9px; background: var(--cyan-dim); color: var(--cyan); font-weight: 900; }
+    .flow-card h3 { margin: 0 0 4px; font-size: .95rem; }
+    .flow-card p { margin: 0; color: var(--muted); font-size: .78rem; }
+    .arrow { align-self: center; color: var(--cyan); font-size: 1.25rem; }
+    .ranks { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 12px; }
+    .rank { padding: 7px; border: 1px solid #2c5c70; border-radius: 6px; color: #b9d4e5; background: #0b2a3c; font: .68rem "SFMono-Regular", Consolas, monospace; text-align: center; }
+
+    .safety-grid, .evidence-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .safety-card, .evidence-card { padding: 18px; border: 1px solid var(--line); border-radius: 12px; background: rgba(4, 16, 26, .52); }
+    .safety-card strong, .evidence-card strong { display: block; margin-bottom: 6px; color: var(--cyan); font-size: .87rem; }
+    .safety-card p, .evidence-card p { margin: 0; color: var(--muted); font-size: .8rem; }
+    .evidence-card strong { color: var(--amber); }
+
+    footer { display: flex; justify-content: space-between; gap: 24px; margin-top: 34px; padding: 18px 4px; color: var(--faint); font-size: .76rem; }
+    footer p { margin: 0; }
+    .source-links { display: flex; flex-wrap: wrap; gap: 12px; }
+
+    @media (max-width: 850px) {
+      .hero, .lab-grid, .alias-visual, .context-example { grid-template-columns: 1fr; }
+      .status-strip { grid-template-columns: 1fr 1fr; }
+      .stage { min-height: 0; border-right: 0; border-bottom: 1px solid var(--line); }
+      .flow { grid-template-columns: 1fr; }
+      .arrow { transform: rotate(90deg); justify-self: center; }
+      .safety-grid, .evidence-grid { grid-template-columns: 1fr; }
+      .section-head { display: block; }
+      .section-head p { margin-top: 8px; }
+    }
+
+    @media (max-width: 620px) {
+      .shell { width: min(100% - 18px, 1180px); padding-top: 34px; }
+      .status-strip { grid-template-columns: 1fr; }
+      .controls { grid-template-columns: 1fr; }
+      .button-group { justify-content: center; }
+      .candidate-layout { grid-template-columns: 1fr; }
+      .candidate-list { grid-template-columns: repeat(5, 1fr); }
+      .candidate { display: grid; min-width: 0; padding: 6px 2px; text-align: center; }
+      .candidate::after { display: none; }
+      .alias-row { grid-template-columns: 76px 1fr; }
+      footer { display: block; }
+      .source-links { margin-top: 10px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="hero">
+      <div>
+        <span class="eyebrow">SparkCache in SparkRing</span>
+        <h1>How conversation context is <em>stored and restored</em></h1>
+        <p class="lede">SparkCache aligns cache identity and admission to 256-token boundaries. The current branch restores the longest exact snapshot already present on every rank; it does not yet make every 256-token boundary an independently stored prefix.</p>
+      </div>
+      <aside class="hero-note">
+        <strong>Example configuration</strong>
+        <p>TP4/DCP1 across four DGX Spark systems. Each rank owns a different KV shard and a separate rank-local cache. The example below uses a 1,347-token conversation.</p>
+      </aside>
+    </header>
+
+    <div class="status-strip" aria-label="Request summary">
+      <div class="status-pill"><span class="status-tag">Current</span><span class="value">256 tokens</span><span class="label">logical identity and admission boundary</span></div>
+      <div class="status-pill"><span class="status-tag">Current</span><span class="value">Longest exact</span><span class="label">previously published snapshot found on every rank</span></div>
+      <div class="status-pill"><span class="status-tag">Current GLM</span><span class="value">Opaque pages</span><span class="label">whole-boundary HMA snapshot, byte-partitioned on disk</span></div>
+      <div class="status-pill"><span class="status-tag planned">Planned</span><span class="value">Aliases + tails</span><span class="label">sparse prefix descriptors and incremental publication</span></div>
+    </div>
+
+    <section aria-labelledby="problem-title">
+      <div class="section-head">
+        <h2 id="problem-title"><span class="num">01</span> Messages become one token stream</h2>
+        <p>Role boundaries and cache boundaries are independent. After chat templating and tokenization, SparkCache sees one ordered sequence of token IDs.</p>
+      </div>
+      <div class="context-example">
+        <article class="messages">
+          <h3>Example conversation</h3>
+          <p>Illustrative text; token counts show the serialized size.</p>
+          <div class="message"><span class="message-role">system</span><span class="message-text">You are an operations assistant. Use the attached runbook…</span><span class="message-count">384</span></div>
+          <div class="message"><span class="message-role">user</span><span class="message-text">Summarize the incident timeline and identify the first fault…</span><span class="message-count">148</span></div>
+          <div class="message"><span class="message-role">assistant</span><span class="message-text">The first observable fault occurs at 09:14 when rank 2…</span><span class="message-count">430</span></div>
+          <div class="message"><span class="message-role">user</span><span class="message-text">Now compare that result with the deployment logs from Friday…</span><span class="message-count">385</span></div>
+        </article>
+        <article class="serialized">
+          <h3>Serialized prompt · 1,347 tokens</h3>
+          <p>White lines mark real 256-token logical boundaries.</p>
+          <div class="context-track" aria-label="Messages crossing five complete logical cache intervals and one remainder">
+            <div class="message-segment system">system<small>384</small></div>
+            <div class="message-segment user-one">user<small>148</small></div>
+            <div class="message-segment assistant">assistant<small>430</small></div>
+            <div class="message-segment user-two">new user<small>385</small></div>
+            <span class="boundary-line" data-at="256" style="left:19.01%"></span>
+            <span class="boundary-line" data-at="512" style="left:38.01%"></span>
+            <span class="boundary-line" data-at="768" style="left:57.02%"></span>
+            <span class="boundary-line" data-at="1024" style="left:76.02%"></span>
+            <span class="boundary-line" data-at="1280" style="left:95.03%"></span>
+          </div>
+          <div class="chunk-grid" aria-label="Logical cache intervals"><div class="chunk-cell">A<small>0–256</small></div><div class="chunk-cell">B<small>256–512</small></div><div class="chunk-cell">C<small>512–768</small></div><div class="chunk-cell">D<small>768–1024</small></div><div class="chunk-cell">E<small>1024–1280</small></div><div class="chunk-cell remainder">+67</div></div>
+          <div class="span-summary"><div class="safe-span">five complete logical intervals · 1,280 tokens</div><div class="remainder-span" aria-label="67-token remainder"></div></div>
+          <p class="context-note"><strong>Important:</strong> these 256-token intervals are real for hashing, alignment, manifest positions, and admission. In GLM-5.3 <code>block_pages_v1</code>, they do not correspond to independently usable physical KV objects.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="lab" aria-labelledby="lab-title">
+      <div class="lab-head">
+        <div class="section-head" style="margin-bottom:0">
+          <h2 id="lab-title"><span class="num">02</span> Current exact-prefix restore</h2>
+          <p><span class="status-tag">Implemented</span> Switch scenarios, then step through boundary hashing, exact stored-entry discovery, all-rank availability, verification, restore, and tail prefill.</p>
+        </div>
+        <div class="scenario-tabs" role="tablist" aria-label="Cache scenarios">
+          <button class="scenario-tab" role="tab" aria-selected="true" data-scenario="healthy">Exact 1,024 stored everywhere</button>
+          <button class="scenario-tab" role="tab" aria-selected="false" data-scenario="stale">1,024 absent on rank 3</button>
+          <button class="scenario-tab" role="tab" aria-selected="false" data-scenario="corrupt">Rank 2 object corrupt</button>
+          <button class="scenario-tab" role="tab" aria-selected="false" data-scenario="cold">Cold cache</button>
+        </div>
+      </div>
+      <div class="controls">
+        <div class="button-group">
+          <button class="step-button" id="reset" aria-label="Start over">↺</button>
+          <button class="step-button" id="previous" aria-label="Previous step">←</button>
+          <button class="step-button" id="next" aria-label="Next step">→</button>
+          <button class="step-button" id="play" aria-label="Play steps">▶</button>
+        </div>
+        <label class="slider-wrap">Step <input id="step-range" type="range" min="0" max="5" value="0" aria-label="Request step"></label>
+        <div class="step-count" id="step-count">1 / 6</div>
+      </div>
+      <div class="lab-grid">
+        <div class="stage">
+          <span class="stage-label" id="stage-label">Step 1 · boundary</span>
+          <h3 id="stage-title">Align to complete logical intervals</h3>
+          <p class="stage-copy" id="stage-copy">The prompt has 1,347 tokens. SparkCache excludes the live token and rounds down to five complete 256-token intervals: 1,280 potentially reusable tokens.</p>
+          <div class="prompt-viz">
+            <div class="token-row" id="prompt-row" aria-label="Prompt chunk state"></div>
+          </div>
+          <div class="candidate-layout">
+            <div class="candidate-list" id="candidate-list" aria-label="Prefix candidates"></div>
+            <div class="quorum" id="quorum" aria-label="All-rank exact-snapshot availability matrix"></div>
+          </div>
+        </div>
+        <aside class="result" aria-live="polite">
+          <span class="result-kicker">Reusable target context</span>
+          <div class="result-value"><span id="restored-value">0</span></div>
+          <div class="result-unit">tokens admitted for external restore</div>
+          <div class="meter" id="meter"><div class="meter-fill" id="meter-fill"></div></div>
+          <div class="result-unit" id="meter-label">0% of the 1,280-token safe span</div>
+          <div class="result-stats">
+            <div class="stat"><b id="prefill-value">1,280</b><small>target tokens to prefill</small></div>
+            <div class="stat"><b id="disk-reads">0</b><small>candidate disk probes</small></div>
+          </div>
+          <div class="verdict" id="verdict">No prefix has been admitted yet. Serving continues while optional cache discovery runs.</div>
+        </aside>
+      </div>
+    </section>
+
+    <section aria-labelledby="alias-title">
+      <div class="section-head">
+        <h2 id="alias-title"><span class="num">03</span> “256-token chunk” has two meanings</h2>
+        <p>The logical geometry is shared, but the physical payload semantics differ by storage mode. This distinction determines whether prefix aliases and tail-only writes can safely reuse stored bytes.</p>
+      </div>
+      <div class="alias-visual">
+        <article class="payload-bank">
+          <h3><span class="status-tag">Current</span> <code>per_token_rows</code></h3>
+          <p class="mini-copy">Each encoded chunk contains the owned tensor rows for one logical token interval.</p>
+          <div class="file-row"><div class="file">rows A<small>0–256</small></div><div class="file">rows B<small>256–512</small></div><div class="file">rows C<small>512–768</small></div><div class="file">rows D<small>768–1024</small></div></div>
+          <p class="alias-caption">The payloads have prefix meaning. This is the safe first target for descriptors that reference an existing immutable trunk without copying its bytes.</p>
+        </article>
+        <article class="aliases">
+          <h3><span class="status-tag">Current GLM</span> <code>block_pages_v1</code></h3>
+          <p class="mini-copy">SparkCache first encodes one opaque, exact-boundary HMA page snapshot, then divides its bytes into as many files as there are 256-token logical intervals.</p>
+          <div class="alias-row"><span class="alias-name">snapshot</span><div class="refs"><span class="ref">header</span><span class="ref">all layer pages</span><span class="ref">all groups</span></div></div>
+          <div class="alias-row"><span class="alias-name">on disk</span><div class="refs"><span class="ref">byte 1/4</span><span class="ref">byte 2/4</span><span class="ref">byte 3/4</span><span class="ref">byte 4/4</span></div></div>
+          <p class="alias-caption">Those files are authenticated byte partitions of the whole snapshot—not token-local KV chunks. Truncating them cannot create a valid earlier GLM prefix. GLM tail-only storage needs a new page-semantic format and a distinct cache namespace.</p>
+        </article>
+      </div>
+    </section>
+
+    <section aria-labelledby="flow-title">
+      <div class="section-head">
+        <h2 id="flow-title"><span class="num">04</span> Scheduler selection and rank verification</h2>
+        <p><span class="status-tag">Implemented</span> The availability map carries tiny digest advertisements. KV payload stays local to each DGX Spark and never crosses the cache network during normal restore.</p>
+      </div>
+      <div class="flow">
+        <article class="flow-card"><div class="icon">1</div><h3>Scheduler</h3><p>Hashes the prompt once, snapshots the exact wire-compatible digest at each eligible boundary, and scans longest-first. A candidate exists only if that exact span was published by an earlier request.</p></article>
+        <div class="arrow" aria-hidden="true">→</div>
+        <article class="flow-card"><div class="icon">4×</div><h3>All-rank availability</h3><p>A digest is eligible only when every expected physical TP rank advertises its compatible exact manifest in the current worker generation.</p><div class="ranks"><span class="rank">rank 0</span><span class="rank">rank 1</span><span class="rank">rank 2</span><span class="rank">rank 3</span></div></article>
+        <div class="arrow" aria-hidden="true">→</div>
+        <article class="flow-card"><div class="icon">✓</div><h3>Worker verification</h3><p>Each rank independently opens its manifest, checks identity and compatibility, verifies chunk hashes, and releases restored blocks only after coordinated success.</p></article>
+      </div>
+    </section>
+
+    <section aria-labelledby="safety-title">
+      <div class="section-head">
+        <h2 id="safety-title"><span class="num">05</span> Verified-or-recompute restore</h2>
+        <p>Context is restored only after identity, quorum, compatibility, and chunk integrity checks pass.</p>
+      </div>
+      <div class="safety-grid">
+        <article class="safety-card"><strong>Verified state or recomputation</strong><p>A missing rank, malformed manifest, incompatible identity, or bad chunk hash becomes a miss. The request recomputes instead of consuming unverified KV state.</p></article>
+        <article class="safety-card"><strong>Identity stays topology-bound</strong><p>Checkpoint digests, layout, TP/DCP, physical rank, chunk geometry, record schema, draft policy, and the prefix-key format remain part of the namespace.</p></article>
+        <article class="safety-card"><strong>Optional work cannot stall serving</strong><p>Inventory warm-up may turn a potential reuse into recomputation. Backlog limits skip optional restores, and unrelated inference continues.</p></article>
+      </div>
+    </section>
+
+    <section aria-labelledby="roadmap-title">
+      <div class="section-head">
+        <h2 id="roadmap-title"><span class="num">06</span> What is planned, not implemented</h2>
+        <p>These improvements build on exact-prefix discovery, but none should be inferred from the current 256-token geometry alone.</p>
+      </div>
+      <div class="safety-grid">
+        <article class="safety-card"><strong><span class="status-tag planned">Planned</span> Sparse prefix descriptors</strong><p>Publish bounded metadata for selected earlier prefixes that references already durable payload. The safe first implementation is <code>per_token_rows</code>; opaque GLM page snapshots cannot be shortened by manifest tricks.</p></article>
+        <article class="safety-card"><strong><span class="status-tag planned">Planned</span> Tail-only publication</strong><p>Write only state created after the longest verified prefix. Today, a growing conversation can publish another complete exact-boundary snapshot, including its existing trunk.</p></article>
+        <article class="safety-card"><strong><span class="status-tag planned">Planned</span> Single-flight restore</strong><p>Let one leader restore a shared digest, publish the resulting GPU blocks through vLLM, and let concurrent followers reuse those blocks. Today, concurrent same-prefix requests may each schedule external restore work.</p></article>
+      </div>
+    </section>
+
+    <section aria-labelledby="deployment-title">
+      <div class="section-head">
+        <h2 id="deployment-title"><span class="num">07</span> GLM-5.3 TP4 evidence</h2>
+        <p>The native direct-restore result is experimental performance evidence, not yet a C16 concurrency qualification.</p>
+      </div>
+      <div class="evidence-grid">
+        <article class="evidence-card"><strong>Exact runtime</strong><p>Four DGX Spark systems, GLM-5.3 Flash, TP4/DCP1, two host restore workers, two native placement lanes, and two 256 MiB mapped-host arenas per rank.</p></article>
+        <article class="evidence-card"><strong>Recorded 128K restore</strong><p>Each rank restored 813,068,464 bytes through four native slabs. Cache service was 131.3–250.1 ms per rank; end-to-end request latency was 0.907 s.</p></article>
+        <article class="evidence-card"><strong>Correctness and remaining work</strong><p>A post-restore semantic canary matched and health remained 200. C2/C8/C16 shared, mixed-trunk, unrelated-cold, and decode-interference tests remain.</p></article>
+      </div>
+    </section>
+
+    <footer>
+      <p>Current behavior and explicitly separated design work · 2026-08-29.</p>
+      <div class="source-links">
+        <a href="https://github.com/FujitsuPolycom/sparkcache/tree/main">main</a>
+        <a href="../ROADMAP.md">research roadmap</a>
+        <a href="../GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md">native restore record</a>
+      </div>
+    </footer>
+  </main>
+
+  <script>
+    (() => {
+      const steps = [
+        { label: "Step 1 · boundary", title: "Align to complete logical intervals", copy: "The prompt has 1,347 tokens. SparkCache excludes the live token and rounds down to five complete 256-token intervals: 1,280 potentially reusable tokens." },
+        { label: "Step 2 · hashing", title: "Generate exact prefix digests in one pass", copy: "One incremental SHA-256 pass copies the exact wire-compatible digest at 256, 512, 768, 1,024, and 1,280 tokens. Extending the prompt does not change an earlier boundary's digest." },
+        { label: "Step 3 · availability", title: "Find the longest stored exact entry", copy: "The scheduler checks boundary digests longest-first. It selects the first exact snapshot advertised by every expected physical TP rank—without issuing a disk read for each absent candidate." },
+        { label: "Step 4 · verification", title: "Probe and verify one exact snapshot", copy: "Workers independently open the selected manifest and verify identity, committed span, record compatibility, and every referenced object hash before restored blocks can be released." },
+        { label: "Step 5 · coordinated outcome", title: "Restore together or recompute together", copy: "All ranks commit to the same outcome. If one shard cannot be verified, the external restore is cancelled everywhere; no rank continues with partially trusted KV state." },
+        { label: "Step 6 · continuation", title: "Prefill the uncached tail", copy: "After a successful restore, vLLM computes the new aligned tail plus the live remainder. If this grown request is published today, SparkCache stores another complete exact-boundary snapshot; tail-only publication remains planned." }
+      ];
+
+      const scenarios = {
+        healthy: {
+          available: [4, 4, 4, 4], candidate: 1024, corrupt: false,
+          verdict: "All four ranks verify the exact 1,024-token snapshot. That snapshot restores from rank-local NVMe; logical interval E is the aligned tail to prefill."
+        },
+        stale: {
+          available: [4, 4, 4, 3], candidate: 768, corrupt: false,
+          verdict: "Rank 3 does not advertise the exact 1,024-token snapshot, so selection falls back to an exact 768-token snapshot present everywhere. Logical intervals D–E are prefilled by the model."
+        },
+        corrupt: {
+          available: [4, 4, 4, 4], candidate: 1024, corrupt: true,
+          verdict: "Rank 2 advertises the exact 1,024-token snapshot but its object does not pass byte verification. Every rank abandons the restore and the full safe span recomputes."
+        },
+        cold: {
+          available: [0, 0, 0, 0], candidate: 0, corrupt: false,
+          verdict: "No all-rank candidate exists. SparkCache returns a normal cache miss and vLLM prefills the full safe span."
+        }
+      };
+
+      const boundaries = [1280, 1024, 768, 512, 256];
+      const letters = ["A", "B", "C", "D", "E"];
+      let scenarioName = "healthy";
+      let step = 0;
+      let timer = null;
+
+      const $ = (id) => document.getElementById(id);
+      const promptRow = $("prompt-row");
+      const candidates = $("candidate-list");
+      const quorum = $("quorum");
+      const range = $("step-range");
+
+      function buildStatic() {
+        promptRow.innerHTML = letters.map((letter, index) => `<div class="token" data-chunk="${index}">${letter}<small>${index < 4 ? "cached" : "new"}</small></div>`).join("") + '<div class="token live">+67<small>remainder</small></div>';
+        candidates.innerHTML = boundaries.map(n => `<div class="candidate" data-prefix="${n}"><span>prefix</span><b>${n}</b></div>`).join("");
+      }
+
+      function buildQuorum(scenario, focusPrefix) {
+        const headers = '<span></span>' + boundaries.map(n => `<span class="q-head">${n}</span>`).join("");
+        const rows = scenario.available.map((count, rank) => {
+          const cells = boundaries.map((boundary) => {
+            const chunkCount = boundary / 256;
+            let kind = count >= chunkCount ? "hit" : "miss";
+            if (scenario.corrupt && rank === 2 && boundary === 1024 && step >= 3) kind = "corrupt";
+            const focus = focusPrefix === boundary ? " focus" : "";
+            return `<span class="q-cell ${kind}${focus}" aria-label="rank ${rank}, prefix ${boundary}, ${kind}"></span>`;
+          }).join("");
+          return `<span class="rank-label">rank ${rank}</span>${cells}`;
+        }).join("");
+        quorum.innerHTML = headers + rows + '<span class="matrix-note">✓ exact snapshot advertised in this worker generation · — absent · ! did not pass verification</span>';
+      }
+
+      function admittedTokens(scenario) {
+        if (step < 4 || scenario.corrupt) return 0;
+        return scenario.candidate;
+      }
+
+      function update() {
+        const scenario = scenarios[scenarioName];
+        const admitted = admittedTokens(scenario);
+        const focusPrefix = step >= 2 && scenario.candidate ? scenario.candidate : null;
+        $("stage-label").textContent = steps[step].label;
+        $("stage-title").textContent = steps[step].title;
+        $("stage-copy").textContent = steps[step].copy;
+        $("step-count").textContent = `${step + 1} / ${steps.length}`;
+        range.value = step;
+        $("previous").disabled = step === 0;
+        $("next").disabled = step === steps.length - 1;
+
+        document.querySelectorAll("#prompt-row .token[data-chunk]").forEach((node, index) => {
+          node.className = "token";
+          if (step === 0 && index === 4) node.classList.add("inactive");
+          if (step >= 4) {
+            if (scenario.corrupt) node.classList.add("fail");
+            else if (index < admitted / 256) node.classList.add("chosen");
+            else node.classList.add("compute");
+          }
+          node.querySelector("small").textContent = step >= 4 ? (scenario.corrupt ? "recompute" : index < admitted / 256 ? "restore" : "prefill") : index < 4 ? "cached" : "new";
+        });
+
+        document.querySelectorAll(".candidate").forEach((node) => {
+          const value = Number(node.dataset.prefix);
+          node.className = "candidate";
+          if (step >= 2 && value > scenario.candidate) node.classList.add("checked");
+          if (step >= 2 && value === scenario.candidate && scenario.candidate) node.classList.add("selected");
+          if (step >= 3 && scenario.corrupt && value === scenario.candidate) node.classList.add("failed");
+        });
+
+        buildQuorum(scenario, focusPrefix);
+        $("restored-value").textContent = admitted.toLocaleString();
+        $("prefill-value").textContent = (1280 - admitted).toLocaleString();
+        $("disk-reads").textContent = step >= 3 && scenario.candidate ? "1" : "0";
+        const percent = Math.round(admitted / 1280 * 100);
+        $("meter-fill").style.width = `${percent}%`;
+        $("meter-label").textContent = `${percent}% of the 1,280-token safe span`;
+        $("meter").classList.toggle("fail", scenario.corrupt && step >= 3);
+        $("verdict").classList.toggle("fail", scenario.corrupt && step >= 3);
+        $("verdict").textContent = step < 2
+          ? "No prefix has been admitted yet. Serving continues while optional cache discovery runs."
+          : step < 4
+            ? scenario.candidate ? `The exact ${scenario.candidate.toLocaleString()}-token snapshot is being checked; no KV state is trusted yet.` : scenario.verdict
+            : scenario.verdict;
+      }
+
+      function stop() {
+        if (timer) clearInterval(timer);
+        timer = null;
+        $("play").textContent = "▶";
+        $("play").classList.remove("playing");
+        $("play").setAttribute("aria-label", "Play steps");
+      }
+
+      function setStep(value) {
+        step = Math.max(0, Math.min(steps.length - 1, value));
+        update();
+      }
+
+      document.querySelectorAll(".scenario-tab").forEach(button => {
+        button.addEventListener("click", () => {
+          scenarioName = button.dataset.scenario;
+          document.querySelectorAll(".scenario-tab").forEach(tab => tab.setAttribute("aria-selected", String(tab === button)));
+          stop();
+          update();
+        });
+      });
+      $("reset").addEventListener("click", () => { stop(); setStep(0); });
+      $("previous").addEventListener("click", () => { stop(); setStep(step - 1); });
+      $("next").addEventListener("click", () => { stop(); setStep(step + 1); });
+      range.addEventListener("input", () => { stop(); setStep(Number(range.value)); });
+      $("play").addEventListener("click", () => {
+        if (timer) return stop();
+        if (step === steps.length - 1) setStep(0);
+        $("play").textContent = "Ⅱ";
+        $("play").classList.add("playing");
+        $("play").setAttribute("aria-label", "Pause steps");
+        timer = setInterval(() => {
+          if (step === steps.length - 1) return stop();
+          setStep(step + 1);
+        }, 1250);
+      });
+
+      buildStatic();
+      update();
+    })();
+  </script>
+</body>
+</html>
