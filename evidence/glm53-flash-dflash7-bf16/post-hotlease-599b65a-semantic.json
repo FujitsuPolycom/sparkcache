@@ -1,0 +1,21 @@
+{
+  "schema": "sparkcache-glm53-qualification-request/v1",
+  "kind": "semantic",
+  "model": "glm-5.3-flash-nvfp4-dflash7-bf16-tp4",
+  "prompt_sha256": "2db5eec56761ff3e65d2ffac7831166072631322bae9f6535c20766cc518f70c",
+  "elapsed_seconds": 1.031,
+  "finish_reason": "stop",
+  "content_sha256": "ff796e7ed318b7f7121b4a182cab9df829dfdf8d6b20fa1d41b94fa3c00fcb45",
+  "content_characters": 182,
+  "semantic_match": true,
+  "usage": {
+    "prompt_tokens": 27,
+    "total_tokens": 72,
+    "completion_tokens": 45,
+    "prompt_tokens_details": null,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    }
+  },
+  "validation_passed": true
+}

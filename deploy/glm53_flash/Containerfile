@@ -46,11 +46,11 @@ RUN set -eu; \
       02c71da26bbac81629248ee42b0a71bd2db817d339894d647d2ff6b66fd5ad19) \
         patch --batch --forward -p1 -d "$root" \
           < /opt/sparkcache-vllm-patches/040-sparkcache-shared-prefix-lease.patch ;; \
-      9670ab245eec1d939fb214f956c968e22a5e2550901a1c3719e311c4a1603503) ;; \
+      ee03dc9ce2b720c0be6e9f572d23580ba96eff68fe3406250557e83071654af0) ;; \
       *) echo "unsupported installed kv_cache_manager.py SHA-256: $before" >&2; exit 1 ;; \
     esac; \
     test "$(sha256sum "$kv_manager" | awk '{print $1}')" = \
-      9670ab245eec1d939fb214f956c968e22a5e2550901a1c3719e311c4a1603503; \
+      ee03dc9ce2b720c0be6e9f572d23580ba96eff68fe3406250557e83071654af0; \
     before="$(sha256sum "$scheduler" | awk '{print $1}')"; \
     case "$before" in \
       9d2b2d52c2634c3f9b7dffdb631d60e1925f579dc63273df8166e973f04386a9) \

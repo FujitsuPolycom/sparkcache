@@ -137,6 +137,15 @@ authoritative tuple when present, while retaining physical-page arithmetic as
 the fallback when no tuple exists. Optional lease rejections now emit one-line
 warnings rather than exception tracebacks.
 
+The concise-log build (`599b65a`) confirmed the remaining normalization
+problem without traceback noise: `Lease pin skipped ... partial-page metadata
+is invalid`. The leader's raw Mamba table included internal checkpoint blocks
+outside the logical prefix slice. All sixteen requests again completed through
+verified external restore (p50 4.663 seconds, maximum 7.698 seconds). The
+corrected lease builder now first normalizes each group's logical source
+window, then substitutes an authenticated manager-provided checkpoint block at
+the partial boundary before hidden-request adoption and immutable-page copy.
+
 Diagnostic receipts:
 
 - `evidence/glm53-flash-dflash7-bf16/singleflight-128k-c16-830a117.json`;
@@ -144,7 +153,9 @@ Diagnostic receipts:
 - `evidence/glm53-flash-dflash7-bf16/singleflight-retention18432-128k-c16.json`;
 - `evidence/glm53-flash-dflash7-bf16/post-retention18432-semantic.json`;
 - `evidence/glm53-flash-dflash7-bf16/hotlease-d30cdea-128k-c16.json`;
-- `evidence/glm53-flash-dflash7-bf16/post-hotlease-d30cdea-semantic.json`.
+- `evidence/glm53-flash-dflash7-bf16/post-hotlease-d30cdea-semantic.json`;
+- `evidence/glm53-flash-dflash7-bf16/hotlease-599b65a-128k-c16.json`;
+- `evidence/glm53-flash-dflash7-bf16/post-hotlease-599b65a-semantic.json`.
 
 ## Repository validation
 
