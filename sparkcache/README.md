@@ -194,24 +194,26 @@ when placement completes and intentionally excludes that bookkeeping.
   descriptors; default publication selects 4,096-token boundaries and retains
   at most 64 aliases. Exact manifests take precedence over aliases with the
   same digest.
-- **Immutable row tails — implemented, unqualified.** Setting
+- **Immutable row tails — implemented.** Setting
   `spark_cache_publication_schema` to `tail-cow-v1` selects a distinct cache
   namespace. The scheduler selects the longest earlier prefix advertised by
   every physical rank. Workers snapshot only rows after that boundary and
   publish `sparkcache-tail-manifest/v1` metadata over authenticated descriptor
   chains and immutable replacement-tail objects. A partial terminal chunk is
-  replaced, never modified. Restore rejection recomputes the request.
+  replaced, never modified. Restore rejection recomputes the request. GPU-free
+  regression coverage exists; live model-serving qualification does not.
 - **Opaque-page aliases — unsupported.** A `block_pages_v1` chunk is a byte
   partition of one complete HMA boundary snapshot, not an independently usable
   token range, so arbitrary earlier-prefix aliases cannot be derived from its
   chunks.
-- **Immutable block-page tails — implemented, unqualified.** The
+- **Immutable block-page tails — implemented.** The
   `sparkcache-hybrid-page-delta/v1` codec reuses only byte-identical page
   prefixes and binds the base snapshot, layout, block counts, and
   recurrent/sliding boundary. `sparkcache-page-delta-manifest/v1` embeds its
   authenticated base graph, allowing capacity maintenance to retain shared
   objects after older roots are removed. Restore reconstructs the verified
-  full snapshot before Python or native page placement.
+  full snapshot before Python or native page placement. GPU-free regression
+  coverage exists; live model-serving qualification does not.
 - **Concurrent shared GPU prefix — implemented.** One leader restores a
   persistent digest. After every rank succeeds, up to sixteen waiting followers
   attach through vLLM block references. Two leases may remain reusable for

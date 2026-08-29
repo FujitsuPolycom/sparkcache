@@ -3121,17 +3121,30 @@ class ManifestStore:
         if not is_prefix_alias:
             try:
                 manifest = json.loads(raw)
-                if manifest.get("schema") == _PAGE_DELTA_MANIFEST_SCHEMA:
+                schema_name = manifest.get("schema")
+                if schema_name in (
+                    _TAIL_MANIFEST_SCHEMA,
+                    _PAGE_DELTA_MANIFEST_SCHEMA,
+                ):
                     identity_wire = dict(manifest["identity"])
                     if "record_schema" in identity_wire:
                         identity_wire["record_schema"] = tuple(
                             identity_wire["record_schema"]
                         )
-                    descriptors = self._page_graph_descriptors(
-                        manifest,
-                        identity=CacheIdentity(**identity_wire),
-                        context_digest=context_digest,
-                    )
+                    identity = CacheIdentity(**identity_wire)
+                    if schema_name == _TAIL_MANIFEST_SCHEMA:
+                        resolved, _segments = self._resolve_tail_manifest(
+                            manifest,
+                            identity=identity,
+                            context_digest=context_digest,
+                        )
+                        descriptors = resolved["chunks"]
+                    else:
+                        descriptors = self._page_graph_descriptors(
+                            manifest,
+                            identity=identity,
+                            context_digest=context_digest,
+                        )
                 else:
                     descriptors = manifest.get("chunks", [])
             except (

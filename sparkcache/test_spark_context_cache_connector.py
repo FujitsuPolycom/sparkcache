@@ -431,19 +431,33 @@ class HybridPageRoundTripTests(unittest.TestCase):
             damaged = bytearray(delta_path.read_bytes())
             damaged[-1] ^= 1
             delta_path.write_bytes(damaged)
-            self.assertFalse(
-                connector._load_one(
-                    _ReqPlan(
-                        "page-corrupt-load",
-                        result_digest,
-                        1024,
-                        destination[0],
-                        False,
-                        block_ids_by_group=destination,
-                    )
+
+            damaged_sweep = connector.sweep_integrity()
+
+            self.assertEqual(damaged_sweep["invalidated"], 1)
+            self.assertNotIn(result_digest, connector._held)
+            self.assertFalse(delta_path.exists())
+            full[[3, 5]] = expected_full
+            compressed[[3, 5]] = expected_compressed
+            state[[2]] = expected_state
+            connector._store_one(
+                _ReqPlan(
+                    "page-tail-repair",
+                    result_digest,
+                    1024,
+                    result_groups[0],
+                    True,
+                    block_ids_by_group=result_groups,
+                    token_ids=tokens,
+                    base_context_digest=base_digest,
+                    base_span_tokens=512,
                 )
             )
-            self.assertNotIn(result_digest, connector._held)
+            repaired = connector._store.lookup(
+                connector._identity(0),
+                result_digest,
+            )
+            self.assertTrue(repaired.is_hit, repaired.reason)
 
     def test_multiple_group_pages_restore_byte_exactly_to_new_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2656,6 +2670,28 @@ class AsyncStoreTests(unittest.TestCase):
                 connector.counters["prefix_alias_publication_failed"],
                 0,
             )
+            manifest_path = (
+                root
+                / "manifests"
+                / connector._identity(0).storage_key
+                / f"{result_digest}.json"
+            )
+            manifest = json.loads(manifest_path.read_bytes())
+            tail_path = root / "chunks" / f"{manifest['tail_chunks'][0]['sha256']}.spcc"
+            damaged = bytearray(tail_path.read_bytes())
+            damaged[-1] ^= 1
+            tail_path.write_bytes(damaged)
+
+            sweep = connector.sweep_integrity()
+
+            self.assertEqual(sweep["invalidated"], 1)
+            self.assertFalse(tail_path.exists())
+            connector._store_one(extension)
+            repaired = connector._store.lookup(
+                connector._identity(0),
+                result_digest,
+            )
+            self.assertTrue(repaired.is_hit, repaired.reason)
             connector.shutdown()
 
     def test_under_limit_commit_does_not_reread_its_manifest(self) -> None:

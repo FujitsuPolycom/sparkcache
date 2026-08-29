@@ -285,14 +285,16 @@ CUDA execution requires a CUDA 13 build from
 
 ## Limitations and research work
 
-Tail-only publication for `per_token_rows` is **implemented but unqualified**.
+Tail-only publication for `per_token_rows` is **implemented** with GPU-free
+regression coverage and no live model-serving qualification.
 The opt-in `tail-cow-v1` publication schema writes only immutable replacement
 and extension chunks after an all-rank reusable boundary. It uses a distinct
 cache namespace. Default `snapshot-v1` deployments retain their existing wire
 identity and full-snapshot publication behavior.
 
-Tail-only publication for `block_pages_v1` is also **implemented but
-unqualified**. The page-semantic `sparkcache-hybrid-page-delta/v1` codec binds
+Tail-only publication for `block_pages_v1` is also **implemented** with
+GPU-free regression coverage and no live model-serving qualification. The
+page-semantic `sparkcache-hybrid-page-delta/v1` codec binds
 the exact base snapshot and recurrent/sliding boundary and reuses only
 byte-identical opaque pages. Restore reconstructs and verifies the complete
 snapshot before Python or native page placement. Arbitrary earlier-prefix
