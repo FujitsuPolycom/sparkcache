@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 from unittest import mock
 
@@ -33,3 +35,16 @@ def test_parent_license_boundary_is_explicit() -> None:
     assert public.EXPECTED_LICENSES == (
         "LicenseRef-NVIDIA-Deep-Learning-Container AND Apache-2.0 AND BSD-3-Clause"
     )
+
+
+def test_script_help_runs_from_outside_the_repository(tmp_path: Path) -> None:
+    script = Path(public.__file__).resolve()
+    completed = subprocess.run(
+        (sys.executable, str(script), "--help"),
+        cwd=tmp_path,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert completed.returncode == 0, completed.stderr

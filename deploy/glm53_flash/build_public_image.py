@@ -7,11 +7,16 @@ import argparse
 import json
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Iterable
 
-from deploy.deployment_contract.source import source_tree_sha256
-from deploy.glm53_flash.build_image import build_command
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+from deploy.deployment_contract.source import source_tree_sha256  # noqa: E402
+from deploy.glm53_flash.build_image import build_command  # noqa: E402
 
 
 RECEIPT_SCHEMA = "sparkcache-glm53-public-image/v1"
