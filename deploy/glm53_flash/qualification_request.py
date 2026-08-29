@@ -26,6 +26,30 @@ def semantic_prompt() -> str:
     return f"Respond with exactly {SEMANTIC_ANSWER} and no other text."
 
 
+def request_body(kind: str, model: str) -> dict[str, object]:
+    """Build the request whose response is evaluated by this qualifier."""
+
+    prompt = persistent_prompt() if kind == "persistent" else semantic_prompt()
+    body: dict[str, object] = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 1.0 if kind == "persistent" else 0.0,
+        "max_tokens": 64 if kind == "persistent" else 256,
+    }
+    if kind == "semantic":
+        # GLM's chat parser separates reasoning from visible content when
+        # thinking is enabled. Disabling it on this runtime can leave raw
+        # reasoning and a closing </think> marker in message.content.
+        body["chat_template_kwargs"] = {"enable_thinking": True}
+    return body
+
+
+def semantic_content_matches(content: object) -> bool:
+    """Accept only the exact visible answer requested by the canary."""
+
+    return isinstance(content, str) and content == SEMANTIC_ANSWER
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--endpoint", required=True)
@@ -36,15 +60,7 @@ def main() -> int:
     args = parser.parse_args()
 
     prompt = persistent_prompt() if args.kind == "persistent" else semantic_prompt()
-    request_body = {
-        "model": args.model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 1.0 if args.kind == "persistent" else 0.0,
-        "max_tokens": 64 if args.kind == "persistent" else 256,
-    }
-    if args.kind == "semantic":
-        request_body["chat_template_kwargs"] = {"enable_thinking": False}
-    encoded = json.dumps(request_body).encode("utf-8")
+    encoded = json.dumps(request_body(args.kind, args.model)).encode("utf-8")
     request = urllib.request.Request(
         args.endpoint.rstrip("/") + "/v1/chat/completions",
         data=encoded,
@@ -55,9 +71,10 @@ def main() -> int:
         body = json.load(response)
     elapsed = time.perf_counter() - started
     choice = body["choices"][0]
-    content = str(choice["message"].get("content") or "").strip()
+    raw_content = choice["message"].get("content")
+    content = raw_content if isinstance(raw_content, str) else ""
     semantic_match = (
-        content.endswith(SEMANTIC_ANSWER) if args.kind == "semantic" else None
+        semantic_content_matches(raw_content) if args.kind == "semantic" else None
     )
     receipt = {
         "schema": "sparkcache-glm53-qualification-request/v1",

@@ -144,8 +144,10 @@ timing.
 | 131,072-token shared prefix, pretokenized C16 | standalone measurement | 2.698 s client p50 and 2.701 s maximum |
 
 The 16-request shared-prefix qualification used vLLM `--max-num-seqs 32`.
-Every request succeeded, each rank performed one external restore, and a
-semantic canary passed after the run.
+Every request succeeded and each rank performed one external restore. The
+historical post-run canary accepted any content ending in
+`SPARKCACHE_GLM53_OK`; its receipt proves continued generation and the marker
+suffix, not exact visible output.
 
 Two- and eight-request identical-prefix cohorts and a 16-request shared-trunk
 cohort with distinct tails also passed under the recorded runtime.

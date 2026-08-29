@@ -15,6 +15,13 @@ followers, another checkpoint, another topology, or another vLLM source tree.
 Those cases remain outside the qualification evidence. Tail-only publication
 and page-semantic GLM prefix aliases are **unsupported**.
 
+The committed semantic receipts used a suffix-only predicate: content ending
+in `SPARKCACHE_GLM53_OK` was recorded as `semantic_match: true`. They prove
+continued generation and the expected suffix, but they do not prove that the
+visible response contained exactly `SPARKCACHE_GLM53_OK`. Exact-output semantic
+qualification requires a receipt produced by the equality validator in
+`deploy/glm53_flash/qualification_request.py`.
+
 ## Qualified runtime identity
 
 | Attribute | Value |
@@ -83,7 +90,8 @@ The Python reconstruction pipeline measured 1.29--1.46 seconds per rank for
 the same stored prefix. Native cache service therefore reduced the slowest-rank
 time to 250.1 ms. End-to-end client latency was 0.907 seconds, including
 scheduler work, live-token execution, and DFlash generation. A separate
-semantic canary matched and HTTP health remained 200.
+historical canary found the expected marker suffix, and HTTP health remained
+200.
 
 ### Eight concurrent 16K prefixes
 
@@ -122,7 +130,8 @@ moving tokenizer work outside the timed interval:
 
 The pretokenized C16 restore used 104.2--165.3 ms of cache service per rank
 and at most 3.2 ms of restore-queue wait. Every request completed, queues
-drained to zero, no engine exited, and the post-run semantic canary matched.
+drained to zero, no engine exited, and the historical post-run canary found the
+expected marker suffix.
 
 Qualified receipts:
 

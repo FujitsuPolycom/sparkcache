@@ -80,9 +80,10 @@ embedded in the derived images.
 [`GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md`](../../GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md)
 contains the commands, source contract, and receipts. The four images stored
 and restored 8,192 tokens across a coordinated restart in 147.2--194.0 ms per
-rank. The restored request completed in 1.509 seconds. A semantic canary
-matched, DFlash produced seven tokens per draft, and all ranks remained free of
-OOMs, restarts, and fatal-log matches.
+rank. The restored request completed in 1.509 seconds. A historical canary
+found the `SPARKCACHE_GLM53_OK` suffix but did not require exact visible
+content. DFlash produced seven tokens per draft, and all ranks remained free
+of OOMs, restarts, and fatal-log matches.
 
 ## Qualification boundary
 

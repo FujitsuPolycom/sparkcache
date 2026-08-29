@@ -103,8 +103,10 @@ request formed quorum and restored exactly 8,192 external tokens:
 
 vLLM reported 16,457 external-prefix queries, 8,192 external-prefix hits, and
 8,192 prompt tokens sourced from external KV transfer. The restored request
-completed successfully in 1.509 seconds. A fresh uncached semantic canary
-finished with `stop` and final answer suffix `SPARKCACHE_GLM53_OK`.
+completed successfully in 1.509 seconds. An uncached semantic canary
+finished with `stop` and final answer suffix `SPARKCACHE_GLM53_OK`. Its
+suffix-only predicate did not prove that visible content contained no preceding
+reasoning text or parser marker.
 
 DFlash counters remained exact: 43 drafts produced 301 draft tokens
 (`43 × 7`) and 112 accepted tokens. The service recorded zero preemptions.
@@ -158,7 +160,11 @@ python deploy/glm53_flash/qualification_request.py \
 
 Its receipt,
 [`post-restore-semantic.json`](evidence/glm53-flash-dflash7-bf16/post-restore-semantic.json),
-must record `finish_reason: stop` and `semantic_match: true`.
+records `finish_reason: stop` and `semantic_match: true` under the historical
+suffix-only predicate. That receipt proves continued generation and the marker
+suffix, not exact visible output. Exact-output semantic qualification requires
+a new receipt from the equality validator in `qualification_request.py`; the
+visible `message.content` must equal `SPARKCACHE_GLM53_OK` byte for byte.
 
 ## Limitations
 
@@ -167,5 +173,6 @@ contract, target or draft checkpoint, parallel topology, scheduler budget,
 cache geometry, native direct restore, streaming snapshots, or MTP profile.
 It does not establish throughput neutrality or restore performance for spans
 larger than 8,192 tokens. Full reasoning-trace equality is not a semantic
-oracle for this GLM runtime; the qualification uses exact final-answer suffix,
-successful continued generation, all-rank restore, and fail-closed counters.
+oracle for this GLM runtime. The historical canary establishes successful
+continued generation and a final-answer suffix only. It does not establish
+exact visible output.
