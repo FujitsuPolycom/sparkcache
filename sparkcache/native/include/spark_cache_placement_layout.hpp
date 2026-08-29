@@ -476,6 +476,46 @@ inline bool validate_page_scatter(
   return true;
 }
 
+inline bool validate_page_completion(
+    std::uint64_t snapshot_bytes,
+    std::uint64_t submitted_snapshot_bytes,
+    const SparkCachePageDestinationDescriptor* destinations,
+    std::uint32_t destination_count,
+    const SparkCachePageGroupDescriptor* groups,
+    std::uint32_t group_count,
+    const std::vector<std::uint64_t>& destination_covered,
+    std::string* error) {
+  auto fail = [&](const char* message) {
+    if (error != nullptr) {
+      *error = message;
+    }
+    return false;
+  };
+  if (snapshot_bytes == 0 || destinations == nullptr || destination_count == 0 ||
+      groups == nullptr || group_count == 0 ||
+      destination_covered.size() != destination_count) {
+    return fail("page restore completion state is invalid");
+  }
+  if (submitted_snapshot_bytes != snapshot_bytes) {
+    return fail("page slabs do not cover the complete snapshot");
+  }
+  for (std::uint32_t index = 0; index < destination_count; ++index) {
+    const auto& destination = destinations[index];
+    if (destination.group_index >= group_count) {
+      return fail("page destination references a missing group");
+    }
+    std::uint64_t expected = 0;
+    if (!checked_mul(
+            groups[destination.group_index].slot_count,
+            destination.bytes_per_page,
+            &expected) ||
+        destination_covered[index] != expected) {
+      return fail("page slabs do not cover every destination");
+    }
+  }
+  return true;
+}
+
 }  // namespace spark_cache::placement
 
 #endif  // SPARK_CACHE_PLACEMENT_LAYOUT_HPP_

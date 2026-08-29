@@ -228,3 +228,18 @@ def test_parser_names_the_outer_sha_trust_boundary() -> None:
     text = HEADER.read_text(encoding="utf-8")
     assert "after the caller has verified the manifest's outer SHA-256" in text
     assert "spark_cache_parse_verified_v1_chunk" in text
+
+
+def test_page_finish_proves_complete_coverage_and_modes_cannot_mix() -> None:
+    text = CUDA.read_text(encoding="utf-8")
+    transposed = text.index("spark_cache_placement_submit_transposed_slab")
+    page_submit = text.index("spark_cache_placement_submit_page_slab")
+    transposed_body = text[transposed:page_submit]
+    assert "placement->restore_mode != RestoreMode::kTransposed" in transposed_body
+    assert "validate_page_completion" not in transposed_body
+
+    finish = text.index("spark_cache_placement_finish_restore")
+    abort = text.index("spark_cache_placement_abort_restore")
+    finish_body = text[finish:abort]
+    assert "placement->restore_mode == RestoreMode::kPages" in finish_body
+    assert "validate_page_completion(" in finish_body

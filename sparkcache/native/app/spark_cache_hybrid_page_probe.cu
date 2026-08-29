@@ -63,11 +63,67 @@ int main() {
           placement, &page_destination, 1),
       placement,
       "configure page destinations");
+
+  // A partially submitted page transaction must remain unavailable to its
+  // parked request. This exercises the production finish edge, not only the
+  // standalone CPU layout validator.
   ok = ok && placement_ok(
       spark_cache_placement_begin_page_restore(
           placement, &group, 1, slots.data(), slots.size(), 8),
       placement,
-      "begin page restore");
+      "begin incomplete page restore");
+  void* incomplete_arena = nullptr;
+  std::uint64_t incomplete_capacity = 0;
+  ok = ok && placement_ok(
+      spark_cache_placement_acquire_arena(
+          placement, 0, &incomplete_arena, &incomplete_capacity),
+      placement,
+      "acquire incomplete arena");
+  const std::array<std::uint8_t, 4> incomplete_source{1, 2, 3, 4};
+  if (ok && incomplete_capacity >= incomplete_source.size()) {
+    std::memcpy(
+        incomplete_arena, incomplete_source.data(), incomplete_source.size());
+  } else {
+    ok = false;
+  }
+  const SparkCachePageCopySpan incomplete_span{
+      0, 0, 0, incomplete_source.size(), 0, 0};
+  ok = ok && placement_ok(
+      spark_cache_placement_submit_page_slab(
+          placement, 0, incomplete_source.size(), &incomplete_span, 1),
+      placement,
+      "submit incomplete page slab");
+  void* mixed_arena = nullptr;
+  std::uint64_t mixed_capacity = 0;
+  ok = ok && placement_ok(
+      spark_cache_placement_acquire_arena(
+          placement, 1, &mixed_arena, &mixed_capacity),
+      placement,
+      "acquire mixed-mode arena");
+  const SparkCacheTransposedSource mixed_source{0, 0, 0};
+  const auto mixed_status = spark_cache_placement_submit_transposed_slab(
+      placement, 1, 1, &mixed_source, 1);
+  ok = ok && mixed_status == SPARK_CACHE_PLACEMENT_INVALID_STATE &&
+       std::strstr(
+           spark_cache_placement_last_error(placement),
+           "cannot mix transposed and non-transposed") != nullptr;
+  SparkCachePlacementStats incomplete_stats{};
+  const auto incomplete_finish =
+      spark_cache_placement_finish_restore(placement, &incomplete_stats);
+  ok = ok && incomplete_finish == SPARK_CACHE_PLACEMENT_INVALID_STATE &&
+       std::strstr(
+           spark_cache_placement_last_error(placement),
+           "do not cover the complete snapshot") != nullptr;
+  ok = ok && placement_ok(
+      spark_cache_placement_abort_restore(placement),
+      placement,
+      "abort incomplete page restore");
+
+  ok = ok && placement_ok(
+      spark_cache_placement_begin_page_restore(
+          placement, &group, 1, slots.data(), slots.size(), 8),
+      placement,
+      "begin complete page restore");
 
   void* arena = nullptr;
   std::uint64_t capacity = 0;

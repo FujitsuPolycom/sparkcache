@@ -18,6 +18,7 @@ namespace {
 using spark_cache::placement::validate_config;
 using spark_cache::placement::validate_destinations;
 using spark_cache::placement::validate_direct_slab;
+using spark_cache::placement::validate_page_completion;
 using spark_cache::placement::validate_page_scatter;
 using spark_cache::placement::validate_slots;
 using spark_cache::placement::validate_transposed_slab;
@@ -1088,8 +1089,9 @@ spark_cache_placement_submit_transposed_slab(
   if (required != SPARK_CACHE_PLACEMENT_OK) {
     return required;
   }
-  if (placement->restore_mode == RestoreMode::kDirect) {
-    set_error(placement, "cannot mix transposed and direct restore slabs");
+  if (placement->restore_mode != RestoreMode::kUnset &&
+      placement->restore_mode != RestoreMode::kTransposed) {
+    set_error(placement, "cannot mix transposed and non-transposed restore slabs");
     return SPARK_CACHE_PLACEMENT_INVALID_STATE;
   }
   if (arena_used_bytes == 0 ||
@@ -1116,26 +1118,6 @@ spark_cache_placement_submit_transposed_slab(
           placement,
           "transposed destination was submitted more than once");
       return SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT;
-    }
-  }
-  if (placement->restore_mode == RestoreMode::kPages) {
-    if (placement->page_submitted_snapshot_bytes !=
-        placement->page_snapshot_bytes) {
-      set_error(placement, "page slabs do not cover the complete snapshot");
-      return SPARK_CACHE_PLACEMENT_INVALID_STATE;
-    }
-    for (std::uint32_t index = 0;
-         index < placement->page_destination_count;
-         ++index) {
-      const auto& destination = placement->page_destinations[index];
-      const auto& group = placement->page_groups[destination.group_index];
-      const std::uint64_t expected =
-          static_cast<std::uint64_t>(group.slot_count) *
-          destination.bytes_per_page;
-      if (placement->page_destination_covered[index] != expected) {
-        set_error(placement, "page slabs do not cover every destination");
-        return SPARK_CACHE_PLACEMENT_INVALID_STATE;
-      }
     }
   }
   std::memcpy(
@@ -1308,6 +1290,21 @@ spark_cache_placement_finish_restore(
             "transposed slabs do not cover every destination");
         return SPARK_CACHE_PLACEMENT_INVALID_STATE;
       }
+    }
+  }
+  if (placement->restore_mode == RestoreMode::kPages) {
+    std::string detail;
+    if (!validate_page_completion(
+            placement->page_snapshot_bytes,
+            placement->page_submitted_snapshot_bytes,
+            placement->page_destinations.data(),
+            placement->page_destination_count,
+            placement->page_groups.data(),
+            placement->page_group_count,
+            placement->page_destination_covered,
+            &detail)) {
+      set_error(placement, detail);
+      return SPARK_CACHE_PLACEMENT_INVALID_STATE;
     }
   }
   for (auto& arena : placement->arenas) {

@@ -382,6 +382,47 @@ void test_page_validation_is_atomic_before_copy() {
       [](std::uint8_t value) { return value == 0xa5; }));
 }
 
+void test_page_completion_requires_every_snapshot_and_destination_byte() {
+  const std::array<SparkCachePageDestinationDescriptor, 2> destinations{{
+      {1, 4, 4, 4, 0, 0},
+      {1, 4, 2, 2, 0, 0},
+  }};
+  const SparkCachePageGroupDescriptor group{0, 2, 0, 0};
+  std::string error;
+
+  assert(!spark_cache::placement::validate_page_completion(
+      12,
+      8,
+      destinations.data(),
+      destinations.size(),
+      &group,
+      1,
+      {8, 4},
+      &error));
+  assert(error == "page slabs do not cover the complete snapshot");
+
+  assert(!spark_cache::placement::validate_page_completion(
+      12,
+      12,
+      destinations.data(),
+      destinations.size(),
+      &group,
+      1,
+      {8, 3},
+      &error));
+  assert(error == "page slabs do not cover every destination");
+
+  assert(spark_cache::placement::validate_page_completion(
+      12,
+      12,
+      destinations.data(),
+      destinations.size(),
+      &group,
+      1,
+      {8, 4},
+      &error));
+}
+
 }  // namespace
 
 int main() {
@@ -392,5 +433,6 @@ int main() {
   test_duplicate_slots_are_rejected();
   test_page_abi_and_byte_exact_scatter();
   test_page_validation_is_atomic_before_copy();
+  test_page_completion_requires_every_snapshot_and_destination_byte();
   return 0;
 }
