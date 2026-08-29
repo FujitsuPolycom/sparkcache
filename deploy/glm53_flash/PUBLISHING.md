@@ -1,8 +1,9 @@
 # Publish the GLM-5.3 SparkCache image
 
 Status: **implemented** for image construction and private GHCR publication.
-Four-rank TP4/DCP1 serving remains unqualified until the exact registry digest
-passes the cache-enabled and cache-disabled procedures.
+An exact registry digest remains unqualified until all four TP4/DCP1 ranks pull
+that digest and pass persistent store, coordinated restart, verified restore,
+exact semantic output, cache-disabled serving, health, and fatal-log checks.
 
 The published artifact is a FujitsuPolycom community derivative. It is not an
 official NVIDIA, vLLM, local-inference-lab, B12X, Inco AI, Z.AI, or SparkCache
@@ -38,16 +39,13 @@ python sparkcache/deploy/glm53_flash/build_public_image.py \
 
 ## SBOM
 
-Generate and inspect an SPDX JSON software bill of materials with Syft before
-publication:
+Install Syft before publication. `publish_image.py` invokes Syft against the
+immutable image ID recorded by the build receipt. The `--sbom` argument names a
+new output path and must not identify an existing file.
 
-```bash
-syft scan sparkring-glm53-sparkcache:da4d7be-dflash2-bf16-arm64 \
-  --output spdx-json=glm53-sparkcache.spdx.json
-```
-
-The SBOM supplements rather than replaces the immutable source pins, Git trees,
-license files, and image labels.
+The generated SPDX JSON document supplements rather than replaces immutable
+source pins, Git trees, license files, and image labels. The publication receipt
+records its SHA-256 and the source image ID.
 
 ## Private publication
 
@@ -63,10 +61,10 @@ python sparkcache/deploy/glm53_flash/publish_image.py \
   --output glm53-sparkcache-publication-receipt.json
 ```
 
-Keep the package private while its status is implemented. Pull the receipt's
-`registry_digest` on all four ranks, verify one local image ID, and run the
-complete TP4/DCP1 qualification. Publish the qualification receipt before
-making the GHCR package public.
+Keep each registry digest private until that digest has a TP4/DCP1 qualification
+receipt. Pull the receipt's `registry_digest` on all four ranks, verify each
+local image ID, and run the named serving checks above. Publish the qualification
+receipt before making the GHCR package public.
 
 Public GHCR visibility is irreversible. Confirm the image contains no model
 weights, credentials, site configuration, cache entries, or unlicensed source
