@@ -109,6 +109,23 @@ reclamation target, not a preallocation reservation. One publisher per
 rank-local root is qualified; multiple publishers can transiently exceed the
 watermark until maintenance reconciles physical use.
 
+## Restore timing
+
+Every asynchronous restore emits one compact JSON record prefixed with
+`spark-context-cache-restore-timing:`. Schema
+`sparkcache-restore-timing/v1` separates time waiting for a load worker from
+manifest lookup, chunk read/verification/decoding, state reconstruction,
+device-transfer submission, and CUDA-stream synchronization. It also reports
+the selected span, chunk count, encoded hybrid-page bytes, service time, and
+enqueue-to-completion time.
+
+The record is diagnostic only. Missing or malformed timing observations do not
+change whether cached state is accepted: SparkCache restores verified state or
+recomputes the request. The legacy human-readable total remains available for
+existing log consumers. That legacy total includes the best-effort manifest
+recency touch after successful restoration; the structured `service_ms` ends
+when placement completes and intentionally excludes that bookkeeping.
+
 ## Optional paths
 
 - **Native direct restore — implemented.** Requires the checksum-attested

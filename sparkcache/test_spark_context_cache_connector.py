@@ -24,6 +24,10 @@ from unittest import mock
 import torch
 
 import sparkcache.spark_context_cache_codec as codec
+from sparkcache.spark_context_cache_restore_timing import (
+    RESTORE_TIMING_PREFIX,
+    RestoreTiming,
+)
 
 
 def _install_vllm_stubs() -> None:
@@ -3148,6 +3152,77 @@ class AsyncRestoreTests(unittest.TestCase):
             self.assertEqual(connector.get_finished(set()), (None, None))
             self.assertEqual(connector.counters["load_verified"], 1)
 
+    def test_async_restore_records_queue_and_service_phases(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(Path(directory), 0, 64)
+            connector.register_kv_caches(_make_pools(8, 64))
+            digest = "7" * 64
+            self._store_entry(connector, digest)
+            connector.bind_connector_metadata(
+                SparkCacheConnectorMetadata(
+                    plans=[
+                        _ReqPlan(
+                            "timed-restore",
+                            digest,
+                            self.SPAN,
+                            self.BLOCKS,
+                            False,
+                        )
+                    ]
+                )
+            )
+
+            with mock.patch.object(connector_module.logger, "info") as log_info:
+                connector.start_load_kv(None)
+                self.assertEqual(_drain(connector), {"timed-restore"})
+
+            rendered = next(
+                call.args[1]
+                for call in log_info.call_args_list
+                if len(call.args) == 2
+                and isinstance(call.args[1], str)
+                and call.args[1].startswith(RESTORE_TIMING_PREFIX)
+            )
+            record = json.loads(rendered.removeprefix(RESTORE_TIMING_PREFIX))
+            self.assertEqual(record["request_id"], "timed-restore")
+            self.assertEqual(record["outcome"], "verified")
+            self.assertGreaterEqual(record["queue_wait_ms"], 0)
+            self.assertGreater(record["service_ms"], 0)
+            self.assertGreater(record["phase_ms"]["manifest_lookup"], 0)
+            self.assertGreater(record["phase_ms"]["restore_read"], 0)
+            self.assertGreater(record["phase_ms"]["reassembly_decode"], 0)
+            self.assertGreater(record["phase_ms"]["h2d_submit"], 0)
+
+    def test_timing_failure_does_not_prevent_restore_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(Path(directory), 0, 64)
+            connector.register_kv_caches(_make_pools(8, 64))
+            digest = "6" * 64
+            self._store_entry(connector, digest)
+            connector.bind_connector_metadata(
+                SparkCacheConnectorMetadata(
+                    plans=[
+                        _ReqPlan(
+                            "timing-failure",
+                            digest,
+                            self.SPAN,
+                            self.BLOCKS,
+                            False,
+                        )
+                    ]
+                )
+            )
+
+            with mock.patch.object(
+                RestoreTiming,
+                "start_service",
+                side_effect=RuntimeError("synthetic timing failure"),
+            ):
+                connector.start_load_kv(None)
+                self.assertEqual(_drain(connector), {"timing-failure"})
+
+            self.assertEqual(connector.counters["load_verified"], 1)
+
     def test_corrupt_restore_finishes_for_clean_recompute(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "rank2"
@@ -4740,7 +4815,21 @@ class DeepSeekTP4HMAPageTests(unittest.TestCase):
                     block_ids_by_group=destination_tables,
                 )
 
-                self.assertTrue(connector._load_one(load))
+                timing = RestoreTiming(
+                    request_id=load.request_id,
+                    digest=load.digest,
+                    span_tokens=load.span_tokens,
+                    storage_mode="block_pages_v1",
+                    enqueued_ns=time.perf_counter_ns(),
+                )
+                timing.start_service()
+                self.assertTrue(connector._load_one(load, timing=timing))
+                timing.finish("verified")
+                self.assertGreater(timing.phase_ns["restore_read"], 0)
+                self.assertGreater(timing.phase_ns["reassembly_decode"], 0)
+                self.assertGreater(timing.phase_ns["h2d_submit"], 0)
+                self.assertGreater(timing.page_bytes, 0)
+                self.assertEqual(timing.chunk_count, 4)
 
                 destination_selected = connector._select_group_blocks_for_span(
                     destination_tables,

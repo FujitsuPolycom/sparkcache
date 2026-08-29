@@ -84,6 +84,7 @@ from sparkcache.spark_context_cache_hybrid import (
     encode_page_snapshot,
     split_snapshot,
 )
+from sparkcache.spark_context_cache_restore_timing import RestoreTiming
 from sparkcache.spark_context_cache_store import (
     CacheIdentity,
     ContextChunk,
@@ -168,6 +169,12 @@ class _ReqPlan:
     @property
     def group_block_ids(self) -> tuple[tuple[int, ...], ...]:
         return self.block_ids_by_group or (self.block_ids,)
+
+
+@dataclass(frozen=True)
+class _QueuedLoad:
+    plan: _ReqPlan
+    timing: RestoreTiming
 
 
 @dataclass(frozen=True)
@@ -563,7 +570,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._store_thread: threading.Thread | None = None
         self._store_inflight = 0
         self._store_accepting = True
-        self._load_queue: "queue.SimpleQueue[_ReqPlan | None]" = queue.SimpleQueue()
+        self._load_queue: "queue.SimpleQueue[_QueuedLoad | None]" = queue.SimpleQueue()
         self._load_threads: list[threading.Thread] = []
         self._load_thread_limit = config.load_thread_limit
         if self._native_restore_enabled:
@@ -1974,17 +1981,23 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
 
     def _load_worker_main(self) -> None:
         while True:
-            plan = self._load_queue.get()
-            if plan is None:
+            queued = self._load_queue.get()
+            if queued is None:
                 return
+            plan = queued.plan
+            timing = queued.timing
             started = time.perf_counter()
+            with contextlib.suppress(Exception):
+                timing.start_service()
             try:
-                verified = self._load_one(plan)
+                verified = self._load_one(plan, timing=timing)
             except Exception as error:  # noqa: BLE001
                 logger.warning(
                     "spark-context-cache: load crashed fail-closed: %s", error
                 )
                 verified = False
+            with contextlib.suppress(Exception):
+                timing.finish("verified" if verified else "recompute")
             with self._load_cv:
                 if verified:
                     self.counters["load_verified"] += 1
@@ -1999,6 +2012,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self._finished_load_reqs.add(plan.request_id)
                 self._inflight_load_reqs.discard(plan.request_id)
                 self._load_cv.notify_all()
+            with contextlib.suppress(Exception):
+                logger.info("%s", timing.render())
             if verified:
                 with contextlib.suppress(Exception):
                     ttl_seconds = self._capacity_policy.ttl_seconds
@@ -2036,30 +2051,58 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         with self._load_lock:
             self._inflight_load_reqs.update(plan.request_id for plan in load_plans)
         for plan in load_plans:
-            self._load_queue.put(plan)
+            self._load_queue.put(
+                _QueuedLoad(
+                    plan=plan,
+                    timing=RestoreTiming(
+                        request_id=plan.request_id,
+                        digest=plan.digest,
+                        span_tokens=plan.span_tokens,
+                        storage_mode=self._storage_mode,
+                        enqueued_ns=time.perf_counter_ns(),
+                    ),
+                )
+            )
 
-    def _load_one(self, plan: _ReqPlan) -> bool:
+    def _load_one(
+        self,
+        plan: _ReqPlan,
+        *,
+        timing: RestoreTiming | None = None,
+    ) -> bool:
         try:
             rank = self._worker_rank()
             identity = self._identity(rank)
-            if self._store.expired(
-                identity,
-                plan.digest,
-                self._capacity_policy.ttl_seconds,
-            ):
-                with self._load_lock:
-                    self._held.discard(plan.digest)
-                self._capacity_wakeup.set()
-                logger.info(
-                    "spark-context-cache: worker rank %d TTL miss for %s",
-                    rank,
-                    plan.digest[:12],
+            lookup_started = time.perf_counter_ns()
+            try:
+                if self._store.expired(
+                    identity,
+                    plan.digest,
+                    self._capacity_policy.ttl_seconds,
+                ):
+                    with self._load_lock:
+                        self._held.discard(plan.digest)
+                    self._capacity_wakeup.set()
+                    logger.info(
+                        "spark-context-cache: worker rank %d TTL miss for %s",
+                        rank,
+                        plan.digest[:12],
+                    )
+                    return False
+                # Restore is the integrity boundary and re-hashes every chunk in
+                # parallel. A full lookup verification here would read/hash/decode
+                # the complete context twice before installation.
+                lookup = self._store.lookup(
+                    identity,
+                    plan.digest,
+                    verify_chunks=False,
                 )
-                return False
-            # Restore is the integrity boundary and re-hashes every chunk in
-            # parallel. A full lookup verification here would read/hash/decode
-            # the complete context twice before installation.
-            lookup = self._store.lookup(identity, plan.digest, verify_chunks=False)
+            finally:
+                if timing is not None:
+                    timing.observe(
+                        "manifest_lookup",
+                        time.perf_counter_ns() - lookup_started,
+                    )
             if not lookup.is_hit:
                 logger.warning(
                     "spark-context-cache: worker rank %d miss (%s) for %s",
@@ -2071,7 +2114,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     self._invalidate_after_failure(plan.digest)
                 return False
             if self._storage_mode == "block_pages_v1":
-                return self._load_hybrid_pages(lookup, plan)
+                return self._load_hybrid_pages(lookup, plan, timing=timing)
             if self._native_restore_enabled:
                 if (
                     self._native_adapter is None
@@ -2113,6 +2156,19 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     )
                     self._invalidate_after_failure(plan.digest)
                     return False
+                if timing is not None:
+                    timing.observe(
+                        "restore_read",
+                        int(result.read_and_hash_ms * 1_000_000),
+                    )
+                    timing.observe(
+                        "h2d_submit",
+                        int(result.parse_and_submit_ms * 1_000_000),
+                    )
+                    timing.observe(
+                        "cuda_sync",
+                        int(result.finish_ms * 1_000_000),
+                    )
                 self.counters["native_load_verified"] = (
                     self.counters.get("native_load_verified", 0) + 1
                 )
@@ -2131,12 +2187,19 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     result.finish_ms,
                 )
                 return True
+            restore_started = time.perf_counter_ns()
             chunks = self._store.restore(lookup)
+            if timing is not None:
+                timing.observe(
+                    "restore_read",
+                    time.perf_counter_ns() - restore_started,
+                )
             if chunks is None or len(chunks) != chunk_count(
                 plan.span_tokens, self._chunk_tokens
             ):
                 self._invalidate_after_failure(plan.digest)
                 return False
+            reassembly_started = time.perf_counter_ns()
             positions = owned_positions(plan.span_tokens, self._dcp_degree, rank)
             slots = local_slots_for_positions(
                 positions, plan.block_ids, self._block_size, self._dcp_degree
@@ -2158,7 +2221,14 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     )
                     for name, payload in split.items():
                         layer_rows[name].append(payload)
+            if timing is not None:
+                timing.chunk_count = len(chunks)
+                timing.observe(
+                    "reassembly_decode",
+                    time.perf_counter_ns() - reassembly_started,
+                )
             slot_tensor = torch.tensor(slots, dtype=torch.long)
+            submit_started = time.perf_counter_ns()
             with self._load_write_context():
                 for plan_entry in self._plans:
                     tensor = self._layer_tensors[plan_entry.name]
@@ -2170,15 +2240,32 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     staged = flat.to(rows.device)
                     rows_u8 = rows.view(torch.uint8)
                     rows_u8[slot_tensor.to(rows.device)] = staged
+            if timing is not None:
+                timing.observe(
+                    "h2d_submit",
+                    time.perf_counter_ns() - submit_started,
+                )
             if self._load_stream is not None:
+                sync_started = time.perf_counter_ns()
                 self._load_stream.synchronize()
+                if timing is not None:
+                    timing.observe(
+                        "cuda_sync",
+                        time.perf_counter_ns() - sync_started,
+                    )
             return True
         except (CodecError, KeyError, RuntimeError, ValueError) as error:
             logger.warning("spark-context-cache: load failed fail-closed: %s", error)
             self._invalidate_after_failure(plan.digest)
             return False
 
-    def _load_hybrid_pages(self, lookup: Any, plan: _ReqPlan) -> bool:
+    def _load_hybrid_pages(
+        self,
+        lookup: Any,
+        plan: _ReqPlan,
+        *,
+        timing: RestoreTiming | None = None,
+    ) -> bool:
         layout = self._page_layout
         if layout is None:
             raise RuntimeError("block-page layout was not registered")
@@ -2187,10 +2274,17 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         )
         if len(groups) != len(layout.groups):
             raise HybridCodecError("request block tables disagree with page groups")
+        restore_started = time.perf_counter_ns()
         chunks = self._store.restore(lookup)
+        if timing is not None:
+            timing.observe(
+                "restore_read",
+                time.perf_counter_ns() - restore_started,
+            )
         expected_chunks = chunk_count(plan.span_tokens, self._chunk_tokens)
         if chunks is None or len(chunks) != expected_chunks:
             raise HybridCodecError("hybrid snapshot chunk count differs")
+        reassembly_started = time.perf_counter_ns()
         encoded_parts = []
         for index, chunk in enumerate(chunks):
             start = index * self._chunk_tokens
@@ -2199,11 +2293,20 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             if stored != tuple(range(start, end)):
                 raise HybridCodecError("hybrid snapshot positions differ")
             encoded_parts.append(chunk.records[StateRecord.TARGET_CKV])
+        encoded_pages = b"".join(encoded_parts)
         payloads = decode_page_snapshot(
             layout,
-            b"".join(encoded_parts),
+            encoded_pages,
             tuple(len(group) for group in groups),
         )
+        if timing is not None:
+            timing.chunk_count = len(chunks)
+            timing.page_bytes = len(encoded_pages)
+            timing.observe(
+                "reassembly_decode",
+                time.perf_counter_ns() - reassembly_started,
+            )
+        submit_started = time.perf_counter_ns()
         with self._load_write_context():
             for page_group, block_ids in zip(layout.groups, groups):
                 for layer in page_group.layers:
@@ -2215,8 +2318,19 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         block_ids, dtype=torch.long, device=tensor.device
                     )
                     tensor[index_tensor] = source.to(tensor.device)
+        if timing is not None:
+            timing.observe(
+                "h2d_submit",
+                time.perf_counter_ns() - submit_started,
+            )
         if self._load_stream is not None:
+            sync_started = time.perf_counter_ns()
             self._load_stream.synchronize()
+            if timing is not None:
+                timing.observe(
+                    "cuda_sync",
+                    time.perf_counter_ns() - sync_started,
+                )
         return True
 
     def _invalidate_after_failure(self, digest: str) -> None:
