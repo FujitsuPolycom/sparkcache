@@ -206,6 +206,49 @@ class CodecTests(unittest.TestCase):
                         token_count=invalid,
                     )
 
+    def test_incremental_prefix_digests_match_existing_exact_keys(self) -> None:
+        tokens = list(range(1400))
+        boundaries = (256, 512, 768, 1024, 1280)
+        produced = codec.chunk_prefix_digests(
+            tokens,
+            "identity",
+            boundaries=boundaries,
+        )
+        self.assertEqual(
+            produced,
+            tuple(
+                (
+                    boundary,
+                    codec.context_prefix_digest(
+                        tokens,
+                        "identity",
+                        token_count=boundary,
+                    ),
+                )
+                for boundary in boundaries
+            ),
+        )
+        self.assertEqual(
+            produced[:4],
+            codec.chunk_prefix_digests(
+                tokens[:1100],
+                "identity",
+                boundaries=boundaries[:4],
+            ),
+        )
+
+    def test_incremental_prefix_digest_boundaries_are_strict(self) -> None:
+        tokens = list(range(1024))
+        for boundaries in ((0,), (255,), (512, 256), (256, 256), (1280,)):
+            with self.subTest(boundaries=boundaries), self.assertRaises(
+                codec.CodecError
+            ):
+                codec.chunk_prefix_digests(
+                    tokens,
+                    "identity",
+                    boundaries=boundaries,
+                )
+
     def test_vectorized_integer_codec_matches_v1_wire_bytes(self) -> None:
         tokens = [0, 1, 255, 65535, 2**32 - 1]
         v1_reference_bytes = b"".join(
@@ -2908,6 +2951,110 @@ class QuorumAdmissionTests(unittest.TestCase):
             )
             matched, _ = c.get_num_new_matched_tokens(req, 0)
             self.assertEqual(matched, 1024)
+
+    def test_extended_prompt_restores_longest_previous_exact_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(Path(directory), 0, 64)
+            connector.register_kv_caches(_make_pools(8, 64))
+            tokens = list(range(1400))
+            shorter = connector._digest(tokens, 1024)
+            connector.bind_connector_metadata(
+                SparkCacheConnectorMetadata(
+                    plans=[_ReqPlan("stored-turn", shorter, 1024, (3, 0, 5, 1), True)]
+                )
+            )
+            connector.wait_for_save()
+            _drain_store(connector)
+            for rank in range(4):
+                connector.update_connector_output(
+                    types.SimpleNamespace(
+                        invalid_block_ids=set(),
+                        kv_connector_stats=types.SimpleNamespace(
+                            data={
+                                "spark_context_cache": {
+                                    "rank": rank,
+                                    "held": [shorter],
+                                }
+                            }
+                        ),
+                    )
+                )
+
+            request = types.SimpleNamespace(
+                request_id="extended-turn",
+                prompt_token_ids=tokens,
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(request, 0),
+                (1024, True),
+            )
+            self.assertEqual(connector._need_load["extended-turn"], (shorter, 1024))
+
+    def test_longest_candidate_requires_every_physical_rank(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(Path(directory), 0, 64)
+            connector.register_kv_caches(_make_pools(8, 64))
+            tokens = list(range(1400))
+            shorter = connector._digest(tokens, 1024)
+            longer = connector._digest(tokens, 1280)
+            for request_id, digest, span, blocks in (
+                ("short", shorter, 1024, (3, 0, 5, 1)),
+                ("long", longer, 1280, (3, 0, 5, 1, 2)),
+            ):
+                connector.bind_connector_metadata(
+                    SparkCacheConnectorMetadata(
+                        plans=[_ReqPlan(request_id, digest, span, blocks, True)]
+                    )
+                )
+                connector.wait_for_save()
+                _drain_store(connector)
+            for rank in range(4):
+                held = [shorter, longer] if rank < 3 else [shorter]
+                connector.update_connector_output(
+                    types.SimpleNamespace(
+                        invalid_block_ids=set(),
+                        kv_connector_stats=types.SimpleNamespace(
+                            data={"spark_context_cache": {"rank": rank, "held": held}}
+                        ),
+                    )
+                )
+            request = types.SimpleNamespace(
+                request_id="fallback",
+                prompt_token_ids=tokens,
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(request, 0),
+                (1024, True),
+            )
+            connector._need_load.clear()
+            connector._quorum[longer].add(3)
+            request.request_id = "prefer-longer"
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(request, 0),
+                (1280, True),
+            )
+
+    def test_oversized_prompt_can_restore_bounded_previous_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                64,
+                extra_config={"spark_cache_max_span_tokens": "1024"},
+            )
+            connector.register_kv_caches(_make_pools(8, 64))
+            tokens = list(range(2000))
+            digest = connector._digest(tokens, 1024)
+            connector._quorum[digest] = {0, 1, 2, 3}
+            connector._scheduler_probe = "none"
+            request = types.SimpleNamespace(
+                request_id="oversized-prefix",
+                prompt_token_ids=tokens,
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(request, 0),
+                (1024, True),
+            )
 
     def test_rank_withdrawing_stops_the_offer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

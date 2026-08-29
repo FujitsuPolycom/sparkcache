@@ -78,6 +78,8 @@ struct SparkCachePlacement {
   std::uint32_t slot_count = 0;
   std::uint32_t submitted_rows = 0;
   std::uint64_t page_snapshot_bytes = 0;
+  std::uint64_t page_submitted_snapshot_bytes = 0;
+  std::vector<std::uint64_t> page_destination_covered;
   RestoreMode restore_mode = RestoreMode::kUnset;
   bool restore_active = false;
   SparkCachePlacementStats stats{};
@@ -914,6 +916,9 @@ spark_cache_placement_begin_page_restore(
   placement->page_group_count = group_count;
   placement->slot_count = slot_count;
   placement->page_snapshot_bytes = snapshot_bytes;
+  placement->page_submitted_snapshot_bytes = 0;
+  placement->page_destination_covered.assign(
+      placement->page_destination_count, 0);
   placement->restore_mode = RestoreMode::kUnset;
   placement->restore_active = true;
   placement->stats = SparkCachePlacementStats{};
@@ -1113,6 +1118,26 @@ spark_cache_placement_submit_transposed_slab(
       return SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT;
     }
   }
+  if (placement->restore_mode == RestoreMode::kPages) {
+    if (placement->page_submitted_snapshot_bytes !=
+        placement->page_snapshot_bytes) {
+      set_error(placement, "page slabs do not cover the complete snapshot");
+      return SPARK_CACHE_PLACEMENT_INVALID_STATE;
+    }
+    for (std::uint32_t index = 0;
+         index < placement->page_destination_count;
+         ++index) {
+      const auto& destination = placement->page_destinations[index];
+      const auto& group = placement->page_groups[destination.group_index];
+      const std::uint64_t expected =
+          static_cast<std::uint64_t>(group.slot_count) *
+          destination.bytes_per_page;
+      if (placement->page_destination_covered[index] != expected) {
+        set_error(placement, "page slabs do not cover every destination");
+        return SPARK_CACHE_PLACEMENT_INVALID_STATE;
+      }
+    }
+  }
   std::memcpy(
       arena->host_sources,
       sources,
@@ -1172,8 +1197,9 @@ spark_cache_placement_submit_page_slab(
   if (required != SPARK_CACHE_PLACEMENT_OK) {
     return required;
   }
-  if (placement->restore_mode != RestoreMode::kUnset) {
-    set_error(placement, "page restore currently requires one complete slab");
+  if (placement->restore_mode != RestoreMode::kUnset &&
+      placement->restore_mode != RestoreMode::kPages) {
+    set_error(placement, "cannot mix page and row restore slabs");
     return SPARK_CACHE_PLACEMENT_INVALID_STATE;
   }
   if (arena_used_bytes == 0 ||
@@ -1182,21 +1208,39 @@ spark_cache_placement_submit_page_slab(
     set_error(placement, "page slab exceeds configured bounds");
     return SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT;
   }
-  std::string detail;
-  if (!validate_page_scatter(
-          arena_used_bytes,
-          placement->page_snapshot_bytes,
-          spans,
-          span_count,
-          placement->page_destinations.data(),
-          placement->page_destination_count,
-          placement->page_groups.data(),
-          placement->page_group_count,
-          placement->page_slots.data(),
-          placement->slot_count,
-          &detail)) {
-    set_error(placement, detail);
+  if (spans == nullptr || span_count == 0) {
+    set_error(placement, "page slab spans are empty");
     return SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT;
+  }
+  std::uint64_t next_snapshot = placement->page_submitted_snapshot_bytes;
+  auto next_covered = placement->page_destination_covered;
+  for (std::uint32_t index = 0; index < span_count; ++index) {
+    const auto& span = spans[index];
+    if (span.flags != 0 || span.byte_count == 0 ||
+        span.destination_index >= placement->page_destination_count ||
+        span.snapshot_offset_bytes != next_snapshot ||
+        span.destination_byte_offset != next_covered[span.destination_index] ||
+        span.arena_offset_bytes + span.byte_count < span.arena_offset_bytes ||
+        span.arena_offset_bytes + span.byte_count > arena_used_bytes ||
+        next_snapshot + span.byte_count < next_snapshot ||
+        next_snapshot + span.byte_count > placement->page_snapshot_bytes) {
+      set_error(placement, "page slab span coverage or bounds are invalid");
+      return SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT;
+    }
+    const auto& destination =
+        placement->page_destinations[span.destination_index];
+    const auto& group = placement->page_groups[destination.group_index];
+    const std::uint64_t destination_bytes =
+        static_cast<std::uint64_t>(group.slot_count) *
+        destination.bytes_per_page;
+    if (span.destination_byte_offset + span.byte_count <
+            span.destination_byte_offset ||
+        span.destination_byte_offset + span.byte_count > destination_bytes) {
+      set_error(placement, "page slab exceeds destination logical bytes");
+      return SPARK_CACHE_PLACEMENT_INVALID_ARGUMENT;
+    }
+    next_snapshot += span.byte_count;
+    next_covered[span.destination_index] += span.byte_count;
   }
   std::memcpy(
       arena->host_page_spans,
@@ -1229,6 +1273,8 @@ spark_cache_placement_submit_page_slab(
   arena->acquired = false;
   arena->in_flight = true;
   placement->restore_mode = RestoreMode::kPages;
+  placement->page_submitted_snapshot_bytes = next_snapshot;
+  placement->page_destination_covered = std::move(next_covered);
   placement->stats.source_bytes += arena_used_bytes;
   placement->stats.restored_rows = placement->slot_count;
   placement->stats.slabs_submitted += 1;
@@ -1312,6 +1358,11 @@ spark_cache_placement_abort_restore(SparkCachePlacement* placement) {
   placement->restore_mode = RestoreMode::kUnset;
   placement->slot_count = 0;
   placement->submitted_rows = 0;
+  placement->page_snapshot_bytes = 0;
+  placement->page_submitted_snapshot_bytes = 0;
+  placement->page_destination_covered.clear();
+  placement->page_groups.clear();
+  placement->page_slots.clear();
   set_error(placement, "");
   return SPARK_CACHE_PLACEMENT_OK;
 }

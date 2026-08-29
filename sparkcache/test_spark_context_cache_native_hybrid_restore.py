@@ -9,6 +9,7 @@ from sparkcache.spark_context_cache_hybrid import (
 )
 from sparkcache.spark_context_cache_native_hybrid_restore import (
     build_page_copy_spans,
+    plan_page_slabs,
 )
 
 
@@ -38,4 +39,14 @@ def test_page_copy_spans_cover_payload_once_in_layout_order() -> None:
     assert [span.snapshot_offset_bytes for span in spans] == [0, 8, 12]
     assert [span.destination_byte_offset for span in spans] == [0, 0, 0]
     assert sum(span.byte_count for span in spans) == 15
-    assert spans[0].arena_offset_bytes == plan.header_bytes
+    assert spans[0].arena_offset_bytes == 0
+
+    slabs = plan_page_slabs(plan, arena_bytes=7)
+    assert [(slab.payload_start, slab.payload_end) for slab in slabs] == [
+        (0, 7),
+        (7, 14),
+        (14, 15),
+    ]
+    flattened = [span for slab in slabs for span in slab.spans]
+    assert [span.snapshot_offset_bytes for span in flattened] == [0, 7, 8, 12, 14]
+    assert sum(span.byte_count for span in flattened) == 15

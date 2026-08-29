@@ -61,6 +61,7 @@ from sparkcache.spark_context_cache_codec import (
     CHUNK_TOKENS,
     CodecError,
     build_layer_plans,
+    chunk_prefix_digests,
     chunk_count,
     classify_layer,
     context_prefix_digest,
@@ -583,10 +584,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._load_queue: "queue.SimpleQueue[_QueuedLoad | None]" = queue.SimpleQueue()
         self._load_threads: list[threading.Thread] = []
         self._load_thread_limit = config.load_thread_limit
-        if self._native_restore_enabled:
+        if self._native_restore_enabled and self._storage_mode != "block_pages_v1":
             # One native adapter owns one transaction and two arenas. Keep
-            # outer restores serialized; its bounded inner preadv/hash pool
-            # supplies the desired storage parallelism.
+            # row restores serialized; native page mode creates one adapter
+            # per bounded load lane instead.
             self._load_thread_limit = 1
         self._inflight_load_reqs: set[str] = set()
         self._finished_load_reqs: set[str] = set()
@@ -852,21 +853,56 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> tuple[int | None, bool]:
         if not self._restore_enabled:
             return 0, False
-        token_ids = list(request.prompt_token_ids or [])
-        span = self._aligned_span(len(token_ids))
-        if span < self._min_span or span <= num_computed_tokens:
+        if (
+            request.request_id not in self._need_load
+            and len(self._need_load) >= self._max_pending_restores
+        ):
+            self.counters["restore_skip_backlog"] = (
+                self.counters.get("restore_skip_backlog", 0) + 1
+            )
             return 0, False
-        if span > self._max_span:
+        token_ids = list(request.prompt_token_ids or [])
+        aligned_span = self._aligned_span(len(token_ids))
+        span_ceiling = min(
+            aligned_span,
+            self._max_span // self._chunk_tokens * self._chunk_tokens,
+        )
+        first_candidate = max(
+            (
+                (self._min_span + self._chunk_tokens - 1)
+                // self._chunk_tokens
+                * self._chunk_tokens
+            ),
+            (num_computed_tokens // self._chunk_tokens + 1) * self._chunk_tokens,
+        )
+        if span_ceiling < first_candidate:
+            return 0, False
+        if aligned_span > self._max_span:
             self.counters["restore_skip_oversize"] = (
                 self.counters.get("restore_skip_oversize", 0) + 1
             )
-            return 0, False
-        digest = self._digest(token_ids, span)
+        candidates = chunk_prefix_digests(
+            token_ids,
+            self._context_digest_salt,
+            boundaries=range(
+                first_candidate,
+                span_ceiling + 1,
+                self._chunk_tokens,
+            ),
+        )
+        selected = next(
+            (
+                (candidate_span, candidate_digest)
+                for candidate_span, candidate_digest in reversed(candidates)
+                if self._has_full_quorum(candidate_digest)
+            ),
+            None,
+        )
         # Manifest-only probe: chunk payloads are re-read and re-hashed by
         # every worker at load time, and any worker failure degrades to a
         # rank-synchronous recompute, so hashing ~200 MB here would only
         # add scheduler latency without adding safety.
-        if not self._has_full_quorum(digest):
+        if selected is None:
             # Not every rank can offer a compatible manifest (or none has
             # reported yet). Treat as a plain miss: the request re-prefills
             # and republishes, which is also how a corrupted entry retires.
@@ -874,6 +910,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self.counters.get("quorum_incomplete", 0) + 1
             )
             return 0, False
+        span, digest = selected
         if self._scheduler_probe == "tp0":
             lookup = self._store.lookup(
                 self._identity(self._shard_rank), digest, verify_chunks=False
@@ -892,18 +929,6 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             digest[:12],
             span,
         )
-        if (
-            request.request_id not in self._need_load
-            and len(self._need_load) >= self._max_pending_restores
-        ):
-            # Returning a hit commits vLLM to an asynchronous load, so the
-            # bound must act here, before that promise is made. Evicting an
-            # already-promised entry instead would leave its request parked
-            # with nothing scheduled to load or finish it.
-            self.counters["restore_skip_backlog"] = (
-                self.counters.get("restore_skip_backlog", 0) + 1
-            )
-            return 0, False
         self._need_load[request.request_id] = (digest, span)
         return span - num_computed_tokens, True
 

@@ -273,13 +273,19 @@ def build_page_destination_descriptors(
                 raise NativePlacementContractError(
                     f"registered page layer {layer.name} shape differs from layout"
                 )
-            contiguous = getattr(tensor, "is_contiguous", None)
-            if not callable(contiguous) or contiguous() is not True:
-                raise NativePlacementContractError(
-                    f"registered page layer {layer.name} must be contiguous"
-                )
             element_size = int(tensor.element_size())
             stride = tuple(tensor.stride())
+            expected_stride = 1
+            for dimension, actual_stride in zip(
+                reversed(shape[1:]),
+                reversed(stride[1:]),
+            ):
+                if int(actual_stride) != expected_stride:
+                    raise NativePlacementContractError(
+                        f"registered page layer {layer.name} page interior"
+                        " is not contiguous"
+                    )
+                expected_stride *= int(dimension)
             page_stride = _u32(
                 int(stride[0]) * element_size,
                 f"{layer.name} page stride",
@@ -290,9 +296,9 @@ def build_page_destination_descriptors(
                 f"{layer.name} bytes per page",
                 positive=True,
             )
-            if page_stride != page_bytes:
+            if page_stride < page_bytes:
                 raise NativePlacementContractError(
-                    f"registered page layer {layer.name} page stride is not packed"
+                    f"registered page layer {layer.name} page stride overlaps"
                 )
             pointer = _u64(
                 int(tensor.data_ptr()),
