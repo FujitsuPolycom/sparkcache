@@ -100,7 +100,7 @@
     {
     "path": "vllm/v1/core/single_type_kv_cache_manager.py",
     "accepted_sha256": {
-      "recurrent_boundary_contract": "f67a1850a7e0288baaa6d42e7ec55b22b09c156720767e23acaabedcae333c8a"
+      "recurrent_boundary_contract": "2ab95dea008d65488bc2d55ccbe023c4481dba633fe92924001b9e4155ff38a2"
       },
       "required_symbols": [
         "SingleTypeKVCacheManager.add_local_computed_blocks",
