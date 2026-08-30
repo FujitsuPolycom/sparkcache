@@ -173,7 +173,7 @@ python deploy/glm53_flash/build_image.py \
   --output-image sparkring-glm53-sparkcache:b12x-kda-adaptive-mtp-0b67266a-arm64
 ```
 
-The dedicated patch directory and ten-file contract reject any vLLM source
+The dedicated patch directory and eleven-file contract reject any vLLM source
 preimage or postimage outside the pinned revision. The overlay leaves
 SparkCache wire values, digest salts, chunk geometry, and cache-identity fields
 unchanged. Adaptive and static embedded MTP profiles use separate draft-state

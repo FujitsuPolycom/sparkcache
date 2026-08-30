@@ -4,6 +4,10 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
+
+from sparkcache.runtime_patches import verify_lease_contract as verifier
+
 
 ROOT = Path(__file__).parents[2]
 CONTRACT = Path(__file__).with_name(
@@ -15,6 +19,10 @@ SOURCE_RECEIPT = PATCH_ROOT / "source-receipt.json"
 CONTAINERFILE = ROOT / "deploy/glm53_flash/Containerfile.b12x-kda-adaptive-mtp"
 VLLM_COMMIT = "0b67266a0f37d6146a8403fb8482403c62f412d5"
 SOURCE_ROLE = "source_built_glm53_b12x_kda_adaptive_mtp"
+KDA_PATH = "vllm/model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py"
+E105_KDA_SHA256 = (
+    "a879af0081f69ba8288ef909e1d69b5bbb85bdff7e5aa0d3c11ad892bfea8410"
+)
 
 
 def _sha256(path: Path) -> str:
@@ -61,12 +69,39 @@ def test_glm53_b12x_kda_adaptive_mtp_contract_attests_the_complete_sparkcache_vl
         "vllm/v1/worker/gpu_model_runner.py",
         "vllm/v1/core/single_type_kv_cache_manager.py",
         "vllm/v1/kv_cache_interface.py",
+        KDA_PATH,
     }
     assert all(
         set(record["accepted_sha256"]) == {SOURCE_ROLE}
         for record in contract["files"]
     )
     assert all(record["required_symbols"] for record in contract["files"])
+
+
+def test_glm53_b12x_kda_contract_rejects_the_e105_kda_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
+    kda = next(record for record in contract["files"] if record["path"] == KDA_PATH)
+    assert E105_KDA_SHA256 not in kda["accepted_sha256"].values()
+
+    source = tmp_path / KDA_PATH
+    source.parent.mkdir(parents=True)
+    source.write_text("pass\n", encoding="utf-8")
+    contract_path = tmp_path / "kda-contract.json"
+    contract_path.write_text(
+        json.dumps(
+            {
+                "schema": contract["schema"],
+                "files": [{**kda, "required_symbols": []}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(verifier, "_sha256", lambda _path: E105_KDA_SHA256)
+    with pytest.raises(verifier.ContractError, match="lease-contract mismatch"):
+        verifier.verify_contract(tmp_path, contract_path)
 
 
 def test_glm53_b12x_kda_adaptive_mtp_overlay_has_exact_preimage_and_postimage_receipts() -> None:
@@ -79,7 +114,9 @@ def test_glm53_b12x_kda_adaptive_mtp_overlay_has_exact_preimage_and_postimage_re
         "041-sparkcache-shared-prefix-attach.patch",
     }
     for name, receipt in receipts.items():
-        assert (PATCH_ROOT / name).is_file()
+        patch_path = PATCH_ROOT / name
+        assert patch_path.is_file()
+        assert "+ " not in patch_path.read_text(encoding="utf-8").splitlines()
         assert set(receipt["accepted_preimage_sha256"]) == {SOURCE_ROLE}
         assert set(receipt["accepted_postimage_sha256"]) == {SOURCE_ROLE}
         assert receipt["accepted_preimage_sha256"][SOURCE_ROLE] in recipe
@@ -87,6 +124,8 @@ def test_glm53_b12x_kda_adaptive_mtp_overlay_has_exact_preimage_and_postimage_re
         assert name in recipe
     assert CONTRACT.name in recipe
     assert "patches/vllm-glm53-b12x-kda-adaptive-mtp" in recipe
+    patch_positions = [recipe.index(f"/{name}") for name in receipts]
+    assert patch_positions == sorted(patch_positions)
 
 
 def test_glm53_b12x_kda_adaptive_mtp_patch_sequence_terminates_at_attested_contract_postimages() -> None:

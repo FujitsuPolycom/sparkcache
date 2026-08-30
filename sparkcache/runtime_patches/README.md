@@ -61,7 +61,8 @@ Its SparkCache integration uses
 `vllm-kv-block-lease-contract-glm53-b12x-kda-adaptive-mtp.json` and the
 exact-input overlays under `patches/vllm-glm53-b12x-kda-adaptive-mtp`.
 The three KDA commits after `e10536a` change only the KDA implementation and
-its model tests; the ten SparkCache-owned source preimages are byte-identical.
+its model tests. Ten SparkCache ownership files remain byte-identical, while
+the eleventh contract file binds the live-tensor B12X KDA implementation.
 The contract has **implemented** status. Four-rank TP4/DCP1 serving remains
 unqualified until a receipt names an immutable image built from this revision.
 
