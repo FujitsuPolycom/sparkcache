@@ -298,6 +298,17 @@ byte-identical opaque pages. Restore reconstructs and verifies the complete
 snapshot before Python or native page placement. Arbitrary earlier-prefix
 aliases cannot be derived from opaque page snapshots.
 
+Page-delta publication writes `sparkcache-page-delta-manifest/v2` metadata over
+authenticated byte extents of at most 64 MiB. This physical grouping reduces
+the 1,024 delta files implied by a 262,144-token logical boundary to at most 24
+objects for a 1,575,821,491-byte delta. Reads retain at most four extent
+payloads in addition to one assembled delta buffer. The logical admission and
+digest boundary remains 256 tokens. Version 1 page-delta manifests remain
+readable; cache identity, digest salts, and the `page-tail-cow-v1` namespace do
+not change. Restore still materializes one authenticated delta buffer and the
+verified reconstructed snapshot before placement. Direct placement from base
+and delta extents is unsupported by this schema.
+
 Opaque HMA snapshots cannot be shortened by truncating chunk lists. SparkCache
 therefore uses the page-semantic format and distinct namespace described above.
 At most two page deltas may form one graph; the following publication compacts

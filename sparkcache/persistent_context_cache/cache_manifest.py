@@ -42,6 +42,18 @@ _PREFIX_SEGMENT_SCHEMA = "sparkcache-prefix-descriptor-segment/v1"
 _PREFIX_ALIAS_SCHEMA = "sparkcache-prefix-alias/v1"
 _TAIL_MANIFEST_SCHEMA = "sparkcache-tail-manifest/v1"
 _PAGE_DELTA_MANIFEST_SCHEMA = "sparkcache-page-delta-manifest/v1"
+_PAGE_DELTA_MANIFEST_SCHEMA_V2 = "sparkcache-page-delta-manifest/v2"
+_PAGE_DELTA_MANIFEST_SCHEMAS = frozenset(
+    (_PAGE_DELTA_MANIFEST_SCHEMA, _PAGE_DELTA_MANIFEST_SCHEMA_V2)
+)
+# The v2 physical geometry is independent of the 256-token digest and
+# admission boundary. A 64-MiB extent reduces a 1.58-GB delta to 24 objects;
+# bounded batches cap temporary payload bytes at 128 MiB while publishing and
+# 256 MiB while reading, in addition to the assembled authenticated delta.
+_PAGE_DELTA_OBJECT_BYTES = 64 * 1024 * 1024
+_MAX_PAGE_DELTA_OBJECT_BYTES = 64 * 1024 * 1024
+_PAGE_DELTA_WRITE_BATCH_SIZE = 2
+_PAGE_DELTA_READ_BATCH_SIZE = 4
 # Two delta roots cap reconstruction at two full-snapshot applications. A
 # following extension is compacted by the connector into a fresh flat root.
 _MAX_PAGE_DELTA_DEPTH = 2
@@ -138,6 +150,13 @@ class IncompleteEntry(ValueError):
 
 class PageDeltaDepthExceeded(ValueError):
     """Another page delta would exceed the bounded reconstruction depth."""
+
+
+def _is_page_delta_root(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and value.get("schema") in _PAGE_DELTA_MANIFEST_SCHEMAS
+    )
 
 
 @dataclass(frozen=True)
@@ -1139,6 +1158,19 @@ def _validate_page_delta_root(
 ) -> tuple[Mapping[str, Any], tuple[Mapping[str, Any], ...]]:
     if not isinstance(manifest, dict):
         raise CacheFormatError("page delta manifest is not an object")
+    schema = manifest.get("schema")
+    if schema == _PAGE_DELTA_MANIFEST_SCHEMA:
+        delta_keys = {"delta_chunks"}
+    elif schema == _PAGE_DELTA_MANIFEST_SCHEMA_V2:
+        delta_keys = {
+            "delta_encoded_bytes",
+            "delta_object_bytes",
+            "delta_objects",
+            "delta_sha256",
+            "logical_chunk_tokens",
+        }
+    else:
+        raise _IncompatibleManifestError("page delta manifest schema differs")
     _strict_keys(
         manifest,
         {
@@ -1154,8 +1186,8 @@ def _validate_page_delta_root(
             "layout_sha256",
             "base_block_counts",
             "result_block_counts",
-            "delta_chunks",
             "metadata_sha256",
+            *delta_keys,
         },
         "page delta manifest",
     )
@@ -1171,8 +1203,7 @@ def _validate_page_delta_root(
     if _sha256(_canonical_json(authenticated)) != metadata_digest:
         raise CacheFormatError("page delta metadata checksum mismatch")
     if (
-        manifest["schema"] != _PAGE_DELTA_MANIFEST_SCHEMA
-        or manifest["format_abi"] != FORMAT_ABI
+        manifest["format_abi"] != FORMAT_ABI
         or identity.publication_schema != "page-tail-cow-v1"
         or manifest["identity"] != identity.to_wire()
         or manifest["context_digest"] != context_digest
@@ -1191,20 +1222,71 @@ def _validate_page_delta_root(
         or len(manifest["base_block_counts"]) != len(manifest["result_block_counts"])
     ):
         raise CacheFormatError("page delta manifest geometry differs")
-    delta_chunks = manifest["delta_chunks"]
-    synthetic = {
-        "format_abi": FORMAT_ABI,
-        "identity": identity.to_wire(),
-        "context_digest": context_digest,
-        "committed_tokens": manifest["committed_tokens"],
-        "chunks": delta_chunks,
-    }
-    descriptors = _validate_manifest_metadata(
-        synthetic,
-        EntryKey(identity.storage_key, context_digest),
-        expected_identity=identity,
-    )
-    return manifest["base_root"], descriptors
+    if schema == _PAGE_DELTA_MANIFEST_SCHEMA:
+        synthetic = {
+            "format_abi": FORMAT_ABI,
+            "identity": identity.to_wire(),
+            "context_digest": context_digest,
+            "committed_tokens": manifest["committed_tokens"],
+            "chunks": manifest["delta_chunks"],
+        }
+        descriptors = _validate_manifest_metadata(
+            synthetic,
+            EntryKey(identity.storage_key, context_digest),
+            expected_identity=identity,
+        )
+        return manifest["base_root"], descriptors
+
+    try:
+        _validate_digest(manifest["delta_sha256"], "page delta payload sha256")
+    except ValueError as error:
+        raise CacheFormatError(str(error)) from error
+    encoded_bytes = manifest["delta_encoded_bytes"]
+    object_bytes = manifest["delta_object_bytes"]
+    if (
+        type(encoded_bytes) is not int
+        or encoded_bytes <= 0
+        or type(object_bytes) is not int
+        or not 0 < object_bytes <= _MAX_PAGE_DELTA_OBJECT_BYTES
+        or manifest["logical_chunk_tokens"] != identity.chunk_tokens
+    ):
+        raise CacheFormatError("page delta object geometry differs")
+    objects = manifest["delta_objects"]
+    if not isinstance(objects, list) or not objects:
+        raise CacheFormatError("page delta object descriptors are invalid")
+    expected_start = 0
+    descriptors: list[Mapping[str, Any]] = []
+    for index, descriptor in enumerate(objects):
+        if not isinstance(descriptor, dict):
+            raise CacheFormatError("page delta object descriptor is not an object")
+        _strict_keys(
+            descriptor,
+            {"sha256", "bytes", "encoded_start", "encoded_end"},
+            "page delta object descriptor",
+        )
+        try:
+            _validate_digest(descriptor["sha256"], "page delta object sha256")
+        except ValueError as error:
+            raise CacheFormatError(str(error)) from error
+        size = descriptor["bytes"]
+        start = descriptor["encoded_start"]
+        end = descriptor["encoded_end"]
+        if (
+            type(size) is not int
+            or type(start) is not int
+            or type(end) is not int
+            or size <= 0
+            or start != expected_start
+            or end != start + size
+            or (index < len(objects) - 1 and size != object_bytes)
+            or size > object_bytes
+        ):
+            raise CacheFormatError("page delta object descriptor geometry differs")
+        descriptors.append(descriptor)
+        expected_start = end
+    if expected_start != encoded_bytes:
+        raise CacheFormatError("page delta object coverage differs")
+    return manifest["base_root"], tuple(descriptors)
 
 
 def _decode_chunk(
@@ -1268,6 +1350,29 @@ def _decode_chunk(
         )
     except (TypeError, ValueError) as error:
         raise CacheFormatError(str(error)) from error
+
+
+def _read_page_delta_object_batch(
+    object_root: Path,
+    descriptors: Sequence[Mapping[str, Any]],
+) -> tuple[bytes, ...]:
+    """Read one bounded batch of authenticated page-delta byte extents."""
+
+    def read_one(descriptor: Mapping[str, Any]) -> bytes:
+        encoded = (object_root / f"{descriptor['sha256']}.spcc").read_bytes()
+        if (
+            len(encoded) != descriptor["bytes"]
+            or _sha256(encoded) != descriptor["sha256"]
+        ):
+            raise CacheFormatError("page delta object checksum mismatch")
+        return encoded
+
+    if not descriptors:
+        return ()
+    with ThreadPoolExecutor(
+        max_workers=min(len(descriptors), _PAGE_DELTA_READ_BATCH_SIZE)
+    ) as pool:
+        return tuple(pool.map(read_one, descriptors))
 
 
 class ManifestTransaction:
@@ -1551,7 +1656,9 @@ class ManifestStore:
             manifest = json.loads(path.read_bytes())
             segments: tuple[str, ...] = ()
             schema_name = manifest.get("schema") if isinstance(manifest, dict) else None
-            if schema_name in (_TAIL_MANIFEST_SCHEMA, _PAGE_DELTA_MANIFEST_SCHEMA):
+            if schema_name == _TAIL_MANIFEST_SCHEMA or schema_name in (
+                _PAGE_DELTA_MANIFEST_SCHEMAS
+            ):
                 identity_wire = dict(manifest.get("identity", {}))
                 if "record_schema" in identity_wire:
                     schema = identity_wire["record_schema"]
@@ -2229,7 +2336,7 @@ class ManifestStore:
             context_digest=context_digest,
         )
         base_digest = manifest["base_context_digest"]
-        if base_root.get("schema") == _PAGE_DELTA_MANIFEST_SCHEMA:
+        if _is_page_delta_root(base_root):
             base_chunks = self._page_graph_descriptors(
                 base_root,
                 identity=identity,
@@ -2251,8 +2358,7 @@ class ManifestStore:
         count = 0
         root: Any = manifest
         while (
-            isinstance(root, Mapping)
-            and root.get("schema") == _PAGE_DELTA_MANIFEST_SCHEMA
+            _is_page_delta_root(root)
         ):
             count += 1
             root = root.get("base_root")
@@ -2285,6 +2391,38 @@ class ManifestStore:
             return ()
         with ThreadPoolExecutor(max_workers=min(8, len(descriptors))) as pool:
             return tuple(pool.map(_read_one, descriptors))
+
+    def _read_page_delta_objects(
+        self,
+        descriptors: Sequence[Mapping[str, Any]],
+        *,
+        encoded_bytes: int,
+        encoded_sha256: str,
+    ) -> bytearray:
+        """Read ordered macro objects with bounded transient payload memory."""
+
+        if encoded_bytes <= 0 or not descriptors:
+            raise CacheFormatError("page delta object coverage is empty")
+        result = bytearray(encoded_bytes)
+        digest = hashlib.sha256()
+        expected_start = 0
+        object_root = self.root / "chunks"
+        for first in range(0, len(descriptors), _PAGE_DELTA_READ_BATCH_SIZE):
+            batch = tuple(
+                descriptors[first : first + _PAGE_DELTA_READ_BATCH_SIZE]
+            )
+            payloads = _read_page_delta_object_batch(object_root, batch)
+            for descriptor, payload in zip(batch, payloads, strict=True):
+                start = int(descriptor["encoded_start"])
+                end = int(descriptor["encoded_end"])
+                if start != expected_start or end != start + len(payload):
+                    raise CacheFormatError("page delta object coverage differs")
+                result[start:end] = payload
+                digest.update(payload)
+                expected_start = end
+        if expected_start != encoded_bytes or digest.hexdigest() != encoded_sha256:
+            raise CacheFormatError("page delta payload checksum mismatch")
+        return result
 
     def publish_prefix_aliases(
         self,
@@ -2620,11 +2758,9 @@ class ManifestStore:
             )
         from sparkcache.spark_context_cache_codec import (
             context_prefix_digest,
-            pack_positions,
         )
         from sparkcache.spark_context_cache_hybrid import (
             encode_page_delta,
-            split_snapshot,
         )
 
         with _RootGuard(self.root, shared=True, blocking=True):
@@ -2668,50 +2804,35 @@ class ManifestStore:
                 base_boundary_tokens=base_boundary_tokens,
                 result_boundary_tokens=result_boundary_tokens,
             )
-            part_count = (
-                result_boundary_tokens + identity.chunk_tokens - 1
-            ) // identity.chunk_tokens
-            parts = split_snapshot(delta, part_count)
-            chunks = tuple(
-                ContextChunk(
-                    index * identity.chunk_tokens,
-                    min(
-                        result_boundary_tokens,
-                        (index + 1) * identity.chunk_tokens,
-                    ),
-                    {
-                        StateRecord.LOGICAL_POSITIONS: pack_positions(
-                            range(
-                                index * identity.chunk_tokens,
-                                min(
-                                    result_boundary_tokens,
-                                    (index + 1) * identity.chunk_tokens,
-                                ),
-                            )
-                        ),
-                        StateRecord.TARGET_CKV: part,
-                    },
-                )
-                for index, part in enumerate(parts)
-            )
             descriptors: list[dict[str, Any]] = []
             objects: list[tuple[Path, bytes]] = []
-            for chunk in chunks:
-                encoded = _encode_chunk(chunk)
-                digest = _sha256(encoded)
+            delta_view = memoryview(delta)
+            for start in range(0, len(delta), _PAGE_DELTA_OBJECT_BYTES):
+                end = min(len(delta), start + _PAGE_DELTA_OBJECT_BYTES)
+                encoded = delta_view[start:end].tobytes()
+                object_digest = _sha256(encoded)
                 descriptors.append(
                     {
-                        "sha256": digest,
+                        "sha256": object_digest,
                         "bytes": len(encoded),
-                        "logical_start": chunk.logical_start,
-                        "logical_end": chunk.logical_end,
+                        "encoded_start": start,
+                        "encoded_end": end,
                     }
                 )
-                objects.append((self.root / "chunks" / f"{digest}.spcc", encoded))
-            _publish_immutable_batch(objects)
+                objects.append(
+                    (
+                        self.root / "chunks" / f"{object_digest}.spcc",
+                        encoded,
+                    )
+                )
+                if len(objects) == _PAGE_DELTA_WRITE_BATCH_SIZE:
+                    _publish_immutable_batch(objects)
+                    objects.clear()
+            if objects:
+                _publish_immutable_batch(objects)
             base_root = dict(base._manifest)
             root = {
-                "schema": _PAGE_DELTA_MANIFEST_SCHEMA,
+                "schema": _PAGE_DELTA_MANIFEST_SCHEMA_V2,
                 "format_abi": FORMAT_ABI,
                 "identity": identity.to_wire(),
                 "context_digest": result_context_digest,
@@ -2723,7 +2844,11 @@ class ManifestStore:
                 "layout_sha256": layout.digest,
                 "base_block_counts": list(base_block_counts),
                 "result_block_counts": list(result_block_counts),
-                "delta_chunks": descriptors,
+                "delta_encoded_bytes": len(delta),
+                "delta_object_bytes": _PAGE_DELTA_OBJECT_BYTES,
+                "delta_objects": descriptors,
+                "delta_sha256": _sha256(delta),
+                "logical_chunk_tokens": identity.chunk_tokens,
             }
             root["metadata_sha256"] = _sha256(_canonical_json(root))
             encoded_root = _canonical_json(root)
@@ -2759,7 +2884,7 @@ class ManifestStore:
         if not lookup.is_hit or lookup._manifest is None:
             raise ValueError("cannot restore a cache miss")
         manifest = lookup._manifest
-        if manifest.get("schema") != _PAGE_DELTA_MANIFEST_SCHEMA:
+        if not _is_page_delta_root(manifest):
             chunks = self.restore(lookup)
             if chunks is None:
                 raise CacheFormatError("page snapshot restore failed")
@@ -2788,7 +2913,7 @@ class ManifestStore:
             _manifest=base_root,
             root_kind=(
                 "page_delta"
-                if base_root.get("schema") == _PAGE_DELTA_MANIFEST_SCHEMA
+                if _is_page_delta_root(base_root)
                 else "manifest"
             ),
         )
@@ -2799,13 +2924,20 @@ class ManifestStore:
             result_boundary_tokens=manifest["base_committed_tokens"],
             _depth=_depth + 1,
         )
-        delta_chunks = self._read_context_chunks(
-            delta_descriptors,
-            identity.required_records,
-        )
-        encoded_delta = b"".join(
-            chunk.records[StateRecord.TARGET_CKV] for chunk in delta_chunks
-        )
+        if manifest["schema"] == _PAGE_DELTA_MANIFEST_SCHEMA_V2:
+            encoded_delta = self._read_page_delta_objects(
+                delta_descriptors,
+                encoded_bytes=manifest["delta_encoded_bytes"],
+                encoded_sha256=manifest["delta_sha256"],
+            )
+        else:
+            delta_chunks = self._read_context_chunks(
+                delta_descriptors,
+                identity.required_records,
+            )
+            encoded_delta = b"".join(
+                chunk.records[StateRecord.TARGET_CKV] for chunk in delta_chunks
+            )
         from sparkcache.spark_context_cache_hybrid import apply_page_delta
 
         return apply_page_delta(
@@ -2930,10 +3062,7 @@ class ManifestStore:
                     identity=identity,
                     context_digest=context_digest,
                 )
-            is_page_delta = (
-                isinstance(manifest, dict)
-                and manifest.get("schema") == _PAGE_DELTA_MANIFEST_SCHEMA
-            )
+            is_page_delta = _is_page_delta_root(manifest)
             if is_page_delta:
                 chunks = self._page_graph_descriptors(
                     manifest,
@@ -2949,8 +3078,6 @@ class ManifestStore:
             for descriptor in chunks:
                 digest = descriptor["sha256"]
                 encoded_bytes = descriptor["bytes"]
-                logical_start = descriptor["logical_start"]
-                logical_end = descriptor["logical_end"]
                 if verify_chunks:
                     encoded_chunk = (
                         self.root / "chunks" / f"{digest}.spcc"
@@ -2960,6 +3087,10 @@ class ManifestStore:
                         or _sha256(encoded_chunk) != digest
                     ):
                         raise CacheFormatError("chunk checksum mismatch")
+                    if "encoded_start" in descriptor:
+                        continue
+                    logical_start = descriptor["logical_start"]
+                    logical_end = descriptor["logical_end"]
                     # The descriptor digest authenticates the complete encoded
                     # chunk: prefix, header (including record digests and
                     # offsets), and every payload byte. Re-hashing each record
@@ -3154,9 +3285,8 @@ class ManifestStore:
             try:
                 manifest = json.loads(raw)
                 schema_name = manifest.get("schema")
-                if schema_name in (
-                    _TAIL_MANIFEST_SCHEMA,
-                    _PAGE_DELTA_MANIFEST_SCHEMA,
+                if schema_name == _TAIL_MANIFEST_SCHEMA or schema_name in (
+                    _PAGE_DELTA_MANIFEST_SCHEMAS
                 ):
                     identity_wire = dict(manifest["identity"])
                     if "record_schema" in identity_wire:

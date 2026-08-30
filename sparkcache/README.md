@@ -226,12 +226,19 @@ when placement completes and intentionally excludes that bookkeeping.
   prefixes and binds the base snapshot, layout, block counts, and semantic
   token boundaries. A boundary inside an HMA page replaces that complete page
   while retaining earlier byte-identical pages. The
-  `sparkcache-page-delta-manifest/v1` schema embeds its authenticated base
-  graph, allowing capacity maintenance to retain shared objects after
-  predecessor roots are removed. Restore reconstructs the verified full
-  snapshot before Python or native page placement. GPU-free regression coverage
-  exists; live model-serving qualification does not. A graph contains at most
-  two deltas. The following extension publishes a fresh flat snapshot, bounding
+  `sparkcache-page-delta-manifest/v2` schema embeds its authenticated base
+  graph and groups delta bytes into immutable objects of at most 64 MiB. A
+  1,575,821,491-byte delta therefore uses at most 24 physical delta objects
+  instead of 1,024 objects derived from logical token chunks. Ordered restore
+  batches retain at most four object payloads in addition to one assembled
+  delta buffer. Version 1 manifests remain readable. Cache identity, digest
+  salts, the 256-token logical boundary, and the `page-tail-cow-v1` namespace
+  are unchanged. Capacity maintenance retains shared objects after predecessor
+  roots are removed. Restore reconstructs the verified full snapshot before
+  Python or native page placement. GPU-free regression coverage exists; live
+  model-serving qualification does not. Direct placement from base and delta
+  extents is unsupported by this schema. A graph contains at most two deltas.
+  The following extension publishes a fresh flat snapshot, bounding
   reconstruction work and metadata ancestry.
 - **Concurrent shared GPU prefix — implemented.** One leader restores a
   persistent digest. After every rank succeeds, up to sixteen waiting followers

@@ -220,7 +220,7 @@ class ManifestStoreTests(unittest.TestCase):
                 page_root_path,
                 *(
                     root / "chunks" / f"{item['sha256']}.spcc"
-                    for item in page_root["delta_chunks"]
+                    for item in page_root["delta_objects"]
                 ),
             ]
             self.assertGreaterEqual(
@@ -250,7 +250,7 @@ class ManifestStoreTests(unittest.TestCase):
                 chained_root_path,
                 *(
                     root / "chunks" / f"{item['sha256']}.spcc"
-                    for item in chained_root["delta_chunks"]
+                    for item in chained_root["delta_objects"]
                 ),
             ]
             self.assertGreaterEqual(

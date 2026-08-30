@@ -979,13 +979,10 @@ class DefectD16HybridPageBoundaryTests(unittest.TestCase):
             assert manifest is not None
             self.assertEqual(manifest["base_block_counts"], [28, 1])
             self.assertEqual(manifest["result_block_counts"], [47, 1])
-            delta_chunks = connector._store._read_context_chunks(
-                manifest["delta_chunks"],
-                connector._identity(0).required_records,
-            )
-            encoded_delta = b"".join(
-                chunk.records[package_store.StateRecord.TARGET_CKV]
-                for chunk in delta_chunks
+            encoded_delta = connector._store._read_page_delta_objects(
+                manifest["delta_objects"],
+                encoded_bytes=manifest["delta_encoded_bytes"],
+                encoded_sha256=manifest["delta_sha256"],
             )
             self.assertLess(
                 len(encoded_delta),

@@ -606,7 +606,7 @@ class HybridPageRoundTripTests(unittest.TestCase):
                 ).read_bytes()
             )
             delta_path = (
-                root / "chunks" / f"{manifest['delta_chunks'][0]['sha256']}.spcc"
+                root / "chunks" / f"{manifest['delta_objects'][0]['sha256']}.spcc"
             )
             damaged = bytearray(delta_path.read_bytes())
             damaged[-1] ^= 1
