@@ -49,7 +49,7 @@ Status words are deliberate:
 | Tail-only row publication | **implemented** | Opt-in `tail-cow-v1`; GPU-free tested, no live serving qualification |
 | Opaque HMA page snapshots | **qualified** | Exact DeepSeek-V4 and GLM deployments linked above |
 | Tail-only opaque-page deltas | **qualified** | Byte-correct `sparkcache-page-delta-manifest/v2` publication and restore on local image `ed60…`; latency and write-volume bounds are not established |
-| 64 MiB flat page macro objects | **implemented** | `sparkcache-page-snapshot-manifest/v2` at SparkCache `90946fd6`; GPU-free tested, not live qualified; [review evidence](https://github.com/FujitsuPolycom/sparkcache/pull/40) |
+| 64 MiB flat page macro objects | **implemented** | `sparkcache-page-snapshot-manifest/v2` at SparkCache `229d7d6`; GPU-free tested, not live qualified; [review evidence](https://github.com/FujitsuPolycom/sparkcache/pull/40) |
 | SparkCache CUDA restore and placement | **qualified** | Exact GLM-5.3 TP4/DCP1 source artifacts in the linked records |
 | Shared exact-prefix GPU blocks | **qualified** | Up to 16 waiting followers in the recorded GLM-5.3 runtime |
 | Different-root shared row segments | **implemented** | Authenticated `per_token_rows` descriptor-prefix sharing; GPU-free tested, not live qualified |
@@ -220,7 +220,7 @@ snapshot's complete digest before the parked request may resume.
   is the qualification authority.
   It does not qualify a published OCI digest, response quality, general
   restore latency, or write endurance.
-- Flat `sparkcache-page-snapshot-manifest/v2` objects at SparkCache `90946fd6`
+- Flat `sparkcache-page-snapshot-manifest/v2` objects at SparkCache `229d7d6`
   are **implemented** and GPU-free tested, not live qualified. Their 13-object
   813,068,464-byte geometry is a
   format result, not a latency claim.

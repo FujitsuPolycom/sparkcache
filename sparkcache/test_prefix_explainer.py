@@ -131,7 +131,7 @@ def test_readme_links_explorer_and_states_capabilities() -> None:
         "Different-root shared row segments | **implemented**",
         "16 distinct request tails shared one restored 128K `block_pages_v1` prefix",
         "sha256:ed60be066d6d9eadea267bc4597a0687869f3ddb95a3e5c6f86649893a838eb8",
-        "Flat `sparkcache-page-snapshot-manifest/v2` objects at SparkCache `90946fd6`",
+        "Flat `sparkcache-page-snapshot-manifest/v2` objects at SparkCache `229d7d6`",
     )
     for fragment in required:
         assert fragment in readme
