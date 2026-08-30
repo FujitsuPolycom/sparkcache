@@ -1975,6 +1975,16 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         blocks_by_group,
                     )
                     continue
+                if exact_token_ids:
+                    # A durable worker commit can finish while the scheduler is
+                    # idle. Its first quorum report then returns only after the
+                    # next request has begun prefill, which is too late for the
+                    # base choice made in scheduled_new_reqs above. Select from
+                    # the latest all-rank view at the actual publication step.
+                    base_digest, base_span = self._publication_base(
+                        exact_token_ids,
+                        span,
+                    )
                 del self._store_progress[req_id]
                 self._store_token_ids.pop(req_id, None)
                 self._store_bases.pop(req_id, None)
