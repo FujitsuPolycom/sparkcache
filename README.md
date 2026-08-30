@@ -26,7 +26,7 @@ bounded workload named by its evidence record.
 | `sparkcache==0.1.0a1`, DeepSeek-V4 TP2/DCP1 and TP4/DCP1 | 73,728 restored tokens | 413.9–517.0 ms cache service per rank | [release-wheel validation](MULTI_MODEL_LIVE_VALIDATION.md) |
 | `sparkcache==0.1.0a2`, GLM-5.2 TP4/DCP4 | 225,536 restored tokens | 3.17–4.17 s cache service per rank | [package validation](GLM52_A2_LIVE_VALIDATION.md) |
 | GLM-5.3 DFlash7 TP4/DCP1 source runtime at `da4d7be6` | `snapshot-v1`, 131,072 tokens, C1 | 131–250 ms cold SparkCache CUDA restore per rank; continued generation reached the recorded marker | [CUDA restore validation](GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md) |
-| GLM-5.3 DFlash7 TP4/DCP1 local image `cc2c0e2…` | `snapshot-v1`, `sparkcache-page-snapshot-manifest/v2`, 131,072 tokens, C1 | 13 authenticated objects; all-rank SparkCache CUDA restore took 1.55–1.70 s and returned the exact codeword before and after restart | [CUDA restore validation](GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md) |
+| GLM-5.3 DFlash7 TP4/DCP1 local image `35b58a7…`, SparkCache `a1511d2` | `snapshot-v1`, `sparkcache-page-snapshot-manifest/v2`, 131,072 tokens, C1 | 13 authenticated objects; sequential object read/hash took 1.35–1.50 s, all-rank SparkCache CUDA restore took 1.55–1.70 s, and the exact codeword matched before and after restart | [CUDA restore validation](GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md) |
 
 C1, C8, and C16 mean one, eight, and sixteen concurrent requests. At the tested
 20 GiB KV-cache setting, C2×128K is an observed capacity candidate, not a
@@ -53,7 +53,7 @@ Status words are deliberate:
 | Tail-only row publication | **implemented** | Opt-in `tail-cow-v1`; GPU-free tested, no live serving qualification |
 | Opaque HMA page snapshots | **qualified** | Exact DeepSeek-V4 and GLM deployments linked above |
 | Tail-only opaque-page deltas | **research-only** | Implemented and GPU-free tested; C2 restored-delta responses failed exact semantics while recomputation succeeded |
-| 64 MiB flat page macro objects | **qualified** | `sparkcache-page-snapshot-manifest/v2` at SparkCache `229d7d6`; exact 13-object, 131,072-token C1 restart case on local image `cc2c0e2…`; [review evidence](https://github.com/FujitsuPolycom/sparkcache/pull/40) |
+| 64 MiB flat page macro objects | **qualified** | Schema and header-accounting implementation originated at SparkCache `229d7d6`; exact C1 runtime is SparkCache `a1511d2`, tree `4d5b8e…`, image `35b58a7…`; [review evidence](https://github.com/FujitsuPolycom/sparkcache/pull/40) |
 | SparkCache CUDA restore and placement | **qualified** | Exact GLM-5.3 TP4/DCP1 source artifacts in the linked records |
 | Shared exact-prefix GPU blocks | **implemented** | Bounded vLLM lease path; earlier timing receipts are diagnostic, not exact-output semantic qualification |
 | Different-root shared row segments | **implemented** | Authenticated `per_token_rows` descriptor-prefix sharing; GPU-free tested, not live qualified |
@@ -108,6 +108,13 @@ objects of at most 64 MiB. An 813,068,464-byte flat snapshot therefore needs 13
 payload objects rather than 512 logical-chunk files. Version 1 flat manifests
 remain readable. Physical grouping does not change the 256-token identity or
 admission geometry.
+
+The qualified v2 CUDA path reads and hashes its 13 macro objects sequentially.
+That phase measured 1.35–1.50 seconds within the 1.55–1.70-second all-rank
+restore. The result is correct but slower than the identified legacy
+512-object path, which used bounded parallel reads within each arena slab.
+Existing legacy roots remain readable; the connector does not offer an
+operator setting that publishes additional legacy roots.
 
 Conversation extensions use `sparkcache-hybrid-page-delta/v1` page semantics
 and `sparkcache-page-delta-manifest/v2` roots. The delta binds the exact base,
@@ -246,11 +253,14 @@ snapshot's complete digest before the parked request may resume.
 - Full `snapshot-v1` opaque-page restore is **qualified** at 131,072 tokens and
   C1 for the exact GLM-5.3 DFlash7 TP4/DCP1 artifacts named in the validation
   record.
-- Flat `sparkcache-page-snapshot-manifest/v2` objects at SparkCache `229d7d6`
-  are qualified only for local image
-  `sha256:cc2c0e2f812f4b78d5b91f863aaf46fd8e8e505844245aa50911af1fb8e061c0`:
-  13 objects, all-rank SparkCache CUDA restore in 1.55–1.70 seconds, and the
-  exact codeword before and after restart. No published OCI digest is qualified.
+- Flat `sparkcache-page-snapshot-manifest/v2` and header-inclusive source-byte
+  accounting originated at SparkCache `229d7d6`. Qualification belongs to the
+  complete runtime source `a1511d26a1fe2b17b24561bc52e376bf7f54b06a`, tree
+  `4d5b8eb8c5c13793ee7a1e67b2b34bd38fcf4ddb`, and local image
+  `sha256:35b58a7bf414059c65b8f74e4e4b17ee6a81b7008e1bffbc9bd298b5e08c739e`:
+  13 objects, sequential read/hash in 1.35–1.50 seconds, all-rank SparkCache
+  CUDA restore in 1.55–1.70 seconds, and the exact codeword before and after
+  restart. No published OCI digest is qualified.
 - Tail-only page deltas and opaque-page base-read cohorts are **research-only**.
   The implementation and GPU-free tests remain, but the exact C2 restored-delta
   case failed semantics while recomputation succeeded.

@@ -14,6 +14,14 @@ records:
   recovery, and the exact 13-object flat-v2 C1 restart case. Its concurrency
   receipts are diagnostic rather than exact-output semantic qualification.
 
+The flat-v2 semantic result belongs to local image
+`sha256:35b58a7bf414059c65b8f74e4e4b17ee6a81b7008e1bffbc9bd298b5e08c739e`,
+SparkCache source `a1511d26a1fe2b17b24561bc52e376bf7f54b06a`, and source tree
+`4d5b8eb8c5c13793ee7a1e67b2b34bd38fcf4ddb`. SparkCache `229d7d6` is the
+flat-v2 schema and header-accounting implementation origin, not the complete
+runtime source. Sequential macro-object read/hash consumed 1.35–1.50 seconds
+of the 1.55–1.70-second all-rank restore.
+
 Qualification applies only to the checkpoint revisions, source contracts,
 topology, settings, and immutable artifacts named in those records. It does
 not transfer to another vLLM tree, target or draft checkpoint, TP/DCP geometry,

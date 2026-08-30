@@ -236,11 +236,15 @@ when placement completes and intentionally excludes that bookkeeping.
   authenticated objects of at most 64 MiB while preserving logical identity
   and admission geometry. Version 1 flat manifests remain readable.
   SparkCache CUDA restore counts complete authenticated arena bytes, including
-  the snapshot header, while copy spans cover payload bytes. Local image
-  `sha256:cc2c0e2f812f4b78d5b91f863aaf46fd8e8e505844245aa50911af1fb8e061c0`
-  restored the 131,072-token, 13-object snapshot on every rank in 1.55–1.70
-  seconds and returned the exact codeword before and after restart. That C1
-  result does not qualify a published OCI artifact or concurrent restores.
+  the snapshot header, while copy spans cover payload bytes. The schema and
+  header-accounting implementation originated at SparkCache `229d7d6`.
+  Qualification belongs to complete runtime source `a1511d2`, tree `4d5b8e…`,
+  and local image
+  `sha256:35b58a7bf414059c65b8f74e4e4b17ee6a81b7008e1bffbc9bd298b5e08c739e`.
+  It restored the 131,072-token, 13-object snapshot on every rank in 1.55–1.70
+  seconds and returned the exact codeword before and after restart. Sequential
+  object read/hash consumed 1.35–1.50 seconds. That C1 result does not qualify a
+  published OCI artifact or concurrent restores.
 - **Different-root row-segment sharing — implemented.** Distinct
   `per_token_rows` result roots may share one authenticated descriptor prefix
   when every rank proves the same chunk sequence. GPU-free coverage exists;
@@ -293,9 +297,11 @@ GLM-5.3 Flash opaque full snapshots are qualified at TP4/DCP1 with BF16 DFlash2
 using seven draft tokens. Source revision
 `2b86fb9d02fa3595cca5caa864b81aedce44b8bb` qualifies the recorded
 `snapshot-v1` SparkCache CUDA restore and multi-group recovery at 131,072
-tokens. SparkCache `229d7d6` and local image `cc2c0e2…` additionally qualify the
-13-object `sparkcache-page-snapshot-manifest/v2` C1 restart case. Tail deltas,
-host-base read coalescing, and multi-root concurrent restore are research-only.
+tokens. SparkCache `229d7d6` is the implementation origin for flat-v2 objects
+and header accounting; complete source `a1511d2`, tree `4d5b8e…`, and local
+image `35b58a7…` qualify the 13-object
+`sparkcache-page-snapshot-manifest/v2` C1 restart case. Tail deltas, host-base
+read coalescing, and multi-root concurrent restore are research-only.
 At 20 GiB of KV cache, C2×128K is an observed capacity candidate, not a
 qualified cached workload. C6×128K admitted only one request at a time and
 serialized completion over 61–313 seconds. C8×64K and C16×32K remain planned

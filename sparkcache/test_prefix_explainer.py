@@ -104,12 +104,13 @@ def test_prefix_explorer_describes_present_storage_and_restore_behavior() -> Non
         "C2×128K is an observed safe candidate",
         "C8×64K and C16×32K are planned and unqualified",
         "C16×128K is unsupported without GPU trunk sharing or additional KV capacity",
+        "Sequential object read/hash consumed 1.35–1.50 seconds",
         "request-private GPU tail",
         "persistent copy-on-write tail objects",
         "When enabled, SparkCache CUDA restore owns verified reconstruction and device transfer",
         "SparkCache CUDA placement component",
         "GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md",
-        "sha256:cc2c0e2f812f4b78d5b91f863aaf46fd8e8e505844245aa50911af1fb8e061c0",
+        "sha256:35b58a7bf414059c65b8f74e4e4b17ee6a81b7008e1bffbc9bd298b5e08c739e",
     )
     for fragment in required:
         assert fragment.casefold() in visible.casefold()
@@ -139,8 +140,9 @@ def test_readme_links_explorer_and_states_capabilities() -> None:
         "sparkcache-page-base-restore-flight/v1",
         "C2×128K is an observed capacity candidate",
         "C8×64K and C16×32K are planned and unqualified",
-        "sha256:cc2c0e2f812f4b78d5b91f863aaf46fd8e8e505844245aa50911af1fb8e061c0",
-        "Flat `sparkcache-page-snapshot-manifest/v2` objects at SparkCache `229d7d6`",
+        "sha256:35b58a7bf414059c65b8f74e4e4b17ee6a81b7008e1bffbc9bd298b5e08c739e",
+        "implementation originated at SparkCache `229d7d6`",
+        "complete runtime source `a1511d26a1fe2b17b24561bc52e376bf7f54b06a`",
         "Tail-only page deltas and opaque-page base-read cohorts are **research-only**",
     )
     for fragment in required:

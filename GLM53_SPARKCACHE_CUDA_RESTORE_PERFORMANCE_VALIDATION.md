@@ -10,11 +10,15 @@ qualification covers verified all-rank placement, multi-group recovery, and
 continued generation.
 
 The flat `sparkcache-page-snapshot-manifest/v2` artifact is also qualified for
-one exact C1 case: 813,068,464 encoded bytes in 13 authenticated objects, an
-all-rank SparkCache CUDA restore of 1.55–1.70 seconds, and the exact expected
-codeword before and after restart. This result is bound to local image
-`sha256:cc2c0e2f812f4b78d5b91f863aaf46fd8e8e505844245aa50911af1fb8e061c0`
-and SparkCache `229d7d6158261e9510ab99d7e82d532abb9ade01`. No public OCI digest is
+one exact C1 case: 813,068,464 encoded bytes in 13 authenticated objects,
+sequential object read/hash of 1.35–1.50 seconds, an all-rank SparkCache CUDA
+restore of 1.55–1.70 seconds, and the exact expected codeword before and after
+restart. This result is bound to local image
+`sha256:35b58a7bf414059c65b8f74e4e4b17ee6a81b7008e1bffbc9bd298b5e08c739e`,
+SparkCache source `a1511d26a1fe2b17b24561bc52e376bf7f54b06a`, and source tree
+`4d5b8eb8c5c13793ee7a1e67b2b34bd38fcf4ddb`. SparkCache `229d7d6` is the
+implementation origin of the flat-v2 schema and header-inclusive statistics
+fix, not the complete qualified runtime identity. No public OCI digest is
 qualified by this record.
 
 Tail-only opaque-page deltas, 16-member host-base read coalescing, and
@@ -70,9 +74,12 @@ and source-tree SHA-256 `b3e84d...` identified in the table above.
 
 | Attribute | Value |
 |---|---|
-| SparkCache source revision | `229d7d6158261e9510ab99d7e82d532abb9ade01` |
-| Local image ID | `sha256:cc2c0e2f812f4b78d5b91f863aaf46fd8e8e505844245aa50911af1fb8e061c0` |
-| Parent image ID | `sha256:ed60be066d6d9eadea267bc4597a0687869f3ddb95a3e5c6f86649893a838eb8` |
+| SparkCache source revision | `a1511d26a1fe2b17b24561bc52e376bf7f54b06a` |
+| SparkCache source tree | `4d5b8eb8c5c13793ee7a1e67b2b34bd38fcf4ddb` |
+| SparkCache source-tree SHA-256 | `6651f2823c816fac93779cbca54a8f19c0ed262830953149f3a87d189d1f833b` |
+| Flat-v2/header-fix implementation origin | `229d7d6158261e9510ab99d7e82d532abb9ade01` |
+| Local image ID | `sha256:35b58a7bf414059c65b8f74e4e4b17ee6a81b7008e1bffbc9bd298b5e08c739e` |
+| Parent image ID | `sha256:cc2c0e2f812f4b78d5b91f863aaf46fd8e8e505844245aa50911af1fb8e061c0` |
 | Publication identity | `snapshot-v1` |
 | Root schema | `sparkcache-page-snapshot-manifest/v2` |
 | Persistent prefix | 131,072 tokens and 813,068,464 encoded bytes per rank |
@@ -80,10 +87,17 @@ and source-tree SHA-256 `b3e84d...` identified in the table above.
 | Serving topology | GLM-5.3 Flash DFlash7, TP4/DCP1, one rank per DGX Spark |
 | Qualified workload | C1 publication, restart, all-rank restore, and exact codeword |
 
-The measured all-rank SparkCache CUDA restore was 1.55–1.70 seconds. The
-codeword oracle matched exactly before restart and after restoration. The
-result qualifies this artifact and workload only; it does not qualify a
-registry artifact, tail-delta roots, or concurrent restored roots.
+The measured all-rank SparkCache CUDA restore was 1.55–1.70 seconds, of which
+sequential macro-object read/hash consumed 1.35–1.50 seconds. The codeword
+oracle matched exactly before restart and after restoration. The result
+qualifies this artifact and workload only; it does not qualify a registry
+artifact, tail-delta roots, or concurrent restored roots.
+
+The sequential read/hash phase is a measured performance limitation of the
+flat-v2 CUDA path. The identified legacy 512-object path used bounded parallel
+reads within each arena slab. Existing legacy roots remain readable and follow
+that restore branch, but connector publication writes flat-v2 roots and exposes
+no operator setting for legacy publication.
 
 ## Implemented restore path
 

@@ -60,9 +60,11 @@ confirm completion.
 **Status: research-only qualification work.** Multi-group full-snapshot page
 restore is implemented and source-runtime-qualified for the recorded GLM-5.3
 TP4/DCP1 profile at 131,072 tokens and C1. Flat-v2 macro objects are qualified
-for the exact 13-object local C1 artifact. Tail page deltas reconstruct a fully
-verified snapshot before Python or SparkCache CUDA placement, but the C2 live
-case failed exact semantics and does not qualify that path.
+for exact 13-object C1 image `35b58a7…` at SparkCache `a1511d2`; their
+sequential read/hash phase measured 1.35–1.50 seconds. Tail page deltas
+reconstruct a fully verified snapshot before Python or SparkCache CUDA
+placement, but the C2 live case failed exact semantics and does not qualify that
+path.
 
 DeepSeek-V4 opaque HMA pages retain their verified Python restore path. CUDA
 support for that profile must describe all five page groups, preserve each
