@@ -86,6 +86,7 @@ def test_prefix_explorer_describes_present_storage_and_restore_behavior() -> Non
         "descriptor segment contains at most 16 chunk descriptors",
         "4,096-token boundaries",
         "at most 64 aliases",
+        "share authenticated row segments across different roots",
         "sparkcache-tail-manifest/v1",
         "sparkcache-hybrid-page-delta/v1",
         "sparkcache-page-delta-manifest/v2",
