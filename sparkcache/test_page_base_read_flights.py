@@ -11,6 +11,7 @@ from sparkcache.page_base_read_flights import (
     PageBaseReadEvidence,
     PageBaseReadFlightKey,
     PageBaseReadFlights,
+    PageBaseReadResult,
 )
 
 
@@ -182,6 +183,36 @@ def test_reader_bytearray_is_copied_before_followers_observe_it() -> None:
     assert isinstance(leader_result, bytes)
     assert leader_result == b"authenticated-base"
     assert follower_result == b"authenticated-base"
+
+
+def test_native_object_result_uses_authenticated_byte_charge_and_same_bounds() -> None:
+    flights = PageBaseReadFlights(
+        max_flights=2,
+        max_members=16,
+        max_bytes_per_flight=8,
+        max_bytes_total=16,
+    )
+    key = _key(encoded_bytes=8)
+    flights.register_cohort(key, ("leader", "follower"))
+    result = PageBaseReadResult(value=(b"object-a",), encoded_bytes=8)
+
+    assert flights.resolve("leader", key, lambda: result) is result
+    snapshot = flights.snapshot()
+    assert snapshot.retained_bytes == 8
+    assert snapshot.registered_members == 1
+    assert flights.resolve("follower", key, lambda: b"wrong") is result
+    assert flights.snapshot().retained_bytes == 0
+
+    wrong = _key("wrong", encoded_bytes=8)
+    flights.register_cohort(wrong, ("wrong-a", "wrong-b"))
+    with pytest.raises(PageBaseReadError, match="length differs"):
+        flights.resolve(
+            "wrong-a",
+            wrong,
+            lambda: PageBaseReadResult(value=(b"short",), encoded_bytes=5),
+        )
+    with pytest.raises(PageBaseReadError, match="length differs"):
+        flights.resolve("wrong-b", wrong, lambda: b"independent")
 
 
 def test_reader_length_must_equal_authenticated_geometry() -> None:
