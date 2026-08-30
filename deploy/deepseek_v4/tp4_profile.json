@@ -4,7 +4,7 @@
   "cache_model_profile": "deepseek-v4-fp8-hma",
   "published_runtime_base": "ghcr.io/fujitsupolycom/gb10-vllm-serving@sha256:6fc26fdad81a18f0fff67ce0a05f6d90165625ea2e1cac8a6f39bfb462017028",
   "sparkcache": {
-    "source_sha256": "83853050f790b18af95d424fec837abeb1a9a33f0538b5e4b97c16fb9c681781"
+    "source_sha256": "05f74f69e514ca5984bb6108e3bb0831efadc216b73899b1fb3cfcc29b3492ab"
   },
   "model": {
     "repository": "deepseek-ai/DeepSeek-V4-Flash-0731",

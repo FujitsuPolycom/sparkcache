@@ -225,13 +225,17 @@ when placement completes and intentionally excludes that bookkeeping.
   `sparkcache-hybrid-page-delta/v1` codec reuses only byte-identical page
   prefixes and binds the base snapshot, layout, block counts, and semantic
   token boundaries. A boundary inside an HMA page replaces that complete page
-  while retaining earlier byte-identical pages. For an aligned recurrent group,
-  vLLM may retain the replay-boundary page outside the advancing request block
-  table. Its `SchedulerOutput.recurrent_boundary_blocks` hand-off names the
-  pinned physical block by request, group, and token boundary. SparkCache uses
-  that block only after all three identities and the recurrent topology match;
-  missing or contradictory metadata skips publication rather than scanning
-  later running or speculative state. The
+  while retaining earlier byte-identical pages. At an exact recurrent-page
+  boundary, vLLM may retain the replay-boundary page outside the advancing
+  request block table. Its `SchedulerOutput.recurrent_boundary_blocks` hand-off
+  names the pinned physical block by request, group, and token boundary.
+  SparkCache defers a new recurrent request until a later cached scheduler step,
+  when the preceding forward's hand-off can be observed. It then requires one
+  matching entry for every recurrent group whose block size exactly divides the
+  publication boundary; missing or contradictory proof skips publication
+  rather than scanning later running or speculative state. At a boundary inside
+  a recurrent page, the request table's partial page remains authoritative and
+  an unexpected override is rejected. The
   `sparkcache-page-delta-manifest/v2` schema embeds its authenticated base graph
   and groups delta bytes into immutable objects of at most 64 MiB. A
   1,575,821,491-byte delta therefore uses at most 24 physical delta objects

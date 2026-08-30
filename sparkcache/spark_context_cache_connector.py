@@ -1616,12 +1616,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> tuple[tuple[int, int], ...] | None:
         """Validate vLLM's exact recurrent replay-boundary block hand-off.
 
-        An empty tuple is valid only when the registered topology has no
-        aligned recurrent group. None means the metadata is absent,
-        incomplete, or contradictory, so publication must be skipped.
-        SparkCache never derives a replacement from another non-null table
-        entry because later entries can hold running or speculative state
-        beyond ``boundary_tokens``.
+        An empty tuple is valid when the registered topology has no recurrent
+        group exactly aligned at ``boundary_tokens``. A nonaligned recurrent
+        group's partial page remains authoritative in the request block table.
+        None means required metadata is absent, incomplete, or contradictory,
+        so publication must be skipped. SparkCache never derives an aligned
+        replacement from another non-null table entry because later entries
+        can hold running or speculative state beyond ``boundary_tokens``.
         """
 
         def reject(reason: str) -> None:
@@ -1635,20 +1636,31 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             )
             return None
 
-        required_groups = {
+        recurrent_groups = {
             group_index
             for group_index, topology in enumerate(self._group_topology)
             if topology["reuse_policy"] == "recurrent_align"
         }
-        if not required_groups:
+        if not recurrent_groups:
             return ()
+        required_groups = {
+            group_index
+            for group_index in recurrent_groups
+            if boundary_tokens
+            % int(self._group_topology[group_index]["block_size"])
+            == 0
+        }
         raw = getattr(scheduler_output, "recurrent_boundary_blocks", None)
         if raw is None:
+            if not required_groups:
+                return ()
             return reject("vLLM supplied no recurrent boundary mapping")
         if not isinstance(raw, Mapping):
             return reject("top-level value is not a mapping")
         entries = raw.get(request_id)
         if entries is None:
+            if not required_groups:
+                return ()
             return reject("request has no recurrent boundary entries")
         if not isinstance(entries, (list, tuple)):
             return reject("request value is not a sequence")
@@ -1668,6 +1680,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             topology = self._group_topology[group_index]
             if topology["reuse_policy"] != "recurrent_align":
                 return reject("group is not an aligned recurrent cache")
+            if group_index not in required_groups:
+                return reject("recurrent group is not aligned at the store boundary")
             if block_id <= 0:
                 return reject("physical block is vLLM's null block")
             if entry_boundary != boundary_tokens:
@@ -1741,15 +1755,6 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 if self._has_full_quorum(digest):
                     self.counters["store_skipped_quorum"] += 1
                     continue
-                recurrent_boundary_blocks = (
-                    self._validated_recurrent_boundary_blocks(
-                        scheduler_output,
-                        req_id,
-                        span,
-                    )
-                )
-                if recurrent_boundary_blocks is None:
-                    continue
                 already = new_req.num_computed_tokens + scheduled
                 if self._streaming_snapshots_enabled:
                     self._append_streaming_snapshot_offer(
@@ -1771,10 +1776,25 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                             [list(group) for group in group_blocks],
                         )
                         self._store_token_ids[req_id] = exact_token_ids
-                        if recurrent_boundary_blocks:
-                            self._store_recurrent_boundaries[req_id] = (
-                                recurrent_boundary_blocks
-                            )
+                elif any(
+                    topology["reuse_policy"] == "recurrent_align"
+                    for topology in self._group_topology
+                ):
+                    # vLLM can only expose the hash-proven replay-boundary
+                    # block after the scheduled prefill has run. Preserve the
+                    # complete new-request table even when this step promises
+                    # the whole span; the following cached/decode step either
+                    # supplies the aligned proof or publishes the authoritative
+                    # nonaligned partial page from this table.
+                    self._store_progress[req_id] = (
+                        digest,
+                        span,
+                        already,
+                        [list(group) for group in group_blocks],
+                    )
+                    self._store_token_ids[req_id] = exact_token_ids
+                    if base_digest:
+                        self._store_bases[req_id] = (base_digest, base_span)
                 elif already >= span:
                     meta.plans.append(
                         _ReqPlan(
@@ -1787,9 +1807,6 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                             token_ids=exact_token_ids,
                             base_context_digest=base_digest,
                             base_span_tokens=base_span,
-                            recurrent_boundary_blocks=(
-                                recurrent_boundary_blocks
-                            ),
                         )
                     )
                 else:
@@ -1803,10 +1820,6 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         [list(group) for group in group_blocks],
                     )
                     self._store_token_ids[req_id] = exact_token_ids
-                    if recurrent_boundary_blocks:
-                        self._store_recurrent_boundaries[req_id] = (
-                            recurrent_boundary_blocks
-                        )
                     if base_digest:
                         self._store_bases[req_id] = (base_digest, base_span)
         cached = scheduler_output.scheduled_cached_reqs
@@ -1816,19 +1829,6 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             digest, span, done, blocks_by_group = self._store_progress[req_id]
             exact_token_ids = self._store_token_ids.get(req_id, ())
             base_digest, base_span = self._store_bases.get(req_id, ("", 0))
-            recurrent_boundary_blocks = self._validated_recurrent_boundary_blocks(
-                scheduler_output,
-                req_id,
-                span,
-            )
-            if recurrent_boundary_blocks is None:
-                del self._store_progress[req_id]
-                self._store_token_ids.pop(req_id, None)
-                self._store_bases.pop(req_id, None)
-                self._store_recurrent_boundaries.pop(req_id, None)
-                continue
-            if recurrent_boundary_blocks:
-                self._store_recurrent_boundaries[req_id] = recurrent_boundary_blocks
             new_block_ids = cached.new_block_ids[index]
             appended = (
                 [
@@ -1882,13 +1882,19 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     block_ids=blocks,
                 )
             elif done >= span:
+                recurrent_boundary_blocks = (
+                    self._validated_recurrent_boundary_blocks(
+                        scheduler_output,
+                        req_id,
+                        span,
+                    )
+                )
                 del self._store_progress[req_id]
                 self._store_token_ids.pop(req_id, None)
                 self._store_bases.pop(req_id, None)
-                recurrent_boundary_blocks = self._store_recurrent_boundaries.pop(
-                    req_id,
-                    (),
-                )
+                self._store_recurrent_boundaries.pop(req_id, None)
+                if recurrent_boundary_blocks is None:
+                    continue
                 if self._has_full_quorum(digest):
                     self.counters["store_skipped_quorum"] += 1
                     continue
