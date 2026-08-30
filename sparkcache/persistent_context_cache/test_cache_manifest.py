@@ -98,6 +98,41 @@ def _clear_once_in_subprocess(
 
 
 class ManifestStoreTests(unittest.TestCase):
+    def test_page_delta_chunk_reads_overlap_and_preserve_descriptor_order(
+        self,
+    ) -> None:
+        identity = _identity()
+        chunks = (_chunk(0, 256), _chunk(256, 512))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ManifestStore(root)
+            digest = hashlib.sha256(b"parallel-page-delta-reads").hexdigest()
+            store.commit(
+                identity=identity,
+                context_digest=digest,
+                chunks=chunks,
+                span_tokens=512,
+            )
+            manifest_path = (
+                root / "manifests" / identity.storage_key / f"{digest}.json"
+            )
+            descriptors = json.loads(manifest_path.read_bytes())["chunks"]
+            overlap = threading.Barrier(len(descriptors), timeout=2.0)
+            original_read_bytes = Path.read_bytes
+
+            def read_with_overlap(path: Path) -> bytes:
+                if path.suffix == ".spcc":
+                    overlap.wait()
+                return original_read_bytes(path)
+
+            with mock.patch.object(Path, "read_bytes", read_with_overlap):
+                restored = store._read_context_chunks(
+                    descriptors,
+                    identity.required_records,
+                )
+
+            self.assertEqual(restored, chunks)
+
     def test_page_extension_materializes_full_snapshot_after_base_root_removal(
         self,
     ) -> None:

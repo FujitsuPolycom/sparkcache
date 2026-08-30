@@ -2263,8 +2263,7 @@ class ManifestStore:
         descriptors: Sequence[Mapping[str, Any]],
         required: frozenset[StateRecord],
     ) -> tuple[ContextChunk, ...]:
-        result = []
-        for descriptor in descriptors:
+        def _read_one(descriptor: Mapping[str, Any]) -> ContextChunk:
             encoded = (
                 self.root / "chunks" / f"{descriptor['sha256']}.spcc"
             ).read_bytes()
@@ -2280,8 +2279,12 @@ class ManifestStore:
                 or chunk.logical_end != descriptor["logical_end"]
             ):
                 raise CacheFormatError("chunk range disagrees with descriptor")
-            result.append(chunk)
-        return tuple(result)
+            return chunk
+
+        if not descriptors:
+            return ()
+        with ThreadPoolExecutor(max_workers=min(8, len(descriptors))) as pool:
+            return tuple(pool.map(_read_one, descriptors))
 
     def publish_prefix_aliases(
         self,
