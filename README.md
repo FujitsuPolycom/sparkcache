@@ -357,15 +357,18 @@ snapshot therefore requires 13 payload objects rather than 512 logical-chunk
 files; the manifest remains the atomic visibility point.
 
 SparkCache CUDA restore authenticates the first flat object before parsing the
-snapshot header. It then reads and authenticates at most two later objects
+snapshot header. It then reads and authenticates at most four later objects
 concurrently into request-private host buffers before waiting for a placement
 arena. A host batch retains at most 256 MiB beyond the two placement-owned
 arenas. This lets storage reads for one bounded batch overlap placement of the
-preceding batch. Objects are added to the complete-snapshot SHA-256, copied into
-mapped arenas, and submitted to CUDA in manifest order only after every read in
-that bounded batch succeeds. The
+preceding batch. Authenticated objects are copied into mapped arenas and
+submitted to CUDA in manifest order only after every read in that bounded batch
+succeeds. The root's `snapshot_sha256` field remains part of the authenticated
+version 2 schema, but direct restore does not recompute it over the complete
+byte stream after every object's SHA-256 has already matched its ordered,
+contiguous descriptor. The
 `spark_cache_cuda_restore_io_workers` setting may reduce this path to one read
-worker; values above two remain capped at two. Restore diagnostics report
+worker; values above four remain capped at four. Restore diagnostics report
 foreground read-and-hash time, arena wait, host copy, CUDA submission-call
 time, and final completion time. This scheduling does not alter cache identity,
 persisted schemas, or fallback behavior.

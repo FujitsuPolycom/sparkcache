@@ -2938,8 +2938,8 @@ class ManifestStore:
 
         Physical extents are independent of the identity's logical chunk
         geometry. The root retains the exact 256-token boundary and chunk
-        count used by lookup/admission, while restore authenticates both each
-        extent and the reassembled byte stream before any page placement.
+        count used by lookup/admission. Restore authenticates the root metadata,
+        contiguous descriptor geometry, and each extent before placement.
         """
 
         _validate_digest(context_digest, "context_digest")

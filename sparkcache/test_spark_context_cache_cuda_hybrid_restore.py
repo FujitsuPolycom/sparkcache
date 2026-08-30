@@ -168,6 +168,17 @@ def test_flat_macro_objects_authenticate_before_direct_page_submission(
         "arena_memoryview",
         lambda arena, *, length: memoryview(arena.payload)[:length],
     )
+    original_sha256 = cuda_hybrid.hashlib.sha256
+    missing_payload = object()
+
+    def object_sha256(payload=missing_payload):
+        if payload is missing_payload:
+            raise AssertionError(
+                "authenticated page objects must not be hashed a second time"
+            )
+        return original_sha256(payload)
+
+    monkeypatch.setattr(cuda_hybrid.hashlib, "sha256", object_sha256)
 
     result = execute_cuda_hybrid_restore(
         adapter=adapter,
@@ -236,7 +247,7 @@ def test_flat_macro_objects_authenticate_before_direct_page_submission(
             arena_bytes=cut,
         )
     damaged_transaction = adapter.transactions[-1]
-    assert damaged_transaction.submissions
+    assert len(damaged_transaction.submissions) == 1
     assert damaged_transaction.state is RestoreState.ABORTED
     assert not damaged_transaction.can_resume
 
@@ -244,16 +255,19 @@ def test_flat_macro_objects_authenticate_before_direct_page_submission(
     manifest_path = tmp_path / "manifests" / identity.storage_key / f"{digest}.json"
     wrong_root = dict(manifest)
     wrong_root["snapshot_sha256"] = "0" * 64
-    wrong_root.pop("metadata_sha256")
-    wrong_root["metadata_sha256"] = hashlib.sha256(
-        cache_manifest._canonical_json(wrong_root)
-    ).hexdigest()
-    manifest_path.write_bytes(cache_manifest._canonical_json(wrong_root))
-    wrong_lookup = store.lookup(identity, digest, verify_chunks=False)
-    assert wrong_lookup.is_hit
+    wrong_encoded = cache_manifest._canonical_json(wrong_root)
+    manifest_path.write_bytes(wrong_encoded)
+    wrong_lookup = type(lookup)(
+        True,
+        "hit",
+        manifest_digest=hashlib.sha256(wrong_encoded).hexdigest(),
+        _manifest=wrong_root,
+        root_kind="page_snapshot",
+    )
+    transactions_before_root_damage = len(adapter.transactions)
     with pytest.raises(
         cuda_hybrid.CudaHybridRestoreError,
-        match="snapshot checksum mismatch",
+        match="identity is not authenticated",
     ):
         execute_cuda_hybrid_restore(
             adapter=adapter,
@@ -265,13 +279,90 @@ def test_flat_macro_objects_authenticate_before_direct_page_submission(
             expected_span_tokens=256,
             arena_bytes=cut,
         )
-    root_digest_transaction = adapter.transactions[-1]
-    assert len(root_digest_transaction.submissions) == 2
-    assert root_digest_transaction.state is RestoreState.ABORTED
-    assert not root_digest_transaction.can_resume
+    assert len(adapter.transactions) == transactions_before_root_damage
 
 
-def test_flat_macro_prefetches_before_arena_wait_and_submits_in_manifest_order(
+@pytest.mark.parametrize("damage", ("reorder", "range"))
+def test_flat_macro_descriptor_damage_is_rejected_before_transaction(
+    tmp_path,
+    monkeypatch,
+    damage,
+) -> None:
+    layout = PageLayout(
+        (PageGroup(2, (PageLayer("page", "torch.uint8", (128,), 128),)),)
+    )
+    encoded = encode_page_snapshot(
+        layout,
+        (8,),
+        {"page": bytes(index % 251 for index in range(1024))},
+    )
+    plan = plan_page_snapshot(layout, encoded, (8,))
+    object_bytes = plan.header_bytes + 32
+    identity = CacheIdentity(
+        target_checkpoint="1" * 64,
+        draft_checkpoint="2" * 64,
+        quantization_layout="test-block-pages-v1",
+        rope_layout="test-rope-v1",
+        tp_degree=1,
+        dcp_degree=1,
+        record_schema=("target_ckv", "logical_positions"),
+    )
+    digest = hashlib.sha256(f"flat-macro-{damage}".encode()).hexdigest()
+    store = ManifestStore(tmp_path)
+    monkeypatch.setattr(cache_manifest, "_PAGE_SNAPSHOT_OBJECT_BYTES", object_bytes)
+    store.commit_page_snapshot(
+        identity=identity,
+        context_digest=digest,
+        span_tokens=256,
+        snapshot=encoded,
+    )
+    lookup = store.lookup(identity, digest, verify_chunks=False)
+    assert lookup.is_hit and lookup._manifest is not None
+    damaged_root = dict(lookup._manifest)
+    descriptors = [dict(item) for item in damaged_root["snapshot_objects"]]
+    damaged_root["snapshot_objects"] = descriptors
+    if damage == "reorder":
+        descriptors[0], descriptors[1] = descriptors[1], descriptors[0]
+    else:
+        descriptors[1]["encoded_start"] += 1
+    damaged_root.pop("metadata_sha256")
+    damaged_root["metadata_sha256"] = hashlib.sha256(
+        cache_manifest._canonical_json(damaged_root)
+    ).hexdigest()
+    encoded_root = cache_manifest._canonical_json(damaged_root)
+    manifest_path = (
+        tmp_path / "manifests" / identity.storage_key / f"{digest}.json"
+    )
+    manifest_path.write_bytes(encoded_root)
+    damaged_lookup = type(lookup)(
+        True,
+        "hit",
+        manifest_digest=hashlib.sha256(encoded_root).hexdigest(),
+        _manifest=damaged_root,
+        root_kind="page_snapshot",
+    )
+
+    class RejectTransaction:
+        def begin_parked_page_restore(self, *_args, **_kwargs):
+            raise AssertionError("descriptor damage must fail before a transaction")
+
+    with pytest.raises(
+        cuda_hybrid.CudaHybridRestoreError,
+        match="geometry is invalid",
+    ):
+        execute_cuda_hybrid_restore(
+            adapter=RejectTransaction(),
+            request_id=f"flat-macro-{damage}",
+            lookup=damaged_lookup,
+            cache_root=tmp_path,
+            layout=layout,
+            group_slots=(tuple(range(8)),),
+            expected_span_tokens=256,
+            arena_bytes=object_bytes,
+        )
+
+
+def test_flat_macro_prefetches_four_objects_before_arena_wait(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -334,8 +425,8 @@ def test_flat_macro_prefetches_before_arena_wait_and_submits_in_manifest_order(
         def acquire_arena(self, index):
             self.arena_acquisitions += 1
             if self.arena_acquisitions > 1:
-                assert two_readers.wait(timeout=0.5), (
-                    "the next authenticated object pair must be read before "
+                assert four_readers.wait(timeout=0.5), (
+                    "the next authenticated object batch must be read before "
                     "waiting for a mapped CUDA arena"
                 )
                 time.sleep(0.001)
@@ -367,7 +458,7 @@ def test_flat_macro_prefetches_before_arena_wait_and_submits_in_manifest_order(
 
     original_read = cuda_hybrid._pread_exact_into
     lock = threading.Lock()
-    two_readers = threading.Event()
+    four_readers = threading.Event()
     call_count = 0
     active_reads = 0
     maximum_active_reads = 0
@@ -393,10 +484,10 @@ def test_flat_macro_prefetches_before_arena_wait_and_submits_in_manifest_order(
                     maximum_prefetch_bytes,
                     active_prefetch_bytes,
                 )
-                if active_reads == 2:
-                    two_readers.set()
+                if active_reads == 4:
+                    four_readers.set()
         if call_index > 0 and require_overlap:
-            assert two_readers.wait(timeout=0.5)
+            assert four_readers.wait(timeout=0.5)
         try:
             return original_read(path, encoded_bytes, target)
         finally:
@@ -425,7 +516,7 @@ def test_flat_macro_prefetches_before_arena_wait_and_submits_in_manifest_order(
         io_workers=8,
     )
 
-    assert maximum_active_reads == 2
+    assert maximum_active_reads == 4
     assert maximum_prefetch_bytes <= 256 * 1024 * 1024
     assert result.arena_wait_ms > 0
     assert result.host_copy_ms > 0

@@ -35,7 +35,7 @@ _CHUNK_PREFIX = struct.Struct("<8sII")
 _CHUNK_MAGIC = b"SPCKV001"
 _TARGET_KIND = cuda.RECORD_TARGET_CKV
 _PAGE_SNAPSHOT_MANIFEST_SCHEMA = "sparkcache-page-snapshot-manifest/v2"
-_MAX_PAGE_OBJECT_READ_WORKERS = 2
+_MAX_PAGE_OBJECT_READ_WORKERS = 4
 _MAX_PAGE_OBJECT_PREFETCH_BYTES = 256 * 1024 * 1024
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -407,8 +407,6 @@ def _execute_page_object_restore(
     _pread_exact_into(first.path, first.encoded_bytes, memoryview(first_payload))
     if hashlib.sha256(first_payload).hexdigest() != first.sha256:
         raise CudaHybridRestoreError(f"page object SHA-256 mismatch for {first.path}")
-    snapshot_digest = hashlib.sha256()
-    snapshot_digest.update(first_payload)
     read_ms = 1e3 * (time.perf_counter() - started)
     page_plan = plan_page_snapshot(
         layout,
@@ -469,18 +467,21 @@ def _execute_page_object_restore(
         read_workers = min(
             io_workers,
             _MAX_PAGE_OBJECT_READ_WORKERS,
-            cuda.ARENA_COUNT,
         )
 
         def read_and_authenticate(
             item: tuple[CudaPageObject, bytearray],
         ) -> None:
             page_object, buffer = item
-            _pread_exact_into(
-                page_object.path,
-                page_object.encoded_bytes,
-                memoryview(buffer),
-            )
+            target = memoryview(buffer)
+            try:
+                _pread_exact_into(
+                    page_object.path,
+                    page_object.encoded_bytes,
+                    target,
+                )
+            finally:
+                target.release()
             if hashlib.sha256(buffer).hexdigest() != page_object.sha256:
                 raise CudaHybridRestoreError(
                     f"page object SHA-256 mismatch for {page_object.path}"
@@ -533,14 +534,10 @@ def _execute_page_object_restore(
                     # preceding arena's in-flight placement without exposing an
                     # unauthenticated partial batch to the GPU.
                     for index, page_object, buffer in staged:
-                        snapshot_digest.update(buffer)
                         submit_authenticated_object(index, page_object, buffer)
                 finally:
                     for _index, _page_object, buffer in staged:
                         buffer.clear()
-        manifest = lookup._manifest
-        if snapshot_digest.hexdigest() != manifest.get("snapshot_sha256"):
-            raise CudaHybridRestoreError("flat page snapshot checksum mismatch")
         started = time.perf_counter()
         stats = transaction.finish()
         finish_ms = 1e3 * (time.perf_counter() - started)
