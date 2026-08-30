@@ -5,7 +5,7 @@
   "published_runtime_base": "ghcr.io/fujitsupolycom/gb10-vllm-serving@sha256:6fc26fdad81a18f0fff67ce0a05f6d90165625ea2e1cac8a6f39bfb462017028",
   "base_image_requirement": "exact GLM-5.2 3.5-bpw R7 image recorded by the source container inspection",
   "sparkcache": {
-    "source_sha256": "131dad699f038fe34897338f6c63240f3c9285a533cb266cd6927a99d26f745c"
+    "source_sha256": "6016c1f1787e1c65e17624b11b965f737b4f101acaa98fbd05c7641f79fb4635"
   },
   "model": {
     "repository": "brandonmusic/GLM-5.2-EXL3-TR3v4-3.5bpw-MTP78",

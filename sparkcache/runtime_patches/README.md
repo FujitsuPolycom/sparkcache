@@ -55,6 +55,27 @@ python -m sparkcache.runtime_patches.verify_lease_contract \
   --contract sparkcache/runtime_patches/vllm-kv-block-lease-contract-e10536a.json
 ```
 
+The GLM-5.3 runtime with live-tensor B12X KDA binding pins
+`local-inference-lab/vllm@0b67266a0f37d6146a8403fb8482403c62f412d5`.
+Its SparkCache integration uses
+`vllm-kv-block-lease-contract-glm53-b12x-kda-adaptive-mtp.json` and the
+exact-input overlays under `patches/vllm-glm53-b12x-kda-adaptive-mtp`.
+The three KDA commits after `e10536a` change only the KDA implementation and
+its model tests; the ten SparkCache-owned source preimages are byte-identical.
+The contract has **implemented** status. Four-rank TP4/DCP1 serving remains
+unqualified until a receipt names an immutable image built from this revision.
+
+```bash
+python -m sparkcache.runtime_patches.verify_lease_contract \
+  --vllm-root /path/to/0b67266a/source \
+  --contract sparkcache/runtime_patches/vllm-kv-block-lease-contract-glm53-b12x-kda-adaptive-mtp.json
+```
+
+This runtime contract does not change SparkCache wire values, digest salts,
+256-token chunk geometry, or cache-identity fields. Static embedded MTP and
+adaptive embedded MTP retain distinct draft-state identities. Incompatible or
+unverified stored state is rejected and recomputed.
+
 ## Narrow integration
 
 Use `sparkcache.streaming.BlockLeaseRegistry` in the worker connector:

@@ -59,6 +59,31 @@ def test_build_command_selects_the_e105_source_built_recipe(tmp_path: Path) -> N
     assert command[command.index("-f") + 1] == str(recipe.resolve())
 
 
+def test_build_command_selects_the_b12x_kda_adaptive_mtp_recipe(
+    tmp_path: Path,
+) -> None:
+    relative = "deploy/glm53_flash/Containerfile.b12x-kda-adaptive-mtp"
+    recipe = tmp_path / relative
+    recipe.parent.mkdir(parents=True)
+    recipe.write_text("FROM scratch\n", encoding="utf-8")
+    with mock.patch(
+        "deploy.glm53_flash.build_image.subprocess.run",
+        return_value=subprocess.CompletedProcess([], 0, IMAGE_ID + "\n", ""),
+    ):
+        command = build_command(
+            repository=tmp_path,
+            base_image="local-glm53:b12x-kda-adaptive-mtp",
+            base_image_id=IMAGE_ID,
+            source_sha256=SOURCE_ID,
+            sparkcache_revision=SPARKCACHE_REVISION,
+            base_image_licenses=LICENSES,
+            output_image="glm53-sparkcache:b12x-kda-adaptive-mtp",
+            containerfile=relative,
+        )
+
+    assert command[command.index("-f") + 1] == str(recipe.resolve())
+
+
 def test_build_command_rejects_parent_identity_drift() -> None:
     with mock.patch(
         "deploy.glm53_flash.build_image.subprocess.run",
