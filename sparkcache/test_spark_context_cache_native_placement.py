@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from sparkcache.spark_context_cache_codec import LayerPlan
+from sparkcache.spark_context_cache_hybrid import PageGroup, PageLayer, PageLayout
 from sparkcache.spark_context_cache_native_placement import (
     ArenaMode,
     NativePlacementAdapter,
@@ -16,6 +17,7 @@ from sparkcache.spark_context_cache_native_placement import (
     NativePlacementLibrary,
     RestoreState,
     build_destination_descriptors,
+    build_page_destination_descriptors,
 )
 import sparkcache.spark_cache_native as native
 
@@ -249,6 +251,43 @@ def test_destination_descriptor_requires_exact_registered_tensor_set():
                 "unplanned": FakeTensor(pointer=0x2000),
             },
         )
+
+
+def test_page_destination_uses_grouped_manager_page_geometry():
+    layout = PageLayout(
+        (
+            PageGroup(
+                block_size=2304,
+                layers=(
+                    PageLayer(
+                        name="full",
+                        dtype="torch.uint8",
+                        page_shape=(9, 1, 4),
+                        bytes_per_page=36,
+                    ),
+                ),
+                reuse_policy="full",
+            ),
+        )
+    )
+    descriptors = build_page_destination_descriptors(
+        layout,
+        {
+            "full": FakeTensor(
+                pointer=0x4000,
+                shape=(8, 9, 1, 4),
+                strides=(36, 4, 4, 1),
+                element_size=1,
+            )
+        },
+    )
+
+    assert len(descriptors) == 1
+    descriptor = descriptors[0]
+    assert descriptor.destination_base == 0x4000
+    assert descriptor.destination_pages == 8
+    assert descriptor.destination_page_stride_bytes == 36
+    assert descriptor.bytes_per_page == 36
 
 
 def test_request_stays_parked_until_native_finish_succeeds(tmp_path):

@@ -667,7 +667,11 @@ def parse_connector_config(
         )
     quantization_layout = profile.quantization_layout
     if storage_mode == "block_pages_v1":
-        quantization_layout += ":" + kv_group_topology_digest(kv_cache_config)
+        # A cache-manager block ID names one complete physical page, including
+        # split kernel rows and opaque bytes beyond the logical tensor shape.
+        quantization_layout += ":manager-pages-v1:" + kv_group_topology_digest(
+            kv_cache_config
+        )
     record_schema = (
         ("target_ckv", "logical_positions") if storage_mode == "block_pages_v1" else ()
     )
