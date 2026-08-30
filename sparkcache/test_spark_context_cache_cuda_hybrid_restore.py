@@ -253,6 +253,35 @@ def test_flat_macro_objects_authenticate_before_direct_page_submission(
 
     damaged_path.write_bytes(healthy)
     manifest_path = tmp_path / "manifests" / identity.storage_key / f"{digest}.json"
+    malformed_root = dict(manifest)
+    malformed_root["snapshot_sha256"] = "not-a-digest"
+    malformed_root.pop("metadata_sha256")
+    malformed_root["metadata_sha256"] = hashlib.sha256(
+        cache_manifest._canonical_json(malformed_root)
+    ).hexdigest()
+    malformed_encoded = cache_manifest._canonical_json(malformed_root)
+    manifest_path.write_bytes(malformed_encoded)
+    malformed_lookup = type(lookup)(
+        True,
+        "hit",
+        manifest_digest=hashlib.sha256(malformed_encoded).hexdigest(),
+        _manifest=malformed_root,
+        root_kind="page_snapshot",
+    )
+    transactions_before_malformed_root = len(adapter.transactions)
+    with pytest.raises(cuda_hybrid.CudaHybridRestoreError):
+        execute_cuda_hybrid_restore(
+            adapter=adapter,
+            request_id="flat-macro-malformed-root-digest",
+            lookup=malformed_lookup,
+            cache_root=tmp_path,
+            layout=layout,
+            group_slots=((3, 4, 5, 6),),
+            expected_span_tokens=256,
+            arena_bytes=cut,
+        )
+    assert len(adapter.transactions) == transactions_before_malformed_root
+
     wrong_root = dict(manifest)
     wrong_root["snapshot_sha256"] = "0" * 64
     wrong_encoded = cache_manifest._canonical_json(wrong_root)
@@ -267,7 +296,7 @@ def test_flat_macro_objects_authenticate_before_direct_page_submission(
     transactions_before_root_damage = len(adapter.transactions)
     with pytest.raises(
         cuda_hybrid.CudaHybridRestoreError,
-        match="identity is not authenticated",
+        match="metadata checksum mismatch",
     ):
         execute_cuda_hybrid_restore(
             adapter=adapter,
@@ -348,7 +377,7 @@ def test_flat_macro_descriptor_damage_is_rejected_before_transaction(
 
     with pytest.raises(
         cuda_hybrid.CudaHybridRestoreError,
-        match="geometry is invalid",
+        match="descriptor geometry differs",
     ):
         execute_cuda_hybrid_restore(
             adapter=RejectTransaction(),

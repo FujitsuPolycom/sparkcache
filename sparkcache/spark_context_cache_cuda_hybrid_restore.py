@@ -15,9 +15,10 @@ from typing import Any, Sequence
 
 from sparkcache import spark_cache_cuda as cuda
 from sparkcache.persistent_context_cache.cache_manifest import (
+    CacheFormatError,
     CacheIdentity,
     StateRecord,
-    _canonical_json,
+    _validate_page_snapshot_root,
 )
 from sparkcache.spark_context_cache_hybrid import PageSnapshotPlan
 from sparkcache.spark_context_cache_hybrid import PageLayout, plan_page_snapshot
@@ -294,16 +295,16 @@ def _plan_page_objects(
             identity_wire["record_schema"] = tuple(identity_wire["record_schema"])
         identity = CacheIdentity(**identity_wire)
         context_digest = manifest["context_digest"]
-        metadata_digest = manifest["metadata_sha256"]
         if (
             not isinstance(context_digest, str)
             or _DIGEST.fullmatch(context_digest) is None
-            or not isinstance(metadata_digest, str)
-            or _DIGEST.fullmatch(metadata_digest) is None
         ):
             raise ValueError("manifest digest fields are invalid")
-        authenticated = dict(manifest)
-        authenticated.pop("metadata_sha256")
+        validated_objects = _validate_page_snapshot_root(
+            manifest,
+            identity=identity,
+            context_digest=context_digest,
+        )
         manifest_path = (
             Path(cache_root)
             / "manifests"
@@ -312,7 +313,14 @@ def _plan_page_objects(
         )
         encoded_manifest = manifest_path.read_bytes()
         persisted = json.loads(encoded_manifest)
-    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+    except (
+        CacheFormatError,
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as error:
         raise CudaHybridRestoreError(
             f"flat page root identity was rejected: {error}"
         ) from error
@@ -323,16 +331,14 @@ def _plan_page_objects(
         or persisted != manifest
         or hashlib.sha256(encoded_manifest).hexdigest()
         != getattr(lookup, "manifest_digest", None)
-        or hashlib.sha256(_canonical_json(authenticated)).hexdigest() != metadata_digest
     ):
         raise CudaHybridRestoreError("flat page root identity is not authenticated")
     total = manifest.get("snapshot_encoded_bytes")
-    raw_objects = manifest.get("snapshot_objects")
+    raw_objects = validated_objects
     if (
         isinstance(total, bool)
         or not isinstance(total, int)
         or total <= 0
-        or not isinstance(raw_objects, list)
         or not raw_objects
     ):
         raise CudaHybridRestoreError("flat page macro geometry is invalid")
