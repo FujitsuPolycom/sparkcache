@@ -22,13 +22,13 @@ flat-v2 schema and header-accounting implementation origin, not the complete
 runtime source. Sequential macro-object read/hash consumed 1.35–1.50 seconds
 of the 1.55–1.70-second all-rank restore.
 
-PR43 final head `eabe7fd0c878db7384ef87fe80a1e96b9bedcf67` implements bounded
-pipelined prefetch for remaining flat-v2 objects. At most four reads fill
-request-private host buffers before arena waits, with a 256 MiB host-batch bound
-and manifest-ordered copy/submission after authentication. Ordered descriptors
-and per-object SHA-256 remove the redundant complete-stream hash pass. It is
-GPU-free tested and not live qualified; the retained C1 qualification remains
-image `35b58a7…` with the sequential measurements above.
+Four-reader flat-v2 prefetch at SparkCache
+`eabe7fd0c878db7384ef87fe80a1e96b9bedcf67` is **research-only**. Image
+`sha256:df4e09a32cdbf1c0e69cc7c4c9e95d890d6c7a1e3eaac84f969912a16fd27dd3`
+structurally verified all four rank-local 131,072-token snapshots but returned
+`spark` instead of the required `red`; recomputation returned `red`. It is not
+a deployable restore artifact. The executable setup remains pinned to image
+`35b58a7…` and its sequential measurements above.
 
 Qualification applies only to the checkpoint revisions, source contracts,
 topology, settings, and immutable artifacts named in those records. It does

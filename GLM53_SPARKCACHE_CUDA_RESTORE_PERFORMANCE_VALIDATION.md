@@ -99,10 +99,10 @@ reads within each arena slab. Existing legacy roots remain readable and follow
 that restore branch, but connector publication writes flat-v2 roots and exposes
 no operator setting for legacy publication.
 
-### Pipelined-prefetch implementation after the qualified artifact
+### Research-only four-reader prefetch
 
-SparkCache PR43 final head `eabe7fd0c878db7384ef87fe80a1e96b9bedcf67`
-replaces the sequential remaining-object loop with bounded pipelined prefetch.
+SparkCache `eabe7fd0c878db7384ef87fe80a1e96b9bedcf67` contains bounded
+four-reader prefetch for flat version 2 objects.
 Its Git tree is `d88a65ea265a6f212367baa8c4a4970079d6b08a` and its deployable
 SparkCache source SHA-256 is
 `d9a7800ce201b0671676fc8d71423947c7b24e4797758db727c06e0e684495fe`.
@@ -122,10 +122,19 @@ descriptors and each object's SHA-256 before direct placement. The root's
 path no longer repeats SHA-256 over the complete byte stream after every object
 digest has matched. Persisted object and geometry checks are unchanged.
 
-This scheduling is **implemented** and GPU-free tested. It is not present in
-image `35b58a7…` and has no live semantic or performance qualification. The
-safe retained qualification remains the sequential 1.55–1.70-second C1 restore
-described above.
+Status: **research-only**. ARM64 image
+`sha256:df4e09a32cdbf1c0e69cc7c4c9e95d890d6c7a1e3eaac84f969912a16fd27dd3`
+structurally verified 813,068,464 bytes in 13 objects on every rank. Read and
+authentication took 484.1–528.8 ms, placement took 323.7–330.9 ms including
+293.2–297.7 ms of arena wait, final completion took 129.5–131.6 ms, and cache
+service took 1,231.7–1,331.2 ms.
+
+The restored response was `spark`; the deterministic oracle required `red`.
+A one-token-changed prompt with the same length recomputed `red` in 55.141
+seconds. Structural validation therefore did not establish semantic
+correctness. The image is rejected for deployment and does not replace the
+single-reader qualification. The exact evidence is recorded in
+[`flat-v2-four-reader-semantic-rejection-eabe7fd.json`](evidence/glm53-flash-dflash7-bf16/flat-v2-four-reader-semantic-rejection-eabe7fd.json).
 
 ## Implemented restore path
 
@@ -293,8 +302,9 @@ Source revision `2b86fb9d02fa3595cca5caa864b81aedce44b8bb` passed:
 ## Qualification limits
 
 - The qualified workload is C1 full-snapshot restore at 131,072 tokens.
-- PR43 bounded four-reader flat-v2 prefetch is implemented and GPU-free tested, not
-  live qualified. It does not inherit the `35b58a7…` result.
+- Four-reader flat-v2 prefetch at SparkCache `eabe7fd` is research-only because
+  its structurally verified restore failed the exact semantic oracle. It does
+  not inherit the `35b58a7…` result.
 - Historical C2/C8/C16 timing and completion receipts are diagnostic because
   they do not carry exact-output semantic proof.
 - Tail-delta publication, shared host-base reads, shared GPU-prefix attachment,

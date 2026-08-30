@@ -53,7 +53,8 @@ Status words are deliberate:
 | Tail-only row publication | **implemented** | Opt-in `tail-cow-v1`; GPU-free tested, no live serving qualification |
 | Opaque HMA page snapshots | **qualified** | Exact DeepSeek-V4 and GLM deployments linked above |
 | Tail-only opaque-page deltas | **research-only** | Implemented and GPU-free tested; C2 restored-delta responses failed exact semantics while recomputation succeeded |
-| 64 MiB flat page macro objects | **qualified** | Exact C1 evidence remains SparkCache `a1511d2` / image `35b58a7…` with sequential reads; PR43 final head `eabe7fd` implements bounded four-reader prefetch and is GPU-free tested, not live qualified |
+| 64 MiB flat page macro objects | **qualified** | Exact C1 evidence is SparkCache `a1511d2` / image `35b58a7…` with sequential reads |
+| Four-reader flat-page prefetch | **research-only** | SparkCache `eabe7fd` passed structural checks but failed the exact 131,072-token semantic oracle |
 | SparkCache CUDA restore and placement | **qualified** | Exact GLM-5.3 TP4/DCP1 source artifacts in the linked records |
 | Shared exact-prefix GPU blocks | **implemented** | Bounded vLLM lease path; earlier timing receipts are diagnostic, not exact-output semantic qualification |
 | Different-root shared row segments | **implemented** | Authenticated `per_token_rows` descriptor-prefix sharing; GPU-free tested, not live qualified |
@@ -114,24 +115,15 @@ sequentially. That phase measured 1.35–1.50 seconds within the 1.55–1.70-sec
 all-rank restore. The result is correct but slower than the identified legacy
 512-object path, which used bounded parallel reads within each arena slab.
 
-PR43 final head `eabe7fd0c878db7384ef87fe80a1e96b9bedcf67` implements bounded
-flat-v2 pipelined prefetch. It authenticates the first object before parsing the
-header, then reads and authenticates at most four remaining objects concurrently
-into request-private host buffers before waiting for a placement arena. A batch
-retains at most 256 MiB beyond the two arenas, allowing storage work to overlap
-placement of the preceding batch. Only after the complete batch succeeds are
-objects copied into mapped arenas and submitted in manifest order.
-`spark_cache_cuda_restore_io_workers` may reduce the path to one worker; values
-above four remain capped at four. Diagnostics separate read/hash, arena wait,
-host copy, submission-call, and completion time.
-
-Version 2 root validation authenticates the ordered contiguous descriptor table
-and every object's SHA-256. The `snapshot_sha256` field remains authenticated
-schema metadata, but direct restore no longer recomputes a redundant SHA-256
-over the complete byte stream after all object digests match. This pipeline is
-implemented and GPU-free tested, not live qualified. Existing legacy roots
-remain readable; the connector does not offer an operator setting that
-publishes additional legacy roots.
+Four-reader flat-v2 prefetch at SparkCache
+`eabe7fd0c878db7384ef87fe80a1e96b9bedcf67` is **research-only**. Its bounded
+reader passed GPU-free integrity and ordering tests and structurally verified
+all four rank-local 131,072-token snapshots. The restored response was `spark`
+instead of the required `red`; an equivalent recomputation returned `red`.
+Image `df4e09a…` is therefore rejected as a deployable restore artifact and
+does not replace the qualified single-reader image. The exact identity,
+timings, and semantic result are recorded in the
+[research receipt](evidence/glm53-flash-dflash7-bf16/flat-v2-four-reader-semantic-rejection-eabe7fd.json).
 
 Conversation extensions use `sparkcache-hybrid-page-delta/v1` page semantics
 and `sparkcache-page-delta-manifest/v2` roots. The delta binds the exact base,
@@ -278,9 +270,10 @@ snapshot's complete digest before the parked request may resume.
   13 objects, sequential read/hash in 1.35–1.50 seconds, all-rank SparkCache
   CUDA restore in 1.55–1.70 seconds, and the exact codeword before and after
   restart. No published OCI digest is qualified.
-- Bounded four-reader flat-v2 prefetch at PR43 final head `eabe7fd` is
-  **implemented** and GPU-free tested, not live qualified. It does not transfer
-  the `35b58a7…` semantic or timing result to the PR43 artifact.
+- Bounded four-reader flat-v2 prefetch at SparkCache `eabe7fd` is
+  **research-only**. Its structurally verified 131,072-token restore failed the
+  exact codeword oracle, so image `df4e09a…` is not deployable and does not
+  inherit the `35b58a7…` qualification.
 - Tail-only page deltas and opaque-page base-read cohorts are **research-only**.
   The implementation and GPU-free tests remain, but the exact C2 restored-delta
   case failed semantics while recomputation succeeded.

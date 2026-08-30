@@ -105,11 +105,9 @@ def test_prefix_explorer_describes_present_storage_and_restore_behavior() -> Non
         "C8×64K and C16×32K are planned and unqualified",
         "C16×128K is unsupported without GPU trunk sharing or additional KV capacity",
         "Sequential object read/hash consumed 1.35–1.50 seconds",
-        "PR43 final head eabe7fd adds bounded pipelined prefetch",
-        "at most four objects are read into request-private host buffers",
-        "256 MiB host-batch bound",
-        "complete-stream hash pass redundant",
-        "no live artifact qualifies that scheduling",
+        "Four-reader prefetch at SparkCache eabe7fd structurally verified",
+        "returned spark instead of the required red",
+        "Image df4e09a… is not deployable",
         "request-private GPU tail",
         "persistent copy-on-write tail objects",
         "When enabled, SparkCache CUDA restore owns verified reconstruction and device transfer",
@@ -135,6 +133,7 @@ def test_prefix_explorer_uses_canonical_status_vocabulary() -> None:
 
 def test_readme_links_explorer_and_states_capabilities() -> None:
     readme = README.read_text(encoding="utf-8")
+    prose = " ".join(readme.split())
 
     required = (
         "[interactive prefix-reuse explorer](docs/sparkcache-prefix-explainer.html)",
@@ -148,9 +147,9 @@ def test_readme_links_explorer_and_states_capabilities() -> None:
         "sha256:35b58a7bf414059c65b8f74e4e4b17ee6a81b7008e1bffbc9bd298b5e08c739e",
         "accounting originated at SparkCache `229d7d6`",
         "complete runtime source `a1511d26a1fe2b17b24561bc52e376bf7f54b06a`",
-        "PR43 final head `eabe7fd0c878db7384ef87fe80a1e96b9bedcf67`",
-        "GPU-free tested, not live qualified",
+        "Four-reader flat-v2 prefetch at SparkCache",
+        "failed the exact codeword oracle",
         "Tail-only page deltas and opaque-page base-read cohorts are **research-only**",
     )
     for fragment in required:
-        assert fragment in readme
+        assert fragment in prose

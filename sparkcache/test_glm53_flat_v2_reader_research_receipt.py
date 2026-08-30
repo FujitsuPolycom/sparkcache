@@ -76,6 +76,8 @@ def test_readme_labels_four_reader_candidate_research_only() -> None:
     readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
     prose = " ".join(readme.split())
 
-    assert "Bounded flat-object prefetch is **research-only**" in prose
-    assert "does not replace the single-reader qualification" in prose
+    assert "Four-reader flat-v2 prefetch at SparkCache" in prose
+    assert "is **research-only**" in prose
+    assert "failed the exact 131,072-token semantic oracle" in prose
+    assert "does not replace the qualified single-reader image" in prose
     assert RECEIPT.name in readme
