@@ -19,6 +19,13 @@ SOURCE_RECEIPT = PATCH_ROOT / "source-receipt.json"
 CONTAINERFILE = ROOT / "deploy/glm53_flash/Containerfile.b12x-kda-adaptive-mtp"
 VLLM_COMMIT = "0b67266a0f37d6146a8403fb8482403c62f412d5"
 SOURCE_ROLE = "source_built_glm53_b12x_kda_adaptive_mtp"
+RECURRENT_BOUNDARY_ROLE = "recurrent_boundary_contract"
+RECURRENT_BOUNDARY_FILES = {
+    "vllm/v1/core/kv_cache_manager.py",
+    "vllm/v1/core/sched/output.py",
+    "vllm/v1/core/sched/scheduler.py",
+    "vllm/v1/core/single_type_kv_cache_manager.py",
+}
 KDA_PATH = "vllm/model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py"
 E105_KDA_SHA256 = (
     "a879af0081f69ba8288ef909e1d69b5bbb85bdff7e5aa0d3c11ad892bfea8410"
@@ -71,11 +78,23 @@ def test_glm53_b12x_kda_adaptive_mtp_contract_attests_the_complete_sparkcache_vl
         "vllm/v1/kv_cache_interface.py",
         KDA_PATH,
     }
-    assert all(
-        set(record["accepted_sha256"]) == {SOURCE_ROLE}
-        for record in contract["files"]
-    )
+    for record in contract["files"]:
+        expected_roles = {SOURCE_ROLE}
+        if record["path"] in RECURRENT_BOUNDARY_FILES:
+            expected_roles.add(RECURRENT_BOUNDARY_ROLE)
+        assert set(record["accepted_sha256"]) == expected_roles
     assert all(record["required_symbols"] for record in contract["files"])
+
+    by_path = {record["path"]: record for record in contract["files"]}
+    assert by_path["vllm/v1/core/sched/output.py"]["accepted_sha256"][
+        RECURRENT_BOUNDARY_ROLE
+    ] == "9911b3f9d21815a185285852b5a6176e5484e1ab0ff5c30f7caaa68ea0fab543"
+    assert "SchedulerOutput.recurrent_boundary_blocks" in by_path[
+        "vllm/v1/core/sched/output.py"
+    ]["required_symbols"]
+    assert "KVCacheManager.take_recurrent_boundary_blocks" in by_path[
+        "vllm/v1/core/kv_cache_manager.py"
+    ]["required_symbols"]
 
 
 def test_glm53_b12x_kda_contract_rejects_the_e105_kda_source(

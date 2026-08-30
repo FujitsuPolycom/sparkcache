@@ -1023,6 +1023,302 @@ class DefectD16HybridPageBoundaryTests(unittest.TestCase):
             )
 
 
+class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
+    """D-17: vLLM identifies off-table recurrent replay boundaries."""
+
+    BOUNDARY = 6912
+    PROMPT_TOKENS = 6992
+    BOUNDARY_BLOCK = 42
+
+    @staticmethod
+    def _config() -> types.SimpleNamespace:
+        class FullAttentionSpec:
+            block_size = 2304
+            storage_block_size = 2304
+            page_size_bytes = 64
+
+        class MambaSpec:
+            block_size = 2304
+            storage_block_size = 2304
+            page_size_bytes = 64
+            mamba_cache_mode = "align"
+            tokens_per_state = 2304
+            num_speculative_blocks = 7
+            num_prefill_checkpoint_blocks = 0
+
+        return types.SimpleNamespace(
+            kv_cache_groups=(
+                types.SimpleNamespace(
+                    kv_cache_spec=FullAttentionSpec(),
+                    is_eagle_group=False,
+                    layer_names=("full",),
+                ),
+                types.SimpleNamespace(
+                    kv_cache_spec=MambaSpec(),
+                    is_eagle_group=False,
+                    layer_names=("recurrent",),
+                ),
+            )
+        )
+
+    @classmethod
+    def _tables(cls) -> tuple[tuple[int, ...], ...]:
+        # The recurrent replay-boundary slot is null after vLLM advances the
+        # running state. Entries 71..78 are the later running state and seven
+        # DFlash verification slots, so none can substitute for block 42.
+        return ((11, 12, 13, 14), (0, 0, 0, 71, 72, 73, 74, 75, 76, 77, 78))
+
+    @classmethod
+    def _scheduler_output(
+        cls,
+        recurrent_boundary_blocks: object = None,
+    ) -> types.SimpleNamespace:
+        request_id = "dflash-recurrent-boundary"
+        output = types.SimpleNamespace(
+            scheduled_new_reqs=[
+                types.SimpleNamespace(
+                    req_id=request_id,
+                    prompt_token_ids=list(range(cls.PROMPT_TOKENS)),
+                    block_ids=cls._tables(),
+                    num_computed_tokens=0,
+                )
+            ],
+            scheduled_cached_reqs=types.SimpleNamespace(
+                req_ids=[],
+                resumed_req_ids=set(),
+                num_computed_tokens=[],
+                new_block_ids=[],
+            ),
+            num_scheduled_tokens={request_id: cls.PROMPT_TOKENS},
+            preempted_req_ids=set(),
+        )
+        if recurrent_boundary_blocks is not None:
+            output.recurrent_boundary_blocks = recurrent_boundary_blocks
+        return output
+
+    def test_explicit_boundary_block_round_trips_through_manifest_store(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self._config()
+            scheduler = _make_connector(
+                root,
+                0,
+                block_size=256,
+                role=KVConnectorRole.SCHEDULER,
+                override_worker_rank=False,
+                tp=1,
+                dcp=1,
+                kv_cache_config=config,
+                extra_config={"spark_cache_model_profile": "glm53-flash-hybrid"},
+            )
+            output = self._scheduler_output(
+                {
+                    "dflash-recurrent-boundary": [
+                        (1, self.BOUNDARY_BLOCK, self.BOUNDARY)
+                    ]
+                }
+            )
+
+            self.assertTrue(scheduler.supports_recurrent_boundary_blocks)
+            metadata = scheduler.build_connector_meta(output)
+
+            self.assertEqual(len(metadata.plans), 1)
+            plan = metadata.plans[0]
+            self.assertEqual(plan.span_tokens, self.BOUNDARY)
+            self.assertEqual(plan.recurrent_boundary_blocks, ((1, 42),))
+            worker = _make_connector(
+                root,
+                0,
+                block_size=256,
+                tp=1,
+                dcp=1,
+                kv_cache_config=config,
+                extra_config={"spark_cache_model_profile": "glm53-flash-hybrid"},
+            )
+            pools = {
+                name: (
+                    torch.arange(128 * 64, dtype=torch.int32)
+                    .add(offset)
+                    .remainder(251)
+                    .to(torch.uint8)
+                    .reshape(128, 1, 64)
+                )
+                for name, offset in (("full", 0), ("recurrent", 29))
+            }
+            worker.register_kv_caches(pools)
+            expected_full = pools["full"][[11, 12, 13]].clone()
+            expected_recurrent = pools["recurrent"][[self.BOUNDARY_BLOCK]].clone()
+
+            worker._store_one(plan)
+
+            lookup = worker._store.lookup(worker._identity(0), plan.digest)
+            self.assertTrue(lookup.is_hit, lookup.reason)
+            destination = (
+                (90, 91, 92),
+                (0, 0, 93, 94, 95, 96, 97, 98, 99, 100, 101),
+            )
+            pools["full"][[90, 91, 92]].zero_()
+            pools["recurrent"][[93]].zero_()
+            self.assertTrue(
+                worker._load_one(
+                    _ReqPlan(
+                        "dflash-recurrent-restore",
+                        plan.digest,
+                        self.BOUNDARY,
+                        destination[0],
+                        False,
+                        block_ids_by_group=destination,
+                    )
+                )
+            )
+            self.assertTrue(torch.equal(pools["full"][[90, 91, 92]], expected_full))
+            self.assertTrue(
+                torch.equal(pools["recurrent"][[93]], expected_recurrent)
+            )
+
+    def test_missing_or_wrong_request_metadata_skips_publication(self) -> None:
+        for boundary_metadata in (
+            None,
+            {"another-request": [(1, self.BOUNDARY_BLOCK, self.BOUNDARY)]},
+        ):
+            with self.subTest(boundary_metadata=boundary_metadata):
+                with tempfile.TemporaryDirectory() as directory:
+                    connector = _make_connector(
+                        Path(directory),
+                        0,
+                        block_size=256,
+                        role=KVConnectorRole.SCHEDULER,
+                        override_worker_rank=False,
+                        tp=1,
+                        dcp=1,
+                        kv_cache_config=self._config(),
+                        extra_config={
+                            "spark_cache_model_profile": "glm53-flash-hybrid"
+                        },
+                    )
+                    output = self._scheduler_output(boundary_metadata)
+                    full, recurrent = output.scheduled_new_reqs[0].block_ids
+                    recurrent = list(recurrent)
+                    recurrent[2] = 69  # stale or recycled, not boundary-proven
+                    output.scheduled_new_reqs[0].block_ids = (full, tuple(recurrent))
+                    metadata = connector.build_connector_meta(output)
+                    self.assertEqual(metadata.plans, [])
+                    self.assertEqual(
+                        connector.counters[
+                            "recurrent_boundary_metadata_rejected"
+                        ],
+                        1,
+                    )
+
+    def test_contradictory_boundary_metadata_skips_publication(self) -> None:
+        invalid_entries = (
+            [],
+            [(1, self.BOUNDARY_BLOCK, self.BOUNDARY - 256)],
+            [(2, self.BOUNDARY_BLOCK, self.BOUNDARY)],
+            [(1, self.BOUNDARY_BLOCK, self.BOUNDARY), (1, 43, self.BOUNDARY)],
+            [(1, 0, self.BOUNDARY)],
+            [(0, self.BOUNDARY_BLOCK, self.BOUNDARY)],
+        )
+        for entries in invalid_entries:
+            with self.subTest(entries=entries):
+                with tempfile.TemporaryDirectory() as directory:
+                    connector = _make_connector(
+                        Path(directory),
+                        0,
+                        block_size=256,
+                        role=KVConnectorRole.SCHEDULER,
+                        override_worker_rank=False,
+                        tp=1,
+                        dcp=1,
+                        kv_cache_config=self._config(),
+                        extra_config={
+                            "spark_cache_model_profile": "glm53-flash-hybrid"
+                        },
+                    )
+                    metadata = connector.build_connector_meta(
+                        self._scheduler_output(
+                            {"dflash-recurrent-boundary": entries}
+                        )
+                    )
+                    self.assertEqual(metadata.plans, [])
+                    self.assertEqual(
+                        connector.counters[
+                            "recurrent_boundary_metadata_rejected"
+                        ],
+                        1,
+                    )
+
+    def test_partial_recurrent_group_coverage_skips_publication(self) -> None:
+        config = self._config()
+        second_recurrent = types.SimpleNamespace(
+            kv_cache_spec=config.kv_cache_groups[1].kv_cache_spec,
+            is_eagle_group=False,
+            layer_names=("recurrent-2",),
+        )
+        config.kv_cache_groups = (*config.kv_cache_groups, second_recurrent)
+        output = self._scheduler_output(
+            {"dflash-recurrent-boundary": [(1, 42, self.BOUNDARY)]}
+        )
+        output.scheduled_new_reqs[0].block_ids = (
+            *self._tables(),
+            (0, 0, 0, 81, 82, 83, 84, 85, 86, 87, 88),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                block_size=256,
+                role=KVConnectorRole.SCHEDULER,
+                override_worker_rank=False,
+                tp=1,
+                dcp=1,
+                kv_cache_config=config,
+                extra_config={"spark_cache_model_profile": "glm53-flash-hybrid"},
+            )
+
+            metadata = connector.build_connector_meta(output)
+
+            self.assertEqual(metadata.plans, [])
+            self.assertEqual(
+                connector.counters["recurrent_boundary_metadata_rejected"],
+                1,
+            )
+
+    def test_preemption_discards_request_lifetime_boundary_block(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                block_size=256,
+                role=KVConnectorRole.SCHEDULER,
+                override_worker_rank=False,
+                tp=1,
+                dcp=1,
+                kv_cache_config=self._config(),
+                extra_config={"spark_cache_model_profile": "glm53-flash-hybrid"},
+            )
+            request_id = "dflash-recurrent-boundary"
+            connector._store_recurrent_boundaries[request_id] = (
+                (1, self.BOUNDARY_BLOCK),
+            )
+            output = types.SimpleNamespace(
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=types.SimpleNamespace(
+                    req_ids=[],
+                    resumed_req_ids=set(),
+                    num_computed_tokens=[],
+                    new_block_ids=[],
+                ),
+                num_scheduled_tokens={},
+                preempted_req_ids={request_id},
+            )
+
+            metadata = connector.build_connector_meta(output)
+
+            self.assertEqual(metadata.preempted_request_ids, (request_id,))
+            self.assertNotIn(request_id, connector._store_recurrent_boundaries)
+
+
 class DigestNamespaceTests(unittest.TestCase):
     """D-4: context digests are identical across roles and physical ranks."""
 

@@ -24,9 +24,10 @@
       ]
     },
     {
-      "path": "vllm/v1/core/sched/scheduler.py",
-      "accepted_sha256": {
-        "source_built_glm53_b12x_kda_adaptive_mtp": "6d397c97f31e67a75efc01b5ddd89fa58db425de14fa43965ef2d6146b6b9bdb"
+    "path": "vllm/v1/core/sched/scheduler.py",
+    "accepted_sha256": {
+      "source_built_glm53_b12x_kda_adaptive_mtp": "6d397c97f31e67a75efc01b5ddd89fa58db425de14fa43965ef2d6146b6b9bdb",
+      "recurrent_boundary_contract": "260f36ce8fabf70c193b20009ea465eea7b1b6c8e9fb72f2307a01ba8fcf7b2a"
       },
       "required_symbols": [
         "Scheduler.schedule",
@@ -39,9 +40,10 @@
       ]
     },
     {
-      "path": "vllm/v1/core/kv_cache_manager.py",
-      "accepted_sha256": {
-        "source_built_glm53_b12x_kda_adaptive_mtp": "ee03dc9ce2b720c0be6e9f572d23580ba96eff68fe3406250557e83071654af0"
+    "path": "vllm/v1/core/kv_cache_manager.py",
+    "accepted_sha256": {
+      "source_built_glm53_b12x_kda_adaptive_mtp": "ee03dc9ce2b720c0be6e9f572d23580ba96eff68fe3406250557e83071654af0",
+      "recurrent_boundary_contract": "c5b83d382c96b2bf8c466a993ed77123a14a971e2661797128533319388d0b5f"
       },
       "required_symbols": [
         "KVCacheManager.get_block_ids",
@@ -51,17 +53,20 @@
         "KVCacheManager.expire_shared_prefix_leases",
         "KVCacheManager.discard_shared_prefix_lease",
         "KVCacheManager.evict_shared_prefix_leases_until_free",
-        "KVCacheManager.take_kv_cache_block_copies"
+      "KVCacheManager.take_kv_cache_block_copies",
+      "KVCacheManager.take_recurrent_boundary_blocks"
       ]
     },
     {
-      "path": "vllm/v1/core/sched/output.py",
-      "accepted_sha256": {
-        "source_built_glm53_b12x_kda_adaptive_mtp": "65235eba652e5a3ccee18bf3cbfeac9bf4da8fb9c61e961580f612cfb7e593bc"
+    "path": "vllm/v1/core/sched/output.py",
+    "accepted_sha256": {
+      "source_built_glm53_b12x_kda_adaptive_mtp": "65235eba652e5a3ccee18bf3cbfeac9bf4da8fb9c61e961580f612cfb7e593bc",
+      "recurrent_boundary_contract": "9911b3f9d21815a185285852b5a6176e5484e1ab0ff5c30f7caaa68ea0fab543"
       },
       "required_symbols": [
         "SchedulerOutput.preempted_req_ids",
-        "SchedulerOutput.kv_cache_block_copies"
+      "SchedulerOutput.kv_cache_block_copies",
+      "SchedulerOutput.recurrent_boundary_blocks"
       ]
     },
     {
@@ -96,9 +101,10 @@
       ]
     },
     {
-      "path": "vllm/v1/core/single_type_kv_cache_manager.py",
-      "accepted_sha256": {
-        "source_built_glm53_b12x_kda_adaptive_mtp": "e4b1c5c38b63b708fd55aa40a9ab0d008b266d006a63dcfcef55890ac1371cb8"
+    "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+    "accepted_sha256": {
+      "source_built_glm53_b12x_kda_adaptive_mtp": "e4b1c5c38b63b708fd55aa40a9ab0d008b266d006a63dcfcef55890ac1371cb8",
+      "recurrent_boundary_contract": "f67a1850a7e0288baaa6d42e7ec55b22b09c156720767e23acaabedcae333c8a"
       },
       "required_symbols": [
         "SingleTypeKVCacheManager.add_local_computed_blocks",
@@ -107,7 +113,8 @@
         "SingleTypeKVCacheManager.take_pending_cow_copies",
         "SingleTypeKVCacheManager.pop_blocks_for_free",
         "MambaManager.remove_skipped_blocks",
-        "MambaManager.allocate_new_blocks"
+      "MambaManager.allocate_new_blocks",
+      "SingleTypeKVCacheManager.take_pending_aligned_recurrent_boundaries"
       ]
     },
     {
