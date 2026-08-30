@@ -62,7 +62,7 @@
   ],
   "contract": {
     "path": "sparkcache/runtime_patches/vllm-kv-block-lease-contract-glm53-b12x-kda-adaptive-mtp.json",
-    "sha256": "45d7a92b38b836a4f829f02df85e339cfeea860e1080e4663a8340af6c125125"
+    "sha256": "f36ed14eaf1f97a5dffa94bda8151b1e0fa182afc0d121b757b70bebc6a43811"
   },
-  "result": "All four patches apply in order to the LF source tree, and the eleven-file SparkCache contract verifies the resulting source bytes, including the live-tensor B12X KDA implementation."
+  "result": "All four SparkCache patches apply in order to the LF source tree and produce the exact preimages required by the recurrent-boundary producer. The eleven-file final-runtime contract verifies only after that producer creates its four recurrent postimages; it also covers the unchanged live-tensor B12X KDA surface."
 }

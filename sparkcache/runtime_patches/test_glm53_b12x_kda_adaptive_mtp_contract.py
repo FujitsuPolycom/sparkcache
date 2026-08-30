@@ -79,10 +79,7 @@ def test_glm53_b12x_kda_adaptive_mtp_contract_attests_the_complete_sparkcache_vl
         KDA_PATH,
     }
     for record in contract["files"]:
-        expected_roles = {SOURCE_ROLE}
-        if record["path"] in RECURRENT_BOUNDARY_FILES:
-            expected_roles.add(RECURRENT_BOUNDARY_ROLE)
-        assert set(record["accepted_sha256"]) == expected_roles
+        assert set(record["accepted_sha256"]) == {RECURRENT_BOUNDARY_ROLE}
     assert all(record["required_symbols"] for record in contract["files"])
 
     by_path = {record["path"]: record for record in contract["files"]}
@@ -147,11 +144,11 @@ def test_glm53_b12x_kda_adaptive_mtp_overlay_has_exact_preimage_and_postimage_re
     assert patch_positions == sorted(patch_positions)
 
 
-def test_glm53_b12x_kda_adaptive_mtp_patch_sequence_terminates_at_attested_contract_postimages() -> None:
+def test_glm53_b12x_kda_adaptive_mtp_patch_sequence_precedes_the_final_contract() -> None:
     receipts = json.loads(PREIMAGES.read_text(encoding="utf-8"))
     contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
     accepted = {
-        record["path"]: record["accepted_sha256"][SOURCE_ROLE]
+        record["path"]: record["accepted_sha256"][RECURRENT_BOUNDARY_ROLE]
         for record in contract["files"]
     }
     scheduler_recovery = receipts["030-sparkcache-hma-load-failure.patch"]
@@ -163,13 +160,53 @@ def test_glm53_b12x_kda_adaptive_mtp_patch_sequence_terminates_at_attested_contr
         scheduler_recovery["accepted_postimage_sha256"][SOURCE_ROLE]
         == scheduler_attach["accepted_preimage_sha256"][SOURCE_ROLE]
     )
-    assert (
-        scheduler_attach["accepted_postimage_sha256"][SOURCE_ROLE]
-        == accepted[scheduler_attach["target_path"]]
-    )
-    assert (
-        manager_lease["accepted_postimage_sha256"][SOURCE_ROLE]
-        == accepted[manager_lease["target_path"]]
+    assert scheduler_attach["accepted_postimage_sha256"][SOURCE_ROLE] != accepted[
+        scheduler_attach["target_path"]
+    ]
+    assert manager_lease["accepted_postimage_sha256"][SOURCE_ROLE] != accepted[
+        manager_lease["target_path"]
+    ]
+
+
+def test_glm53_recurrent_contract_verifies_one_coherent_final_source_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
+    accepted_by_path: dict[Path, str] = {}
+    for record in contract["files"]:
+        relative = Path(record["path"])
+        accepted_by_path[relative] = record["accepted_sha256"][
+            RECURRENT_BOUNDARY_ROLE
+        ]
+        classes: dict[str, list[str]] = {}
+        for symbol in record["required_symbols"]:
+            class_name, member_name = symbol.split(".")
+            classes.setdefault(class_name, []).append(member_name)
+        source = tmp_path / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(
+            "\n\n".join(
+                "class "
+                + class_name
+                + ":\n"
+                + "\n".join(
+                    f"    def {member_name}(self):\n        pass"
+                    for member_name in members
+                )
+                for class_name, members in classes.items()
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def exact_composed_digest(path: Path) -> str:
+        return accepted_by_path[path.resolve().relative_to(tmp_path.resolve())]
+
+    monkeypatch.setattr(verifier, "_sha256", exact_composed_digest)
+    verified = verifier.verify_contract(tmp_path, CONTRACT)
+    assert [path.relative_to(tmp_path) for path in verified] == list(
+        accepted_by_path
     )
 
 
