@@ -22,12 +22,13 @@ flat-v2 schema and header-accounting implementation origin, not the complete
 runtime source. Sequential macro-object read/hash consumed 1.35–1.50 seconds
 of the 1.55–1.70-second all-rank restore.
 
-PR43 final head `ad8df66e8ff1b6680689612690fedcdd75eff175` implements bounded
-pipelined prefetch for remaining flat-v2 objects. At most two reads fill
+PR43 final head `eabe7fd0c878db7384ef87fe80a1e96b9bedcf67` implements bounded
+pipelined prefetch for remaining flat-v2 objects. At most four reads fill
 request-private host buffers before arena waits, with a 256 MiB host-batch bound
-and manifest-ordered digest/copy/submission after authentication. It is GPU-free
-tested and not live qualified; the retained C1 qualification remains image
-`35b58a7…` with the sequential measurements above.
+and manifest-ordered copy/submission after authentication. Ordered descriptors
+and per-object SHA-256 remove the redundant complete-stream hash pass. It is
+GPU-free tested and not live qualified; the retained C1 qualification remains
+image `35b58a7…` with the sequential measurements above.
 
 Qualification applies only to the checkpoint revisions, source contracts,
 topology, settings, and immutable artifacts named in those records. It does

@@ -245,13 +245,15 @@ when placement completes and intentionally excludes that bookkeeping.
   seconds and returned the exact codeword before and after restart. Sequential
   object read/hash consumed 1.35–1.50 seconds. That C1 result does not qualify a
   published OCI artifact or concurrent restores.
-  PR43 final head `ad8df66` implements bounded pipelined prefetch. The first
+  PR43 final head `eabe7fd` implements bounded pipelined prefetch. The first
   object is authenticated before header parsing; remaining objects are read and
-  authenticated at most two at a time into request-private host buffers before
+  authenticated at most four at a time into request-private host buffers before
   arena waits. A batch retains at most 256 MiB beyond the two arenas. After the
-  batch succeeds, objects are digested, copied into mapped arenas, and submitted
-  in manifest order. This pipeline is GPU-free tested but has no live
-  qualification.
+  batch succeeds, objects are copied into mapped arenas and submitted in
+  manifest order. The authenticated ordered descriptor table and per-object
+  SHA-256 values make another complete-byte-stream SHA-256 pass redundant; the
+  schema's `snapshot_sha256` field remains validated metadata. This pipeline is
+  GPU-free tested but has no live qualification.
 - **Different-root row-segment sharing — implemented.** Distinct
   `per_token_rows` result roots may share one authenticated descriptor prefix
   when every rank proves the same chunk sequence. GPU-free coverage exists;
@@ -309,7 +311,7 @@ and header accounting; complete source `a1511d2`, tree `4d5b8e…`, and local
 image `35b58a7…` qualify the 13-object
 `sparkcache-page-snapshot-manifest/v2` C1 restart case. Tail deltas, host-base
 read coalescing, and multi-root concurrent restore are research-only.
-PR43 final head `ad8df66` adds bounded flat-v2 pipelined prefetch; that
+PR43 final head `eabe7fd` adds bounded four-reader flat-v2 prefetch; that
 implementation is GPU-free tested and not live qualified.
 At 20 GiB of KV cache, C2×128K is an observed capacity candidate, not a
 qualified cached workload. C6×128K admitted only one request at a time and

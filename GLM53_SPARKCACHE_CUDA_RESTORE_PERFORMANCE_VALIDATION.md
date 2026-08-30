@@ -101,18 +101,26 @@ no operator setting for legacy publication.
 
 ### Pipelined-prefetch implementation after the qualified artifact
 
-SparkCache PR43 final head `ad8df66e8ff1b6680689612690fedcdd75eff175`
+SparkCache PR43 final head `eabe7fd0c878db7384ef87fe80a1e96b9bedcf67`
 replaces the sequential remaining-object loop with bounded pipelined prefetch.
+Its Git tree is `d88a65ea265a6f212367baa8c4a4970079d6b08a` and its deployable
+SparkCache source SHA-256 is
+`d9a7800ce201b0671676fc8d71423947c7b24e4797758db727c06e0e684495fe`.
 It authenticates the first object before parsing the snapshot header, then
-reads and authenticates at most two remaining objects concurrently into
+reads and authenticates at most four remaining objects concurrently into
 request-private host buffers before waiting for a placement arena. One host
 batch retains at most 256 MiB beyond the two placement-owned arenas, allowing
-storage reads to overlap placement of the preceding batch. Complete-snapshot
-SHA-256 accumulation, mapped-arena copy, and CUDA submission remain in manifest
-order and begin only after every read in the batch succeeds. The configured I/O
-worker count may reduce concurrency to one; values above two remain capped at
-two. Diagnostics separate read/hash, arena wait, host copy, submission-call,
-and final completion time.
+storage reads to overlap placement of the preceding batch. Mapped-arena copy
+and CUDA submission remain in manifest order and begin only after every read in
+the batch succeeds. The configured I/O worker count may reduce concurrency to
+one; values above four remain capped at four. Diagnostics separate read/hash,
+arena wait, host copy, submission-call, and final completion time.
+
+The version 2 root validator authenticates the ordered contiguous object
+descriptors and each object's SHA-256 before direct placement. The root's
+`snapshot_sha256` remains part of authenticated schema metadata, but the direct
+path no longer repeats SHA-256 over the complete byte stream after every object
+digest has matched. Persisted object and geometry checks are unchanged.
 
 This scheduling is **implemented** and GPU-free tested. It is not present in
 image `35b58a7…` and has no live semantic or performance qualification. The
@@ -285,7 +293,7 @@ Source revision `2b86fb9d02fa3595cca5caa864b81aedce44b8bb` passed:
 ## Qualification limits
 
 - The qualified workload is C1 full-snapshot restore at 131,072 tokens.
-- PR43 bounded flat-v2 pipelined prefetch is implemented and GPU-free tested, not
+- PR43 bounded four-reader flat-v2 prefetch is implemented and GPU-free tested, not
   live qualified. It does not inherit the `35b58a7…` result.
 - Historical C2/C8/C16 timing and completion receipts are diagnostic because
   they do not carry exact-output semantic proof.

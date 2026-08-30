@@ -66,10 +66,11 @@ reconstruct a fully verified snapshot before Python or SparkCache CUDA
 placement, but the C2 live case failed exact semantics and does not qualify that
 path.
 
-PR43 final head `ad8df66` implements bounded flat-v2 pipelined prefetch and has
-GPU-free coverage. A live artifact must repeat the exact C1 restart/codeword
-workload before the prefetch scheduling can replace the retained sequential
-qualification.
+PR43 final head `eabe7fd` implements bounded four-reader flat-v2 prefetch,
+removes the redundant complete-stream hash pass after ordered per-object
+authentication, and has GPU-free coverage. A live artifact must repeat the exact
+C1 restart/codeword workload before the prefetch scheduling can replace the
+retained sequential qualification.
 
 DeepSeek-V4 opaque HMA pages retain their verified Python restore path. CUDA
 support for that profile must describe all five page groups, preserve each
