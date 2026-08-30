@@ -105,7 +105,8 @@ def test_prefix_explorer_describes_present_storage_and_restore_behavior() -> Non
         "C8×64K and C16×32K are planned and unqualified",
         "C16×128K is unsupported without GPU trunk sharing or additional KV capacity",
         "Sequential object read/hash consumed 1.35–1.50 seconds",
-        "PR43 b553c48 adds bounded two-arena parallel reads",
+        "PR43 final head ad8df66 adds bounded pipelined prefetch",
+        "256 MiB host-batch bound",
         "no live artifact qualifies that scheduling",
         "request-private GPU tail",
         "persistent copy-on-write tail objects",
@@ -145,7 +146,7 @@ def test_readme_links_explorer_and_states_capabilities() -> None:
         "sha256:35b58a7bf414059c65b8f74e4e4b17ee6a81b7008e1bffbc9bd298b5e08c739e",
         "accounting originated at SparkCache `229d7d6`",
         "complete runtime source `a1511d26a1fe2b17b24561bc52e376bf7f54b06a`",
-        "PR43 head `b553c487bc273ad3efefa4052dc06376543dcd9d`",
+        "PR43 final head `ad8df66e8ff1b6680689612690fedcdd75eff175`",
         "GPU-free tested, not live qualified",
         "Tail-only page deltas and opaque-page base-read cohorts are **research-only**",
     )
