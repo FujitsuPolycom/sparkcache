@@ -37,7 +37,7 @@
     {
     "path": "vllm/v1/core/sched/scheduler.py",
     "accepted_sha256": {
-      "recurrent_boundary_contract": "74afcccd11b0ad48cab3925c623cb310effbf425825bc278bed03163848c528f"
+      "recurrent_boundary_contract": "494bfd8758e32d3b265fe4df92e8c93b91292899baf5fafe8b490d27bd15cd0f"
       },
       "required_symbols": [
         "Scheduler.schedule",
