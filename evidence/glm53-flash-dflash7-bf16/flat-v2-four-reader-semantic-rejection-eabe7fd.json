@@ -1,0 +1,76 @@
+{
+  "schema": "sparkcache-glm53-flat-v2-reader-research/v1",
+  "status": "research-only",
+  "conclusion": "semantic-rejection",
+  "runtime": {
+    "image_id": "sha256:df4e09a32cdbf1c0e69cc7c4c9e95d890d6c7a1e3eaac84f969912a16fd27dd3",
+    "sparkcache_commit": "eabe7fd0c878db7384ef87fe80a1e96b9bedcf67",
+    "sparkcache_tree": "d88a65ea265a6f212367baa8c4a4970079d6b08a",
+    "sparkcache_source_sha256": "d9a7800ce201b0671676fc8d71423947c7b24e4797758db727c06e0e684495fe",
+    "topology": "TP4/DCP1",
+    "publication_schema": "snapshot-v1",
+    "flat_manifest_schema": "sparkcache-page-snapshot-manifest/v2",
+    "maximum_parallel_reads": 4
+  },
+  "stored_context": {
+    "context_digest": "b4161571df103395e2abae10372a90f35468561ec6c42bf4a7b7f0d0dfda5873",
+    "prompt_sha256": "965acd85cb28f804ab59cdc160688b04efaee14341e0bd27b647673e652ab812",
+    "tokens": 131072,
+    "encoded_bytes_per_rank": 813068464,
+    "objects_per_rank": 13
+  },
+  "structural_restore": {
+    "ranks": [0, 1, 2, 3],
+    "all_ranks_verified": true,
+    "read_and_hash_ms": {
+      "minimum": 484.1,
+      "maximum": 528.8
+    },
+    "placement_ms": {
+      "minimum": 323.7,
+      "maximum": 330.9
+    },
+    "arena_wait_ms": {
+      "minimum": 293.2,
+      "maximum": 297.7
+    },
+    "final_completion_ms": {
+      "minimum": 129.5,
+      "maximum": 131.6
+    },
+    "cache_service_ms": {
+      "minimum": 1231.7,
+      "maximum": 1331.2
+    }
+  },
+  "semantic_restore": {
+    "expected": "red",
+    "observed": "spark",
+    "passed": false,
+    "response_sha256": "0bb1366f58973e94b3cd518d4981be67c86ee35768039e392bb5c494b27bc58e"
+  },
+  "recomputation_control": {
+    "relationship": "one-token-changed prompt with the same token count",
+    "prompt_sha256": "4bb683a895caaaacb783294e65cb9c4b59c808c1e7b563a48edb6cd52b302dfe",
+    "tokens": 131072,
+    "expected": "red",
+    "observed": "red",
+    "passed": true,
+    "elapsed_seconds": 55.14106,
+    "response_sha256": "2c68d02422a6c4bdb42bd10221940894e746342bef6a56695fdbcb549074a355"
+  },
+  "rollback": {
+    "image_id": "sha256:5a3abacbd1d5a23332e24b4f68a3459532ceff1e02418a9366ab98e8f0919c98",
+    "original_prompt_recomputed": true,
+    "expected": "red",
+    "observed": "red",
+    "passed": true,
+    "elapsed_seconds": 52.415905,
+    "qualified_fallback_restore_recheck": "pending-at-record-time"
+  },
+  "admission": {
+    "deployable": false,
+    "qualified": false,
+    "reason": "A structurally verified persistent restore failed the exact semantic oracle."
+  }
+}
