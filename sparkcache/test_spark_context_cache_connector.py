@@ -4766,6 +4766,189 @@ class AsyncRestoreTests(unittest.TestCase):
         connector._quorum[digest] = {0, 1, 2, 3}
         return digest
 
+    def test_async_restore_waits_for_prior_cuda_work_before_gpu_write(self) -> None:
+        """Placement starts only after earlier model-runner CUDA work completes."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(Path(directory), 0, 64)
+            connector.register_kv_caches(_make_pools(8, 64))
+            connector._layer_tensors = {
+                "cuda-page": types.SimpleNamespace(
+                    device=types.SimpleNamespace(type="cuda", index=0)
+                )
+            }
+            connector.bind_connector_metadata(
+                SparkCacheConnectorMetadata(
+                    plans=[
+                        _ReqPlan(
+                            "ordered-restore",
+                            "8" * 64,
+                            self.SPAN,
+                            self.BLOCKS,
+                            False,
+                        )
+                    ]
+                )
+            )
+
+            recorded = threading.Event()
+            wait_started = threading.Event()
+            permit_restore = threading.Event()
+            restore_started = threading.Event()
+            model_runner_stream = object()
+            test_case = self
+
+            class PriorCudaWork:
+                def record(self, stream) -> None:
+                    test_case.assertIs(stream, model_runner_stream)
+                    recorded.set()
+
+                def synchronize(self) -> None:
+                    wait_started.set()
+                    test_case.assertTrue(permit_restore.wait(timeout=30))
+
+            prerequisite = PriorCudaWork()
+
+            def restored(*_args, **_kwargs) -> bool:
+                restore_started.set()
+                return True
+
+            connector._load_one = restored
+            try:
+                with (
+                    mock.patch.object(
+                        torch.cuda,
+                        "Event",
+                        return_value=prerequisite,
+                    ),
+                    mock.patch.object(
+                        torch.cuda,
+                        "current_stream",
+                        return_value=model_runner_stream,
+                    ),
+                ):
+                    connector.start_load_kv(None)
+                    self.assertTrue(recorded.wait(timeout=1))
+                    self.assertTrue(wait_started.wait(timeout=1))
+                    self.assertFalse(restore_started.is_set())
+                    permit_restore.set()
+                    self.assertEqual(_drain(connector), {"ordered-restore"})
+                self.assertTrue(restore_started.is_set())
+                self.assertEqual(connector.counters["load_verified"], 1)
+            finally:
+                permit_restore.set()
+                connector.shutdown()
+
+    def test_cuda_prerequisite_record_failure_recomputes_without_placement(
+        self,
+    ) -> None:
+        """An unprovable stream dependency never permits a cache write."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(Path(directory), 0, 64)
+            connector.register_kv_caches(_make_pools(8, 64))
+            connector._layer_tensors = {
+                "cuda-page": types.SimpleNamespace(
+                    device=types.SimpleNamespace(type="cuda", index=0)
+                )
+            }
+            connector.bind_connector_metadata(
+                SparkCacheConnectorMetadata(
+                    plans=[
+                        _ReqPlan(
+                            "unordered-restore",
+                            "9" * 64,
+                            self.SPAN,
+                            self.BLOCKS,
+                            False,
+                        )
+                    ]
+                )
+            )
+            connector._load_one = mock.Mock(return_value=True)
+            try:
+                with mock.patch.object(
+                    torch.cuda,
+                    "Event",
+                    side_effect=RuntimeError("event allocation rejected"),
+                ):
+                    connector.start_load_kv(None)
+                    self.assertEqual(_drain(connector), {"unordered-restore"})
+                connector._load_one.assert_not_called()
+                self.assertEqual(connector.counters["load_failed"], 1)
+                self.assertEqual(
+                    connector.get_block_ids_with_load_errors(),
+                    set(self.BLOCKS),
+                )
+            finally:
+                connector.shutdown()
+
+    def test_pre_forward_shares_one_cuda_prerequisite_across_queued_loads(
+        self,
+    ) -> None:
+        """One model-runner stream event orders every restore in the callback."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                64,
+                extra_config={"spark_cache_load_threads": "2"},
+            )
+            connector.register_kv_caches(_make_pools(8, 64))
+            connector._layer_tensors = {
+                "cuda-page": types.SimpleNamespace(
+                    device=types.SimpleNamespace(type="cuda", index=0)
+                )
+            }
+            connector.bind_connector_metadata(
+                SparkCacheConnectorMetadata(
+                    plans=[
+                        _ReqPlan(
+                            "ordered-a",
+                            "a" * 64,
+                            self.SPAN,
+                            self.BLOCKS,
+                            False,
+                        ),
+                        _ReqPlan(
+                            "ordered-b",
+                            "b" * 64,
+                            self.SPAN,
+                            (2, 4, 6, 7),
+                            False,
+                        ),
+                    ]
+                )
+            )
+            prerequisite = mock.Mock()
+            connector._ensure_load_threads = mock.Mock()
+            try:
+                with (
+                    mock.patch.object(
+                        torch.cuda,
+                        "Event",
+                        return_value=prerequisite,
+                    ) as event_factory,
+                    mock.patch.object(
+                        torch.cuda,
+                        "current_stream",
+                        return_value=object(),
+                    ),
+                ):
+                    connector.start_load_kv(None)
+                first = connector._load_queue.get_nowait()
+                second = connector._load_queue.get_nowait()
+                self.assertIs(first.prior_cuda_event, prerequisite)
+                self.assertIs(second.prior_cuda_event, prerequisite)
+                event_factory.assert_called_once_with(
+                    blocking=False,
+                    interprocess=False,
+                )
+                prerequisite.record.assert_called_once()
+            finally:
+                connector.shutdown()
+
     def test_identical_requests_share_one_restore_plan(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = self._cohort_connector(Path(directory))

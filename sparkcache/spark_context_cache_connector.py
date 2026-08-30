@@ -261,6 +261,8 @@ class _RestoreFollower:
 class _QueuedLoad:
     plan: _ReqPlan
     timing: RestoreTiming
+    prior_cuda_event: Any | None = None
+    prior_cuda_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3093,6 +3095,16 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             with contextlib.suppress(Exception):
                 timing.start_service()
             try:
+                prerequisite_started = time.perf_counter_ns()
+                if queued.prior_cuda_error is not None:
+                    raise RuntimeError(queued.prior_cuda_error)
+                if queued.prior_cuda_event is not None:
+                    queued.prior_cuda_event.synchronize()
+                with contextlib.suppress(Exception):
+                    timing.observe(
+                        "prior_cuda_work",
+                        time.perf_counter_ns() - prerequisite_started,
+                    )
                 verified = self._load_one(
                     plan,
                     timing=timing,
@@ -3168,6 +3180,33 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self._load_stream = torch.cuda.Stream(device=device)
         return torch.cuda.stream(self._load_stream)
 
+    def _record_prior_cuda_work(self) -> tuple[Any | None, str | None]:
+        """Capture model-runner CUDA work that must precede cache placement.
+
+        vLLM calls ``start_load_kv`` on its model-runner thread after it has
+        enqueued cache-block zeroing and copy-on-write operations. SparkCache
+        performs restore writes on background threads and independent CUDA
+        streams. Recording an event on the caller's stream gives every queued
+        restore an explicit dependency on those earlier writes without making
+        the serving thread wait.
+        """
+
+        if not self._layer_tensors:
+            return None, None
+        device = next(iter(self._layer_tensors.values())).device
+        if getattr(device, "type", None) != "cuda":
+            return None, None
+        try:
+            event = torch.cuda.Event(blocking=False, interprocess=False)
+            event.record(torch.cuda.current_stream(device=device))
+        except Exception as error:  # noqa: BLE001
+            return (
+                None,
+                "prior model-runner CUDA work could not be ordered before"
+                f" cache placement: {type(error).__name__}: {error}",
+            )
+        return event, None
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, SparkCacheConnectorMetadata):
@@ -3175,6 +3214,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         load_plans = [plan for plan in metadata.plans if not plan.is_store]
         if not load_plans:
             return
+        prior_cuda_event, prior_cuda_error = self._record_prior_cuda_work()
         runnable, deferred, page_base_keys = self._prepare_page_base_read_cohorts(
             load_plans
         )
@@ -3189,6 +3229,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     storage_mode=self._storage_mode,
                     enqueued_ns=time.perf_counter_ns(),
                 ),
+                prior_cuda_event=prior_cuda_event,
+                prior_cuda_error=prior_cuda_error,
             )
             for plan in (*runnable, *deferred)
         }

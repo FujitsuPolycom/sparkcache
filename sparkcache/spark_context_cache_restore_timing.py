@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 RESTORE_TIMING_PREFIX = "spark-context-cache-restore-timing:"
 RESTORE_PHASES = (
     "manifest_lookup",
+    "prior_cuda_work",
     "restore_read",
     "reassembly_decode",
     "h2d_submit",

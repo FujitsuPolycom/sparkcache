@@ -20,6 +20,7 @@ class RestoreTimingTests(unittest.TestCase):
         )
         timing.start_service(2_000_000)
         timing.add("manifest_lookup", 3_000_000)
+        timing.add("prior_cuda_work", 2_000_000)
         timing.add("restore_read", 4_000_000)
         timing.add("reassembly_decode", 5_000_000)
         timing.add("h2d_submit", 6_000_000)
@@ -44,6 +45,7 @@ class RestoreTimingTests(unittest.TestCase):
             set(record["phase_ms"]),
             {
                 "manifest_lookup",
+                "prior_cuda_work",
                 "restore_read",
                 "reassembly_decode",
                 "h2d_submit",
