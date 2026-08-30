@@ -30,7 +30,7 @@ decode-context-parallel degree.
 | Tail-only opaque-page publication | **implemented** | Authenticated `block_pages_v1` deltas; reconstruction and placement have no live serving qualification |
 | Different-root row-segment sharing | **implemented** | Coalesces authenticated `per_token_rows` trunks; no live serving qualification |
 | Opaque hybrid-memory-allocator page snapshots | **qualified** | Listed DeepSeek-V4 and GLM deployments only |
-| Native direct page restore | **qualified** | Flat GLM-5.3 TP4/DCP1 snapshots under the recorded source deployment |
+| SparkCache C++/CUDA page restore | **qualified** | Flat GLM-5.3 TP4/DCP1 snapshots under the recorded source deployment |
 | Concurrent exact-prefix GPU reuse | **qualified** | Up to 16 waiting followers, two retained prefixes, 15-second retention; GLM-5.3 through 16 concurrent requests |
 | Streaming snapshots | **research-only** | GLM-5.2 DCP4 inventory; disabled for opaque page profiles |
 | Buddy replication | **research-only** | Protocol and receiver state exist; no network carrier is included |
@@ -72,13 +72,13 @@ qualification. Live qualification is bound to an exact artifact, model,
 topology, and vLLM source contract.
 
 The public GLM-5.3 OCI artifact is qualified for its recorded 8,192-token
-Python-placement restore. A separate source deployment qualifies native
-131,072-token restore and bounded exact-prefix GPU reuse. See
+Python/Torch page restore. A separate source deployment qualifies SparkCache
+C++/CUDA page restore at 131,072 tokens and bounded exact-prefix GPU reuse. See
 [the public image record](deploy/glm53_flash/IMAGE_ANNOUNCEMENT.md),
 [the GLM-5.3 validation](GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md), and
-[the native restore record](GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md).
+[the C++/CUDA restore record](GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md).
 
-The public image omits model checkpoints. The native-restore and shared-prefix
+The public image omits model checkpoints. The C++/CUDA restore and shared-prefix
 qualification belongs to a source-bound runtime without a published OCI
 digest. The adaptive-MTP runtime described in the GLM-5.3 deployment guide is
 implemented but requires its own four-rank qualification record.
@@ -157,7 +157,7 @@ timing.
 | Prefix and concurrency | Comparison | Recorded result |
 |---|---|---|
 | 8,192 tokens, C1 | qualified Python page restore | 147.2–194.0 ms cache service per rank |
-| 16,384 tokens, C8 | Python/Torch placement vs native placement | 9.45–10.64 s vs 1.2–2.1 s client latency |
+| 16,384 tokens, C8 | Python/Torch page restore vs SparkCache C++/CUDA page restore | 9.45–10.64 s vs 1.2–2.1 s client latency |
 | 131,072 tokens, C1 | reconstruction pipeline vs cold direct mapped-arena restore | 1.29–1.46 s vs 131–250 ms cache service per rank; a host-warm restore reached 104–165 ms |
 | 131,072-token shared prefix, C16 | independent restores vs shared verified GPU blocks | rank-local work fell from 16 × 813 MB to 1 × 813 MB; standard-chat client p50 fell from 3.363 s to 2.980 s |
 | 131,072-token shared prefix, pretokenized C16 | standalone measurement | 2.698 s client p50 and 2.701 s maximum |
@@ -249,7 +249,7 @@ and recovery behavior are derived and tested.
 |---|---|---|
 | `vllm-project/vllm@fcc614141e5e9ab18cb304c476f7feed2a9552e3` with `patches/vllm/` | **implemented** | Exact patch inputs are published; no standalone public runtime builder is provided |
 | vLLM build `e2666d9a6` with `patches/vllm-e2666d9a6/` | **qualified** | DeepSeek-V4 and GLM-5.2 builders verify source, patch, and postimage hashes |
-| `local-inference-lab/vllm@da4d7be6c97434f6942292ed8abbf4b32dc44355` with `patches/vllm-da4d7be/` | **qualified** | GLM-5.3 HMA recovery, native restore, and bounded shared-prefix attachment |
+| `local-inference-lab/vllm@da4d7be6c97434f6942292ed8abbf4b32dc44355` with `patches/vllm-da4d7be/` | **qualified** | GLM-5.3 HMA recovery, SparkCache C++/CUDA restore, and bounded shared-prefix attachment |
 | `local-inference-lab/vllm@e10536aadf02a18fccddda7ec939c33147e8b0b3` with `patches/vllm-e10536a/` | **implemented** | Adaptive-MTP integration and ten-file lease contract; no four-rank qualification |
 | `local-inference-lab/vllm@0b67266a0f37d6146a8403fb8482403c62f412d5` with `patches/vllm-glm53-b12x-kda-adaptive-mtp/` | **implemented** | Adaptive MTP, live-tensor B12X KDA, and eleven-file runtime contract; no four-rank qualification |
 
@@ -265,9 +265,9 @@ Native loading requires an explicit library path and SHA-256. CUDA 13 builds
 run a GPU-free byte-exact reference test and a CUDA hybrid-page probe before
 model-serving qualification.
 
-Native direct restore reads `.spcc` objects into alternating mapped arenas,
-hashes complete files in place, validates authenticated extents, and overlaps
-read work with CUDA submission.
+SparkCache's C++/CUDA restore path reads `.spcc` objects into alternating
+mapped arenas, hashes complete files in place, validates authenticated extents,
+and overlaps read work with CUDA submission into vLLM-owned cache pages.
 
 ## Repository map and development validation
 
