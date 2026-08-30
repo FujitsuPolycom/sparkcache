@@ -356,6 +356,15 @@ mapped arena before submitting its copy spans. A flat 813,068,464-byte
 snapshot therefore requires 13 payload objects rather than 512 logical-chunk
 files; the manifest remains the atomic visibility point.
 
+SparkCache CUDA restore authenticates the first flat object before parsing the
+snapshot header. It then reads and authenticates at most two later objects
+concurrently into the two placement-owned arenas. Objects are added to the
+complete-snapshot SHA-256 and submitted to CUDA in manifest order only after
+every read in that bounded pair succeeds. The
+`spark_cache_cuda_restore_io_workers` setting may reduce this path to one read
+worker; values above two remain capped by arena ownership. This scheduling
+does not alter cache identity, persisted schemas, or fallback behavior.
+
 Flat macro publication and its SparkCache CUDA restore path are
 **implemented and GPU-free tested, not live qualified**. The object-count
 geometry above follows the format contract; it is not a claim of measured

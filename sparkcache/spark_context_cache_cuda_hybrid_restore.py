@@ -35,6 +35,7 @@ _CHUNK_PREFIX = struct.Struct("<8sII")
 _CHUNK_MAGIC = b"SPCKV001"
 _TARGET_KIND = cuda.RECORD_TARGET_CKV
 _PAGE_SNAPSHOT_MANIFEST_SCHEMA = "sparkcache-page-snapshot-manifest/v2"
+_MAX_PAGE_OBJECT_READ_WORKERS = 2
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -386,6 +387,7 @@ def _execute_page_object_restore(
     group_slots: Sequence[Sequence[int]],
     expected_span_tokens: int,
     arena_bytes: int,
+    io_workers: int,
 ) -> CudaHybridRestoreResult:
     """Authenticate each flat extent before submitting its page-copy spans."""
 
@@ -417,33 +419,18 @@ def _execute_page_object_restore(
     )
     submit_ms = 0.0
     with transaction:
-        for index, page_object in enumerate(objects):
-            arena_index = index % cuda.ARENA_COUNT
-            arena = transaction.acquire_arena(arena_index)
-            buffer = cuda.arena_memoryview(
-                arena,
-                length=page_object.encoded_bytes,
-            )
-            if index == 0:
-                buffer[:] = first_payload
-                first_payload.clear()
-            else:
-                started = time.perf_counter()
-                _pread_exact_into(
-                    page_object.path,
-                    page_object.encoded_bytes,
-                    buffer,
-                )
-                if hashlib.sha256(buffer).hexdigest() != page_object.sha256:
-                    raise CudaHybridRestoreError(
-                        f"page object SHA-256 mismatch for {page_object.path}"
-                    )
-                snapshot_digest.update(buffer)
-                read_ms += 1e3 * (time.perf_counter() - started)
+        first_arena = transaction.acquire_arena(0)
+        first_buffer = cuda.arena_memoryview(
+            first_arena,
+            length=first.encoded_bytes,
+        )
+        try:
+            first_buffer[:] = first_payload
+            first_payload.clear()
             spans = build_page_object_spans(
                 page_plan,
-                encoded_start=page_object.encoded_start,
-                encoded_end=page_object.encoded_end,
+                encoded_start=first.encoded_start,
+                encoded_end=first.encoded_end,
             )
             if not spans:
                 raise CudaHybridRestoreError(
@@ -451,12 +438,80 @@ def _execute_page_object_restore(
                 )
             started = time.perf_counter()
             transaction.submit_page_slab(
-                arena_index=arena_index,
-                arena_used_bytes=page_object.encoded_bytes,
+                arena_index=0,
+                arena_used_bytes=first.encoded_bytes,
                 spans=spans,
             )
             submit_ms += 1e3 * (time.perf_counter() - started)
-            buffer.release()
+        finally:
+            first_buffer.release()
+
+        read_workers = min(
+            io_workers,
+            _MAX_PAGE_OBJECT_READ_WORKERS,
+            cuda.ARENA_COUNT,
+        )
+
+        def read_and_authenticate(item: tuple[CudaPageObject, memoryview]) -> None:
+            page_object, buffer = item
+            _pread_exact_into(
+                page_object.path,
+                page_object.encoded_bytes,
+                buffer,
+            )
+            if hashlib.sha256(buffer).hexdigest() != page_object.sha256:
+                raise CudaHybridRestoreError(
+                    f"page object SHA-256 mismatch for {page_object.path}"
+                )
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=read_workers
+        ) as read_pool:
+            for batch_start in range(1, len(objects), read_workers):
+                batch = objects[batch_start : batch_start + read_workers]
+                staged: list[tuple[int, CudaPageObject, memoryview]] = []
+                try:
+                    for offset, page_object in enumerate(batch):
+                        object_index = batch_start + offset
+                        arena_index = object_index % cuda.ARENA_COUNT
+                        arena = transaction.acquire_arena(arena_index)
+                        buffer = cuda.arena_memoryview(
+                            arena,
+                            length=page_object.encoded_bytes,
+                        )
+                        staged.append((arena_index, page_object, buffer))
+                    started = time.perf_counter()
+                    tuple(
+                        read_pool.map(
+                            read_and_authenticate,
+                            (
+                                (page_object, buffer)
+                                for _arena_index, page_object, buffer in staged
+                            ),
+                        )
+                    )
+                    read_ms += 1e3 * (time.perf_counter() - started)
+                    for arena_index, page_object, buffer in staged:
+                        snapshot_digest.update(buffer)
+                        spans = build_page_object_spans(
+                            page_plan,
+                            encoded_start=page_object.encoded_start,
+                            encoded_end=page_object.encoded_end,
+                        )
+                        if not spans:
+                            raise CudaHybridRestoreError(
+                                "flat page object contains no restorable payload"
+                            )
+                        started = time.perf_counter()
+                        transaction.submit_page_slab(
+                            arena_index=arena_index,
+                            arena_used_bytes=page_object.encoded_bytes,
+                            spans=spans,
+                        )
+                        submit_ms += 1e3 * (time.perf_counter() - started)
+                finally:
+                    for _arena_index, _page_object, buffer in staged:
+                        buffer.release()
         manifest = lookup._manifest
         if snapshot_digest.hexdigest() != manifest.get("snapshot_sha256"):
             raise CudaHybridRestoreError("flat page snapshot checksum mismatch")
@@ -526,6 +581,7 @@ def execute_cuda_hybrid_restore(
             group_slots=group_slots,
             expected_span_tokens=expected_span_tokens,
             arena_bytes=arena_bytes,
+            io_workers=io_workers,
         )
 
     slabs = plan_cuda_restore(

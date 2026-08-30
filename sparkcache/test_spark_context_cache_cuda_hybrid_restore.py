@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -267,6 +268,198 @@ def test_flat_macro_objects_authenticate_before_direct_page_submission(
     assert len(root_digest_transaction.submissions) == 2
     assert root_digest_transaction.state is RestoreState.ABORTED
     assert not root_digest_transaction.can_resume
+
+
+def test_flat_macro_reads_overlap_two_at_a_time_and_submit_in_manifest_order(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    layout = PageLayout(
+        (PageGroup(2, (PageLayer("page", "torch.uint8", (128,), 128),)),)
+    )
+    encoded = encode_page_snapshot(
+        layout,
+        (8,),
+        {"page": bytes(index % 251 for index in range(1024))},
+    )
+    plan = plan_page_snapshot(layout, encoded, (8,))
+    object_bytes = plan.header_bytes + 32
+    identity = CacheIdentity(
+        target_checkpoint="1" * 64,
+        draft_checkpoint="2" * 64,
+        quantization_layout="test-block-pages-v1",
+        rope_layout="test-rope-v1",
+        tp_degree=1,
+        dcp_degree=1,
+        record_schema=("target_ckv", "logical_positions"),
+    )
+    digest = hashlib.sha256(b"parallel-flat-macro").hexdigest()
+    store = ManifestStore(tmp_path)
+    monkeypatch.setattr(cache_manifest, "_PAGE_SNAPSHOT_OBJECT_BYTES", object_bytes)
+    store.commit_page_snapshot(
+        identity=identity,
+        context_digest=digest,
+        span_tokens=256,
+        snapshot=encoded,
+    )
+    lookup = store.lookup(identity, digest, verify_chunks=False)
+    manifest = lookup._manifest
+    assert manifest is not None
+    assert len(manifest["snapshot_objects"]) >= 3
+
+    class Arena:
+        arena_mode = cuda_hybrid.cuda.ARENA_MAPPED_HOST
+
+        def __init__(self) -> None:
+            self.payload = bytearray(object_bytes)
+            self.capacity_bytes = object_bytes
+
+    class Transaction:
+        def __init__(self) -> None:
+            self.arenas = (Arena(), Arena())
+            self.submissions: list[tuple[int, tuple[object, ...]]] = []
+            self.state = RestoreState.PARKED
+            self.can_resume = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, *_args):
+            if exc_type is not None:
+                self.state = RestoreState.ABORTED
+            return None
+
+        def acquire_arena(self, index):
+            return self.arenas[index]
+
+        def submit_page_slab(self, *, arena_index, arena_used_bytes, spans):
+            self.submissions.append((arena_index, tuple(spans)))
+
+        def finish(self):
+            self.state = RestoreState.FINISHED
+            self.can_resume = True
+            count = len(manifest["snapshot_objects"])
+            return SimpleNamespace(
+                source_bytes=len(encoded),
+                slabs_submitted=count,
+                scatter_kernel_launches=count,
+                slot_uploads=1,
+                destination_table_uploads=1,
+                device_error=0,
+                staged_h2d_bytes=0,
+            )
+
+    class Adapter:
+        def __init__(self) -> None:
+            self.transaction = Transaction()
+
+        def begin_parked_page_restore(self, *_args, **_kwargs):
+            return self.transaction
+
+    original_read = cuda_hybrid._pread_exact_into
+    lock = threading.Lock()
+    two_readers = threading.Event()
+    call_count = 0
+    active_reads = 0
+    maximum_active_reads = 0
+    require_overlap = True
+
+    def read_with_overlap(path, encoded_bytes, target):
+        nonlocal call_count, active_reads, maximum_active_reads, require_overlap
+        with lock:
+            call_index = call_count
+            call_count += 1
+            if call_index > 0:
+                active_reads += 1
+                maximum_active_reads = max(maximum_active_reads, active_reads)
+                if active_reads == 2:
+                    two_readers.set()
+        if call_index > 0 and require_overlap:
+            assert two_readers.wait(timeout=0.5)
+        try:
+            return original_read(path, encoded_bytes, target)
+        finally:
+            if call_index > 0:
+                with lock:
+                    active_reads -= 1
+
+    adapter = Adapter()
+    monkeypatch.setattr(cuda_hybrid, "_pread_exact_into", read_with_overlap)
+    monkeypatch.setattr(
+        cuda_hybrid.cuda,
+        "arena_memoryview",
+        lambda arena, *, length: memoryview(arena.payload)[:length],
+    )
+
+    result = execute_cuda_hybrid_restore(
+        adapter=adapter,
+        request_id="parallel-flat-macro",
+        lookup=lookup,
+        cache_root=tmp_path,
+        layout=layout,
+        group_slots=(tuple(range(8)),),
+        expected_span_tokens=256,
+        arena_bytes=object_bytes,
+        io_workers=8,
+    )
+
+    assert maximum_active_reads == 2
+    assert result.slabs == len(manifest["snapshot_objects"])
+    submitted_offsets = [
+        span.snapshot_offset_bytes
+        for _arena_index, spans in adapter.transaction.submissions
+        for span in spans
+    ]
+    assert submitted_offsets == sorted(submitted_offsets)
+
+    damaged_descriptor = manifest["snapshot_objects"][2]
+    damaged_path = tmp_path / "chunks" / f"{damaged_descriptor['sha256']}.spcc"
+    healthy = damaged_path.read_bytes()
+    damaged = bytearray(healthy)
+    damaged[-1] ^= 1
+    damaged_path.write_bytes(damaged)
+    rejected = Adapter()
+    with pytest.raises(
+        cuda_hybrid.CudaHybridRestoreError,
+        match="page object SHA-256 mismatch",
+    ):
+        execute_cuda_hybrid_restore(
+            adapter=rejected,
+            request_id="parallel-flat-macro-corrupt",
+            lookup=lookup,
+            cache_root=tmp_path,
+            layout=layout,
+            group_slots=(tuple(range(8)),),
+            expected_span_tokens=256,
+            arena_bytes=object_bytes,
+            io_workers=8,
+        )
+    assert rejected.transaction.state is RestoreState.ABORTED
+    assert not rejected.transaction.can_resume
+    assert len(rejected.transaction.submissions) == 1
+
+    damaged_path.write_bytes(healthy)
+    call_count = 0
+    active_reads = 0
+    maximum_active_reads = 0
+    require_overlap = False
+    fallback = Adapter()
+    fallback_result = execute_cuda_hybrid_restore(
+        adapter=fallback,
+        request_id="sequential-flat-macro",
+        lookup=lookup,
+        cache_root=tmp_path,
+        layout=layout,
+        group_slots=(tuple(range(8)),),
+        expected_span_tokens=256,
+        arena_bytes=object_bytes,
+        io_workers=1,
+    )
+    assert maximum_active_reads == 1
+    assert fallback_result.slabs == len(manifest["snapshot_objects"])
+    assert len(fallback.transaction.submissions) == len(
+        manifest["snapshot_objects"]
+    )
 
 
 def test_page_object_spans_exclude_header_and_cover_payload_contiguously() -> None:
