@@ -3701,11 +3701,16 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             )
             logger.info(
                 "spark-context-cache: SparkCache CUDA restore verified %d bytes"
-                " slabs=%d read_hash=%.1f ms submit=%.1f ms finish=%.1f ms",
+                " slabs=%d read_hash=%.1f ms placement=%.1f ms"
+                " (arena_wait=%.1f ms host_copy=%.1f ms submit_call=%.1f ms)"
+                " finish=%.1f ms",
                 result.source_bytes,
                 result.slabs,
                 result.read_and_hash_ms,
                 result.copy_and_submit_ms,
+                result.arena_wait_ms,
+                result.host_copy_ms,
+                result.submit_call_ms,
                 result.finish_ms,
             )
             return True

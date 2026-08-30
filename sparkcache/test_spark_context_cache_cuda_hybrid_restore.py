@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -270,7 +271,7 @@ def test_flat_macro_objects_authenticate_before_direct_page_submission(
     assert not root_digest_transaction.can_resume
 
 
-def test_flat_macro_reads_overlap_two_at_a_time_and_submit_in_manifest_order(
+def test_flat_macro_prefetches_before_arena_wait_and_submits_in_manifest_order(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -320,6 +321,7 @@ def test_flat_macro_reads_overlap_two_at_a_time_and_submit_in_manifest_order(
             self.submissions: list[tuple[int, tuple[object, ...]]] = []
             self.state = RestoreState.PARKED
             self.can_resume = False
+            self.arena_acquisitions = 0
 
         def __enter__(self):
             return self
@@ -330,6 +332,13 @@ def test_flat_macro_reads_overlap_two_at_a_time_and_submit_in_manifest_order(
             return None
 
         def acquire_arena(self, index):
+            self.arena_acquisitions += 1
+            if self.arena_acquisitions > 1:
+                assert two_readers.wait(timeout=0.5), (
+                    "the next authenticated object pair must be read before "
+                    "waiting for a mapped CUDA arena"
+                )
+                time.sleep(0.001)
             return self.arenas[index]
 
         def submit_page_slab(self, *, arena_index, arena_used_bytes, spans):
@@ -362,16 +371,28 @@ def test_flat_macro_reads_overlap_two_at_a_time_and_submit_in_manifest_order(
     call_count = 0
     active_reads = 0
     maximum_active_reads = 0
+    active_prefetch_bytes = 0
+    maximum_prefetch_bytes = 0
     require_overlap = True
 
     def read_with_overlap(path, encoded_bytes, target):
-        nonlocal call_count, active_reads, maximum_active_reads, require_overlap
+        nonlocal call_count, active_reads, maximum_active_reads
+        nonlocal active_prefetch_bytes, maximum_prefetch_bytes, require_overlap
         with lock:
             call_index = call_count
             call_count += 1
             if call_index > 0:
+                assert all(
+                    target.obj is not arena.payload
+                    for arena in adapter.transaction.arenas
+                )
                 active_reads += 1
                 maximum_active_reads = max(maximum_active_reads, active_reads)
+                active_prefetch_bytes += encoded_bytes
+                maximum_prefetch_bytes = max(
+                    maximum_prefetch_bytes,
+                    active_prefetch_bytes,
+                )
                 if active_reads == 2:
                     two_readers.set()
         if call_index > 0 and require_overlap:
@@ -382,6 +403,7 @@ def test_flat_macro_reads_overlap_two_at_a_time_and_submit_in_manifest_order(
             if call_index > 0:
                 with lock:
                     active_reads -= 1
+                    active_prefetch_bytes -= encoded_bytes
 
     adapter = Adapter()
     monkeypatch.setattr(cuda_hybrid, "_pread_exact_into", read_with_overlap)
@@ -404,6 +426,13 @@ def test_flat_macro_reads_overlap_two_at_a_time_and_submit_in_manifest_order(
     )
 
     assert maximum_active_reads == 2
+    assert maximum_prefetch_bytes <= 256 * 1024 * 1024
+    assert result.arena_wait_ms > 0
+    assert result.host_copy_ms > 0
+    assert result.submit_call_ms >= 0
+    assert result.copy_and_submit_ms == pytest.approx(
+        result.arena_wait_ms + result.host_copy_ms + result.submit_call_ms
+    )
     assert result.slabs == len(manifest["snapshot_objects"])
     submitted_offsets = [
         span.snapshot_offset_bytes
