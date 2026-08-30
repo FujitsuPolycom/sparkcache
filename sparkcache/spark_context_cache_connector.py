@@ -1680,7 +1680,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             if entry_boundary < boundary_tokens:
                 continue
             if entry_boundary > boundary_tokens:
-                return reject("entry boundary is ahead of the store plan")
+                return reject(
+                    "entry boundary is ahead of the store plan"
+                    f" observed={entry_boundary} target={boundary_tokens}"
+                    f" group={group_index} block={block_id}"
+                )
             if group_index in seen_target_groups:
                 return reject("multiple blocks claim the same recurrent group")
             seen_target_groups.add(group_index)

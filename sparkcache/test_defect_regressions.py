@@ -1478,6 +1478,52 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
                         1,
                     )
 
+    def test_future_boundary_rejection_logs_observed_mapping_identity(self) -> None:
+        output = self._scheduler_output()
+        request = output.scheduled_new_reqs[0]
+        request.prompt_token_ids = list(range(self.NONALIGNED_PROMPT_TOKENS))
+        output.num_scheduled_tokens[request.req_id] = self.NONALIGNED_PROMPT_TOKENS
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                block_size=256,
+                role=KVConnectorRole.SCHEDULER,
+                override_worker_rank=False,
+                tp=1,
+                dcp=1,
+                kv_cache_config=self._config(),
+                extra_config={"spark_cache_model_profile": "glm53-flash-hybrid"},
+            )
+            connector.build_connector_meta(output)
+
+            with mock.patch.object(
+                connector_module.logger, "warning"
+            ) as warning:
+                metadata = connector.build_connector_meta(
+                    self._cached_scheduler_output(
+                        num_computed_tokens=self.NONALIGNED_PROMPT_TOKENS,
+                        recurrent_boundary_blocks={
+                            request.req_id: [
+                                (
+                                    1,
+                                    self.COW_BLOCK,
+                                    self.NONALIGNED_BOUNDARY + 256,
+                                )
+                            ]
+                        },
+                    )
+                )
+
+            self.assertEqual(metadata.plans, [])
+            warning.assert_called_once()
+            log_args = warning.call_args.args
+            self.assertIn(
+                "entry boundary is ahead of the store plan"
+                " observed=8448 target=8192 group=1 block=142",
+                log_args[0] % log_args[1:],
+            )
+
     def test_partial_recurrent_group_coverage_skips_publication(self) -> None:
         config = self._config()
         second_recurrent = types.SimpleNamespace(
