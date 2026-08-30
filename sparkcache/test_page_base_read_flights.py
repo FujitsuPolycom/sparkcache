@@ -90,6 +90,40 @@ def test_two_load_threads_share_one_base_across_sixteen_queued_results() -> None
     )
 
 
+def test_true_singleton_reads_once_and_releases_provisional_flight() -> None:
+    flights = PageBaseReadFlights()
+    key = _key(encoded_bytes=4)
+
+    registration = flights.register_cohort(key, ("singleton",))
+
+    assert registration.member_ids == ("singleton",)
+    assert registration.leader_request_id == "singleton"
+    assert registration.flight_state == "registered"
+    assert flights.resolve("singleton", key, lambda: b"base") == b"base"
+    assert flights.snapshot().active_flights == 0
+    assert flights.snapshot().registered_members == 0
+    assert flights.snapshot().retained_bytes == 0
+    summary = flights.take_summaries()
+    assert len(summary) == 1
+    assert summary[0]["participants"] == 1
+    assert summary[0]["physical_base_reads"] == 1
+    assert summary[0]["avoided_base_reads"] == 0
+    assert summary[0]["outcome"] == "verified"
+
+
+def test_request_bound_to_another_base_does_not_strand_empty_flight() -> None:
+    flights = PageBaseReadFlights()
+    first = _key("first", encoded_bytes=4)
+    conflicting = _key("conflicting", encoded_bytes=4)
+    assert flights.register_cohort(first, ("request",)).member_ids == ("request",)
+
+    assert not flights.register_cohort(conflicting, ("request",)).member_ids
+    assert flights.snapshot().active_flights == 1
+    assert flights.snapshot().registered_members == 1
+    flights.finish("request")
+    assert flights.snapshot().active_flights == 0
+
+
 def test_late_batches_and_singleton_join_pending_base_read() -> None:
     flights = PageBaseReadFlights()
     key = _key(encoded_bytes=9)
@@ -284,6 +318,9 @@ def test_declared_byte_bounds_bypass_before_reading() -> None:
     invalid = _key("invalid", encoded_bytes=0)
     assert not flights.register_cohort(invalid, ("invalid-a", "invalid-b")).member_ids
     assert flights.snapshot().counters["invalid_declared_byte_bypasses"] == 2
+    singleton_over = _key("singleton-over", encoded_bytes=gib + 1)
+    assert not flights.register_cohort(singleton_over, ("singleton-over",)).member_ids
+    assert flights.snapshot().counters["per_flight_byte_limit_bypasses"] == 3
     flights.finish("glm-a")
     flights.finish("glm-b")
 

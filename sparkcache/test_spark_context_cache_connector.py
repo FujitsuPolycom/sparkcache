@@ -1581,6 +1581,102 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
             self.assertEqual(len(summaries), 1)
             connector.shutdown()
 
+    def test_singleton_batch_reader_accepts_fifteen_late_members_without_blocking_unrelated_work(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector, evidence, plans = self._page_base_queue_fixture(
+                Path(directory)
+            )
+            unrelated = _ReqPlan(
+                "unrelated-after-singleton",
+                "f" * 64,
+                1024,
+                (3,),
+                False,
+                block_ids_by_group=((3,), (4,)),
+            )
+
+            def lookup(_identity, digest, **_kwargs):
+                if digest == unrelated.digest:
+                    return LookupResult(False, "miss"), False
+                return LookupResult(True, "hit", root_kind="page_delta"), False
+
+            connector._lookup_reusable = mock.Mock(side_effect=lookup)
+            read_started = threading.Event()
+            release_read = threading.Event()
+            unrelated_finished = threading.Event()
+            reads = 0
+
+            def read_base() -> bytes:
+                nonlocal reads
+                reads += 1
+                read_started.set()
+                self.assertTrue(release_read.wait(timeout=5))
+                return b"authenticated-base"
+
+            def load_one(plan: _ReqPlan, **_kwargs: object) -> bool:
+                if plan.request_id == unrelated.request_id:
+                    unrelated_finished.set()
+                    return True
+                return (
+                    connector._restore_page_base_for_request(
+                        plan.request_id,
+                        evidence,
+                        read_base,
+                    )
+                    == b"authenticated-base"
+                )
+
+            connector._load_one = mock.Mock(side_effect=load_one)
+            with mock.patch.object(connector_module.logger, "info") as log_info:
+                connector.bind_connector_metadata(
+                    SparkCacheConnectorMetadata(plans=plans[:1])
+                )
+                connector.start_load_kv(None)
+                self.assertTrue(read_started.wait(timeout=5))
+                self.assertEqual(
+                    connector._page_base_reads.snapshot().registered_members,
+                    1,
+                )
+
+                connector.bind_connector_metadata(
+                    SparkCacheConnectorMetadata(plans=plans[1:])
+                )
+                connector.start_load_kv(None)
+                self.assertEqual(
+                    connector._page_base_reads.snapshot().registered_members,
+                    16,
+                )
+
+                connector.bind_connector_metadata(
+                    SparkCacheConnectorMetadata(plans=[unrelated])
+                )
+                connector.start_load_kv(None)
+                self.assertTrue(unrelated_finished.wait(timeout=5))
+                release_read.set()
+                self.assertEqual(
+                    _drain(connector),
+                    {*(plan.request_id for plan in plans), unrelated.request_id},
+                )
+
+            self.assertEqual(reads, 1)
+            self.assertEqual(connector.counters["page_base_flight_participants"], 16)
+            self.assertEqual(connector.counters["page_base_physical_reads"], 1)
+            self.assertEqual(connector.counters["page_base_reads_avoided"], 15)
+            summaries = [
+                json.loads(call.args[1])
+                for call in log_info.call_args_list
+                if call.args
+                and call.args[0] == "spark-context-cache-page-base-flight:%s"
+            ]
+            self.assertEqual(len(summaries), 1)
+            self.assertEqual(summaries[0]["participants"], 16)
+            self.assertEqual(summaries[0]["physical_base_reads"], 1)
+            self.assertEqual(summaries[0]["avoided_base_reads"], 15)
+            self.assertEqual(connector._page_base_reads.snapshot().active_flights, 0)
+            connector.shutdown()
+
     def test_later_unrelated_restore_finishes_while_c16_base_read_is_pending(
         self,
     ) -> None:

@@ -116,7 +116,7 @@ class PageBaseReadFlights:
         key: PageBaseReadFlightKey,
         request_ids: Iterable[str],
     ) -> PageBaseCohortRegistration:
-        """Create a multi-request cohort or join an existing retained cohort."""
+        """Create a provisional reader flight or join a retained cohort."""
 
         ordered = tuple(dict.fromkeys(request_ids))
         if not ordered or any(not item for item in ordered):
@@ -129,8 +129,6 @@ class PageBaseReadFlights:
                 self._counters["registration_after_rejection"] += len(ordered)
                 return PageBaseCohortRegistration()
             if flight is None:
-                if len(ordered) < 2:
-                    return PageBaseCohortRegistration()
                 declared_bytes = key.evidence.base_encoded_bytes
                 if type(declared_bytes) is not int or declared_bytes <= 0:
                     self._counters["invalid_declared_byte_bypasses"] += len(ordered)
@@ -153,6 +151,9 @@ class PageBaseReadFlights:
                     return PageBaseCohortRegistration()
                 flight = _Flight(key=key, members=set())
                 self._flights[key] = flight
+                created = True
+            else:
+                created = False
             selected: list[str] = []
             for request_id in ordered:
                 if request_id in self._request_keys:
@@ -164,11 +165,8 @@ class PageBaseReadFlights:
                 self._request_keys[request_id] = key
                 selected.append(request_id)
                 flight.participant_count += 1
-            if len(flight.members) < 2:
-                for request_id in selected:
-                    self._request_keys.pop(request_id, None)
-                    flight.members.discard(request_id)
-                if not flight.members:
+            if not selected:
+                if created:
                     self._flights.pop(key, None)
                 return PageBaseCohortRegistration()
             if flight.designated_leader_request_id is None:
