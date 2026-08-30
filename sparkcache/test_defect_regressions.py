@@ -1894,6 +1894,110 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
             )
 
 
+class DefectD18LatePublicationBaseQuorumTests(unittest.TestCase):
+    """D-18: a base reported after prefill starts still becomes the CoW trunk."""
+
+    BASE_BOUNDARY = 4608
+
+    def test_late_four_rank_base_report_produces_page_delta(self) -> None:
+        fixture = DefectD17RecurrentBoundaryMetadataTests
+        config = fixture._config()
+        extra_config = {
+            "spark_cache_model_profile": "glm53-flash-hybrid",
+            "spark_cache_publication_schema": "tail-cow-v1",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scheduler = _make_connector(
+                root / "scheduler",
+                0,
+                block_size=256,
+                role=KVConnectorRole.SCHEDULER,
+                override_worker_rank=False,
+                tp=4,
+                dcp=1,
+                kv_cache_config=config,
+                extra_config=extra_config,
+            )
+            token_ids = list(range(fixture.PROMPT_TOKENS))
+            base_digest = scheduler._digest(token_ids, self.BASE_BOUNDARY)
+            workers = []
+            for rank in range(4):
+                worker = _make_connector(
+                    root / f"rank{rank}",
+                    rank,
+                    block_size=256,
+                    tp=4,
+                    dcp=1,
+                    kv_cache_config=config,
+                    extra_config=extra_config,
+                )
+                worker._worker_rank = lambda: 0  # type: ignore[method-assign]
+                pools = {
+                    name: torch.full(
+                        (config.num_blocks, 1, 64),
+                        rank + offset,
+                        dtype=torch.uint8,
+                    )
+                    for name, offset in (("full", 1), ("recurrent", 17))
+                }
+                worker.register_kv_caches(pools)
+                worker._store_one(
+                    _ReqPlan(
+                        f"base-rank{rank}",
+                        base_digest,
+                        self.BASE_BOUNDARY,
+                        fixture._tables()[0],
+                        True,
+                        block_ids_by_group=fixture._tables(),
+                        token_ids=tuple(token_ids[: self.BASE_BOUNDARY]),
+                        recurrent_boundary_blocks=((1, fixture.BOUNDARY_BLOCK),),
+                    )
+                )
+                workers.append(worker)
+
+            # The workers have committed the base, but an idle scheduler has
+            # not transported their reports yet. The next request begins one
+            # chunk of prefill before those reports return from the workers.
+            initial = fixture._scheduler_output()
+            initial.num_scheduled_tokens["dflash-recurrent-boundary"] = 2304
+            self.assertEqual(scheduler.build_connector_meta(initial).plans, [])
+            self.assertNotIn("dflash-recurrent-boundary", scheduler._store_bases)
+
+            stats = workers[0].get_kv_connector_stats()
+            for worker in workers[1:]:
+                stats = stats.aggregate(worker.get_kv_connector_stats())
+            self.assertEqual(stats.reduce()["spark_cache_digests_held"], 4)
+            scheduler.update_connector_output(
+                types.SimpleNamespace(
+                    kv_connector_stats=stats,
+                    invalid_block_ids=set(),
+                )
+            )
+            self.assertTrue(scheduler._has_full_quorum(base_digest))
+
+            final = fixture._cached_scheduler_output(
+                num_computed_tokens=4608,
+                num_scheduled_tokens=2304,
+                recurrent_boundary_blocks={
+                    "dflash-recurrent-boundary": [
+                        (1, fixture.BOUNDARY_BLOCK, fixture.BOUNDARY)
+                    ]
+                },
+            )
+            metadata = scheduler.build_connector_meta(final)
+
+            self.assertEqual(len(metadata.plans), 1)
+            plan = metadata.plans[0]
+            self.assertEqual(plan.base_context_digest, base_digest)
+            self.assertEqual(plan.base_span_tokens, self.BASE_BOUNDARY)
+            workers[0]._store_one(plan)
+            lookup = workers[0]._store.lookup(workers[0]._identity(0), plan.digest)
+            self.assertTrue(lookup.is_hit, lookup.reason)
+            self.assertEqual(lookup.root_kind, "page_delta")
+            self.assertEqual(lookup._manifest["base_context_digest"], base_digest)
+
+
 class DigestNamespaceTests(unittest.TestCase):
     """D-4: context digests are identical across roles and physical ranks."""
 
