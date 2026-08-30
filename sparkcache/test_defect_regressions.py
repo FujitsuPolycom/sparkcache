@@ -844,6 +844,185 @@ class DefectD15HybridBlockDeltaTests(unittest.TestCase):
             )
 
 
+class DefectD16HybridPageBoundaryTests(unittest.TestCase):
+    """D-16: page deltas replace a partial terminal HMA page."""
+
+    def test_glm_page_delta_extends_a_chunk_boundary_inside_an_hma_page(
+        self,
+    ) -> None:
+        class FullAttentionSpec:
+            block_size = 256
+            storage_block_size = 256
+            page_size_bytes = 1024
+
+        class MambaSpec:
+            block_size = 2304
+            storage_block_size = 2304
+            page_size_bytes = 1024
+            mamba_cache_mode = "align"
+            tokens_per_state = 2304
+            num_speculative_blocks = 0
+            num_prefill_checkpoint_blocks = 1
+
+        config = types.SimpleNamespace(
+            kv_cache_groups=(
+                types.SimpleNamespace(
+                    kv_cache_spec=FullAttentionSpec(),
+                    is_eagle_group=False,
+                    layer_names=("full",),
+                ),
+                types.SimpleNamespace(
+                    kv_cache_spec=MambaSpec(),
+                    is_eagle_group=False,
+                    layer_names=("recurrent",),
+                ),
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                block_size=256,
+                extra_config={
+                    "spark_cache_model_profile": "glm53-flash-hybrid",
+                    "spark_cache_publication_schema": "tail-cow-v1",
+                },
+                tp=1,
+                dcp=1,
+                kv_cache_config=config,
+            )
+            pools = {
+                name: (
+                    torch.arange(256 * 1024, dtype=torch.int32)
+                    .add(offset)
+                    .remainder(251)
+                    .to(torch.uint8)
+                    .reshape(256, 1, 1024)
+                )
+                for name, offset in (("full", 0), ("recurrent", 37))
+            }
+            connector.register_kv_caches(pools)
+            tokens = tuple(range(12032))
+            base_span = 7168
+            result_span = 12032
+            base_digest = connector._digest(list(tokens), base_span)
+            result_digest = connector._digest(list(tokens), result_span)
+            base_groups = (tuple(range(1, 29)), (70, 71, 72, 73))
+            result_groups = (tuple(range(1, 48)), (70, 71, 72, 73, 74, 75))
+
+            connector._store_one(
+                _ReqPlan(
+                    "glm-base-store",
+                    base_digest,
+                    base_span,
+                    base_groups[0],
+                    True,
+                    block_ids_by_group=base_groups,
+                    token_ids=tokens[:base_span],
+                )
+            )
+            expected_base = {
+                "full": pools["full"][list(base_groups[0])].clone(),
+                "recurrent": pools["recurrent"][[base_groups[1][-1]]].clone(),
+            }
+            base_destination = (tuple(range(128, 156)), (160, 161, 162, 163))
+            pools["full"][list(base_destination[0])].zero_()
+            pools["recurrent"][base_destination[1][-1]].zero_()
+            self.assertTrue(
+                connector._load_one(
+                    _ReqPlan(
+                        "glm-base-restore",
+                        base_digest,
+                        base_span,
+                        base_destination[0],
+                        False,
+                        block_ids_by_group=base_destination,
+                    )
+                )
+            )
+            self.assertTrue(
+                torch.equal(
+                    pools["full"][list(base_destination[0])],
+                    expected_base["full"],
+                )
+            )
+            self.assertTrue(
+                torch.equal(
+                    pools["recurrent"][[base_destination[1][-1]]],
+                    expected_base["recurrent"],
+                )
+            )
+
+            expected_result = {
+                "full": pools["full"][list(result_groups[0])].clone(),
+                "recurrent": pools["recurrent"][[result_groups[1][-1]]].clone(),
+            }
+            extension_plan = _ReqPlan(
+                "glm-extension-store",
+                result_digest,
+                result_span,
+                result_groups[0],
+                True,
+                block_ids_by_group=result_groups,
+                token_ids=tokens,
+                base_context_digest=base_digest,
+                base_span_tokens=base_span,
+            )
+            result_snapshot = connector._snapshot_hybrid_store(extension_plan)
+            connector._store_one(extension_plan)
+
+            lookup = connector._store.lookup(connector._identity(0), result_digest)
+            self.assertTrue(lookup.is_hit, lookup.reason)
+            self.assertEqual(lookup.root_kind, "page_delta")
+            manifest = lookup._manifest
+            self.assertIsNotNone(manifest)
+            assert manifest is not None
+            self.assertEqual(manifest["base_block_counts"], [28, 1])
+            self.assertEqual(manifest["result_block_counts"], [47, 1])
+            delta_chunks = connector._store._read_context_chunks(
+                manifest["delta_chunks"],
+                connector._identity(0).required_records,
+            )
+            encoded_delta = b"".join(
+                chunk.records[package_store.StateRecord.TARGET_CKV]
+                for chunk in delta_chunks
+            )
+            self.assertLess(
+                len(encoded_delta),
+                len(result_snapshot.encoded_pages),
+            )
+            result_destination = (
+                tuple(range(176, 223)),
+                (230, 231, 232, 233, 234, 235),
+            )
+            pools["full"][list(result_destination[0])].zero_()
+            pools["recurrent"][result_destination[1][-1]].zero_()
+            self.assertTrue(
+                connector._load_one(
+                    _ReqPlan(
+                        "glm-extension-restore",
+                        result_digest,
+                        result_span,
+                        result_destination[0],
+                        False,
+                        block_ids_by_group=result_destination,
+                    )
+                )
+            )
+            self.assertTrue(
+                torch.equal(
+                    pools["full"][list(result_destination[0])],
+                    expected_result["full"],
+                )
+            )
+            self.assertTrue(
+                torch.equal(
+                    pools["recurrent"][[result_destination[1][-1]]],
+                    expected_result["recurrent"],
+                )
+            )
+
+
 class DigestNamespaceTests(unittest.TestCase):
     """D-4: context digests are identical across roles and physical ranks."""
 

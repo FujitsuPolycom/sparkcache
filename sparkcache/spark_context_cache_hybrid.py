@@ -231,7 +231,6 @@ def decode_page_snapshot(
 
 
 def _validate_delta_boundaries(
-    layout: PageLayout,
     base_boundary_tokens: int,
     result_boundary_tokens: int,
 ) -> None:
@@ -244,11 +243,6 @@ def _validate_delta_boundaries(
         or result_boundary_tokens <= base_boundary_tokens
     ):
         raise HybridCodecError("page delta boundaries are invalid")
-    for group in layout.groups:
-        if base_boundary_tokens % group.block_size:
-            raise HybridCodecError(
-                "page delta base boundary disagrees with group geometry"
-            )
 
 
 def encode_page_delta(
@@ -265,15 +259,13 @@ def encode_page_delta(
 
     Reuse is established page-by-page across every layer in a page group. A
     group reuses a page only when the result carries byte-identical opaque
-    state at the same logical page index. The base snapshot digest and both
-    semantic boundaries are bound into the delta header.
+    state at the same logical page index. When the base boundary lies inside
+    a page, changed bytes make that complete terminal page part of the delta;
+    preceding byte-identical pages remain reusable. The base snapshot digest
+    and both semantic boundaries are bound into the delta header.
     """
 
-    _validate_delta_boundaries(
-        layout,
-        base_boundary_tokens,
-        result_boundary_tokens,
-    )
+    _validate_delta_boundaries(base_boundary_tokens, result_boundary_tokens)
     base_counts = tuple(int(value) for value in base_block_counts)
     result_counts = tuple(int(value) for value in result_block_counts)
     if len(base_counts) != len(layout.groups) or len(result_counts) != len(
@@ -354,11 +346,7 @@ def apply_page_delta(
 ) -> bytes:
     """Verify and apply one page-semantic delta to its exact base snapshot."""
 
-    _validate_delta_boundaries(
-        layout,
-        base_boundary_tokens,
-        result_boundary_tokens,
-    )
+    _validate_delta_boundaries(base_boundary_tokens, result_boundary_tokens)
     prefix_bytes = len(_DELTA_MAGIC) + _HEADER_LENGTH.size
     if (
         len(encoded_delta) < prefix_bytes
