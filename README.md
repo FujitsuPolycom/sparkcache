@@ -1,34 +1,24 @@
 # SparkCache
 
 > [!WARNING]
-> **Alpha research software.** Use SparkCache for evaluation. APIs, cache
-> formats, deployment patches, and supported profiles may change.
+> **Evaluation use only.** Serving support is limited to the exact artifacts,
+> models, topologies, and source contracts marked **qualified** below. APIs,
+> cache formats, deployment patches, and supported profiles may change.
 
 SparkCache is a persistent, rank-local NVMe context cache for vLLM's
-KV-Connector-V1 interface. Each tensor-parallel worker stores and restores only
-the model state owned by its physical rank.
+KV-Connector-V1 interface. It lets subsequent requests reuse the longest
+verified stored prefix instead of repeating the corresponding prefill. Each
+tensor-parallel worker stores and restores only the model state owned by its
+physical rank.
 
-Sparkcache KV/context Restore reads each rank's local filesystem. SparkCache does not send KV
-payload over a network link. vLLM collectives may still use Ethernet, a
-switched fabric, or a switchless ring.
+Normal restore reads each rank's local filesystem; SparkCache does not send KV
+payload over a cache network. vLLM collectives may still use Ethernet, a
+switched fabric, or a switchless ring. State that cannot pass identity,
+compatibility, all-rank availability, and payload-integrity checks is rejected,
+and vLLM computes the request normally.
 
 Deployment labels use TP for tensor-parallel degree and DCP for
 decode-context-parallel degree.
-
-PyPI version `0.1.0a3` is **implemented** and GPU-free tested. Its package
-artifact has no live serving qualification. Qualification belongs to an exact
-artifact, model, topology, and vLLM source contract.
-
-The public GLM-5.3 OCI artifact is qualified for its recorded 8,192-token
-Python-placement restore. The source deployment separately qualifies native
-131,072-token restore and bounded shared-prefix reuse. See
-[the public image record](deploy/glm53_flash/IMAGE_ANNOUNCEMENT.md),
-[the GLM-5.3 validation](GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md), and
-[the SparkCache CUDA restore record](GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md).
-
-The public image does not contain the model checkpoints. SparkCache CUDA restore and
-shared GPU-prefix qualification belong to a later source-bound runtime that has
-no published OCI digest.
 
 ## Implemented capabilities
 
@@ -36,10 +26,13 @@ no published OCI digest.
 |---|---|---|
 | Content-addressed persistent snapshots | **implemented** | Immutable chunks, manifest-last publication, rank-local capacity control, and verified restore |
 | Longest stored exact-boundary discovery | **implemented** | One incremental token-digest pass; longest all-rank candidate wins |
-| Sparse row-prefix aliases | **implemented** | Authenticated metadata over `per_token_rows`; GPU-free regression coverage |
+| Sparse row-prefix aliases | **implemented** | Authenticated metadata over `per_token_rows`; no live serving qualification |
+| Tail-only row publication | **implemented** | Opt-in `tail-cow-v1` storage for `per_token_rows`; no live serving qualification |
+| Tail-only opaque-page publication | **qualified** | Authenticated `block_pages_v1` deltas restored correctly on the recorded GLM-5.3 TP4/DCP1 source deployment; write-volume and latency qualification remain limited |
+| Different-root segment sharing | **implemented** | Coalesces authenticated stored trunks selected by different request roots; GPU-free behavioral coverage and bounded GLM-5.3 C16 evidence |
 | Opaque hybrid-memory-allocator page snapshots | **qualified** | Listed DeepSeek-V4 and GLM deployments only |
-| Native direct page restore | **qualified** | Exact GLM-5.3 TP4/DCP1 source deployment recorded below |
-| Concurrent shared GPU-prefix reuse | **qualified** | Up to 16 waiting followers, two retained prefixes, 15-second retention; GLM-5.3 through 16 concurrent requests |
+| SparkCache CUDA page restore | **qualified** | Exact GLM-5.3 TP4/DCP1 source deployment recorded below |
+| Concurrent exact-prefix GPU reuse | **qualified** | Up to 16 waiting followers, two retained prefixes, 15-second retention; GLM-5.3 through 16 concurrent requests |
 | Streaming snapshots | **research-only** | GLM-5.2 DCP4 inventory; disabled for opaque page profiles |
 | Buddy replication | **research-only** | Protocol and receiver state exist; no network carrier is included |
 
@@ -72,6 +65,25 @@ Incompatible entries produce a cache miss.
 
 Persistent files contain no CUDA pointers, allocator block tables, physical
 slot coordinates, or transport sequence numbers.
+
+## Artifact and qualification scope
+
+PyPI version `0.1.0a3` has GPU-free package validation but no live serving
+qualification. Live qualification is bound to an exact artifact, model,
+topology, and vLLM source contract.
+
+The public GLM-5.3 OCI artifact is qualified for its recorded 8,192-token
+Python/Torch page restore. A separate source deployment qualifies SparkCache
+CUDA page restore at 131,072 tokens, bounded exact-prefix GPU reuse through
+16 concurrent requests, and correct opaque-page delta restore through 262,144
+tokens. See [the public image record](deploy/glm53_flash/IMAGE_ANNOUNCEMENT.md),
+[the GLM-5.3 validation](GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md), and
+[the SparkCache CUDA restore record](GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md).
+
+The public image omits model checkpoints. The faster SparkCache CUDA restore
+and shared-prefix qualification belongs to a source-bound runtime without a
+published OCI digest. The adaptive-MTP runtime described in the GLM-5.3
+deployment guide is implemented but requires its own four-rank qualification.
 
 ## Quickstart for qualified deployments
 
@@ -137,7 +149,7 @@ the package qualification.
 | Public GLM-5.3 OCI image, TP4/DCP1 | 8,192 | 156.8–171.8 ms | [public image record](deploy/glm53_flash/IMAGE_ANNOUNCEMENT.md) |
 | GLM-5.3 source deployment, TP4/DCP1 | 8,192 | 147.2–194.0 ms | [GLM-5.3 validation](GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md) |
 
-The native GLM-5.3 work changes practical restore cost across prefix sizes and
+SparkCache CUDA restore changes practical restore cost across prefix sizes and
 concurrency. C1, C8, and C16 mean one, eight, and sixteen concurrent requests.
 
 Client timing includes scheduler and model work. Cache-service timing isolates
@@ -217,8 +229,10 @@ Repeated restores do not rewrite KV payload files. A successful restore may
 update manifest recency metadata at most once per minute.
 
 Publishing a reusable context writes immutable payload objects and a manifest.
-A growing conversation can publish another complete snapshot, so SparkCache
-must not be described as having negligible SSD wear.
+The default `snapshot-v1` schema writes a complete grown snapshot. The opt-in
+`tail-cow-v1` schema writes immutable row tails or authenticated opaque-page
+deltas and periodically compacts bounded delta graphs. SparkCache must not be
+described as having negligible SSD wear under either schema.
 
 Operators should monitor the NVMe Data Units Written counter and compare its
 daily change with workload publication volume. Device endurance depends on
@@ -227,7 +241,7 @@ context size, unique publication rate, retention, and storage amplification.
 SparkCache does not expose hourly write budgets, daily write budgets, or a
 physical-write-amplification estimate. Those controls are **unsupported**.
 
-## vLLM source contracts and native components
+## vLLM source contracts and SparkCache CUDA components
 
 SparkCache verifies whole-file hashes and required symbols before accepting a
 patched vLLM source tree. A different hash is unsupported until its ownership
@@ -238,6 +252,8 @@ and recovery behavior are derived and tested.
 | `vllm-project/vllm@fcc614141e5e9ab18cb304c476f7feed2a9552e3` with `patches/vllm/` | **implemented** | Exact patch inputs are published; no standalone public runtime builder is provided |
 | vLLM build `e2666d9a6` with `patches/vllm-e2666d9a6/` | **qualified** | DeepSeek-V4 and GLM-5.2 builders verify source, patch, and postimage hashes |
 | `local-inference-lab/vllm@da4d7be6c97434f6942292ed8abbf4b32dc44355` with `patches/vllm-da4d7be/` | **qualified** | GLM-5.3 HMA recovery, SparkCache CUDA restore, and bounded shared-prefix attachment |
+| `local-inference-lab/vllm@e10536aadf02a18fccddda7ec939c33147e8b0b3` with `patches/vllm-e10536a/` | **implemented** | Adaptive-MTP integration and ten-file lease contract; no four-rank qualification |
+| `local-inference-lab/vllm@0b67266a0f37d6146a8403fb8482403c62f412d5` with `patches/vllm-glm53-b12x-kda-adaptive-mtp/` | **implemented** | Adaptive MTP, live-tensor B12X KDA, and eleven-file runtime contract; no four-rank qualification |
 
 The GLM-5.3 contract at
 [`vllm-kv-block-lease-contract-da4d7be.json`](sparkcache/runtime_patches/vllm-kv-block-lease-contract-da4d7be.json)
@@ -247,13 +263,13 @@ pins ten vLLM files and the symbols used for ownership, copying, and recovery.
 page ABI uses mapped host arenas, authenticated copy spans, and a CUDA scatter
 kernel for opaque hybrid pages.
 
-Native loading requires an explicit library path and SHA-256. CUDA 13 builds
-run a GPU-free byte-exact reference test and a CUDA hybrid-page probe before
-model-serving qualification.
+Loading the SparkCache CUDA placement library requires an explicit path and
+SHA-256. CUDA 13 builds run a GPU-free byte-exact reference test and a CUDA
+hybrid-page probe before model-serving qualification.
 
-SparkCache direct CUDA restore reads `.spcc` objects into alternating mapped arenas,
-hashes complete files in place, validates authenticated extents, and overlaps
-read work with CUDA submission.
+SparkCache direct CUDA restore reads `.spcc` objects into alternating mapped
+arenas, hashes complete files in place, validates authenticated extents, and
+overlaps read work with CUDA submission into vLLM-owned cache pages.
 
 ## Repository map and development validation
 
@@ -261,7 +277,7 @@ read work with CUDA submission.
 |---|---|
 | `sparkcache/spark_context_cache_connector.py` | scheduler admission, worker I/O, all-rank availability, restore coalescing, shared-prefix coordination, and vLLM callbacks |
 | `sparkcache/persistent_context_cache/cache_manifest.py` | exact manifests, row-prefix aliases, immutable chunks, lookup, invalidation, capacity, and garbage collection |
-| `sparkcache/spark_context_cache_native_hybrid_restore.py` | authenticated direct reads, slab planning, and mapped-arena page placement |
+| `sparkcache/spark_context_cache_cuda_restore.py` | authenticated direct reads, slab planning, and mapped-arena page placement |
 | `sparkcache/spark_context_cache_restore_timing.py` | machine-readable asynchronous restore timing |
 | `sparkcache/runtime_patches/` | exact-hash vLLM source contracts and GPU-free patch execution tests |
 | `sparkcache/native/` | C++/CUDA ABI, parser, reference implementation, kernel, and probes |
@@ -290,13 +306,14 @@ and extension chunks after an all-rank reusable boundary. It uses a distinct
 cache namespace. Default `snapshot-v1` deployments retain their existing wire
 identity and full-snapshot publication behavior.
 
-Tail-only publication for `block_pages_v1` is also **implemented** with
-GPU-free regression coverage and no live model-serving qualification. The
-page-semantic `sparkcache-hybrid-page-delta/v1` codec binds
-the exact base snapshot and recurrent/sliding boundary and reuses only
-byte-identical opaque pages. Restore reconstructs and verifies the complete
-snapshot before Python or native page placement. Arbitrary earlier-prefix
-aliases cannot be derived from opaque page snapshots.
+Tail-only publication for `block_pages_v1` is **qualified** for byte-correct
+restore on the recorded GLM-5.3 TP4/DCP1 source deployment. Its latency and
+write-volume behavior remain unqualified. The page-semantic
+`sparkcache-hybrid-page-delta/v1` codec binds the exact base snapshot and
+recurrent/sliding boundary and reuses only byte-identical opaque pages. Restore
+reconstructs and verifies the complete snapshot before Python/Torch or
+SparkCache CUDA placement. Arbitrary earlier-prefix aliases cannot be derived
+from opaque page snapshots.
 
 Opaque HMA snapshots cannot be shortened by truncating chunk lists. SparkCache
 therefore uses the page-semantic format and distinct namespace described above.
@@ -307,6 +324,13 @@ qualification for this path remains outstanding.
 Sparse row-prefix aliases are **implemented** but have no live model-serving
 qualification. Their behavior is covered by GPU-free publication, discovery,
 restore, capacity, and corruption regressions.
+
+Different-root segment sharing is **implemented**. It coalesces one
+authenticated stored trunk across requests whose selected roots have different
+private tails. GPU-free regressions cover descriptor disagreement, corruption,
+cancellation, follower ordering, and unrelated cold requests. The recorded
+GLM-5.3 C16 cohort is bounded evidence for one exact stored trunk; arbitrary
+row-segment sharing has no live serving qualification.
 
 The GLM shared-prefix runtime is qualified through 16 concurrent requests under
 `--max-num-seqs 32`. Cohorts of 24 or 32 requests and more than 16 waiting
