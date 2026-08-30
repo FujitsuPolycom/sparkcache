@@ -9,7 +9,7 @@ records:
 - [`GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md`](../../GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md)
   records an 8,192-token persistent restore through the Python page-placement
   path at 147.2--194.0 ms per rank.
-- [`GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md`](../../GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md)
+- [`GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md`](../../GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md)
   records SparkCache direct CUDA restore of a 131,072-token prefix, multi-group
   recovery, and bounded shared GPU-prefix reuse through C16.
 
