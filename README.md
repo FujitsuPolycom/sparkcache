@@ -356,18 +356,32 @@ mapped arena before submitting its copy spans. A flat 813,068,464-byte
 snapshot therefore requires 13 payload objects rather than 512 logical-chunk
 files; the manifest remains the atomic visibility point.
 
-Bounded flat-object prefetch is **research-only**. The implementation
-authenticates up to four version 2 objects concurrently in request-private host
-buffers and then copies them into mapped placement arenas in manifest order.
-Its GPU-free integrity, ordering, concurrency, and memory-bound tests pass.
+Bounded flat-object prefetch is **research-only**. With explicit
+prior-CUDA-work ordering, SparkCache authenticates up to four version 2 objects
+concurrently in request-private host buffers, records the CUDA work already
+queued by vLLM, waits for that prerequisite before any destination write, and
+copies authenticated objects into mapped placement arenas in manifest order.
+GPU-free integrity, ordering, concurrency, memory-bound, and event-failure
+tests pass.
 
-The exact GLM-5.3 TP4/DCP1 serving evaluation for SparkCache
-`eabe7fd0c878db7384ef87fe80a1e96b9bedcf67` structurally verified all four
-rank-local 131,072-token snapshots but returned `spark` instead of the expected
-`red`. An equivalent recomputation returned `red`. Consequently, the
-four-reader implementation is not a deployable restore path and does not
-replace the single-reader qualification. See the
-[immutable research receipt](evidence/glm53-flash-dflash7-bf16/flat-v2-four-reader-semantic-rejection-eabe7fd.json).
+The exact GLM-5.3 TP4/DCP1 image
+`sha256:f2723a71b49509294072f5886b4fe081ac1f87dd1f931cc3cb8f538bc3eb037d`,
+built from SparkCache `861a9651e043709340644b2c7512cf82fc86c701`,
+restored two distinct 131,072-token flat prefixes. Both one-token responses
+matched the required `red` codeword. All-rank cache-service time was
+1,209.997–1,298.931 ms; authenticated reads took 452.461–514.746 ms, placement
+took 317.709–332.381 ms, the prior-CUDA-work wait took 0.018–0.088 ms, and final
+CUDA completion took 128.729–132.732 ms. The
+[event-fenced research receipt](evidence/glm53-flash-dflash7-bf16/event-fenced-flat-restore-861a965.json)
+retains every structured rank record and the available response and artifact
+hashes.
+
+This evidence covers flat snapshots only. Tail-only page deltas, segment-level
+sharing, concurrent restore, and general deployment qualification remain
+unproven. This two-request result does not replace the single-reader
+qualification. Source `eabe7fd0c878db7384ef87fe80a1e96b9bedcf67`, which lacks
+the prior-CUDA-work ordering, remains semantically rejected by its
+[research receipt](evidence/glm53-flash-dflash7-bf16/flat-v2-four-reader-semantic-rejection-eabe7fd.json).
 
 Flat macro publication and its SparkCache CUDA restore path are
 **implemented and GPU-free tested, not live qualified**. The object-count
