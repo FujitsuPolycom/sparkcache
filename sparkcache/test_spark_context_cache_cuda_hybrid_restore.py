@@ -140,7 +140,9 @@ def test_flat_macro_objects_authenticate_before_direct_page_submission(
             self.state = RestoreState.FINISHED
             self.can_resume = True
             return SimpleNamespace(
-                source_bytes=len(encoded) - plan.header_bytes,
+                # The CUDA ABI counts the complete authenticated arena bytes,
+                # including the snapshot header carried by the first object.
+                source_bytes=len(encoded),
                 slabs_submitted=2,
                 scatter_kernel_launches=2,
                 slot_uploads=1,
@@ -181,6 +183,10 @@ def test_flat_macro_objects_authenticate_before_direct_page_submission(
         payload for _offset, payload in sorted(transaction.submissions)
     )
     assert restored_payload == encoded[plan.header_bytes :]
+    assert sum(len(payload) for _offset, payload in transaction.submissions) == (
+        len(encoded) - plan.header_bytes
+    )
+    assert result.placement_stats.source_bytes == len(encoded)
     assert result.source_bytes == len(encoded)
     assert result.slabs == 2
 

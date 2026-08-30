@@ -468,7 +468,11 @@ def _execute_page_object_restore(
                 "flat page placement did not release the parked request"
             )
     expected_stats = {
-        "source_bytes": snapshot_bytes - page_plan.header_bytes,
+        # The C++ ABI counts every authenticated arena byte submitted through
+        # spark_cache_placement_submit_page_slab. Flat macro objects include
+        # the encoded snapshot header in the first arena even though page-copy
+        # spans cover only payload bytes after that header.
+        "source_bytes": snapshot_bytes,
         "slabs_submitted": len(objects),
         "scatter_kernel_launches": len(objects),
         "slot_uploads": 1,
