@@ -323,6 +323,31 @@ not change. Restore still materializes one authenticated delta buffer and the
 verified reconstructed snapshot before placement. Direct placement from base
 and delta extents is unsupported by this schema.
 
+Persistent base-segment read sharing for `block_pages_v1` page-delta roots is
+**implemented and GPU-free tested; serving qualification is not established**.
+Requests whose
+authenticated result roots name the same base root may share one verified,
+immutable base-snapshot buffer per rank. Every request independently reads and
+authenticates its private delta, reconstructs its result snapshot, and performs
+request-private placement. Mutable recurrent pages are never shared.
+
+One process admits at most two base-read cohorts and 16 cumulative participants
+per cohort. A base must declare at most 1 GiB, and peak byte reservations across
+cohorts must fit within 2 GiB. Followers remain outside the load lanes until the
+base read completes. With two load lanes, a later unrelated restore can use the
+other lane while one base read is pending.
+The buffer is released when every admitted participant acquires or abandons the
+result; there is no retained host-memory cache or time-based reuse. Requests
+that exceed a sharing bound use an independent restore. One
+`sparkcache-page-base-restore-flight/v1` summary records the physical read,
+participants, avoided reads, bytes, duration, outcome, worker generation, and
+storage mode without prompt content.
+
+This read-scheduling behavior does not change `CacheIdentity`, digest salts,
+logical chunk geometry, or the `page-tail-cow-v1` namespace. Version 1 and
+version 2 page-delta roots, legacy flat bases, and flat macro-object bases remain
+separately authenticated by their persisted schemas.
+
 Flat page publication uses the same 64-MiB extent ceiling. Publication retains
 at most two extent payloads per durable batch; Python restore retains at most
 four extent payloads in addition to the assembled snapshot. SparkCache CUDA

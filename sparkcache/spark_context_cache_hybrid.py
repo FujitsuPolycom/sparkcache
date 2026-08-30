@@ -102,6 +102,34 @@ class PageSnapshotPlan:
     spans: tuple[PagePayloadSpan, ...]
 
 
+def page_snapshot_encoded_size(
+    layout: PageLayout,
+    block_counts: Sequence[int],
+) -> int:
+    """Return the exact encoded size without allocating page payload bytes."""
+
+    if len(block_counts) != len(layout.groups):
+        raise HybridCodecError("block-count vector disagrees with page groups")
+    counts = tuple(int(count) for count in block_counts)
+    if any(count <= 0 for count in counts):
+        raise HybridCodecError("every page group must contribute at least one block")
+    header = json.dumps(
+        {
+            "schema": "sparkcache-hybrid-pages/v1",
+            "layout_sha256": layout.digest,
+            "block_counts": counts,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    payload_bytes = sum(
+        count * layer.bytes_per_page
+        for group, count in zip(layout.groups, counts, strict=True)
+        for layer in group.layers
+    )
+    return len(_MAGIC) + _HEADER_LENGTH.size + len(header) + payload_bytes
+
+
 def plan_page_snapshot(
     layout: PageLayout,
     encoded_prefix: bytes | bytearray | memoryview,

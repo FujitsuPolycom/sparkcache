@@ -23,7 +23,9 @@ from enum import Enum
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from types import MappingProxyType
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
+
+from sparkcache.page_base_read_flights import PageBaseReadEvidence
 
 try:
     import fcntl as _fcntl
@@ -3164,6 +3166,11 @@ class ManifestStore:
         layout: Any,
         result_block_counts: Sequence[int],
         result_boundary_tokens: int,
+        base_reader: Callable[
+            [PageBaseReadEvidence, Callable[[], bytes | bytearray]],
+            bytes | bytearray,
+        ]
+        | None = None,
         _depth: int = 0,
     ) -> bytes | bytearray:
         """Materialize an authenticated flat or delta-backed page snapshot."""
@@ -3195,6 +3202,12 @@ class ManifestStore:
             return b"".join(chunk.records[StateRecord.TARGET_CKV] for chunk in chunks)
         if _depth >= _MAX_PAGE_DELTA_DEPTH:
             raise CacheFormatError("page delta graph exceeds the depth limit")
+        evidence = self.page_delta_base_read_evidence(
+            lookup,
+            layout=layout,
+            result_block_counts=result_block_counts,
+            result_boundary_tokens=result_boundary_tokens,
+        )
         identity_wire = dict(manifest["identity"])
         if "record_schema" in identity_wire:
             identity_wire["record_schema"] = tuple(identity_wire["record_schema"])
@@ -3223,12 +3236,20 @@ class ManifestStore:
                 )
             ),
         )
-        base_snapshot = self.restore_page_snapshot(
-            base_lookup,
-            layout=layout,
-            result_block_counts=manifest["base_block_counts"],
-            result_boundary_tokens=manifest["base_committed_tokens"],
-            _depth=_depth + 1,
+        def read_base() -> bytes | bytearray:
+            return self.restore_page_snapshot(
+                base_lookup,
+                layout=layout,
+                result_block_counts=manifest["base_block_counts"],
+                result_boundary_tokens=manifest["base_committed_tokens"],
+                base_reader=None,
+                _depth=_depth + 1,
+            )
+
+        base_snapshot = (
+            base_reader(evidence, read_base)
+            if base_reader is not None and _depth == 0
+            else read_base()
         )
         if manifest["schema"] == _PAGE_DELTA_MANIFEST_SCHEMA_V2:
             encoded_delta = self._read_page_delta_objects(
@@ -3254,6 +3275,90 @@ class ManifestStore:
             result_block_counts=manifest["result_block_counts"],
             base_boundary_tokens=manifest["base_committed_tokens"],
             result_boundary_tokens=manifest["committed_tokens"],
+        )
+
+    def page_delta_base_read_evidence(
+        self,
+        lookup: LookupResult,
+        *,
+        layout: Any,
+        result_block_counts: Sequence[int],
+        result_boundary_tokens: int,
+    ) -> PageBaseReadEvidence:
+        """Authenticate metadata that permits sharing one immutable page base.
+
+        This method reads no payload object. Each result root still authenticates
+        and reads its private delta inside ``restore_page_snapshot``.
+        """
+
+        if (
+            not lookup.is_hit
+            or lookup.root_kind != "page_delta"
+            or lookup._manifest is None
+        ):
+            raise ValueError("page-base evidence requires a page-delta cache hit")
+        manifest = lookup._manifest
+        identity_wire = dict(manifest["identity"])
+        if "record_schema" in identity_wire:
+            identity_wire["record_schema"] = tuple(identity_wire["record_schema"])
+        identity = CacheIdentity(**identity_wire)
+        base_root, _delta_descriptors = _validate_page_delta_root(
+            manifest,
+            identity=identity,
+            context_digest=manifest["context_digest"],
+        )
+        result_counts = tuple(int(value) for value in result_block_counts)
+        base_counts = tuple(int(value) for value in manifest["base_block_counts"])
+        if (
+            manifest["layout_sha256"] != layout.digest
+            or tuple(manifest["result_block_counts"]) != result_counts
+            or manifest["committed_tokens"] != result_boundary_tokens
+            or base_root.get("committed_tokens")
+            != manifest["base_committed_tokens"]
+        ):
+            raise CacheFormatError("page delta restore geometry differs")
+        base_digest = manifest["base_context_digest"]
+        from sparkcache.spark_context_cache_hybrid import page_snapshot_encoded_size
+
+        base_encoded_bytes = page_snapshot_encoded_size(layout, base_counts)
+        if _is_page_delta_root(base_root):
+            self._page_graph_descriptors(
+                base_root,
+                identity=identity,
+                context_digest=base_digest,
+                depth=1,
+            )
+            if (
+                base_root["layout_sha256"] != layout.digest
+                or tuple(base_root["result_block_counts"]) != base_counts
+            ):
+                raise CacheFormatError("page delta base geometry differs")
+            base_root_kind = "page_delta"
+        elif _is_page_snapshot_root(base_root):
+            _validate_page_snapshot_root(
+                base_root,
+                identity=identity,
+                context_digest=base_digest,
+            )
+            if base_root["snapshot_encoded_bytes"] != base_encoded_bytes:
+                raise CacheFormatError("page snapshot base geometry differs")
+            base_root_kind = "page_snapshot"
+        else:
+            _validate_manifest_metadata(
+                base_root,
+                EntryKey(identity.storage_key, base_digest),
+                expected_identity=identity,
+            )
+            base_root_kind = "manifest"
+        return PageBaseReadEvidence(
+            identity_storage_key=identity.storage_key,
+            base_context_digest=base_digest,
+            base_root_sha256=manifest["base_root_sha256"],
+            base_root_kind=base_root_kind,
+            layout_sha256=manifest["layout_sha256"],
+            base_block_counts=base_counts,
+            base_boundary_tokens=manifest["base_committed_tokens"],
+            base_encoded_bytes=base_encoded_bytes,
         )
 
     def begin(

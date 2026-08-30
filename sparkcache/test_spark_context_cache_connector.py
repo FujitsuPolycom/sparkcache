@@ -7,6 +7,7 @@ vLLM is stubbed the same way as the sibling backend suites.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import dataclasses
 import hashlib
 import inspect
@@ -29,6 +30,7 @@ from sparkcache.spark_context_cache_restore_timing import (
     RESTORE_TIMING_PREFIX,
     RestoreTiming,
 )
+from sparkcache.page_base_read_flights import PageBaseReadEvidence
 
 
 def _install_vllm_stubs() -> None:
@@ -295,7 +297,11 @@ class CodecTests(unittest.TestCase):
 class HybridAllocatorContractTests(unittest.TestCase):
     def test_connector_advertises_hybrid_memory_allocator_support(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            connector = _make_connector(Path(directory), 0)
+            connector = _make_connector(
+                Path(directory),
+                0,
+                extra_config={"spark_cache_load_threads": "2"},
+            )
         self.assertIsInstance(connector, SupportsHMA)
 
     def test_all_group_finish_clears_scheduler_tracking(self) -> None:
@@ -1406,6 +1412,569 @@ def _drain_store(
 
 class IntegratedPublicationAndSharingTests(unittest.TestCase):
     """Exercise publication graphs together with restore-flight sharing."""
+
+    @staticmethod
+    def _page_base_queue_fixture(
+        root: Path,
+    ) -> tuple[
+        SparkContextCacheConnector,
+        PageBaseReadEvidence,
+        list[_ReqPlan],
+    ]:
+        connector = _make_connector(
+            root,
+            0,
+            extra_config={"spark_cache_load_threads": "2"},
+        )
+        connector._storage_mode = "block_pages_v1"
+        connector._page_layout = types.SimpleNamespace(digest="layout")
+        connector._select_group_blocks_for_span = mock.Mock(
+            return_value=((1,), (2,))
+        )
+        evidence = PageBaseReadEvidence(
+            identity_storage_key="identity",
+            base_context_digest="a" * 64,
+            base_root_sha256="b" * 64,
+            base_root_kind="page_snapshot",
+            layout_sha256="layout",
+            base_block_counts=(1, 1),
+            base_boundary_tokens=512,
+            base_encoded_bytes=18,
+        )
+        connector._store.page_delta_base_read_evidence = mock.Mock(
+            return_value=evidence
+        )
+        connector._lookup_reusable = mock.Mock(
+            return_value=(
+                LookupResult(True, "hit", root_kind="page_delta"),
+                False,
+            )
+        )
+        plans = [
+            _ReqPlan(
+                f"shared-{index}",
+                f"{index + 1:064x}",
+                1024,
+                (1,),
+                False,
+                block_ids_by_group=((1,), (2,)),
+            )
+            for index in range(16)
+        ]
+        return connector, evidence, plans
+
+    def test_start_load_kv_c16_reads_one_pre_registered_page_base(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector, evidence, plans = self._page_base_queue_fixture(
+                Path(directory)
+            )
+            started = threading.Event()
+            release = threading.Event()
+            reads = 0
+            read_lock = threading.Lock()
+
+            def read_base() -> bytes:
+                nonlocal reads
+                with read_lock:
+                    reads += 1
+                started.set()
+                self.assertTrue(release.wait(timeout=5))
+                return b"authenticated-base"
+
+            def load_one(plan: _ReqPlan, **_kwargs: object) -> bool:
+                return (
+                    connector._restore_page_base_for_request(
+                        plan.request_id,
+                        evidence,
+                        read_base,
+                    )
+                    == b"authenticated-base"
+                )
+
+            connector._load_one = mock.Mock(side_effect=load_one)
+            with mock.patch.object(connector_module.logger, "info") as log_info:
+                connector.bind_connector_metadata(
+                    SparkCacheConnectorMetadata(plans=plans)
+                )
+                connector.start_load_kv(None)
+                self.assertTrue(started.wait(timeout=5))
+                self.assertEqual(connector._load_thread_limit, 2)
+                self.assertEqual(
+                    connector._page_base_reads.snapshot().registered_members,
+                    16,
+                )
+                release.set()
+                self.assertEqual(_drain(connector), set(plan.request_id for plan in plans))
+
+            self.assertEqual(reads, 1)
+            self.assertEqual(connector.counters["load_verified"], 16)
+            self.assertEqual(connector.counters["page_base_flight_participants"], 16)
+            self.assertEqual(connector.counters["page_base_physical_reads"], 1)
+            self.assertEqual(connector.counters["page_base_reads_avoided"], 15)
+            self.assertEqual(connector._page_base_reads.snapshot().active_flights, 0)
+            summaries = [
+                json.loads(call.args[1])
+                for call in log_info.call_args_list
+                if call.args
+                and call.args[0] == "spark-context-cache-page-base-flight:%s"
+            ]
+            self.assertEqual(len(summaries), 1)
+            self.assertEqual(
+                summaries[0]["schema"],
+                "sparkcache-page-base-restore-flight/v1",
+            )
+            self.assertEqual(summaries[0]["participants"], 16)
+            connector.shutdown()
+
+    def test_start_load_kv_joins_eight_seven_and_singleton_batches(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector, evidence, plans = self._page_base_queue_fixture(
+                Path(directory)
+            )
+            started = threading.Event()
+            release = threading.Event()
+            reads = 0
+
+            def read_base() -> bytes:
+                nonlocal reads
+                reads += 1
+                started.set()
+                self.assertTrue(release.wait(timeout=5))
+                return b"authenticated-base"
+
+            connector._load_one = mock.Mock(
+                side_effect=lambda plan, **_kwargs: (
+                    connector._restore_page_base_for_request(
+                        plan.request_id,
+                        evidence,
+                        read_base,
+                    )
+                    == b"authenticated-base"
+                )
+            )
+            with mock.patch.object(connector_module.logger, "info") as log_info:
+                for batch_index, batch in enumerate(
+                    (plans[:8], plans[8:15], plans[15:])
+                ):
+                    connector.bind_connector_metadata(
+                        SparkCacheConnectorMetadata(plans=batch)
+                    )
+                    connector.start_load_kv(None)
+                    if batch_index == 0:
+                        self.assertTrue(started.wait(timeout=5))
+                self.assertEqual(
+                    connector._page_base_reads.snapshot().registered_members,
+                    16,
+                )
+                release.set()
+                self.assertEqual(_drain(connector), set(plan.request_id for plan in plans))
+
+            self.assertEqual(reads, 1)
+            self.assertEqual(connector.counters["page_base_flight_participants"], 16)
+            self.assertEqual(connector.counters["page_base_reads_avoided"], 15)
+            summaries = [
+                json.loads(call.args[1])
+                for call in log_info.call_args_list
+                if call.args
+                and call.args[0] == "spark-context-cache-page-base-flight:%s"
+            ]
+            self.assertEqual(len(summaries), 1)
+            connector.shutdown()
+
+    def test_later_unrelated_restore_finishes_while_c16_base_read_is_pending(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector, evidence, plans = self._page_base_queue_fixture(
+                Path(directory)
+            )
+            unrelated = _ReqPlan(
+                "unrelated",
+                "f" * 64,
+                1024,
+                (3,),
+                False,
+                block_ids_by_group=((3,), (4,)),
+            )
+
+            def lookup(_identity, digest, **_kwargs):
+                if digest == unrelated.digest:
+                    return LookupResult(False, "miss"), False
+                return LookupResult(True, "hit", root_kind="page_delta"), False
+
+            connector._lookup_reusable = mock.Mock(side_effect=lookup)
+            base_started = threading.Event()
+            release_base = threading.Event()
+            unrelated_finished = threading.Event()
+            started_requests: list[str] = []
+            started_lock = threading.Lock()
+
+            def read_base() -> bytes:
+                base_started.set()
+                self.assertTrue(release_base.wait(timeout=5))
+                return b"authenticated-base"
+
+            def load_one(plan: _ReqPlan, **_kwargs: object) -> bool:
+                with started_lock:
+                    started_requests.append(plan.request_id)
+                if plan.request_id == unrelated.request_id:
+                    unrelated_finished.set()
+                    return True
+                return (
+                    connector._restore_page_base_for_request(
+                        plan.request_id,
+                        evidence,
+                        read_base,
+                    )
+                    == b"authenticated-base"
+                )
+
+            connector._load_one = mock.Mock(side_effect=load_one)
+            connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=plans))
+            connector.start_load_kv(None)
+            self.assertTrue(base_started.wait(timeout=5))
+            connector.bind_connector_metadata(
+                SparkCacheConnectorMetadata(plans=[unrelated])
+            )
+            connector.start_load_kv(None)
+
+            self.assertTrue(unrelated_finished.wait(timeout=5))
+            with started_lock:
+                self.assertEqual(started_requests, ["shared-0", "unrelated"])
+            release_base.set()
+            self.assertEqual(
+                _drain(connector),
+                {*(plan.request_id for plan in plans), "unrelated"},
+            )
+            self.assertEqual(connector.counters["page_base_physical_reads"], 1)
+            connector.shutdown()
+
+    def test_cancelled_designated_reader_promotes_one_registered_follower(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector, evidence, plans = self._page_base_queue_fixture(
+                Path(directory)
+            )
+            leader_entered = threading.Event()
+            allow_leader_resolve = threading.Event()
+            base_read = threading.Event()
+            reads = 0
+
+            def read_base() -> bytes:
+                nonlocal reads
+                reads += 1
+                base_read.set()
+                return b"authenticated-base"
+
+            def load_one(plan: _ReqPlan, **_kwargs: object) -> bool:
+                if plan.request_id == "shared-0":
+                    leader_entered.set()
+                    self.assertTrue(allow_leader_resolve.wait(timeout=5))
+                return (
+                    connector._restore_page_base_for_request(
+                        plan.request_id,
+                        evidence,
+                        read_base,
+                    )
+                    == b"authenticated-base"
+                )
+
+            connector._load_one = mock.Mock(side_effect=load_one)
+            connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=plans))
+            connector.start_load_kv(None)
+            self.assertTrue(leader_entered.wait(timeout=5))
+            connector.request_finished(
+                types.SimpleNamespace(request_id="shared-0"),
+                [],
+            )
+            allow_leader_resolve.set()
+            self.assertTrue(base_read.wait(timeout=5))
+            self.assertEqual(_drain(connector), set(plan.request_id for plan in plans))
+
+            self.assertEqual(reads, 1)
+            self.assertEqual(connector.counters["load_failed"], 1)
+            self.assertEqual(connector.counters["load_verified"], 15)
+            self.assertEqual(connector.counters["page_base_flight_participants"], 16)
+            self.assertEqual(connector.counters["page_base_physical_reads"], 1)
+            self.assertEqual(connector.counters["page_base_reads_avoided"], 14)
+            self.assertEqual(connector._page_base_reads.snapshot().active_flights, 0)
+            connector.shutdown()
+
+    def test_two_completed_base_flights_keep_summary_counters_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector, evidence, _plans = self._page_base_queue_fixture(
+                Path(directory)
+            )
+            evidences = (
+                evidence,
+                dataclasses.replace(
+                    evidence,
+                    base_context_digest="c" * 64,
+                    base_root_sha256="d" * 64,
+                ),
+            )
+
+            def complete(index: int) -> None:
+                selected = evidences[index]
+                key = connector._page_base_flight_key(selected)
+                request_ids = (f"leader-{index}", f"follower-{index}")
+                connector._page_base_reads.register_cohort(key, request_ids)
+                self.assertEqual(
+                    connector._restore_page_base_for_request(
+                        request_ids[0],
+                        selected,
+                        lambda: b"authenticated-base",
+                    ),
+                    b"authenticated-base",
+                )
+                self.assertEqual(
+                    connector._restore_page_base_for_request(
+                        request_ids[1],
+                        selected,
+                        lambda: b"wrong",
+                    ),
+                    b"authenticated-base",
+                )
+                connector._emit_page_base_flight_summaries()
+
+            with (
+                mock.patch.object(connector_module.logger, "info") as log_info,
+                ThreadPoolExecutor(max_workers=2) as executor,
+            ):
+                tuple(executor.map(complete, range(2)))
+
+            self.assertEqual(connector.counters["page_base_flights_completed"], 2)
+            self.assertEqual(connector.counters["page_base_flight_participants"], 4)
+            self.assertEqual(connector.counters["page_base_physical_reads"], 2)
+            self.assertEqual(connector.counters["page_base_reads_avoided"], 2)
+            summaries = [
+                call
+                for call in log_info.call_args_list
+                if call.args
+                and call.args[0] == "spark-context-cache-page-base-flight:%s"
+            ]
+            self.assertEqual(len(summaries), 2)
+
+    def test_shutdown_releases_pending_c16_base_cohort(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector, evidence, plans = self._page_base_queue_fixture(
+                Path(directory)
+            )
+            read_started = threading.Event()
+            release_read = threading.Event()
+
+            def read_base() -> bytes:
+                read_started.set()
+                self.assertTrue(release_read.wait(timeout=5))
+                return b"authenticated-base"
+
+            connector._load_one = mock.Mock(
+                side_effect=lambda plan, **_kwargs: (
+                    connector._restore_page_base_for_request(
+                        plan.request_id,
+                        evidence,
+                        read_base,
+                    )
+                    == b"authenticated-base"
+                )
+            )
+            connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=plans))
+            connector.start_load_kv(None)
+            self.assertTrue(read_started.wait(timeout=5))
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                shutdown = executor.submit(connector.shutdown)
+                deadline = time.monotonic() + 5
+                while (
+                    connector._page_base_reads.snapshot().active_flights
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.001)
+                self.assertEqual(
+                    connector._page_base_reads.snapshot().active_flights,
+                    0,
+                )
+                self.assertEqual(
+                    connector._page_base_reads.snapshot().retained_bytes,
+                    0,
+                )
+                release_read.set()
+                shutdown.result(timeout=5)
+
+            self.assertTrue(connector.wait_for_pending_loads(timeout=1))
+            self.assertEqual(connector._deferred_page_base_loads, {})
+            self.assertEqual(connector._page_base_plan_keys, {})
+            self.assertEqual(connector.counters["page_base_flights_cancelled"], 1)
+            self.assertEqual(connector.counters["page_base_flight_participants"], 16)
+
+    def test_page_base_cohort_precedes_followers_with_two_load_lanes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                extra_config={"spark_cache_load_threads": "2"},
+            )
+            connector._storage_mode = "block_pages_v1"
+            connector._page_layout = types.SimpleNamespace(digest="layout")
+            connector._select_group_blocks_for_span = mock.Mock(
+                return_value=((1,), (2,))
+            )
+            evidence = PageBaseReadEvidence(
+                identity_storage_key="identity",
+                base_context_digest="a" * 64,
+                base_root_sha256="b" * 64,
+                base_root_kind="page_snapshot",
+                layout_sha256="layout",
+                base_block_counts=(1, 1),
+                base_boundary_tokens=512,
+                base_encoded_bytes=1024,
+            )
+            connector._store.page_delta_base_read_evidence = mock.Mock(
+                return_value=evidence
+            )
+            shared = [
+                _ReqPlan(
+                    f"shared-{index}",
+                    f"{index + 1:064x}",
+                    1024,
+                    (1,),
+                    False,
+                    block_ids_by_group=((1,), (2,)),
+                )
+                for index in range(16)
+            ]
+            unrelated = _ReqPlan(
+                "unrelated",
+                "f" * 64,
+                1024,
+                (3,),
+                False,
+                block_ids_by_group=((3,), (4,)),
+            )
+
+            def lookup(_identity, digest, **_kwargs):
+                if digest == unrelated.digest:
+                    return LookupResult(False, "miss"), False
+                return LookupResult(True, "hit", root_kind="page_delta"), False
+
+            connector._lookup_reusable = mock.Mock(side_effect=lookup)
+
+            runnable, deferred, page_base_keys = connector._prepare_page_base_read_cohorts(
+                [*shared, unrelated]
+            )
+
+            self.assertEqual(runnable[0].request_id, "shared-0")
+            self.assertEqual(runnable[1].request_id, "unrelated")
+            self.assertEqual(
+                [plan.request_id for plan in deferred],
+                [plan.request_id for plan in shared[1:]],
+            )
+            self.assertEqual(set(page_base_keys), {plan.request_id for plan in shared})
+            self.assertEqual(connector._load_thread_limit, 2)
+            self.assertEqual(connector._page_base_reads.snapshot().registered_members, 16)
+
+    def test_singleton_scheduler_batch_joins_reading_page_base(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(Path(directory), 0)
+            connector._storage_mode = "block_pages_v1"
+            connector._page_layout = types.SimpleNamespace(digest="layout")
+            connector._select_group_blocks_for_span = mock.Mock(
+                return_value=((1,), (2,))
+            )
+            evidence = PageBaseReadEvidence(
+                identity_storage_key="identity",
+                base_context_digest="a" * 64,
+                base_root_sha256="b" * 64,
+                base_root_kind="page_snapshot",
+                layout_sha256="layout",
+                base_block_counts=(1, 1),
+                base_boundary_tokens=512,
+                base_encoded_bytes=4,
+            )
+            connector._store.page_delta_base_read_evidence = mock.Mock(
+                return_value=evidence
+            )
+            connector._lookup_reusable = mock.Mock(
+                return_value=(
+                    LookupResult(True, "hit", root_kind="page_delta"),
+                    False,
+                )
+            )
+            first = [
+                _ReqPlan(
+                    f"first-{index}",
+                    f"{index + 1:064x}",
+                    1024,
+                    (1,),
+                    False,
+                    block_ids_by_group=((1,), (2,)),
+                )
+                for index in range(8)
+            ]
+            connector._prepare_page_base_read_cohorts(first)
+            started = threading.Event()
+            release = threading.Event()
+
+            def read_base() -> bytes:
+                started.set()
+                self.assertTrue(release.wait(timeout=5))
+                return b"base"
+
+            key = connector._page_base_flight_key(evidence)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                leader = executor.submit(
+                    connector._restore_page_base_for_request,
+                    "first-0",
+                    evidence,
+                    read_base,
+                )
+                self.assertTrue(started.wait(timeout=5))
+                singleton = _ReqPlan(
+                    "singleton",
+                    "e" * 64,
+                    1024,
+                    (1,),
+                    False,
+                    block_ids_by_group=((1,), (2,)),
+                )
+                runnable, deferred, keys = connector._prepare_page_base_read_cohorts(
+                    [singleton]
+                )
+                self.assertEqual(runnable, [])
+                self.assertEqual(deferred, [singleton])
+                self.assertEqual(set(keys), {"singleton"})
+                self.assertEqual(
+                    connector._page_base_reads.registered_key("singleton"),
+                    key,
+                )
+                release.set()
+                self.assertEqual(leader.result(timeout=5), b"base")
+
+            for request_id in (
+                *(plan.request_id for plan in first[1:]),
+                "singleton",
+            ):
+                self.assertEqual(
+                    connector._restore_page_base_for_request(
+                        request_id,
+                        evidence,
+                        lambda: b"wrong",
+                    ),
+                    b"base",
+                )
+            with mock.patch.object(connector_module.logger, "info") as log_info:
+                connector._emit_page_base_flight_summaries()
+            self.assertEqual(connector.counters["page_base_physical_reads"], 1)
+            self.assertEqual(connector.counters["page_base_reads_avoided"], 8)
+            summaries = [
+                call.args[1]
+                for call in log_info.call_args_list
+                if call.args
+                and call.args[0] == "spark-context-cache-page-base-flight:%s"
+            ]
+            self.assertEqual(len(summaries), 1)
+            self.assertEqual(json.loads(summaries[0])["participants"], 9)
 
     @staticmethod
     def _publish_divergent_row_extensions(root: Path):

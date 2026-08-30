@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import json
 import math
 
 import queue
@@ -87,6 +88,11 @@ from sparkcache.spark_context_cache_hybrid import (
     split_snapshot,
 )
 from sparkcache.spark_context_cache_restore_timing import RestoreTiming
+from sparkcache.page_base_read_flights import (
+    PageBaseReadEvidence,
+    PageBaseReadFlightKey,
+    PageBaseReadFlights,
+)
 from sparkcache.spark_context_cache_store import (
     CacheIdentity,
     ContextChunk,
@@ -118,6 +124,10 @@ _MAX_RESTORE_FLIGHT_FOLLOWERS = 16
 _MAX_SHARED_PREFIX_LEASES = 2
 _MAX_SHAREABLE_PREFIXES_PER_FLIGHT = 64
 _SHARED_PREFIX_LEASE_TTL_SECONDS = 15.0
+_MAX_PAGE_BASE_READ_FLIGHTS = 2
+_MAX_PAGE_BASE_READ_MEMBERS = 16
+_MAX_PAGE_BASE_BYTES_PER_FLIGHT = 1024**3
+_MAX_PAGE_BASE_BYTES_TOTAL = 2 * 1024**3
 
 # The runtime is deliberately supplied by the embedding process instead of
 # importing or constructing the optional streaming-snapshot runtime here.
@@ -728,6 +738,14 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._native_execute_hybrid_restore: Any = None
         self._native_execute_hybrid_placement: Any = None
         self._native_required_record_mask = 0
+        self._page_base_reads = PageBaseReadFlights(
+            max_flights=_MAX_PAGE_BASE_READ_FLIGHTS,
+            max_members=_MAX_PAGE_BASE_READ_MEMBERS,
+            max_bytes_per_flight=_MAX_PAGE_BASE_BYTES_PER_FLIGHT,
+            max_bytes_total=_MAX_PAGE_BASE_BYTES_TOTAL,
+        )
+        self._page_base_plan_keys: dict[str, PageBaseReadFlightKey] = {}
+        self._deferred_page_base_loads: dict[str, _QueuedLoad] = {}
         # Scheduler state.
         self._need_load: dict[str, tuple[str, int]] = {}
         # Bound on concurrently promised async restores. Enforced at
@@ -815,6 +833,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             "restore_segment_flights_joined": 0,
             "restore_segment_roots_verified": 0,
             "restore_segment_roots_rejected": 0,
+            "page_base_flights_completed": 0,
+            "page_base_flights_recomputed": 0,
+            "page_base_flights_cancelled": 0,
+            "page_base_flight_participants": 0,
+            "page_base_physical_reads": 0,
+            "page_base_reads_avoided": 0,
             "shared_prefix_leases_published": 0,
             "shared_prefix_leases_attached": 0,
             "shared_prefix_leases_expired": 0,
@@ -3121,7 +3145,16 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 # every later filesystem/logging action owned by this work
                 # item. Tests and shutdown can therefore remove the cache root
                 # only after no loader can recreate or reopen its metadata.
+                page_base_key = self._page_base_plan_keys.get(plan.request_id)
+                self._page_base_reads.finish(plan.request_id)
+                if page_base_key is not None:
+                    self._release_page_base_deferred(
+                        page_base_key,
+                        promote_registered=True,
+                    )
+                self._emit_page_base_flight_summaries()
                 with self._load_cv:
+                    self._page_base_plan_keys.pop(plan.request_id, None)
                     self._inflight_load_reqs.discard(plan.request_id)
                     self._load_cv.notify_all()
 
@@ -3142,21 +3175,193 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         load_plans = [plan for plan in metadata.plans if not plan.is_store]
         if not load_plans:
             return
+        runnable, deferred, page_base_keys = self._prepare_page_base_read_cohorts(
+            load_plans
+        )
         self._ensure_load_threads()
+        queued = {
+            plan.request_id: _QueuedLoad(
+                plan=plan,
+                timing=RestoreTiming(
+                    request_id=plan.request_id,
+                    digest=plan.digest,
+                    span_tokens=plan.span_tokens,
+                    storage_mode=self._storage_mode,
+                    enqueued_ns=time.perf_counter_ns(),
+                ),
+            )
+            for plan in (*runnable, *deferred)
+        }
         with self._load_lock:
-            self._inflight_load_reqs.update(plan.request_id for plan in load_plans)
+            self._inflight_load_reqs.update(queued)
+            self._page_base_plan_keys.update(page_base_keys)
+            self._deferred_page_base_loads.update(
+                (plan.request_id, queued[plan.request_id]) for plan in deferred
+            )
+        for plan in runnable:
+            self._load_queue.put(queued[plan.request_id])
+        for key in set(page_base_keys.values()):
+            self._release_page_base_deferred(
+                key,
+                promote_registered=False,
+            )
+
+    def _page_base_flight_key(
+        self,
+        evidence: PageBaseReadEvidence,
+    ) -> PageBaseReadFlightKey:
+        return PageBaseReadFlightKey(
+            worker_generation=self._stats_generation,
+            storage_mode=self._storage_mode,
+            evidence=evidence,
+        )
+
+    def _prepare_page_base_read_cohorts(
+        self,
+        load_plans: Sequence[_ReqPlan],
+    ) -> tuple[
+        list[_ReqPlan],
+        list[_ReqPlan],
+        dict[str, PageBaseReadFlightKey],
+    ]:
+        """Pre-register bases and defer followers until shared bytes are ready."""
+
+        if (
+            self._storage_mode != "block_pages_v1"
+            or self._page_layout is None
+        ):
+            return list(load_plans), [], {}
+        identity = self._identity(self._worker_rank())
+        grouped: dict[PageBaseReadFlightKey, list[_ReqPlan]] = {}
         for plan in load_plans:
-            self._load_queue.put(
-                _QueuedLoad(
-                    plan=plan,
-                    timing=RestoreTiming(
-                        request_id=plan.request_id,
-                        digest=plan.digest,
-                        span_tokens=plan.span_tokens,
-                        storage_mode=self._storage_mode,
-                        enqueued_ns=time.perf_counter_ns(),
-                    ),
+            try:
+                lookup, is_alias = self._lookup_reusable(
+                    identity,
+                    plan.digest,
+                    verify_chunks=False,
+                    verify_chunk_metadata=True,
                 )
+                if is_alias or lookup.root_kind != "page_delta":
+                    continue
+                groups = self._select_group_blocks_for_span(
+                    plan.group_block_ids,
+                    plan.span_tokens,
+                )
+                evidence = self._store.page_delta_base_read_evidence(
+                    lookup,
+                    layout=self._page_layout,
+                    result_block_counts=tuple(len(group) for group in groups),
+                    result_boundary_tokens=plan.span_tokens,
+                )
+                key = self._page_base_flight_key(evidence)
+            except (KeyError, OSError, RuntimeError, ValueError):
+                continue
+            grouped.setdefault(key, []).append(plan)
+
+        registered: set[str] = set()
+        priority: list[_ReqPlan] = []
+        deferred: list[_ReqPlan] = []
+        page_base_keys: dict[str, PageBaseReadFlightKey] = {}
+        by_request = {plan.request_id: plan for plan in load_plans}
+        for key, plans in grouped.items():
+            registration = self._page_base_reads.register_cohort(
+                key,
+                (plan.request_id for plan in plans),
+            )
+            member_ids = set(registration.member_ids)
+            registered.update(member_ids)
+            page_base_keys.update((request_id, key) for request_id in member_ids)
+            leader_id = registration.leader_request_id
+            if registration.flight_state in {"ready", "error"}:
+                priority.extend(
+                    plan for plan in plans if plan.request_id in member_ids
+                )
+                continue
+            if registration.flight_state == "registered" and leader_id in member_ids:
+                priority.append(by_request[leader_id])
+                member_ids.remove(leader_id)
+            deferred.extend(
+                plan for plan in plans if plan.request_id in member_ids
+            )
+        independent = [
+            plan for plan in load_plans if plan.request_id not in registered
+        ]
+        return [*priority, *independent], deferred, page_base_keys
+
+    def _release_page_base_deferred(
+        self,
+        key: PageBaseReadFlightKey,
+        *,
+        promote_registered: bool,
+    ) -> None:
+        """Queue ready followers or one replacement reader without occupying a lane."""
+
+        state = self._page_base_reads.flight_state(key)
+        with self._load_lock:
+            matching = [
+                request_id
+                for request_id in self._deferred_page_base_loads
+                if self._page_base_plan_keys.get(request_id) == key
+            ]
+            if state in {"ready", "error"}:
+                selected = matching
+            elif state == "registered" and promote_registered and matching:
+                selected = matching[:1]
+            else:
+                selected = []
+            queued = [
+                self._deferred_page_base_loads.pop(request_id)
+                for request_id in selected
+            ]
+        for item in queued:
+            self._load_queue.put(item)
+
+    def _release_all_page_base_deferred(self) -> None:
+        """Queue shutdown-cancelled followers so loader ownership can drain."""
+
+        with self._load_lock:
+            queued = list(self._deferred_page_base_loads.values())
+            self._deferred_page_base_loads.clear()
+        for item in queued:
+            self._load_queue.put(item)
+
+    def _restore_page_base_for_request(
+        self,
+        request_id: str,
+        evidence: PageBaseReadEvidence,
+        reader: Callable[[], bytes | bytearray],
+    ) -> bytes | bytearray:
+        key = self._page_base_flight_key(evidence)
+        try:
+            return self._page_base_reads.resolve(request_id, key, reader)
+        finally:
+            self._release_page_base_deferred(
+                key,
+                promote_registered=False,
+            )
+
+    def _emit_page_base_flight_summaries(self) -> None:
+        for summary in self._page_base_reads.take_summaries():
+            outcome = str(summary["outcome"])
+            counter = {
+                "verified": "page_base_flights_completed",
+                "recompute": "page_base_flights_recomputed",
+                "cancelled": "page_base_flights_cancelled",
+            }[outcome]
+            with self._load_lock:
+                self.counters[counter] += 1
+                self.counters["page_base_flight_participants"] += int(
+                    summary["participants"]
+                )
+                self.counters["page_base_physical_reads"] += int(
+                    summary["physical_base_reads"]
+                )
+                self.counters["page_base_reads_avoided"] += int(
+                    summary["avoided_base_reads"]
+                )
+            logger.info(
+                "spark-context-cache-page-base-flight:%s",
+                json.dumps(summary, sort_keys=True, separators=(",", ":")),
             )
 
     def _verify_shared_segment_roots(
@@ -3511,6 +3716,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 layout=layout,
                 result_block_counts=tuple(len(group) for group in groups),
                 result_boundary_tokens=plan.span_tokens,
+                base_reader=lambda evidence, reader: (
+                    self._restore_page_base_for_request(
+                        plan.request_id,
+                        evidence,
+                        reader,
+                    )
+                ),
             )
             restored_chunk_count = chunk_count(plan.span_tokens, self._chunk_tokens)
         else:
@@ -3660,6 +3872,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         # state is dropped here. This is what keeps _need_load, _admitted,
         # and _store_progress bounded without evicting live entries.
         request_id = request.request_id
+        self._page_base_reads.cancel(request_id)
+        self._emit_page_base_flight_summaries()
         follower_digest = self._restore_flight_followers.get(request_id)
         if follower_digest is not None:
             self._remove_restore_follower(request_id)
@@ -3748,6 +3962,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             return self._load_cv.wait_for(lambda: not self._inflight_load_reqs, timeout)
 
     def shutdown(self):
+        self._page_base_reads.close()
+        self._release_all_page_base_deferred()
+        self._emit_page_base_flight_summaries()
         runtime = self._streaming_runtime
         if runtime is not None:
             # Drain/cancel snapshot leases before any native cache or staging
