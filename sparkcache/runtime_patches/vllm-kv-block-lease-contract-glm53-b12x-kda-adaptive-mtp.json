@@ -5,12 +5,23 @@
     {
       "path": "vllm/distributed/kv_transfer/kv_connector/v1/base.py",
       "accepted_sha256": {
-        "recurrent_boundary_contract": "bc1965431087676876f58360cd9cc07ab6c06febe6d747695f10b051fd85c412"
+        "recurrent_boundary_contract": "7460e0638c0c81808dbdbbad7114db2e840e531e9ce83360c55b9171fcc872b1"
       },
       "required_symbols": [
         "KVConnectorBase_V1.handle_preemptions",
         "KVConnectorBase_V1.request_finished",
-        "KVConnectorBase_V1.get_finished"
+        "KVConnectorBase_V1.get_finished",
+        "KVConnectorBase_V1.get_recurrent_publication_boundaries"
+      ]
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py",
+      "accepted_sha256": {
+        "recurrent_boundary_contract": "8741b86b0f3e91af06d01a52240cdc988e3073bf049f72b506f56d6ceebb1ac0"
+      },
+      "required_symbols": [
+        "MultiConnector.supports_recurrent_boundary_blocks",
+        "MultiConnector.get_recurrent_publication_boundaries"
       ]
     },
     {
@@ -26,7 +37,7 @@
     {
     "path": "vllm/v1/core/sched/scheduler.py",
     "accepted_sha256": {
-      "recurrent_boundary_contract": "260f36ce8fabf70c193b20009ea465eea7b1b6c8e9fb72f2307a01ba8fcf7b2a"
+      "recurrent_boundary_contract": "74afcccd11b0ad48cab3925c623cb310effbf425825bc278bed03163848c528f"
       },
       "required_symbols": [
         "Scheduler.schedule",
@@ -35,13 +46,15 @@
         "Scheduler._finalize_shared_prefix_leases",
         "Scheduler._update_from_kv_xfer_finished",
         "Scheduler._update_requests_with_invalid_blocks",
-        "Scheduler._free_blocks"
+        "Scheduler._free_blocks",
+        "Scheduler._recurrent_publication_boundaries",
+        "Scheduler._recurrent_publication_boundary_at"
       ]
     },
     {
     "path": "vllm/v1/core/kv_cache_manager.py",
     "accepted_sha256": {
-      "recurrent_boundary_contract": "c5b83d382c96b2bf8c466a993ed77123a14a971e2661797128533319388d0b5f"
+      "recurrent_boundary_contract": "2c646969b750f6cb4e17fe8a6bf12993d01eefbfbe74e5f8c755f7e0d929faf2"
       },
       "required_symbols": [
         "KVCacheManager.get_block_ids",
@@ -52,7 +65,8 @@
         "KVCacheManager.discard_shared_prefix_lease",
         "KVCacheManager.evict_shared_prefix_leases_until_free",
       "KVCacheManager.take_kv_cache_block_copies",
-      "KVCacheManager.take_recurrent_boundary_blocks"
+      "KVCacheManager.take_recurrent_boundary_blocks",
+      "KVCacheManager.allocate_slots"
       ]
     },
     {
@@ -100,7 +114,7 @@
     {
     "path": "vllm/v1/core/single_type_kv_cache_manager.py",
     "accepted_sha256": {
-      "recurrent_boundary_contract": "f67a1850a7e0288baaa6d42e7ec55b22b09c156720767e23acaabedcae333c8a"
+      "recurrent_boundary_contract": "abbedbd7b9165bbb005c9ba7ceb4367ee1987ac47c632a629dd17ed08ae1db0c"
       },
       "required_symbols": [
         "SingleTypeKVCacheManager.add_local_computed_blocks",

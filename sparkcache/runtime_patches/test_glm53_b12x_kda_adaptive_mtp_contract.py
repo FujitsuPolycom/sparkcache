@@ -21,6 +21,8 @@ VLLM_COMMIT = "0b67266a0f37d6146a8403fb8482403c62f412d5"
 SOURCE_ROLE = "source_built_glm53_b12x_kda_adaptive_mtp"
 RECURRENT_BOUNDARY_ROLE = "recurrent_boundary_contract"
 RECURRENT_BOUNDARY_FILES = {
+    "vllm/distributed/kv_transfer/kv_connector/v1/base.py",
+    "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py",
     "vllm/v1/core/kv_cache_manager.py",
     "vllm/v1/core/sched/output.py",
     "vllm/v1/core/sched/scheduler.py",
@@ -67,6 +69,7 @@ def test_glm53_b12x_kda_adaptive_mtp_contract_attests_the_complete_sparkcache_vl
     assert contract["vllm_commit"] == VLLM_COMMIT
     assert {record["path"] for record in contract["files"]} == {
         "vllm/distributed/kv_transfer/kv_connector/v1/base.py",
+        "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py",
         "vllm/distributed/kv_transfer/kv_connector/utils.py",
         "vllm/v1/core/sched/scheduler.py",
         "vllm/v1/core/kv_cache_manager.py",

@@ -1163,6 +1163,15 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
             )
 
             self.assertTrue(scheduler.supports_recurrent_boundary_blocks)
+            self.assertEqual(scheduler.recurrent_boundary_granularity, 256)
+            self.assertEqual(
+                scheduler.get_recurrent_publication_boundaries(
+                    types.SimpleNamespace(
+                        prompt_token_ids=list(range(self.NONALIGNED_PROMPT_TOKENS))
+                    )
+                ),
+                (self.NONALIGNED_BOUNDARY,),
+            )
             metadata = scheduler.build_connector_meta(output)
 
             self.assertEqual(len(metadata.plans), 1)
@@ -1250,6 +1259,7 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
                 connector.counters["recurrent_boundary_metadata_rejected"],
                 0,
             )
+
             pending = connector.build_connector_meta(
                 self._cached_scheduler_output(
                     num_computed_tokens=self.NONALIGNED_PROMPT_TOKENS,
@@ -1283,6 +1293,31 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
             self.assertEqual(
                 connector.counters["recurrent_boundary_metadata_rejected"],
                 0,
+            )
+
+    def test_publication_boundary_proposal_obeys_store_policy(self) -> None:
+        request = types.SimpleNamespace(
+            prompt_token_ids=list(range(self.NONALIGNED_PROMPT_TOKENS))
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            disabled = _make_connector(
+                Path(directory),
+                0,
+                block_size=256,
+                role=KVConnectorRole.SCHEDULER,
+                override_worker_rank=False,
+                tp=1,
+                dcp=1,
+                kv_cache_config=self._config(),
+                extra_config={
+                    "spark_cache_model_profile": "glm53-flash-hybrid",
+                    "spark_cache_store": "0",
+                },
+            )
+
+            self.assertEqual(
+                disabled.get_recurrent_publication_boundaries(request),
+                (),
             )
 
     def test_conflicting_mapping_poisons_latched_publication(self) -> None:

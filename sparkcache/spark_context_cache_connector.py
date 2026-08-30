@@ -543,6 +543,30 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     # every referenced page before request/preemption cleanup may release it.
     supports_recurrent_boundary_blocks = True
 
+    @property
+    def recurrent_boundary_granularity(self) -> int:
+        """Token boundary used for connector-owned recurrent publication."""
+
+        return self._chunk_tokens
+
+    def get_recurrent_publication_boundaries(
+        self, request: "Request"
+    ) -> tuple[int, ...]:
+        """Propose the exact eligible store boundary without mutating state."""
+
+        if (
+            not self._cache_available
+            or not self._store_enabled
+            or self._streaming_snapshots_enabled
+            or not self._recurrent_group_indexes
+        ):
+            return ()
+        prompt_token_ids = getattr(request, "prompt_token_ids", None) or ()
+        span = self._aligned_span(len(prompt_token_ids))
+        if not self._min_span <= span <= self._max_span:
+            return ()
+        return (span,)
+
     configure_streaming_snapshot_runtime = staticmethod(
         configure_streaming_snapshot_runtime
     )

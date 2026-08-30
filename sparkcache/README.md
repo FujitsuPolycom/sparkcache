@@ -229,6 +229,9 @@ when placement completes and intentionally excludes that bookkeeping.
   boundary, vLLM may retain the replay-boundary page outside the advancing
   request block table. Its `SchedulerOutput.recurrent_boundary_blocks` hand-off
   names the pinned physical block by request, group, and token boundary.
+  `recurrent_boundary_granularity` advertises SparkCache's 256-token publication
+  boundary to the exact vLLM scheduler without changing vLLM's native hash
+  geometry.
   SparkCache defers a new recurrent request until a later cached scheduler step,
   when the preceding forward's hand-off can be observed. It latches one matching
   entry for every recurrent group, including a partial-tail CoW target when the
