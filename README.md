@@ -356,22 +356,18 @@ mapped arena before submitting its copy spans. A flat 813,068,464-byte
 snapshot therefore requires 13 payload objects rather than 512 logical-chunk
 files; the manifest remains the atomic visibility point.
 
-SparkCache CUDA restore authenticates the first flat object before parsing the
-snapshot header. It then reads and authenticates at most four later objects
-concurrently into request-private host buffers before waiting for a placement
-arena. A host batch retains at most 256 MiB beyond the two placement-owned
-arenas. This lets storage reads for one bounded batch overlap placement of the
-preceding batch. Authenticated objects are copied into mapped arenas and
-submitted to CUDA in manifest order only after every read in that bounded batch
-succeeds. The root's `snapshot_sha256` field remains part of the authenticated
-version 2 schema, but direct restore does not recompute it over the complete
-byte stream after every object's SHA-256 has already matched its ordered,
-contiguous descriptor. The
-`spark_cache_cuda_restore_io_workers` setting may reduce this path to one read
-worker; values above four remain capped at four. Restore diagnostics report
-foreground read-and-hash time, arena wait, host copy, CUDA submission-call
-time, and final completion time. This scheduling does not alter cache identity,
-persisted schemas, or fallback behavior.
+Bounded flat-object prefetch is **research-only**. The implementation
+authenticates up to four version 2 objects concurrently in request-private host
+buffers and then copies them into mapped placement arenas in manifest order.
+Its GPU-free integrity, ordering, concurrency, and memory-bound tests pass.
+
+The exact GLM-5.3 TP4/DCP1 serving evaluation for SparkCache
+`eabe7fd0c878db7384ef87fe80a1e96b9bedcf67` structurally verified all four
+rank-local 131,072-token snapshots but returned `spark` instead of the expected
+`red`. An equivalent recomputation returned `red`. Consequently, the
+four-reader implementation is not a deployable restore path and does not
+replace the single-reader qualification. See the
+[immutable research receipt](evidence/glm53-flash-dflash7-bf16/flat-v2-four-reader-semantic-rejection-eabe7fd.json).
 
 Flat macro publication and its SparkCache CUDA restore path are
 **implemented and GPU-free tested, not live qualified**. The object-count
