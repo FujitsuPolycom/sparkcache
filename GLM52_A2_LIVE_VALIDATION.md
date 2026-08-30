@@ -97,4 +97,4 @@ diagnostic.
 This record qualifies only the exact `0.1.0a2` wheel and GLM TP4/DCP4 lane.
 It does not qualify the `0.1.0a2` DeepSeek TP2/DCP1 or TP4/DCP1 profiles, a
 different runtime image, a different checkpoint, another scheduler budget,
-streaming snapshots, or native restore.
+streaming snapshots, or SparkCache CUDA restore.

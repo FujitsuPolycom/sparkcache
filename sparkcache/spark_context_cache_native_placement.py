@@ -1,4 +1,4 @@
-"""Opt-in model-serving seam for the implemented native context-cache placer.
+"""Opt-in model-serving seam for SparkCache CUDA placement.
 
 This module does not install itself into the vLLM connector.  It layers
 artifact attestation, registered-tensor validation, and parked-request
@@ -33,14 +33,14 @@ _U64_MAX = (1 << 64) - 1
 
 
 class NativePlacementContractError(RuntimeError):
-    """The Python/native integration contract is not safe to execute."""
+    """The Python/CUDA integration contract is not safe to execute."""
 
 
 class NativePlacementCallError(RuntimeError):
-    """An attested native function returned a non-success status."""
+    """An attested SparkCache CUDA function returned a non-success status."""
 
     def __init__(self, action: str, status: int, detail: str = "") -> None:
-        message = f"native cache placement failed to {action}: status={status}"
+        message = f"SparkCache CUDA placement failed to {action}: status={status}"
         if detail:
             message += f": {detail}"
         super().__init__(message)
@@ -77,7 +77,7 @@ class RestoreState(Enum):
 
 
 # Public aliases keep the adapter surface explicit without defining a second
-# ctypes ABI that could drift from the native placement contract.
+# ctypes ABI that could drift from the SparkCache CUDA placement contract.
 SparkCacheDestinationDescriptor = native.DestinationDescriptor
 SparkCacheChunkDescriptor = native.ChunkDescriptor
 SparkCachePlacementStats = native.PlacementStats
@@ -353,23 +353,23 @@ class NativePlacementLibrary:
             resolved = Path(artifact_path).resolve(strict=True)
         except (OSError, RuntimeError) as error:
             raise NativePlacementContractError(
-                f"native placement artifact is unavailable: {artifact_path}"
+                f"SparkCache CUDA placement artifact is unavailable: {artifact_path}"
             ) from error
         if not resolved.is_file():
             raise NativePlacementContractError(
-                f"native placement artifact is not a regular file: {resolved}"
+                f"SparkCache CUDA placement artifact is not a regular file: {resolved}"
             )
         actual_sha256 = hashlib.sha256(resolved.read_bytes()).hexdigest()
         if actual_sha256 != expected_sha256:
             raise NativePlacementContractError(
-                "native placement artifact SHA-256 mismatch:"
+                "SparkCache CUDA placement artifact SHA-256 mismatch:"
                 f" expected={expected_sha256}, actual={actual_sha256}"
             )
         try:
             cdll, abi_info = binding_loader(str(resolved))
         except (OSError, native.NativePlacementError) as error:
             raise NativePlacementContractError(
-                f"canonical native binding rejected attested artifact: {error}"
+                f"SparkCache CUDA binding rejected attested artifact: {error}"
             ) from error
         if abi_info.abi_version != native.ABI_VERSION:
             raise NativePlacementContractError(
@@ -399,7 +399,7 @@ class NativePlacementLibrary:
 
 
 class NativePlacementAdapter:
-    """One configured native placer with one serialized restore transaction."""
+    """One CUDA placer with one serialized restore transaction."""
 
     def __init__(
         self,
@@ -442,7 +442,7 @@ class NativePlacementAdapter:
             mode = ArenaMode(arena_mode)
         except (TypeError, ValueError) as error:
             raise NativePlacementContractError(
-                "unsupported native arena mode"
+                "unsupported SparkCache CUDA placement arena mode"
             ) from error
         arena_bytes = _u64(arena_bytes, "arena_bytes", positive=True)
         max_destinations = _u32(max_destinations, "max_destinations", positive=True)
@@ -479,13 +479,13 @@ class NativePlacementAdapter:
         library.check(result, "create placement")
         if not handle.value:
             raise NativePlacementContractError(
-                "native placement create succeeded with a null handle"
+                "SparkCache CUDA placement creation returned a null handle"
             )
         return cls(library, handle, max_destinations, max_slots, mode)
 
     def _ensure_open(self) -> None:
         if self._closed or not self._handle.value:
-            raise NativePlacementContractError("native placement is closed")
+            raise NativePlacementContractError("SparkCache CUDA placement is closed")
 
     def _call(self, action: str, function: Any, *arguments: Any) -> None:
         self._ensure_open()
@@ -563,7 +563,8 @@ class NativePlacementAdapter:
             )
         if self._active is not None:
             raise NativePlacementContractError(
-                f"native restore already active for {self._active.request_id}"
+                "SparkCache CUDA restore is already active for"
+                f" {self._active.request_id}"
             )
         if not isinstance(request_id, str) or not request_id:
             raise NativePlacementContractError("request_id must be a nonempty string")
@@ -603,7 +604,8 @@ class NativePlacementAdapter:
             )
         if self._active is not None:
             raise NativePlacementContractError(
-                f"native restore already active for {self._active.request_id}"
+                "SparkCache CUDA restore is already active for"
+                f" {self._active.request_id}"
             )
         if not isinstance(request_id, str) or not request_id:
             raise NativePlacementContractError("request_id must be a nonempty string")
@@ -618,7 +620,9 @@ class NativePlacementAdapter:
             groups.append(native.PageGroupDescriptor(len(flattened), len(slots), 0, 0))
             flattened.extend(slots)
         if not groups or len(flattened) > self._max_slots:
-            raise NativePlacementContractError("page slot vector exceeds configured maximum")
+            raise NativePlacementContractError(
+                "page slot vector exceeds configured maximum"
+            )
         snapshot_bytes = _u64(snapshot_bytes, "snapshot_bytes", positive=True)
         native_groups = (native.PageGroupDescriptor * len(groups))(*groups)
         native_slots = (ctypes.c_uint32 * len(flattened))(*flattened)
@@ -672,7 +676,7 @@ class NativePlacementAdapter:
 
 
 class ParkedRestore:
-    """Native transaction whose request is resumable only after ``finish``."""
+    """CUDA transaction whose request is resumable only after ``finish``."""
 
     def __init__(
         self,
@@ -700,7 +704,7 @@ class ParkedRestore:
             )
         if self._adapter._active is not self:
             raise NativePlacementContractError(
-                f"restore {self.request_id} no longer owns native placement"
+                f"restore {self.request_id} no longer owns SparkCache CUDA placement"
             )
 
     def _abort_after_failure(self) -> None:
@@ -744,7 +748,7 @@ class ParkedRestore:
         ):
             self._abort_after_failure()
             raise NativePlacementContractError(
-                "native arena view disagrees with the requested arena contract"
+                "SparkCache CUDA arena view disagrees with the requested contract"
             )
         return view
 
@@ -810,7 +814,7 @@ class ParkedRestore:
             isinstance(item, native.ChunkDescriptor) for item in chunk_tuple
         ):
             raise NativePlacementContractError(
-                "direct slab requires native chunk descriptors"
+                "direct CUDA slab requires SparkCache chunk descriptors"
             )
         native_chunks = (native.ChunkDescriptor * len(chunk_tuple))(*chunk_tuple)
         self._call(
@@ -883,8 +887,18 @@ class ParkedRestore:
             self.abort()
 
 
+CudaPlacementAdapter = NativePlacementAdapter
+CudaPlacementCallError = NativePlacementCallError
+CudaPlacementContractError = NativePlacementContractError
+CudaPlacementLibrary = NativePlacementLibrary
+
+
 __all__ = [
     "ArenaMode",
+    "CudaPlacementAdapter",
+    "CudaPlacementCallError",
+    "CudaPlacementContractError",
+    "CudaPlacementLibrary",
     "NativePlacementAdapter",
     "NativePlacementCallError",
     "NativePlacementContractError",

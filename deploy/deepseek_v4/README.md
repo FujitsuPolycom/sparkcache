@@ -15,7 +15,7 @@ DeepSeek-V4 SparkCache profiles.
   size 256;
 - 524,288-token request limit and 32 sequences;
 - 200 GiB high / 180 GiB low rank-local NVMe watermarks; and
-- Python verified restore with streaming and native placement disabled.
+- Python verified restore with streaming and SparkCache CUDA placement disabled.
 
 The launcher rejects DCP2/DCP4 because neither DSpark nor the opaque five-group
 HMA page format defines safe DCP ownership. See `DCP_SUPPORT.md`.

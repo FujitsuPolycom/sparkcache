@@ -27,9 +27,7 @@ SPARKCACHE_SOURCE_PATH = "/opt/sparkcache-src/sparkcache"
 VLLM_SCHEDULER_PATH = (
     "/opt/venv/lib/python3.12/site-packages/vllm/v1/core/sched/scheduler.py"
 )
-VLLM_CONFIG_PATH = (
-    "/opt/venv/lib/python3.12/site-packages/vllm/config/vllm.py"
-)
+VLLM_CONFIG_PATH = "/opt/venv/lib/python3.12/site-packages/vllm/config/vllm.py"
 EXPECTED_SCHEDULER_SHA256 = (
     "d4ebec211b027b6c7f64574f79374237de0f5fde0c5c03f20f1cb1596ffadc3a"
 )
@@ -129,18 +127,36 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--streaming-native-library-sha256")
     parser.add_argument("--streaming-timing", action="store_true")
     parser.add_argument(
+        "--cuda-restore",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--cuda-placement-library")
+    parser.add_argument("--cuda-placement-library-sha256")
+    parser.add_argument(
+        "--cuda-placement-arena-bytes",
+        type=int,
+        default=None,
+    )
+    parser.add_argument("--cuda-restore-io-workers", type=int)
+    parser.add_argument(
         "--native-restore",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=None,
+        help=argparse.SUPPRESS,
     )
-    parser.add_argument("--native-restore-library")
-    parser.add_argument("--native-restore-library-sha256")
+    parser.add_argument("--native-restore-library", help=argparse.SUPPRESS)
+    parser.add_argument("--native-restore-library-sha256", help=argparse.SUPPRESS)
     parser.add_argument(
         "--native-restore-arena-bytes",
         type=int,
-        default=128 * 1024 * 1024,
+        help=argparse.SUPPRESS,
     )
-    parser.add_argument("--native-restore-io-workers", type=int, default=8)
+    parser.add_argument(
+        "--native-restore-io-workers",
+        type=int,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--create-only", action="store_true")
     args = parser.parse_args(argv)
 
@@ -166,10 +182,13 @@ def main(argv: list[str] | None = None) -> int:
             cache_root=args.cache_root,
             streaming_snapshots=args.streaming_snapshots,
             streaming_native_library=args.streaming_native_library,
-            streaming_native_library_sha256=(
-                args.streaming_native_library_sha256
-            ),
+            streaming_native_library_sha256=(args.streaming_native_library_sha256),
             streaming_timing=args.streaming_timing,
+            cuda_restore=args.cuda_restore,
+            cuda_placement_library=args.cuda_placement_library,
+            cuda_placement_library_sha256=args.cuda_placement_library_sha256,
+            cuda_placement_arena_bytes=args.cuda_placement_arena_bytes,
+            cuda_restore_io_workers=args.cuda_restore_io_workers,
             native_restore=args.native_restore,
             native_restore_library=args.native_restore_library,
             native_restore_library_sha256=args.native_restore_library_sha256,

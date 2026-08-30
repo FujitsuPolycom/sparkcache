@@ -27,7 +27,7 @@ GPU-free coverage proves copy-on-write extension, bounded page-delta
 compaction, recurrent/sliding boundary geometry, corruption removal,
 reference-aware maintenance, and verified reconstruction. Live GLM-5.3
 qualification must still measure publication bytes, cold restore latency,
-native-placement latency after page reconstruction, SSD writes, and continued
+SparkCache CUDA-placement latency after page reconstruction, SSD writes, and continued
 generation across repeated conversation extensions.
 
 ### Per-entry retention controls
@@ -54,14 +54,14 @@ verification before vLLM schedules the request. It must reuse the bounded
 asynchronous-load machinery without claiming an external hit until all ranks
 confirm completion.
 
-### Native restore expansion
+### SparkCache CUDA restore expansion
 
 **Status: research-only qualification work.** Native multi-group page restore
 is implemented and source-runtime-qualified for the recorded GLM-5.3 TP4/DCP1
 profile. Tail page deltas reconstruct a fully verified snapshot before Python
-or native placement, but that path has no live performance qualification.
+or SparkCache CUDA placement, but that path has no live performance qualification.
 
-DeepSeek-V4 opaque HMA pages retain their verified Python restore path. Native
+DeepSeek-V4 opaque HMA pages retain their verified Python restore path. CUDA
 support for that profile must describe all five page groups, preserve each
 group's semantic reuse window, and prove byte identity before changing its
 qualified deployment contract.

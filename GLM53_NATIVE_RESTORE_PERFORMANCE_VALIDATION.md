@@ -1,10 +1,14 @@
-# GLM-5.3 native restore and shared-prefix validation
+# GLM-5.3 SparkCache CUDA restore and shared-prefix validation
+
+The repository path retains its compatibility filename so existing evidence
+links remain valid. In this record, SparkCache CUDA restore and SparkCache CUDA
+placement are the canonical capability and data-movement terms.
 
 Date: 2026-08-29
 
 ## Status
 
-Native direct restore, verified multi-group recovery, bounded shared GPU-prefix
+SparkCache direct CUDA restore, verified multi-group recovery, bounded shared GPU-prefix
 reuse, C2/C8/C16 completion, shared-trunk C16 completion, and continued
 generation are **qualified** for the exact GLM-5.3 Flash TP4/DCP1 runtime
 identified below.
@@ -31,7 +35,7 @@ qualification requires a receipt produced by the equality validator in
 | vLLM source revision | `local-inference-lab/vllm@da4d7be6c97434f6942292ed8abbf4b32dc44355` |
 | Serving topology | GLM-5.3 Flash, TP4/DCP1, one rank on each of `spark-r0` through `spark-r3` |
 | Scheduler capacity | `--max-num-seqs 32` |
-| Restore concurrency | Two host restore workers and two native placement lanes per rank |
+| Restore concurrency | Two host restore workers and two SparkCache CUDA placement lanes per rank |
 | Native staging | Two 256 MiB mapped-host arenas per rank |
 | Persistent prefix | 131,072 tokens and 813,068,464 encoded bytes per rank |
 | Runtime receipt | `evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-runtime.json` |
@@ -48,7 +52,7 @@ The direct page-placement implementation is identified by these commits:
 | Responsibility | Revision |
 |---|---|
 | Restore phase timing | `175f9401984a03744d7fe1a985d7c2ef6035f949` |
-| Native hybrid-page placement | `71f367be07788d611698a251fe866d678b0034ae` |
+| SparkCache CUDA page placement | `71f367be07788d611698a251fe866d678b0034ae` |
 | Multi-slab restore and exact-prefix discovery | `8e7f5fc62fd4fffdd661aca9ea634cf130c45d1a` |
 | Direct pipelined slab restore | `94c44930a13df5c668d777e0270e7d8203069d7c` |
 | Authenticated span-table bound | `9dbf73c0caab89b24346567e2769752ac746e114` |
@@ -62,7 +66,7 @@ source-tree SHA-256 `b3e84d...` identified in the table above.
 
 ## Implemented restore path
 
-Native restore reads immutable `.spcc` objects directly into alternating
+SparkCache CUDA restore reads immutable `.spcc` objects directly into alternating
 mapped-host arenas with `pread`, hashes every complete file in place, validates
 its authenticated extent table, and submits only validated spans to the CUDA
 page-placement kernel. Read work and CUDA submission overlap across slabs.
@@ -96,7 +100,7 @@ historical canary found the expected marker suffix, and HTTP health remained
 ### Eight concurrent 16K prefixes
 
 The Python/Torch placement path produced 1.54--1.57 second submission spikes;
-eight clients completed in 9.45--10.64 seconds. Native placement submitted in
+eight clients completed in 9.45--10.64 seconds. SparkCache CUDA placement submitted in
 6--15 ms, and two restore lanes completed eight clients in approximately
 1.2--2.1 seconds. This diagnostic isolates page placement as the dominant
 serialized cost in that workload; it is not a separate deployment

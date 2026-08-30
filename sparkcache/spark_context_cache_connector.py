@@ -798,7 +798,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         }
         logger.info(
             "spark-context-cache: role=%s root=%s dcp=%d store=%s restore=%s"
-            " native_restore=%s max_span=%d load_threads=%d max_bytes=%d"
+            " cuda_restore=%s max_span=%d load_threads=%d max_bytes=%d"
             " low_bytes=%d ttl_seconds=%d",
             role.name,
             self._root,
@@ -826,11 +826,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             runtime = factory(self)
         except Exception as error:
             raise RuntimeError(
-                "spark-context-cache: streaming runtime installation failed closed"
+                "spark-context-cache: streaming runtime installation was rejected"
             ) from error
         if runtime is None:
             raise RuntimeError(
-                "spark-context-cache: streaming runtime installation failed closed"
+                "spark-context-cache: streaming runtime installation was rejected"
             )
         if role is KVConnectorRole.SCHEDULER:
             required = (
@@ -1202,9 +1202,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     _SHARED_PREFIX_LEASE_TTL_SECONDS,
                 ),
             )
-        return (
-            (flight.digest, flight.span_tokens, _SHARED_PREFIX_LEASE_TTL_SECONDS),
-        )
+        return ((flight.digest, flight.span_tokens, _SHARED_PREFIX_LEASE_TTL_SECONDS),)
 
     def get_shared_prefix_lease_to_publish(
         self, request: "Request"
@@ -1231,8 +1229,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         if flight is None or not flight.workers_finished:
             return False
         candidates = {
-            key: span
-            for key, span, _ in self._lease_publication_candidates(flight)
+            key: span for key, span, _ in self._lease_publication_candidates(flight)
         }
         span = candidates.get(lease_key)
         if span is None:
@@ -1905,23 +1902,26 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self.discover_manifests()
 
     def _configure_native_restore(self) -> None:
-        """Attest and bind native placement only after final CUDA inventory."""
+        """Attest SparkCache CUDA placement after final CUDA inventory."""
 
         if self._native_adapter is not None:
             raise RuntimeError(
-                "spark-context-cache: native placement is already configured"
+                "spark-context-cache: SparkCache CUDA placement is already configured"
             )
         if self._storage_mode == "block_pages_v1":
             self._configure_native_hybrid_restore()
             return
         assert self._plans is not None
         if not self._plans:
-            raise RuntimeError("spark-context-cache: native restore has no layer plans")
+            raise RuntimeError(
+                "spark-context-cache: SparkCache CUDA restore has no layer plans"
+            )
         first_tensor = self._layer_tensors[self._plans[0].name]
         device = first_tensor.device
         if device.type != "cuda":
             raise RuntimeError(
-                "spark-context-cache: native restore requires CUDA cache tensors"
+                "spark-context-cache: SparkCache CUDA restore requires CUDA"
+                " cache tensors"
             )
         device_ordinal = (
             int(device.index)
@@ -1950,7 +1950,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             # stores the full chunk on every rank); an arena that cannot
             # hold one encoded chunk would fail every restore plan later.
             raise RuntimeError(
-                "spark-context-cache: native arena"
+                "spark-context-cache: SparkCache CUDA placement arena"
                 f" ({self._native_arena_bytes} bytes) cannot hold one"
                 f" encoded chunk (floor {payload_floor} bytes) at"
                 f" dcp_degree={self._dcp_degree}"
@@ -1990,26 +1990,26 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 if ordinal is None:
                     raise RuntimeError(
                         f"spark-context-cache: record kind {kind} has no"
-                        " native placement ordinal"
+                        " SparkCache CUDA placement ordinal"
                     )
                 required |= 1 << int(ordinal)
             native_execute = components.execute_native_restore
             if not callable(native_execute):
-                raise TypeError("native restore orchestrator is not callable")
+                raise TypeError("SparkCache CUDA restore orchestrator is not callable")
         except Exception as error:
             if adapter is not None:
                 with contextlib.suppress(Exception):
                     adapter.close()
             raise RuntimeError(
-                f"spark-context-cache: native restore configuration"
-                f" failed closed: {error}"
+                f"spark-context-cache: SparkCache CUDA restore configuration"
+                f" was rejected: {error}"
             ) from error
         self._native_adapter = adapter
         self._native_execute_restore = native_execute
         self._native_required_record_mask = required
         self.counters["native_configured"] = 1
         logger.info(
-            "spark-context-cache: native restore configured library=%s"
+            "spark-context-cache: SparkCache CUDA restore configured library=%s"
             " sha256=%s arena_mib=%d destinations=%d slots=%d"
             " max_chunks_per_slab=%d",
             self._native_library_path,
@@ -2023,12 +2023,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     def _configure_native_hybrid_restore(self) -> None:
         layout = self._page_layout
         if layout is None:
-            raise RuntimeError("native hybrid restore has no page layout")
+            raise RuntimeError("SparkCache CUDA restore has no page layout")
         first_layer = layout.groups[0].layers[0]
         first_tensor = self._layer_tensors[first_layer.name]
         device = first_tensor.device
         if device.type != "cuda":
-            raise RuntimeError("native hybrid restore requires CUDA page tensors")
+            raise RuntimeError("SparkCache CUDA restore requires CUDA page tensors")
         device_ordinal = (
             int(device.index)
             if device.index is not None
@@ -2042,7 +2042,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             }
             if len(capacities) != 1:
                 raise RuntimeError(
-                    "native hybrid page group layers disagree on capacity"
+                    "SparkCache CUDA page group layers disagree on capacity"
                 )
             max_slots += capacities.pop()
         adapters = []
@@ -2058,7 +2058,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 & int(components.hybrid_page_cuda_capability)
                 == 0
             ):
-                raise RuntimeError("native library lacks hybrid page CUDA scatter")
+                raise RuntimeError(
+                    "SparkCache CUDA placement library lacks page scatter"
+                )
             for _lane in range(self._load_thread_limit):
                 adapter = components.NativePlacementAdapter.create(
                     library,
@@ -2074,15 +2076,20 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             execute_restore = components.execute_native_hybrid_restore
             execute_placement = components.execute_native_hybrid_placement
             if not callable(execute_restore):
-                raise TypeError("native hybrid direct-restore orchestrator is not callable")
+                raise TypeError(
+                    "SparkCache direct CUDA restore orchestrator is not callable"
+                )
             if not callable(execute_placement):
-                raise TypeError("native hybrid page-placement orchestrator is not callable")
+                raise TypeError(
+                    "SparkCache CUDA page-placement orchestrator is not callable"
+                )
         except Exception as error:
             for adapter in adapters:
                 with contextlib.suppress(Exception):
                     adapter.close()
             raise RuntimeError(
-                f"spark-context-cache: native hybrid restore configuration failed: {error}"
+                "spark-context-cache: SparkCache CUDA restore configuration"
+                f" failed: {error}"
             ) from error
         self._native_adapters = adapters
         self._native_adapter = adapters[0]
@@ -2090,7 +2097,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._native_execute_hybrid_placement = execute_placement
         self.counters["native_hybrid_configured"] = 1
         logger.info(
-            "spark-context-cache: native hybrid restore configured"
+            "spark-context-cache: SparkCache CUDA restore configured"
             " destinations=%d max_slots=%d arena_mib=%d lanes=%d",
             destination_count,
             max_slots,
@@ -2981,8 +2988,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     with self._load_lock:
                         self._held.discard(digest)
                 logger.warning(
-                    "spark-context-cache: shared trunk rejected digest=%s"
-                    " leader=%s",
+                    "spark-context-cache: shared trunk rejected digest=%s leader=%s",
                     digest[:12],
                     plan.digest[:12],
                 )
@@ -3062,7 +3068,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     or self._native_required_record_mask == 0
                 ):
                     raise RuntimeError(
-                        "native restore selected without a configured adapter"
+                        "SparkCache CUDA restore selected without a configured adapter"
                     )
                 positions = owned_positions(plan.span_tokens, self._dcp_degree, rank)
                 slots = local_slots_for_positions(
@@ -3091,7 +3097,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     # retry those blocks: retire the entry and publish all of
                     # this request's blocks as invalid for clean recompute.
                     logger.warning(
-                        "spark-context-cache: native load failed closed: %s",
+                        "spark-context-cache: SparkCache CUDA restore rejected;"
+                        " recomputing: %s",
                         error,
                     )
                     self._invalidate_after_failure(
@@ -3119,7 +3126,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     "native_chunks_verified", 0
                 ) + int(result.verified_chunks)
                 logger.info(
-                    "spark-context-cache: native restored %d chunks"
+                    "spark-context-cache: SparkCache CUDA restore verified %d chunks"
                     " (%d encoded bytes, %d slabs) read_hash=%.1f ms"
                     " parse_submit=%.1f ms finish=%.1f ms",
                     result.verified_chunks,
@@ -3232,10 +3239,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self._native_execute_hybrid_restore
             ):
                 raise RuntimeError(
-                    "native hybrid restore selected without a configured adapter"
+                    "SparkCache CUDA restore selected without a configured adapter"
                 )
             if not 0 <= native_lane < len(self._native_adapters):
-                raise RuntimeError("native hybrid restore lane is unavailable")
+                raise RuntimeError("SparkCache CUDA placement lane is unavailable")
             try:
                 result = self._native_execute_hybrid_restore(
                     adapter=self._native_adapters[native_lane],
@@ -3250,7 +3257,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 )
             except Exception as error:  # noqa: BLE001
                 logger.warning(
-                    "spark-context-cache: native hybrid placement failed: %s",
+                    "spark-context-cache: SparkCache CUDA placement rejected: %s",
                     error,
                 )
                 self._invalidate_after_failure(plan.digest)
@@ -3274,7 +3281,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self.counters.get("native_hybrid_load_verified", 0) + 1
             )
             logger.info(
-                "spark-context-cache: native hybrid direct restored %d bytes"
+                "spark-context-cache: SparkCache direct CUDA restore verified %d bytes"
                 " slabs=%d read_hash=%.1f ms submit=%.1f ms finish=%.1f ms",
                 result.source_bytes,
                 result.slabs,
@@ -3330,10 +3337,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self._native_execute_hybrid_placement
             ):
                 raise RuntimeError(
-                    "native hybrid restore selected without a configured adapter"
+                    "SparkCache CUDA restore selected without a configured adapter"
                 )
             if not 0 <= native_lane < len(self._native_adapters):
-                raise RuntimeError("native hybrid restore lane is unavailable")
+                raise RuntimeError("SparkCache CUDA placement lane is unavailable")
             try:
                 result = self._native_execute_hybrid_placement(
                     adapter=self._native_adapters[native_lane],
@@ -3344,7 +3351,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 )
             except Exception as error:  # noqa: BLE001
                 logger.warning(
-                    "spark-context-cache: native hybrid placement failed: %s",
+                    "spark-context-cache: SparkCache CUDA placement rejected: %s",
                     error,
                 )
                 self._invalidate_after_failure(plan.digest)
@@ -3362,7 +3369,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self.counters.get("native_hybrid_load_verified", 0) + 1
             )
             logger.info(
-                "spark-context-cache: native hybrid restored %d bytes"
+                "spark-context-cache: SparkCache CUDA placement verified %d bytes"
                 " submit=%.1f ms finish=%.1f ms",
                 result.source_bytes,
                 result.copy_and_submit_ms,
@@ -3589,7 +3596,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             )
             logger.warning(
                 "spark-context-cache: shutdown left %d loader(s) alive;"
-                " retaining native placement handle until process exit",
+                " retaining SparkCache CUDA placement handle until process exit",
                 live_threads,
             )
             return None

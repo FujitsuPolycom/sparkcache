@@ -1042,7 +1042,7 @@ class NativeRestoreSelectionTests(unittest.TestCase):
     def test_streaming_snapshot_opt_in_fails_before_native_side_effects(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(
-                RuntimeError, "runtime installation failed closed"
+                RuntimeError, "runtime installation was rejected"
             ):
                 _make_connector(
                     Path(directory),
@@ -1064,11 +1064,11 @@ class NativeRestoreSelectionTests(unittest.TestCase):
                 Path(directory),
                 0,
                 extra_config={
-                    "spark_cache_native_restore": "0",
-                    "spark_cache_native_library": "not-absolute",
-                    "spark_cache_native_library_sha256": "UPPERCASE",
-                    "spark_cache_native_arena_bytes": "not-an-integer",
-                    "spark_cache_native_io_workers": "also-invalid",
+                    "spark_cache_cuda_restore": "0",
+                    "spark_cache_cuda_placement_library": "not-absolute",
+                    "spark_cache_cuda_placement_library_sha256": "UPPERCASE",
+                    "spark_cache_cuda_placement_arena_bytes": "not-an-integer",
+                    "spark_cache_cuda_restore_io_workers": "also-invalid",
                 },
             )
             connector.register_kv_caches(_make_pools(8, 64))
@@ -1079,21 +1079,21 @@ class NativeRestoreSelectionTests(unittest.TestCase):
     def test_native_restore_requires_all_three_attested_settings(self) -> None:
         cases = (
             {},
-            {"spark_cache_native_library": "/tmp/placement.so"},
+            {"spark_cache_cuda_placement_library": "/tmp/placement.so"},
             {
-                "spark_cache_native_library": "/tmp/placement.so",
-                "spark_cache_native_library_sha256": "0" * 64,
+                "spark_cache_cuda_placement_library": "/tmp/placement.so",
+                "spark_cache_cuda_placement_library_sha256": "0" * 64,
             },
         )
         for missing in cases:
             with self.subTest(missing=missing):
                 with tempfile.TemporaryDirectory() as directory:
                     settings = {
-                        "spark_cache_native_restore": "1",
+                        "spark_cache_cuda_restore": "1",
                         **missing,
                     }
                     with self.assertRaisesRegex(
-                        RuntimeError, "native restore requires"
+                        RuntimeError, "SparkCache CUDA restore requires"
                     ):
                         _make_connector(Path(directory), 0, extra_config=settings)
 
@@ -1105,10 +1105,10 @@ class NativeRestoreSelectionTests(unittest.TestCase):
                 Path(directory),
                 0,
                 extra_config={
-                    "spark_cache_native_restore": "1",
-                    "spark_cache_native_library": str(artifact),
-                    "spark_cache_native_library_sha256": "0" * 64,
-                    "spark_cache_native_arena_bytes": str(64 * 1024 * 1024),
+                    "spark_cache_cuda_restore": "1",
+                    "spark_cache_cuda_placement_library": str(artifact),
+                    "spark_cache_cuda_placement_library_sha256": "0" * 64,
+                    "spark_cache_cuda_placement_arena_bytes": str(64 * 1024 * 1024),
                     "spark_cache_load_threads": "2",
                 },
             )
@@ -1166,10 +1166,10 @@ class NativeRestoreSelectionTests(unittest.TestCase):
                 Path(directory),
                 0,
                 extra_config={
-                    "spark_cache_native_restore": "true",
-                    "spark_cache_native_library": str(artifact),
-                    "spark_cache_native_library_sha256": "a" * 64,
-                    "spark_cache_native_arena_bytes": str(128 * 1024 * 1024),
+                    "spark_cache_cuda_restore": "true",
+                    "spark_cache_cuda_placement_library": str(artifact),
+                    "spark_cache_cuda_placement_library_sha256": "a" * 64,
+                    "spark_cache_cuda_placement_arena_bytes": str(128 * 1024 * 1024),
                 },
             )
             with mock.patch.object(
@@ -1196,10 +1196,10 @@ class NativeRestoreSelectionTests(unittest.TestCase):
                 Path(directory),
                 0,
                 extra_config={
-                    "spark_cache_native_restore": "1",
-                    "spark_cache_native_library": str(artifact),
-                    "spark_cache_native_library_sha256": "b" * 64,
-                    "spark_cache_native_arena_bytes": str(64 * 1024 * 1024),
+                    "spark_cache_cuda_restore": "1",
+                    "spark_cache_cuda_placement_library": str(artifact),
+                    "spark_cache_cuda_placement_library_sha256": "b" * 64,
+                    "spark_cache_cuda_placement_arena_bytes": str(64 * 1024 * 1024),
                 },
                 role=KVConnectorRole.SCHEDULER,
             )
@@ -1617,9 +1617,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                 connector.get_num_new_matched_tokens(divergent, 0), (1024, True)
             )
             self.assertEqual(len(connector._restore_flights), 2)
-            self.assertNotIn(
-                divergent.request_id, connector._restore_flight_followers
-            )
+            self.assertNotIn(divergent.request_id, connector._restore_flight_followers)
             self.assertTrue(
                 connector._store.lookup(connector._identity(0), digest_a).is_hit
             )
@@ -4265,14 +4263,10 @@ class AsyncRestoreTests(unittest.TestCase):
                     (None, False),
                 )
 
-            connector.update_state_after_alloc(
-                leader, self._blocks_stub(), self.SPAN
-            )
+            connector.update_state_after_alloc(leader, self._blocks_stub(), self.SPAN)
             metadata = connector.build_connector_meta(_empty_scheduler_output())
             self.assertEqual(len(metadata.plans), 1)
-            self.assertEqual(
-                metadata.plans[0].shared_segments, ((trunk_digest, 768),)
-            )
+            self.assertEqual(metadata.plans[0].shared_segments, ((trunk_digest, 768),))
             connector.update_connector_output(
                 types.SimpleNamespace(
                     invalid_block_ids=set(), finished_recving={leader.request_id}
@@ -4332,9 +4326,7 @@ class AsyncRestoreTests(unittest.TestCase):
                 (trunk_digest, 768),
             )
 
-            connector.update_state_after_alloc(
-                leader, self._blocks_stub(), self.SPAN
-            )
+            connector.update_state_after_alloc(leader, self._blocks_stub(), self.SPAN)
             connector.build_connector_meta(_empty_scheduler_output())
             connector.update_connector_output(
                 types.SimpleNamespace(
@@ -4510,7 +4502,9 @@ class AsyncRestoreTests(unittest.TestCase):
 
         self.assertEqual(results, [True, True, False, True])
 
-    def test_segment_verification_failure_releases_distinct_root_followers(self) -> None:
+    def test_segment_verification_failure_releases_distinct_root_followers(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = self._cohort_connector(Path(directory))
             common = list(range(768))
@@ -4530,9 +4524,7 @@ class AsyncRestoreTests(unittest.TestCase):
             )
             connector.get_num_new_matched_tokens(leader, 0)
             connector.get_num_new_matched_tokens(follower, 0)
-            connector.update_state_after_alloc(
-                leader, self._blocks_stub(), self.SPAN
-            )
+            connector.update_state_after_alloc(leader, self._blocks_stub(), self.SPAN)
             connector.build_connector_meta(_empty_scheduler_output())
 
             connector.update_connector_output(

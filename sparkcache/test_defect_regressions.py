@@ -16,7 +16,8 @@ from unittest import mock
 
 import torch
 import sparkcache.native.python as native_package
-import sparkcache.spark_cache_native as canonical_native
+import sparkcache.spark_cache_cuda as canonical_cuda
+import sparkcache.spark_cache_native as legacy_native
 import sparkcache.spark_context_cache_store as package_store
 import sparkcache.streaming as streaming
 import sparkcache.spark_context_cache_store as flat_store
@@ -107,8 +108,7 @@ class DefectD6QuorumDeltaReportingTests(unittest.TestCase):
             }
             worker._held = set(initial)
             first_cycle = [
-                worker.get_kv_connector_stats().data["reports"][0]
-                for _ in range(3)
+                worker.get_kv_connector_stats().data["reports"][0] for _ in range(3)
             ]
             for report in (
                 first_cycle[2],
@@ -134,8 +134,7 @@ class DefectD6QuorumDeltaReportingTests(unittest.TestCase):
             worker._held = set(replacement)
             worker.get_kv_connector_stats()  # dropped checkpoint chunk zero
             delivered = [
-                worker.get_kv_connector_stats().data["reports"][0]
-                for _ in range(5)
+                worker.get_kv_connector_stats().data["reports"][0] for _ in range(5)
             ]
             complete_cycle = delivered[2:]
             for report in (
@@ -293,17 +292,11 @@ class DefectD6QuorumDeltaReportingTests(unittest.TestCase):
             merged = connector_module.SparkCacheStats(
                 data={"reports": [sequence_one]}
             ).aggregate(
-                connector_module.SparkCacheStats(
-                    data={"reports": [sequence_two]}
-                )
+                connector_module.SparkCacheStats(data={"reports": [sequence_two]})
             )
-            self.assertEqual(
-                merged.data["reports"][0]["delta"]["sequence"], 2
-            )
+            self.assertEqual(merged.data["reports"][0]["delta"]["sequence"], 2)
 
-            scheduler._absorb_quorum(
-                types.SimpleNamespace(kv_connector_stats=merged)
-            )
+            scheduler._absorb_quorum(types.SimpleNamespace(kv_connector_stats=merged))
             self.assertNotIn(replacement, scheduler._quorum)
             scheduler._absorb_quorum(self._output(sequence_one))
             self.assertEqual(scheduler._quorum[replacement], {0})
@@ -313,9 +306,13 @@ class DeadInterfaceRemovalTests(unittest.TestCase):
     """D-10: native and streaming code expose one model-serving interface each."""
 
     def test_native_binding_and_runtime_interfaces_have_one_owner(self) -> None:
-        self.assertIs(native_package.PlacementConfig, canonical_native.PlacementConfig)
+        self.assertIs(native_package.PlacementConfig, canonical_cuda.PlacementConfig)
+        self.assertIs(canonical_cuda.PlacementConfig, legacy_native.PlacementConfig)
+        self.assertIs(
+            canonical_cuda.CudaPlacementError, legacy_native.NativePlacementError
+        )
         self.assertIs(flat_store.ManifestStore, package_store.ManifestStore)
-        self.assertFalse(hasattr(canonical_native, "PlacementHandle"))
+        self.assertFalse(hasattr(canonical_cuda, "PlacementHandle"))
         self.assertFalse(hasattr(ParkedRestore, "submit_transposed_slab"))
         self.assertFalse(hasattr(streaming, "PreemptionDrainAdapter"))
 
@@ -492,9 +489,7 @@ class HybridReuseWindowTests(unittest.TestCase):
                         block_size=64,
                         storage_block_size=64,
                         page_size_bytes=64,
-                        kv_cache_specs={
-                            "swa": SlidingWindowMLASpec(sliding_window)
-                        },
+                        kv_cache_specs={"swa": SlidingWindowMLASpec(sliding_window)},
                     ),
                     is_eagle_group=False,
                     layer_names=("swa",),
@@ -772,9 +767,9 @@ class HybridReuseWindowTests(unittest.TestCase):
                 "state": torch.arange(80 * 1 * 8, dtype=torch.float32).reshape(
                     80, 1, 8
                 ),
-                "state128": torch.arange(
-                    40 * 1 * 8, dtype=torch.float32
-                ).reshape(40, 1, 8),
+                "state128": torch.arange(40 * 1 * 8, dtype=torch.float32).reshape(
+                    40, 1, 8
+                ),
             }
             first.register_kv_caches(pools)
             plan = _ReqPlan(
@@ -813,7 +808,7 @@ class DefectD14HybridSchedulerGeometryTests(unittest.TestCase):
             dcp_degree=1,
             block_size=2304,
             min_span_tokens=4096,
-            native_restore=False,
+            cuda_restore=False,
         )
 
 
@@ -908,8 +903,7 @@ class InvalidManifestMaintenanceTests(unittest.TestCase):
             logical_start=0,
             logical_end=256,
             records={
-                record: record.value.encode()
-                for record in package_store.StateRecord
+                record: record.value.encode() for record in package_store.StateRecord
             },
         )
         context_digest = hashlib.sha256(b"D-13-invalid-manifest").hexdigest()
@@ -923,10 +917,7 @@ class InvalidManifestMaintenanceTests(unittest.TestCase):
                 chunks=[chunk],
             )
             manifest_path = (
-                root
-                / "manifests"
-                / identity.storage_key
-                / f"{context_digest}.json"
+                root / "manifests" / identity.storage_key / f"{context_digest}.json"
             )
             manifest = json.loads(manifest_path.read_bytes())
             manifest["committed_tokens"] = 0

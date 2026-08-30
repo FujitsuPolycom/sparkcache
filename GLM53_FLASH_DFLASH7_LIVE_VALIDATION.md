@@ -170,7 +170,7 @@ visible `message.content` must equal `SPARKCACHE_GLM53_OK` byte for byte.
 
 This evidence does not qualify another SparkCache source tree, vLLM source
 contract, target or draft checkpoint, parallel topology, scheduler budget,
-cache geometry, native direct restore, streaming snapshots, or MTP profile.
+cache geometry, SparkCache direct CUDA restore, streaming snapshots, or MTP profile.
 It does not establish throughput neutrality or restore performance for spans
 larger than 8,192 tokens. Full reasoning-trace equality is not a semantic
 oracle for this GLM runtime. The historical canary establishes successful

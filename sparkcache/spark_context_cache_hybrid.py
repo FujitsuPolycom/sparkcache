@@ -112,7 +112,7 @@ def plan_page_snapshot(
     """Validate the small SPHP1 header and describe payload byte extents.
 
     ``encoded_prefix`` may be the complete snapshot or only the header bytes.
-    Native restore uses the latter after authenticating the containing .spcc
+    SparkCache CUDA restore uses the latter after authenticating the containing .spcc
     object, avoiding a Python slice for every layer payload.
     """
 

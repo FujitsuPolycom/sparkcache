@@ -10,7 +10,7 @@ records:
   records an 8,192-token persistent restore through the Python page-placement
   path at 147.2--194.0 ms per rank.
 - [`GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md`](../../GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md)
-  records native direct restore of a 131,072-token prefix, multi-group
+  records SparkCache direct CUDA restore of a 131,072-token prefix, multi-group
   recovery, and bounded shared GPU-prefix reuse through C16.
 
 Qualification applies only to the checkpoint revisions, source contracts,
@@ -195,14 +195,15 @@ token incomplete for retry; it does not delay model serving indefinitely. See
 [`sparkcache/README.md`](../../sparkcache/README.md#one-shot-cache-clear) for
 token, root-path, and deletion-scope rules.
 
-Native page restore is disabled unless the launch supplies all of:
+SparkCache CUDA restore is disabled unless the launch supplies all of:
 
-- `SPARK_CONTEXT_CACHE_NATIVE_RESTORE=1`;
-- an attested `SPARK_CONTEXT_CACHE_NATIVE_LIBRARY` path;
-- its `SPARK_CONTEXT_CACHE_NATIVE_LIBRARY_SHA256`;
-- a 64, 128, or 256 MiB `SPARK_CONTEXT_CACHE_NATIVE_ARENA_BYTES` value.
+- `SPARK_CONTEXT_CACHE_CUDA_RESTORE=1`;
+- an attested `SPARK_CONTEXT_CACHE_CUDA_PLACEMENT_LIBRARY` path;
+- its `SPARK_CONTEXT_CACHE_CUDA_PLACEMENT_LIBRARY_SHA256`;
+- a 64, 128, or 256 MiB
+  `SPARK_CONTEXT_CACHE_CUDA_PLACEMENT_ARENA_BYTES` value.
 
-The qualified 128K runtime used two host restore workers, two native placement
+The qualified 128K runtime used two host restore workers, two SparkCache CUDA placement
 lanes, and two 256 MiB mapped-host arenas per rank. Streaming snapshots remain
 unsupported for opaque page storage.
 
@@ -233,12 +234,12 @@ python -m deploy.glm53_flash.concurrency_benchmark \
 ```
 
 The default fixture reproduces the recorded 131,072-token persistent prefix.
-See the native restore validation record for exact runtime identities, results,
+See the SparkCache CUDA restore validation record for exact runtime identities, results,
 and committed receipts.
 
 ## Compatibility
 
-The native placement path, longest exact-boundary search, and shared GPU lease
+The SparkCache CUDA placement path, longest exact-boundary search, and shared GPU lease
 do not change `CacheIdentity`, digest values, 256-token logical geometry, exact
 manifest format, or existing chunk bytes. Missing or incompatible state remains
 a cache miss followed by ordinary computation.

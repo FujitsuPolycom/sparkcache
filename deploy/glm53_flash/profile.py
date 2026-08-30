@@ -113,7 +113,7 @@ def build_kv_transfer_config(
             "spark_cache_restore": True,
             "spark_cache_scheduler_probe": "none",
             "spark_cache_streaming_snapshots": False,
-            "spark_cache_native_restore": False,
+            "spark_cache_cuda_restore": False,
             "spark_cache_max_bytes": max_bytes,
             "spark_cache_low_watermark_bytes": low_watermark_bytes,
             "spark_cache_ttl_seconds": 0,

@@ -532,7 +532,7 @@
           <thead><tr><th scope="col">Prefix and concurrency</th><th scope="col">Comparison</th><th scope="col">Recorded effect</th></tr></thead>
           <tbody>
             <tr><td><strong>8,192 tokens · C1</strong></td><td>qualified Python page restore</td><td>147.2–194.0 ms cache service per rank</td></tr>
-            <tr><td><strong>16,384 tokens · C8</strong></td><td>Python/Torch vs native placement</td><td>9.45–10.64 s vs 1.2–2.1 s client latency</td></tr>
+            <tr><td><strong>16,384 tokens · C8</strong></td><td>Python/Torch vs SparkCache CUDA placement</td><td>9.45–10.64 s vs 1.2–2.1 s client latency</td></tr>
             <tr><td><strong>131,072 tokens · C1</strong></td><td>reconstruction pipeline vs cold direct restore</td><td>1.29–1.46 s vs 131–250 ms cache service per rank</td></tr>
             <tr><td><strong>131,072 tokens · C16</strong></td><td>independent vs shared restore</td><td>16 × 813 MB became 1 × 813 MB per rank; the host-warm restore took 104–165 ms per rank; standard-chat client p50 fell from 3.363 s to 2.980 s</td></tr>
             <tr><td><strong>131,072 tokens · pretokenized C16</strong></td><td>standalone measurement</td><td>2.698 s client p50 and 2.701 s maximum; not compared with chat timing</td></tr>
@@ -540,7 +540,7 @@
         </table>
       </div>
       <p class="context-note">The 16-request qualification used vLLM <code>--max-num-seqs 32</code>. Every request completed, each rank performed one external restore, and the semantic canary passed.</p>
-      <p class="context-note">Unrelated-cold C16 and decode-interference remain unqualified. See the <a href="../GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md">native restore and concurrency validation</a> for exact runtime identities and receipts.</p>
+      <p class="context-note">Unrelated-cold C16 and decode-interference remain unqualified. See the <a href="../GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md">SparkCache CUDA restore and concurrency validation</a> for exact runtime identities and receipts.</p>
     </section>
 
     <footer>
@@ -548,7 +548,7 @@
       <div class="source-links">
         <a href="https://github.com/FujitsuPolycom/sparkcache/tree/main">main</a>
         <a href="../ROADMAP.md">research roadmap</a>
-        <a href="../GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md">native restore record</a>
+        <a href="../GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md">SparkCache CUDA restore record</a>
       </div>
     </footer>
   </main>

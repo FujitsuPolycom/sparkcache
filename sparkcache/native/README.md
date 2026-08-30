@@ -1,4 +1,4 @@
-# Native placement and snapshot libraries
+# SparkCache CUDA placement and snapshot libraries
 
 `libspark_cache_placement.so` implements checksum-gated direct restore into
 registered cache tensors. It is **implemented** and opt-in; qualified
@@ -8,10 +8,10 @@ checksum-bound four-rank integration gate cover this library.
 
 `libspark_cache_snapshot.so` implements the store-side gather ring documented
 in [`SNAPSHOT_RING_STATE_MODEL.md`](SNAPSHOT_RING_STATE_MODEL.md). It is
-**research-only** and uses a separate fail-open ABI so optional snapshot
-publication cannot weaken fail-closed restore placement.
+**research-only** and uses a separate best-effort ABI. Optional snapshot
+publication cannot make unverified state eligible for restoration.
 
-The native restore path removes Python object construction and host-side
+The SparkCache CUDA restore path removes Python object construction and host-side
 record transposition from large restores.
 
 ## Why this path exists
@@ -36,7 +36,7 @@ scatter operations. The vectorized Python fallback beside this directory
 reduces assembly to about 0.4 seconds on the development CPU, but it still
 transposes all 3.14 GB in host memory before placement.
 
-The native direct path removes that entire middle representation:
+The SparkCache direct CUDA path removes that entire middle representation:
 
 ```text
 pread encoded .spcc files directly into cudaHostAllocMapped arena
@@ -51,7 +51,7 @@ layer-wise scatter exists on this path.
 
 ## Canonical Python/ctypes boundary
 
-[`../spark_cache_native.py`](../spark_cache_native.py) is the single Python ABI
+[`../spark_cache_cuda.py`](../spark_cache_cuda.py) is the canonical Python ABI
 declaration. The `sparkcache.native.python` package re-exports that module; it
 does not maintain a second copy. Do not independently declare these structures
 in probes or connector modules. `load_library()` first calls
@@ -60,17 +60,17 @@ version, arena/record constants, structure sizes, or required capabilities do
 not match.
 
 Model-serving restore orchestration uses the attested adapter in
-[`../spark_context_cache_native_placement.py`](../spark_context_cache_native_placement.py):
+[`../spark_context_cache_cuda_placement.py`](../spark_context_cache_cuda_placement.py):
 
 ```python
-from sparkcache.spark_context_cache_native_placement import (
+from sparkcache.spark_context_cache_cuda_placement import (
     ArenaMode,
-    NativePlacementAdapter,
-    NativePlacementLibrary,
+    CudaPlacementAdapter,
+    CudaPlacementLibrary,
 )
 
-library = NativePlacementLibrary.load(path, expected_sha256=digest)
-adapter = NativePlacementAdapter.create(
+library = CudaPlacementLibrary.load(path, expected_sha256=digest)
+adapter = CudaPlacementAdapter.create(
     library,
     arena_mode=ArenaMode.MAPPED_HOST,
     arena_bytes=arena_bytes,
@@ -81,7 +81,7 @@ adapter = NativePlacementAdapter.create(
 )
 ```
 
-`execute_native_restore()` owns multi-file slab packing, complete-file digest
+`execute_cuda_restore()` owns multi-file slab packing, complete-file digest
 verification, arena lifetime, direct-slab submission, and parked-request
 completion. `ParkedRestore.finish()` is the only success edge that permits the
 requester to resume; any exception aborts the transaction and recomputes the
@@ -91,6 +91,12 @@ The binding also exposes copied handle errors, a thread-local runtime error
 for failures before `create()` returns a handle, and an in-flight statistics
 snapshot. Python therefore gets complete diagnostics without retaining a
 borrowed C string.
+
+The modules and symbols containing `native` remain compatibility interfaces.
+Canonical imports use `spark_cache_cuda`,
+`spark_context_cache_cuda_placement`, `spark_context_cache_cuda_restore`, and
+`spark_context_cache_cuda_page_restore`. The compatibility names alias the
+same classes and functions; they do not introduce a second implementation.
 
 ## Implemented interfaces
 
@@ -102,7 +108,7 @@ fixed C ABI:
 - one uploaded `uint32` physical-slot vector per restore;
 - two reusable 64, 128, or 256 MiB arenas;
 - direct encoded-chunk and transposed-slab submission modes;
-- fail-closed begin/acquire/submit/finish transaction states.
+- verified-or-recompute begin/acquire/submit/finish transaction states.
 
 The destination descriptor stores a current runtime pointer, capacity,
 stride, record kind, byte width, and source layer ordinal. No physical slot
@@ -305,7 +311,7 @@ Admission gates:
 - no memory-growth trend across ten restores;
 - concurrent serving never stalls behind the parked requester;
 - warm read+verify remains at or below 300 ms p95;
-- native placement is at or below 500 ms p95 on the slowest rank;
+- SparkCache CUDA placement is at or below 500 ms p95 on the slowest rank;
 - complete warm restore is at or below 1.2 seconds p95, with a 1.5-second
   initial acceptance ceiling.
 
@@ -327,6 +333,6 @@ environment flag and an attested library hash. The validation order is:
    eight-request aggregate decode, cancellation, and restart gates;
 6. only then make direct mapped placement the default.
 
-The native direct-placement path shortens the restored requester's own wait.
+The SparkCache direct CUDA placement path shortens the restored requester's own wait.
 The asynchronous scheduler contract keeps that requester-specific wait from
 blocking unrelated requests.

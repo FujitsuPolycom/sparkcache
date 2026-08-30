@@ -24,9 +24,9 @@ Python-placement restore. The source deployment separately qualifies native
 131,072-token restore and bounded shared-prefix reuse. See
 [the public image record](deploy/glm53_flash/IMAGE_ANNOUNCEMENT.md),
 [the GLM-5.3 validation](GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md), and
-[the native restore record](GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md).
+[the SparkCache CUDA restore record](GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md).
 
-The public image does not contain the model checkpoints. Native restore and
+The public image does not contain the model checkpoints. SparkCache CUDA restore and
 shared GPU-prefix qualification belong to a later source-bound runtime that has
 no published OCI digest.
 
@@ -147,7 +147,7 @@ timing.
 | Prefix and concurrency | Comparison | Recorded result |
 |---|---|---|
 | 8,192 tokens, C1 | qualified Python page restore | 147.2–194.0 ms cache service per rank |
-| 16,384 tokens, C8 | Python/Torch placement vs native placement | 9.45–10.64 s vs 1.2–2.1 s client latency |
+| 16,384 tokens, C8 | Python/Torch placement vs SparkCache CUDA placement | 9.45–10.64 s vs 1.2–2.1 s client latency |
 | 131,072 tokens, C1 | reconstruction pipeline vs cold direct mapped-arena restore | 1.29–1.46 s vs 131–250 ms cache service per rank; a host-warm restore reached 104–165 ms |
 | 131,072-token shared prefix, C16 | independent restores vs shared verified GPU blocks | rank-local work fell from 16 × 813 MB to 1 × 813 MB; standard-chat client p50 fell from 3.363 s to 2.980 s |
 | 131,072-token shared prefix, pretokenized C16 | standalone measurement | 2.698 s client p50 and 2.701 s maximum |
@@ -237,7 +237,7 @@ and recovery behavior are derived and tested.
 |---|---|---|
 | `vllm-project/vllm@fcc614141e5e9ab18cb304c476f7feed2a9552e3` with `patches/vllm/` | **implemented** | Exact patch inputs are published; no standalone public runtime builder is provided |
 | vLLM build `e2666d9a6` with `patches/vllm-e2666d9a6/` | **qualified** | DeepSeek-V4 and GLM-5.2 builders verify source, patch, and postimage hashes |
-| `local-inference-lab/vllm@da4d7be6c97434f6942292ed8abbf4b32dc44355` with `patches/vllm-da4d7be/` | **qualified** | GLM-5.3 HMA recovery, native restore, and bounded shared-prefix attachment |
+| `local-inference-lab/vllm@da4d7be6c97434f6942292ed8abbf4b32dc44355` with `patches/vllm-da4d7be/` | **qualified** | GLM-5.3 HMA recovery, SparkCache CUDA restore, and bounded shared-prefix attachment |
 
 The GLM-5.3 contract at
 [`vllm-kv-block-lease-contract-da4d7be.json`](sparkcache/runtime_patches/vllm-kv-block-lease-contract-da4d7be.json)
@@ -251,7 +251,7 @@ Native loading requires an explicit library path and SHA-256. CUDA 13 builds
 run a GPU-free byte-exact reference test and a CUDA hybrid-page probe before
 model-serving qualification.
 
-Native direct restore reads `.spcc` objects into alternating mapped arenas,
+SparkCache direct CUDA restore reads `.spcc` objects into alternating mapped arenas,
 hashes complete files in place, validates authenticated extents, and overlaps
 read work with CUDA submission.
 

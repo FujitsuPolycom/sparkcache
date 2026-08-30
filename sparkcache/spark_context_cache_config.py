@@ -20,10 +20,12 @@ import hashlib
 import json
 import os
 import re
+import threading
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from sparkcache.spark_context_cache_profiles import (
     ProfileError,
@@ -41,9 +43,80 @@ from sparkcache.streaming.feature_gate import (
 )
 
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
-_NATIVE_ARENA_BYTES = frozenset(
+_CUDA_PLACEMENT_ARENA_BYTES = frozenset(
     {64 * 1024 * 1024, 128 * 1024 * 1024, 256 * 1024 * 1024}
 )
+_MISSING = object()
+_LEGACY_CUDA_RESTORE_WARNING_LOCK = threading.Lock()
+_LEGACY_CUDA_RESTORE_WARNING_EMITTED = False
+
+
+def _warn_legacy_cuda_restore_config() -> None:
+    """Warn once when a process relies only on legacy configuration names."""
+
+    global _LEGACY_CUDA_RESTORE_WARNING_EMITTED
+    with _LEGACY_CUDA_RESTORE_WARNING_LOCK:
+        if _LEGACY_CUDA_RESTORE_WARNING_EMITTED:
+            return
+        _LEGACY_CUDA_RESTORE_WARNING_EMITTED = True
+    warnings.warn(
+        "SparkCache native-restore configuration names are deprecated; use the"
+        " SparkCache CUDA restore configuration names",
+        FutureWarning,
+        stacklevel=3,
+    )
+
+
+def _compat_config_value(
+    extra: Callable[[str, Any], Any],
+    *,
+    canonical_key: str,
+    legacy_key: str,
+    canonical_env: str,
+    legacy_env: str,
+    default: Any,
+    normalize: Callable[[Any], Any] = str,
+) -> Any:
+    """Resolve one canonical setting and its compatibility alias."""
+
+    canonical_extra = extra(canonical_key, _MISSING)
+    legacy_extra = extra(legacy_key, _MISSING)
+    canonical_value = (
+        canonical_extra
+        if canonical_extra is not _MISSING
+        else os.environ.get(canonical_env, _MISSING)
+    )
+    legacy_value = (
+        legacy_extra
+        if legacy_extra is not _MISSING
+        else os.environ.get(legacy_env, _MISSING)
+    )
+    if canonical_value is not _MISSING and legacy_value is not _MISSING:
+        try:
+            disagree = normalize(canonical_value) != normalize(legacy_value)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                "spark-context-cache: conflicting SparkCache CUDA restore"
+                f" settings {canonical_key} and legacy alias {legacy_key}"
+            ) from error
+        if disagree:
+            raise RuntimeError(
+                "spark-context-cache: conflicting SparkCache CUDA restore"
+                f" settings {canonical_key} and legacy alias {legacy_key}"
+            )
+        return canonical_value
+    if canonical_value is not _MISSING:
+        return canonical_value
+    if legacy_value is not _MISSING:
+        _warn_legacy_cuda_restore_config()
+        return legacy_value
+    return default
+
+
+def _config_bool(value: Any) -> bool:
+    if value in (1, "1", True, "true"):
+        return True
+    return False
 
 
 def _nonnegative_config_int(value: Any, label: str) -> int:
@@ -226,15 +299,45 @@ class ConnectorConfig:
     store_enabled: bool
     restore_enabled: bool
     streaming_snapshots_enabled: bool
-    native_restore_enabled: bool
-    native_library_path: str
-    native_library_sha256: str
-    native_arena_bytes: int
-    native_io_workers: int
+    cuda_restore_enabled: bool
+    cuda_placement_library_path: str
+    cuda_placement_library_sha256: str
+    cuda_placement_arena_bytes: int
+    cuda_restore_io_workers: int
     scheduler_probe: str
     identity_base: Mapping[str, Any]
     load_thread_limit: int
     max_pending_restores: int
+
+    @property
+    def native_restore_enabled(self) -> bool:
+        """Compatibility alias for :attr:`cuda_restore_enabled`."""
+
+        return self.cuda_restore_enabled
+
+    @property
+    def native_library_path(self) -> str:
+        """Compatibility alias for the CUDA placement library path."""
+
+        return self.cuda_placement_library_path
+
+    @property
+    def native_library_sha256(self) -> str:
+        """Compatibility alias for the CUDA placement library digest."""
+
+        return self.cuda_placement_library_sha256
+
+    @property
+    def native_arena_bytes(self) -> int:
+        """Compatibility alias for the CUDA placement arena size."""
+
+        return self.cuda_placement_arena_bytes
+
+    @property
+    def native_io_workers(self) -> int:
+        """Compatibility alias for the CUDA restore I/O worker count."""
+
+        return self.cuda_restore_io_workers
 
     def build_identity(self, shard_rank: int, tp_shard_rank: int) -> CacheIdentity:
         """Construct a :class:`CacheIdentity` for a DCP shard rank.
@@ -422,68 +525,98 @@ def parse_connector_config(
             "spark-context-cache: tail-cow-v1 publication does not support"
             " streaming snapshots"
         )
-    native_restore_enabled = extra(
-        "spark_cache_native_restore",
-        os.environ.get("SPARK_CONTEXT_CACHE_NATIVE_RESTORE", "0"),
-    ) in (1, "1", True, "true")
-    native_library_path = str(
-        extra(
-            "spark_cache_native_library",
-            os.environ.get("SPARK_CONTEXT_CACHE_NATIVE_LIBRARY", ""),
+    cuda_restore_enabled = _config_bool(
+        _compat_config_value(
+            extra,
+            canonical_key="spark_cache_cuda_restore",
+            legacy_key="spark_cache_native_restore",
+            canonical_env="SPARK_CONTEXT_CACHE_CUDA_RESTORE",
+            legacy_env="SPARK_CONTEXT_CACHE_NATIVE_RESTORE",
+            default="0",
+            normalize=_config_bool,
+        )
+    )
+    cuda_placement_library_path = str(
+        _compat_config_value(
+            extra,
+            canonical_key="spark_cache_cuda_placement_library",
+            legacy_key="spark_cache_native_library",
+            canonical_env="SPARK_CONTEXT_CACHE_CUDA_PLACEMENT_LIBRARY",
+            legacy_env="SPARK_CONTEXT_CACHE_NATIVE_LIBRARY",
+            default="",
         )
         or ""
     )
-    native_library_sha256 = str(
-        extra(
-            "spark_cache_native_library_sha256",
-            os.environ.get("SPARK_CONTEXT_CACHE_NATIVE_LIBRARY_SHA256", ""),
+    cuda_placement_library_sha256 = str(
+        _compat_config_value(
+            extra,
+            canonical_key="spark_cache_cuda_placement_library_sha256",
+            legacy_key="spark_cache_native_library_sha256",
+            canonical_env="SPARK_CONTEXT_CACHE_CUDA_PLACEMENT_LIBRARY_SHA256",
+            legacy_env="SPARK_CONTEXT_CACHE_NATIVE_LIBRARY_SHA256",
+            default="",
         )
         or ""
     )
-    native_arena_raw = str(
-        extra(
-            "spark_cache_native_arena_bytes",
-            os.environ.get("SPARK_CONTEXT_CACHE_NATIVE_ARENA_BYTES", ""),
+    cuda_placement_arena_raw = str(
+        _compat_config_value(
+            extra,
+            canonical_key="spark_cache_cuda_placement_arena_bytes",
+            legacy_key="spark_cache_native_arena_bytes",
+            canonical_env="SPARK_CONTEXT_CACHE_CUDA_PLACEMENT_ARENA_BYTES",
+            legacy_env="SPARK_CONTEXT_CACHE_NATIVE_ARENA_BYTES",
+            default="",
+            normalize=int,
         )
         or ""
     )
     try:
-        native_arena_bytes = int(native_arena_raw) if native_arena_raw else 0
+        cuda_placement_arena_bytes = (
+            int(cuda_placement_arena_raw) if cuda_placement_arena_raw else 0
+        )
     except ValueError as error:
-        if native_restore_enabled:
+        if cuda_restore_enabled:
             raise RuntimeError(
-                "spark-context-cache: native restore requires an integer arena size"
+                "spark-context-cache: SparkCache CUDA restore requires an integer"
+                " placement arena size"
             ) from error
-        native_arena_bytes = 0
-    native_workers_raw = extra(
-        "spark_cache_native_io_workers",
-        os.environ.get("SPARK_CONTEXT_CACHE_NATIVE_IO_WORKERS", "8"),
+        cuda_placement_arena_bytes = 0
+    cuda_restore_workers_raw = _compat_config_value(
+        extra,
+        canonical_key="spark_cache_cuda_restore_io_workers",
+        legacy_key="spark_cache_native_io_workers",
+        canonical_env="SPARK_CONTEXT_CACHE_CUDA_RESTORE_IO_WORKERS",
+        legacy_env="SPARK_CONTEXT_CACHE_NATIVE_IO_WORKERS",
+        default="8",
+        normalize=int,
     )
     try:
-        native_io_workers = int(native_workers_raw)
+        cuda_restore_io_workers = int(cuda_restore_workers_raw)
     except (TypeError, ValueError) as error:
-        if native_restore_enabled:
+        if cuda_restore_enabled:
             raise RuntimeError(
-                "spark-context-cache: native restore requires an integer"
+                "spark-context-cache: SparkCache CUDA restore requires an integer"
                 " IO worker count"
             ) from error
-        native_io_workers = 8
-    if native_restore_enabled:
-        library_path = Path(native_library_path)
+        cuda_restore_io_workers = 8
+    if cuda_restore_enabled:
+        library_path = Path(cuda_placement_library_path)
         if (
-            not native_library_path
+            not cuda_placement_library_path
             or not library_path.is_absolute()
-            or SHA256_RE.fullmatch(native_library_sha256) is None
-            or native_arena_bytes not in _NATIVE_ARENA_BYTES
+            or SHA256_RE.fullmatch(cuda_placement_library_sha256) is None
+            or cuda_placement_arena_bytes not in _CUDA_PLACEMENT_ARENA_BYTES
         ):
             raise RuntimeError(
-                "spark-context-cache: native restore requires an"
-                " absolute library path, a 64-character lowercase"
-                " SHA-256, and arena bytes equal to 64, 128, or 256 MiB"
+                "spark-context-cache: SparkCache CUDA restore requires an"
+                " absolute CUDA placement library path, a 64-character"
+                " lowercase SHA-256, and placement arena bytes equal to"
+                " 64, 128, or 256 MiB"
             )
-        if not 1 <= native_io_workers <= 32:
+        if not 1 <= cuda_restore_io_workers <= 32:
             raise RuntimeError(
-                "spark-context-cache: native restore IO workers must be in [1, 32]"
+                "spark-context-cache: SparkCache CUDA restore IO workers"
+                " must be in [1, 32]"
             )
     draft_policy = extra(
         "spark_cache_draft_policy",
@@ -558,7 +691,7 @@ def parse_connector_config(
             dcp_degree=dcp_degree,
             block_size=block_size,
             min_span_tokens=min_span,
-            native_restore=native_restore_enabled,
+            cuda_restore=cuda_restore_enabled,
         )
     except ProfileError as error:
         raise RuntimeError(f"spark-context-cache: {error}") from error
@@ -588,7 +721,7 @@ def parse_connector_config(
             ),
         ),
     )
-    if native_restore_enabled and storage_mode != "block_pages_v1":
+    if cuda_restore_enabled and storage_mode != "block_pages_v1":
         load_thread_limit = 1
     max_pending_restores_raw = extra(
         "spark_cache_max_pending_restores",
@@ -623,11 +756,11 @@ def parse_connector_config(
         store_enabled=store_enabled,
         restore_enabled=restore_enabled,
         streaming_snapshots_enabled=streaming_snapshots_enabled,
-        native_restore_enabled=native_restore_enabled,
-        native_library_path=native_library_path,
-        native_library_sha256=native_library_sha256,
-        native_arena_bytes=native_arena_bytes,
-        native_io_workers=native_io_workers,
+        cuda_restore_enabled=cuda_restore_enabled,
+        cuda_placement_library_path=cuda_placement_library_path,
+        cuda_placement_library_sha256=cuda_placement_library_sha256,
+        cuda_placement_arena_bytes=cuda_placement_arena_bytes,
+        cuda_restore_io_workers=cuda_restore_io_workers,
         scheduler_probe=scheduler_probe,
         identity_base=_freeze_config_value(identity_base),
         load_thread_limit=load_thread_limit,

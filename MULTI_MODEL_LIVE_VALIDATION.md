@@ -141,6 +141,6 @@ three recorded profiles.
 
 This record does not qualify another wheel, source tree, runtime image,
 checkpoint, scheduler budget, topology, cache geometry, or vLLM source
-contract. DeepSeek DCP2 and DCP4, streaming snapshots, native restore in these
+contract. DeepSeek DCP2 and DCP4, streaming snapshots, SparkCache CUDA restore in these
 profiles, buddy replication, and longest-stored-prefix reuse for a growing
 conversation remain unsupported or research-only as stated in `README.md`.

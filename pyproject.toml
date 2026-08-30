@@ -12,7 +12,7 @@ license-files = ["LICENSE"]
 requires-python = ">=3.11"
 # The storage engine, codec, replication protocol, and streaming state
 # machines are dependency-free. torch is required only by the connector and
-# native-restore modules; vLLM is required only at serve time and is
+# SparkCache CUDA restore modules; vLLM is required only at serve time and is
 # deliberately not a package dependency (see README: runtime pinning).
 dependencies = []
 classifiers = [

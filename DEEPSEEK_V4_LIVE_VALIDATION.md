@@ -124,7 +124,7 @@ filling a 200 GiB root or qualify model-serving load behavior.
 This evidence qualifies one TP2/DCP1 development appliance. Model-serving load
 behavior and arbitrary DeepSeek-V4 deployments are unsupported. Block-page
 storage has bounded NVMe maintenance for end-of-prefill asynchronous
-snapshots. Native restore, streaming snapshots, and DCP-sharded block pages
+snapshots. SparkCache CUDA restore, streaming snapshots, and DCP-sharded block pages
 are unsupported by this profile. The qualified service used the Python
 asynchronous restore path; every chunk was
 checksum-verified before its pages were installed.

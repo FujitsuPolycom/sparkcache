@@ -1,4 +1,4 @@
-"""Native mapped-host placement for an authenticated hybrid page snapshot."""
+"""SparkCache CUDA placement for an authenticated hybrid page snapshot."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ _TARGET_KIND = native.RECORD_TARGET_CKV
 
 
 class NativeHybridRestoreError(RuntimeError):
-    """Hybrid native placement cannot safely complete."""
+    """SparkCache CUDA page placement cannot safely complete."""
 
 
 @dataclass(frozen=True)
@@ -70,7 +70,9 @@ def plan_page_slabs(
     arena_bytes: int,
 ) -> tuple[NativePageSlab, ...]:
     if arena_bytes <= 0:
-        raise NativeHybridRestoreError("native page arena bytes must be positive")
+        raise NativeHybridRestoreError(
+            "SparkCache CUDA placement arena bytes must be positive"
+        )
     payload_bytes = plan.total_bytes - plan.header_bytes
     slabs = []
     for slab_start in range(0, payload_bytes, arena_bytes):
@@ -94,7 +96,9 @@ def plan_page_slabs(
                 )
             )
         if not spans:
-            raise NativeHybridRestoreError("native page slab has no copy spans")
+            raise NativeHybridRestoreError(
+                "SparkCache CUDA page slab has no copy spans"
+            )
         slabs.append(NativePageSlab(slab_start, slab_end, tuple(spans)))
     return tuple(slabs)
 
@@ -123,7 +127,7 @@ def execute_native_hybrid_placement(
             first_arena = transaction.acquire_arena(0)
             if first_arena.arena_mode != native.ARENA_MAPPED_HOST:
                 raise NativeHybridRestoreError(
-                    "hybrid native restore requires a mapped-host arena"
+                    "SparkCache CUDA restore requires a mapped-host arena"
                 )
             slabs = plan_page_slabs(plan, arena_bytes=first_arena.capacity_bytes)
             for slab_index, slab in enumerate(slabs):
@@ -148,15 +152,18 @@ def execute_native_hybrid_placement(
             started = time.perf_counter()
             stats = transaction.finish()
             finish_ms = 1e3 * (time.perf_counter() - started)
-            if transaction.state is not RestoreState.FINISHED or not transaction.can_resume:
+            if (
+                transaction.state is not RestoreState.FINISHED
+                or not transaction.can_resume
+            ):
                 raise NativeHybridRestoreError(
-                    "native page finish did not release the parked request"
+                    "SparkCache CUDA placement did not release the parked request"
                 )
     except NativeHybridRestoreError:
         raise
     except (NativePlacementContractError, RuntimeError, TypeError, ValueError) as error:
         raise NativeHybridRestoreError(
-            f"native hybrid placement failed: {error}"
+            f"SparkCache CUDA page placement was rejected: {error}"
         ) from error
     if (
         int(stats.slot_uploads) != 1
@@ -167,7 +174,7 @@ def execute_native_hybrid_placement(
         or int(stats.staged_h2d_bytes) != 0
     ):
         raise NativeHybridRestoreError(
-            "native hybrid placement statistics violate the mapped transaction"
+            "SparkCache CUDA placement statistics violate the mapped transaction"
         )
     return NativeHybridRestoreResult(
         placement_stats=stats,
@@ -197,7 +204,11 @@ def _target_record_plan(path: Any, encoded_bytes: int) -> tuple[int, int, int]:
             if record.get("kind") == "target_ckv":
                 offset = int(record["offset"])
                 length = int(record["length"])
-                if offset < 0 or length <= 0 or payload_offset + offset + length > encoded_bytes:
+                if (
+                    offset < 0
+                    or length <= 0
+                    or payload_offset + offset + length > encoded_bytes
+                ):
                     break
                 return payload_offset, offset, length
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
@@ -272,7 +283,12 @@ def execute_native_hybrid_restore(
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=min(io_workers, len(slab.chunks))
             ) as pool:
-                tuple(pool.map(lambda item: _read_and_authenticate(*item), zip(slab.chunks, views, strict=True)))
+                tuple(
+                    pool.map(
+                        lambda item: _read_and_authenticate(*item),
+                        zip(slab.chunks, views, strict=True),
+                    )
+                )
             read_ms += 1e3 * (time.perf_counter() - started)
             del views
             del buffer
@@ -296,7 +312,9 @@ def execute_native_hybrid_restore(
                     or int(parsed.record_offset_bytes[_TARGET_KIND]) != target_offset
                     or int(parsed.record_length_bytes[_TARGET_KIND]) != target_length
                 ):
-                    raise NativeHybridRestoreError("authenticated target extent changed")
+                    raise NativeHybridRestoreError(
+                        "authenticated target extent changed"
+                    )
                 extent_start = stream_offset
                 extent_end = stream_offset + target_length
                 for destination_index, layer in enumerate(page_plan.spans):
@@ -306,7 +324,11 @@ def execute_native_hybrid_restore(
                         continue
                     spans.append(
                         native.PageCopySpan(
-                            chunk.arena_offset_bytes + payload + target_offset + start - extent_start,
+                            chunk.arena_offset_bytes
+                            + payload
+                            + target_offset
+                            + start
+                            - extent_start,
                             start - page_plan.header_bytes,
                             start - layer.source_start,
                             end - start,
@@ -334,7 +356,17 @@ def execute_native_hybrid_restore(
     )
 
 
+CudaPageRestoreError = NativeHybridRestoreError
+CudaPageRestoreResult = NativeHybridRestoreResult
+CudaPageSlab = NativePageSlab
+execute_cuda_direct_restore = execute_native_hybrid_restore
+execute_cuda_page_placement = execute_native_hybrid_placement
+
+
 __all__ = [
+    "CudaPageRestoreError",
+    "CudaPageRestoreResult",
+    "CudaPageSlab",
     "NativeHybridRestoreError",
     "NativeHybridRestoreResult",
     "NativePageSlab",
@@ -342,4 +374,6 @@ __all__ = [
     "plan_page_slabs",
     "execute_native_hybrid_placement",
     "execute_native_hybrid_restore",
+    "execute_cuda_direct_restore",
+    "execute_cuda_page_placement",
 ]

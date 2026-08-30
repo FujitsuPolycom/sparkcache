@@ -133,7 +133,7 @@ The default rank-local policy is:
 - fail-closed load policy `recompute`;
 - colocated-target MTP state, with no separate draft digest;
 - scheduler probe `none`; and
-- streaming snapshots and native direct restore disabled.
+- streaming snapshots and SparkCache direct CUDA restore disabled.
 
 The complete `--kv-transfer-config` is the enable switch. The obsolete
 `SPARK_CONTEXT_CACHE_ENABLE` image variable is removed and explicitly unset
@@ -144,9 +144,9 @@ The accepted inspection has neither `--enable-prefix-caching` nor
 transformer preserves an absent flag or one explicit enable and rejects an
 explicit disable.
 
-## Native feature switches
+## CUDA restore and streaming switches
 
-Streaming publication and native direct restore use different libraries and
+Streaming publication and SparkCache direct CUDA restore use different libraries and
 can be enabled independently. Each enable requires its library's container
 path and SHA-256:
 
@@ -157,11 +157,11 @@ path and SHA-256:
   /opt/sparkcache-src/sparkcache/native/build/libspark_cache_snapshot.so \
 --streaming-native-library-sha256 <64-lowercase-hex>
 
-# Add independently for native direct restore.
---native-restore \
---native-restore-library \
+# Add independently for SparkCache direct CUDA restore.
+--cuda-restore \
+--cuda-placement-library \
   /opt/sparkcache-src/sparkcache/native/build/libspark_cache_placement.so \
---native-restore-library-sha256 <64-lowercase-hex>
+--cuda-placement-library-sha256 <64-lowercase-hex>
 ```
 
 Keep both switches off for the qualification baseline. Before enabling
@@ -170,7 +170,7 @@ in the R7 toolchain. The read-only SparkCache source bind then carries the
 resulting library into the container at the paths above.
 
 The 200/180 GiB capacity policy remains active when streaming is enabled.
-Use `--no-streaming-snapshots` and `--no-native-restore` for explicit
+Use `--no-streaming-snapshots` and `--no-cuda-restore` for explicit
 disabled settings.
 
 ## Concurrent deployment instances

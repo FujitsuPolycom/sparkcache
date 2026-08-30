@@ -182,7 +182,7 @@ ENTRYPOINT=["vllm"]
   BF16, seven speculative tokens, draft TP4, CC BY-NC-ND 4.0.
 - KV mode: 12 GiB FP8 GPU KV per rank; measured capacity 549,950 tokens.
 - External cache: SparkCache maximum 48 GiB and low watermark 40 GiB per
-  rank; rank-local NVMe; native direct restore and streaming disabled.
+  rank; rank-local NVMe; SparkCache direct CUDA restore and streaming disabled.
 - Graphs: target `FULL_AND_PIECEWISE`, DFlash FULL, capture sizes
   8, 16, 32, 64, 128, and 256.
 - Scheduler: asynchronous scheduling, chunked prefill, native prefix caching,
@@ -238,7 +238,7 @@ performance baseline is implied.
 ## Known limitations
 
 - MTP drafting, other checkpoints, other topologies, spans over 8,192 tokens,
-  native direct restore, streaming snapshots, throughput, and soak behavior:
+  SparkCache direct CUDA restore, streaming snapshots, throughput, and soak behavior:
   `Not tested`.
 - Exact semantic output was not established by the historical suffix-only
   receipt. Requalification must use the exact-content qualifier.

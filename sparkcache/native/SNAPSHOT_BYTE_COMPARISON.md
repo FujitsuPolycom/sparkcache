@@ -199,7 +199,7 @@ record mask is `0b011`. A separate `mtp_draft_kv` source would contradict the
 qualified registration contract and double-count drafter state.
 
 The 368- and 132-byte source strides are the tightly packed registered-tensor
-contract used by native placement. The 512/256 strides in the small fixture
+contract used by SparkCache CUDA placement. The 512/256 strides in the small fixture
 above are intentional padding stress, not claimed model-serving strides. When
 the source-table exporter is wired in, it must derive and attest
 `tensor.stride(1) * tensor.element_size()` and fail closed unless it agrees
