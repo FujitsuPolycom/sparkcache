@@ -168,7 +168,10 @@ def _load_native_components() -> SimpleNamespace:
         ArenaMode=placement.ArenaMode,
         RecordKind=placement.RecordKind,
         execute_native_restore=restore.execute_native_restore,
-        execute_native_hybrid_placement=(hybrid_restore.execute_native_hybrid_restore),
+        execute_native_hybrid_restore=hybrid_restore.execute_native_hybrid_restore,
+        execute_native_hybrid_placement=(
+            hybrid_restore.execute_native_hybrid_placement
+        ),
         bind_page_reference=binding.bind_page_reference,
         hybrid_page_cuda_capability=binding.CAP_HYBRID_PAGE_CUDA,
     )
@@ -683,7 +686,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._native_adapter: Any = None
         self._native_adapters: list[Any] = []
         self._native_execute_restore: Any = None
-        self._native_execute_hybrid: Any = None
+        self._native_execute_hybrid_restore: Any = None
+        self._native_execute_hybrid_placement: Any = None
         self._native_required_record_mask = 0
         # Scheduler state.
         self._need_load: dict[str, tuple[str, int]] = {}
@@ -2067,9 +2071,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 )
                 adapters.append(adapter)
                 adapter.configure_pages(layout, self._layer_tensors)
-            execute = components.execute_native_hybrid_placement
-            if not callable(execute):
-                raise TypeError("native hybrid restore orchestrator is not callable")
+            execute_restore = components.execute_native_hybrid_restore
+            execute_placement = components.execute_native_hybrid_placement
+            if not callable(execute_restore):
+                raise TypeError("native hybrid direct-restore orchestrator is not callable")
+            if not callable(execute_placement):
+                raise TypeError("native hybrid page-placement orchestrator is not callable")
         except Exception as error:
             for adapter in adapters:
                 with contextlib.suppress(Exception):
@@ -2079,7 +2086,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             ) from error
         self._native_adapters = adapters
         self._native_adapter = adapters[0]
-        self._native_execute_hybrid = execute
+        self._native_execute_hybrid_restore = execute_restore
+        self._native_execute_hybrid_placement = execute_placement
         self.counters["native_hybrid_configured"] = 1
         logger.info(
             "spark-context-cache: native hybrid restore configured"
@@ -3220,14 +3228,16 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         if len(groups) != len(layout.groups):
             raise HybridCodecError("request block tables disagree with page groups")
         if self._native_restore_enabled and lookup.root_kind != "page_delta":
-            if not self._native_adapters or not callable(self._native_execute_hybrid):
+            if not self._native_adapters or not callable(
+                self._native_execute_hybrid_restore
+            ):
                 raise RuntimeError(
                     "native hybrid restore selected without a configured adapter"
                 )
             if not 0 <= native_lane < len(self._native_adapters):
                 raise RuntimeError("native hybrid restore lane is unavailable")
             try:
-                result = self._native_execute_hybrid(
+                result = self._native_execute_hybrid_restore(
                     adapter=self._native_adapters[native_lane],
                     request_id=plan.request_id,
                     lookup=lookup,
@@ -3316,14 +3326,16 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 time.perf_counter_ns() - reassembly_started,
             )
         if self._native_restore_enabled:
-            if not self._native_adapters or not callable(self._native_execute_hybrid):
+            if not self._native_adapters or not callable(
+                self._native_execute_hybrid_placement
+            ):
                 raise RuntimeError(
                     "native hybrid restore selected without a configured adapter"
                 )
             if not 0 <= native_lane < len(self._native_adapters):
                 raise RuntimeError("native hybrid restore lane is unavailable")
             try:
-                result = self._native_execute_hybrid(
+                result = self._native_execute_hybrid_placement(
                     adapter=self._native_adapters[native_lane],
                     request_id=plan.request_id,
                     encoded_pages=encoded_pages,

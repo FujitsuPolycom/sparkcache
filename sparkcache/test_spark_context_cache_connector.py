@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import inspect
 import json
 import os
 import struct
@@ -151,6 +152,19 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # noqa: E402
     KVConnectorRole,
     SupportsHMA,
 )
+
+
+class NativeHybridDispatchTests(unittest.TestCase):
+    def test_loader_exposes_distinct_direct_and_materialized_page_paths(self) -> None:
+        components = connector_module._load_native_components()
+        direct = components.execute_native_hybrid_restore
+        materialized = components.execute_native_hybrid_placement
+
+        self.assertIsNot(direct, materialized)
+        self.assertIn("lookup", inspect.signature(direct).parameters)
+        self.assertNotIn("encoded_pages", inspect.signature(direct).parameters)
+        self.assertIn("encoded_pages", inspect.signature(materialized).parameters)
+        self.assertNotIn("lookup", inspect.signature(materialized).parameters)
 
 
 class CodecTests(unittest.TestCase):
@@ -558,7 +572,7 @@ class HybridPageRoundTripTests(unittest.TestCase):
 
             connector._native_restore_enabled = True
             connector._native_adapters = [object()]
-            connector._native_execute_hybrid = native_placement
+            connector._native_execute_hybrid_placement = native_placement
             self.assertTrue(
                 connector._load_one(
                     _ReqPlan(
