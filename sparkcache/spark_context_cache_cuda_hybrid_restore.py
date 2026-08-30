@@ -11,9 +11,14 @@ import struct
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from sparkcache import spark_cache_cuda as cuda
+from sparkcache.page_base_read_flights import (
+    PageBaseReadEvidence,
+    PageBaseReadError,
+    PageBaseReadResult,
+)
 from sparkcache.persistent_context_cache.cache_manifest import (
     CacheFormatError,
     CacheIdentity,
@@ -91,7 +96,7 @@ class CudaPageObject:
 @dataclass(frozen=True)
 class CudaAuthenticatedPageObject:
     source: CudaPageObject
-    payload: bytearray
+    payload: bytes
 
 
 @dataclass(frozen=True)
@@ -204,7 +209,56 @@ def _read_authenticated_page_object(
         raise CudaHybridRestoreError(
             f"page object SHA-256 mismatch for {source.path}"
         )
-    return CudaAuthenticatedPageObject(source, payload)
+    return CudaAuthenticatedPageObject(source, bytes(payload))
+
+
+def _read_authenticated_page_base(
+    objects: Sequence[CudaPageObject],
+) -> PageBaseReadResult:
+    """Read every flat-base object and publish only authenticated bytes."""
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(_MAX_PAGE_OBJECT_READ_WORKERS, len(objects))
+    ) as read_pool:
+        authenticated = tuple(
+            read_pool.map(_read_authenticated_page_object, objects)
+        )
+    return PageBaseReadResult(
+        value=authenticated,
+        encoded_bytes=sum(item.source.encoded_bytes for item in authenticated),
+    )
+
+
+def _validated_shared_page_base(
+    result: PageBaseReadResult | bytes,
+    objects: Sequence[CudaPageObject],
+) -> tuple[CudaAuthenticatedPageObject, ...]:
+    # The only producer is _read_authenticated_page_base, which hashes every
+    # immutable object before publication. Re-hashing here would turn every
+    # follower into another full-base authentication pass and defeat the
+    # native flight; descriptor and length checks reject cross-base reuse.
+    if not isinstance(result, PageBaseReadResult) or not isinstance(
+        result.value, tuple
+    ):
+        raise CudaHybridRestoreError(
+            "native page-base reader returned an incompatible representation"
+        )
+    authenticated = result.value
+    if (
+        len(authenticated) != len(objects)
+        or any(
+            not isinstance(item, CudaAuthenticatedPageObject)
+            or item.source != source
+            or not isinstance(item.payload, bytes)
+            or len(item.payload) != source.encoded_bytes
+            for item, source in zip(authenticated, objects, strict=True)
+        )
+        or result.encoded_bytes != sum(item.encoded_bytes for item in objects)
+    ):
+        raise CudaHybridRestoreError(
+            "native page-base reader returned incompatible authenticated objects"
+        )
+    return authenticated
 
 
 def _split_logical_source_range(
@@ -255,6 +309,11 @@ def plan_cuda_page_delta_restore(
     group_slots: Sequence[Sequence[int]],
     expected_span_tokens: int,
     arena_bytes: int,
+    base_reader: Callable[
+        [PageBaseReadEvidence, Callable[[], PageBaseReadResult]],
+        PageBaseReadResult | bytes,
+    ]
+    | None = None,
 ) -> CudaPageDeltaRestorePlan:
     """Authenticate a page-delta graph and plan final-order source fragments."""
 
@@ -368,11 +427,42 @@ def plan_cuda_page_delta_restore(
             arena_bytes=arena_bytes,
             label="page snapshot",
         )
-        authenticated_base = _read_authenticated_page_object(base_objects[0])
-        prefetched[base_objects[0].path] = authenticated_base
         stages = tuple(reversed(stages_newest_first))
         if not stages:
             raise CudaHybridRestoreError("page-delta graph contains no delta")
+        shared_base_used = base_reader is not None and len(stages) == 1
+        if shared_base_used:
+            evidence = PageBaseReadEvidence(
+                identity_storage_key=identity.storage_key,
+                base_context_digest=manifest["base_context_digest"],
+                base_root_sha256=manifest["base_root_sha256"],
+                base_root_kind="page_snapshot",
+                layout_sha256=manifest["layout_sha256"],
+                base_block_counts=tuple(manifest["base_block_counts"]),
+                base_boundary_tokens=manifest["base_committed_tokens"],
+                base_encoded_bytes=root["snapshot_encoded_bytes"],
+            )
+            try:
+                shared_base = base_reader(
+                    evidence,
+                    lambda: _read_authenticated_page_base(base_objects),
+                )
+            except PageBaseReadError as error:
+                raise CudaHybridRestoreError(
+                    f"native shared page-base read was rejected: {error}"
+                ) from error
+            authenticated_base_objects = _validated_shared_page_base(
+                shared_base,
+                base_objects,
+            )
+            prefetched.update(
+                (item.source.path, item)
+                for item in authenticated_base_objects
+            )
+            authenticated_base = authenticated_base_objects[0]
+        else:
+            authenticated_base = _read_authenticated_page_object(base_objects[0])
+            prefetched[base_objects[0].path] = authenticated_base
         base_counts = stages[0].plan.base_block_counts
         base_page_plan = plan_page_snapshot(
             layout,
@@ -494,7 +584,11 @@ def plan_cuda_page_delta_restore(
         skipped_base_object_bytes=sum(
             source.encoded_bytes
             for path, source in base_paths.items()
-            if path not in referenced and path != base_objects[0].path
+            if (
+                not shared_base_used
+                and path not in referenced
+                and path != base_objects[0].path
+            )
         ),
     )
 
@@ -1080,6 +1174,11 @@ def _execute_page_delta_restore(
     expected_span_tokens: int,
     arena_bytes: int,
     io_workers: int,
+    base_reader: Callable[
+        [PageBaseReadEvidence, Callable[[], PageBaseReadResult]],
+        PageBaseReadResult | bytes,
+    ]
+    | None,
 ) -> CudaHybridRestoreResult:
     """Place a verified base+delta graph without assembling its final bytes."""
 
@@ -1091,6 +1190,7 @@ def _execute_page_delta_restore(
         group_slots=group_slots,
         expected_span_tokens=expected_span_tokens,
         arena_bytes=arena_bytes,
+        base_reader=base_reader,
     )
     read_ms = 1e3 * (time.perf_counter() - planning_started)
     batches = _delta_submission_batches(plan.source_spans, arena_bytes=arena_bytes)
@@ -1101,7 +1201,7 @@ def _execute_page_delta_restore(
     referenced_paths = {span.source.path for span in plan.source_spans}
     for path in tuple(prefetched):
         if path not in referenced_paths:
-            prefetched.pop(path).payload.clear()
+            prefetched.pop(path)
     read_source_bytes = sum(
         item.source.encoded_bytes for item in plan.prefetched_objects
     )
@@ -1190,10 +1290,6 @@ def _execute_page_delta_restore(
                 spans=native_spans,
             )
             submit_call_ms += 1e3 * (time.perf_counter() - started)
-            for path, item in loaded.items():
-                if path not in prefetched:
-                    item.payload.clear()
-
         if final_sha256.hexdigest() != plan.result_snapshot_sha256:
             raise CudaHybridRestoreError(
                 "page-delta reconstructed snapshot checksum mismatch"
@@ -1205,8 +1301,6 @@ def _execute_page_delta_restore(
             raise CudaHybridRestoreError(
                 "page-delta placement did not release the parked request"
             )
-    for item in prefetched.values():
-        item.payload.clear()
     expected_stats = {
         "source_bytes": payload_bytes,
         "slabs_submitted": len(batches),
@@ -1252,6 +1346,11 @@ def execute_cuda_hybrid_restore(
     expected_span_tokens: int,
     arena_bytes: int,
     io_workers: int = 8,
+    base_reader: Callable[
+        [PageBaseReadEvidence, Callable[[], PageBaseReadResult]],
+        PageBaseReadResult | bytes,
+    ]
+    | None = None,
 ) -> CudaHybridRestoreResult:
     """Pipeline authenticated .spcc reads directly into mapped page scatter."""
 
@@ -1269,6 +1368,7 @@ def execute_cuda_hybrid_restore(
             expected_span_tokens=expected_span_tokens,
             arena_bytes=arena_bytes,
             io_workers=io_workers,
+            base_reader=base_reader,
         )
     if isinstance(manifest, dict) and (
         manifest.get("schema") == _PAGE_SNAPSHOT_MANIFEST_SCHEMA

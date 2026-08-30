@@ -92,6 +92,7 @@ from sparkcache.page_base_read_flights import (
     PageBaseReadEvidence,
     PageBaseReadFlightKey,
     PageBaseReadFlights,
+    PageBaseReadResult,
 )
 from sparkcache.spark_context_cache_store import (
     CacheIdentity,
@@ -3427,12 +3428,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         if (
             self._storage_mode != "block_pages_v1"
             or self._page_layout is None
-            or self._native_restore_enabled
         ):
-            # Direct page-delta restore authenticates and places only source
-            # object fragments that survive delta precedence. Registering a
-            # materialized-base flight here would defer followers for bytes
-            # the native path intentionally never constructs or publishes.
             return list(load_plans), [], {}
         identity = self._identity(self._worker_rank())
         grouped: dict[PageBaseReadFlightKey, list[_ReqPlan]] = {}
@@ -3456,6 +3452,15 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     result_block_counts=tuple(len(group) for group in groups),
                     result_boundary_tokens=plan.span_tokens,
                 )
+                if (
+                    self._native_restore_enabled
+                    and evidence.base_root_kind != "page_snapshot"
+                ):
+                    # Native object sharing currently publishes one verified
+                    # flat-base object set. Nested deltas keep their ordinary
+                    # independent direct path instead of waiting on a flight
+                    # whose representation they cannot consume.
+                    continue
                 key = self._page_base_flight_key(evidence)
             except (KeyError, OSError, RuntimeError, ValueError):
                 continue
@@ -3526,8 +3531,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self,
         request_id: str,
         evidence: PageBaseReadEvidence,
-        reader: Callable[[], bytes | bytearray],
-    ) -> bytes | bytearray:
+        reader: Callable[[], bytes | bytearray | PageBaseReadResult],
+    ) -> bytes | PageBaseReadResult:
         key = self._page_base_flight_key(evidence)
         try:
             return self._page_base_reads.resolve(request_id, key, reader)
@@ -3870,6 +3875,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     expected_span_tokens=plan.span_tokens,
                     arena_bytes=self._native_arena_bytes,
                     io_workers=self._native_io_workers,
+                    base_reader=lambda evidence, reader: (
+                        self._restore_page_base_for_request(
+                            plan.request_id,
+                            evidence,
+                            reader,
+                        )
+                    ),
                 )
             except Exception as error:  # noqa: BLE001
                 logger.warning(

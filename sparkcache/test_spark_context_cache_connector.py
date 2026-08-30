@@ -1488,11 +1488,11 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
         ]
         return connector, evidence, plans
 
-    def test_native_page_delta_restore_does_not_register_materialized_base_flights(
+    def test_native_page_delta_restore_registers_object_base_flights(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            connector, _evidence, plans = self._page_base_queue_fixture(
+            connector, evidence, plans = self._page_base_queue_fixture(
                 Path(directory)
             )
             connector._native_restore_enabled = True
@@ -1501,10 +1501,16 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                 plans
             )
 
-            self.assertEqual(runnable, plans)
-            self.assertEqual(deferred, [])
-            self.assertEqual(keys, {})
-            connector._store.page_delta_base_read_evidence.assert_not_called()
+            self.assertEqual(runnable, plans[:1])
+            self.assertEqual(deferred, plans[1:])
+            expected_key = connector._page_base_flight_key(evidence)
+            self.assertEqual(
+                keys,
+                {plan.request_id: expected_key for plan in plans},
+            )
+            connector._store.page_delta_base_read_evidence.assert_called()
+            for plan in plans:
+                connector._page_base_reads.finish(plan.request_id)
 
     def test_start_load_kv_c16_reads_one_pre_registered_page_base(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
