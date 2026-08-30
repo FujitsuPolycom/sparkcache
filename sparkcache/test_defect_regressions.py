@@ -1028,6 +1028,7 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
     NONALIGNED_BOUNDARY = 8192
     NONALIGNED_PROMPT_TOKENS = 8256
     BOUNDARY_BLOCK = 42
+    COW_BLOCK = 142
 
     @staticmethod
     def _config() -> types.SimpleNamespace:
@@ -1103,15 +1104,21 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
         recurrent_boundary_blocks: object = None,
         group_count: int = 2,
         num_scheduled_tokens: int = 1,
+        resumed: bool = False,
+        new_block_ids: object = None,
     ) -> types.SimpleNamespace:
         request_id = "dflash-recurrent-boundary"
         output = types.SimpleNamespace(
             scheduled_new_reqs=[],
             scheduled_cached_reqs=types.SimpleNamespace(
                 req_ids=[request_id],
-                resumed_req_ids=set(),
+                resumed_req_ids={request_id} if resumed else set(),
                 num_computed_tokens=[num_computed_tokens],
-                new_block_ids=[tuple(() for _ in range(group_count))],
+                new_block_ids=[
+                    new_block_ids
+                    if new_block_ids is not None
+                    else tuple(() for _ in range(group_count))
+                ],
             ),
             num_scheduled_tokens={request_id: num_scheduled_tokens},
             preempted_req_ids=set(),
@@ -1135,18 +1142,24 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
                 kv_cache_config=config,
                 extra_config={"spark_cache_model_profile": "glm53-flash-hybrid"},
             )
+            boundary_metadata = {
+                "dflash-recurrent-boundary": [
+                    (1, self.BOUNDARY_BLOCK, self.BOUNDARY)
+                ]
+            }
             first_metadata = scheduler.build_connector_meta(
-                self._scheduler_output()
+                self._scheduler_output(boundary_metadata)
             )
             self.assertEqual(first_metadata.plans, [])
             self.assertIn("dflash-recurrent-boundary", scheduler._store_progress)
+            self.assertEqual(
+                scheduler._store_recurrent_boundaries[
+                    "dflash-recurrent-boundary"
+                ],
+                ((1, self.BOUNDARY_BLOCK),),
+            )
             output = self._cached_scheduler_output(
                 num_computed_tokens=self.PROMPT_TOKENS,
-                recurrent_boundary_blocks={
-                    "dflash-recurrent-boundary": [
-                        (1, self.BOUNDARY_BLOCK, self.BOUNDARY)
-                    ]
-                },
             )
 
             self.assertTrue(scheduler.supports_recurrent_boundary_blocks)
@@ -1206,7 +1219,7 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
                 torch.equal(pools["recurrent"][[93]], expected_recurrent)
             )
 
-    def test_nonaligned_boundary_uses_request_table_without_mapping(self) -> None:
+    def test_nonaligned_boundary_waits_for_partial_tail_cow_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(
                 Path(directory),
@@ -1229,34 +1242,49 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
             first_metadata = connector.build_connector_meta(output)
             self.assertEqual(first_metadata.plans, [])
             self.assertIn(request.req_id, connector._store_progress)
-            metadata = connector.build_connector_meta(
+            pending = connector.build_connector_meta(
                 self._cached_scheduler_output(
                     num_computed_tokens=self.NONALIGNED_PROMPT_TOKENS,
+                )
+            )
+            self.assertEqual(pending.plans, [])
+            self.assertIn(request.req_id, connector._store_progress)
+            metadata = connector.build_connector_meta(
+                self._cached_scheduler_output(
+                    num_computed_tokens=self.NONALIGNED_PROMPT_TOKENS + 1,
+                    recurrent_boundary_blocks={
+                        request.req_id: [
+                            (1, self.COW_BLOCK, self.NONALIGNED_BOUNDARY)
+                        ]
+                    },
                 )
             )
 
             self.assertEqual(len(metadata.plans), 1)
             plan = metadata.plans[0]
             self.assertEqual(plan.span_tokens, self.NONALIGNED_BOUNDARY)
-            self.assertEqual(plan.recurrent_boundary_blocks, ())
+            self.assertEqual(plan.recurrent_boundary_blocks, ((1, self.COW_BLOCK),))
             self.assertEqual(
                 connector._select_group_blocks_for_span(
                     plan.block_ids_by_group,
                     plan.span_tokens,
                     recurrent_boundary_blocks=plan.recurrent_boundary_blocks,
                 ),
-                ((11, 12, 13, 14), (71,)),
+                ((11, 12, 13, 14), (self.COW_BLOCK,)),
             )
             self.assertEqual(
                 connector.counters["recurrent_boundary_metadata_rejected"],
                 0,
             )
 
-    def test_nonaligned_boundary_rejects_unexpected_mapping(self) -> None:
-        output = self._scheduler_output()
-        request = output.scheduled_new_reqs[0]
-        request.prompt_token_ids = list(range(self.NONALIGNED_PROMPT_TOKENS))
-        output.num_scheduled_tokens[request.req_id] = self.NONALIGNED_PROMPT_TOKENS
+    def test_conflicting_mapping_poisons_latched_publication(self) -> None:
+        output = self._scheduler_output(
+            {
+                "dflash-recurrent-boundary": [
+                    (1, self.BOUNDARY_BLOCK, self.BOUNDARY)
+                ]
+            }
+        )
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(
                 Path(directory),
@@ -1277,11 +1305,7 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
                     num_computed_tokens=self.NONALIGNED_PROMPT_TOKENS,
                     recurrent_boundary_blocks={
                         "dflash-recurrent-boundary": [
-                            (
-                                1,
-                                self.BOUNDARY_BLOCK,
-                                self.NONALIGNED_BOUNDARY,
-                            )
+                            (1, self.BOUNDARY_BLOCK + 1, self.BOUNDARY)
                         ]
                     },
                 )
@@ -1339,7 +1363,7 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
             )
             self.assertNotIn("dflash-recurrent-boundary", connector._store_progress)
 
-    def test_missing_or_wrong_request_metadata_skips_publication(self) -> None:
+    def test_missing_or_wrong_request_metadata_keeps_publication_pending(self) -> None:
         for boundary_metadata in (
             None,
             {"another-request": [(1, self.BOUNDARY_BLOCK, self.BOUNDARY)]},
@@ -1377,7 +1401,23 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
                         connector.counters[
                             "recurrent_boundary_metadata_rejected"
                         ],
-                        1,
+                        0,
+                    )
+                    self.assertIn(
+                        "dflash-recurrent-boundary", connector._store_progress
+                    )
+                    connector.request_finished(
+                        types.SimpleNamespace(
+                            request_id="dflash-recurrent-boundary"
+                        ),
+                        [],
+                    )
+                    self.assertNotIn(
+                        "dflash-recurrent-boundary", connector._store_progress
+                    )
+                    self.assertNotIn(
+                        "dflash-recurrent-boundary",
+                        connector._store_recurrent_boundaries,
                     )
 
     def test_contradictory_boundary_metadata_skips_publication(self) -> None:
@@ -1483,9 +1523,16 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
                 extra_config={"spark_cache_model_profile": "glm53-flash-hybrid"},
             )
             request_id = "dflash-recurrent-boundary"
-            connector._store_recurrent_boundaries[request_id] = (
-                (1, self.BOUNDARY_BLOCK),
+            connector.build_connector_meta(
+                self._scheduler_output(
+                    {
+                        request_id: [
+                            (1, self.BOUNDARY_BLOCK, self.BOUNDARY)
+                        ]
+                    }
+                )
             )
+            self.assertIn(request_id, connector._store_recurrent_boundaries)
             output = types.SimpleNamespace(
                 scheduled_new_reqs=[],
                 scheduled_cached_reqs=types.SimpleNamespace(
@@ -1502,6 +1549,66 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
 
             self.assertEqual(metadata.preempted_request_ids, (request_id,))
             self.assertNotIn(request_id, connector._store_recurrent_boundaries)
+            self.assertIn(request_id, connector._store_progress)
+
+            resumed = connector.build_connector_meta(
+                self._cached_scheduler_output(
+                    num_computed_tokens=self.PROMPT_TOKENS,
+                    resumed=True,
+                    new_block_ids=self._tables(),
+                )
+            )
+            self.assertEqual(resumed.plans, [])
+            self.assertNotIn(request_id, connector._store_recurrent_boundaries)
+            published = connector.build_connector_meta(
+                self._cached_scheduler_output(
+                    num_computed_tokens=self.PROMPT_TOKENS + 1,
+                    recurrent_boundary_blocks={
+                        request_id: [
+                            (1, self.BOUNDARY_BLOCK + 10, self.BOUNDARY)
+                        ]
+                    },
+                )
+            )
+            self.assertEqual(len(published.plans), 1)
+            self.assertEqual(
+                published.plans[0].recurrent_boundary_blocks,
+                ((1, self.BOUNDARY_BLOCK + 10),),
+            )
+
+    def test_quorum_retires_pending_store_without_boundary_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                block_size=256,
+                role=KVConnectorRole.SCHEDULER,
+                override_worker_rank=False,
+                tp=1,
+                dcp=1,
+                kv_cache_config=self._config(),
+                extra_config={"spark_cache_model_profile": "glm53-flash-hybrid"},
+            )
+            request_id = "dflash-recurrent-boundary"
+            connector.build_connector_meta(self._scheduler_output())
+            digest = connector._store_progress[request_id][0]
+            connector._quorum[digest] = {0}
+
+            metadata = connector.build_connector_meta(
+                self._cached_scheduler_output(
+                    num_computed_tokens=self.PROMPT_TOKENS,
+                    recurrent_boundary_blocks="malformed-but-unneeded",
+                )
+            )
+
+            self.assertEqual(metadata.plans, [])
+            self.assertNotIn(request_id, connector._store_progress)
+            self.assertNotIn(request_id, connector._store_recurrent_boundaries)
+            self.assertEqual(connector.counters["store_skipped_quorum"], 1)
+            self.assertEqual(
+                connector.counters["recurrent_boundary_metadata_rejected"],
+                0,
+            )
 
 
 class DigestNamespaceTests(unittest.TestCase):

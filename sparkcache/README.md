@@ -230,12 +230,13 @@ when placement completes and intentionally excludes that bookkeeping.
   request block table. Its `SchedulerOutput.recurrent_boundary_blocks` hand-off
   names the pinned physical block by request, group, and token boundary.
   SparkCache defers a new recurrent request until a later cached scheduler step,
-  when the preceding forward's hand-off can be observed. It then requires one
-  matching entry for every recurrent group whose block size exactly divides the
-  publication boundary; missing or contradictory proof skips publication
-  rather than scanning later running or speculative state. At a boundary inside
-  a recurrent page, the request table's partial page remains authoritative and
-  an unexpected override is rejected. The
+  when the preceding forward's hand-off can be observed. It latches one matching
+  entry for every recurrent group, including a partial-tail CoW target when the
+  boundary lies inside a recurrent page. Outputs with no entry leave publication
+  pending; incomplete, contradictory, or changed evidence cancels it. A store is
+  emitted only after every recurrent group has a proven pinned block. SparkCache
+  never substitutes an accumulated request-table ID because vLLM may have
+  replaced that source block while producing the durable CoW target. The
   `sparkcache-page-delta-manifest/v2` schema embeds its authenticated base graph
   and groups delta bytes into immutable objects of at most 64 MiB. A
   1,575,821,491-byte delta therefore uses at most 24 physical delta objects
