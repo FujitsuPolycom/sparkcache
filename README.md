@@ -53,8 +53,10 @@ Status words are deliberate:
 | SparkCache CUDA restore and placement | **qualified** | Exact GLM-5.3 TP4/DCP1 source artifacts in the linked records |
 | Shared exact-prefix GPU blocks | **qualified** | Up to 16 waiting followers in the recorded GLM-5.3 runtime |
 | Different-root shared row segments | **implemented** | Authenticated `per_token_rows` descriptor-prefix sharing; GPU-free tested, not live qualified |
+| Shared opaque-page base reads | **implemented** | `sparkcache-page-base-restore-flight/v1` cohorts at SparkCache `a1511d2`; GPU-free tested, not live qualified; [review evidence](https://github.com/FujitsuPolycom/sparkcache/pull/42) |
 | Streaming snapshots | **research-only** | GLM-5.2 DCP4 inventory; disabled for opaque page profiles |
 | Buddy replication | **research-only** | Protocol and receiver state exist; no network carrier is included |
+| Heat and SSD write-control model | **research-only** | Independent offline design in [PR #36](https://github.com/FujitsuPolycom/sparkcache/pull/36); excluded from serving and package imports |
 
 SparkCache is alpha research software. APIs, cache formats, patches, and
 supported profiles may change.
@@ -138,6 +140,23 @@ sequence; a mismatch causes the affected request to recompute. Different-root
 row-segment sharing is **implemented** and GPU-free tested, but no live model
 artifact qualifies it.
 
+### Shared opaque-page base reads
+
+Concurrent `block_pages_v1` page-delta restores with independently
+authenticated result roots may share one rank-local read of an identical
+immutable base. Each request still authenticates its private delta,
+reconstructs its own result snapshot, and performs request-private placement.
+The coordinator admits at most two simultaneous flights, 16 cumulative
+participants per flight, 1 GiB declared bytes per flight, and 2 GiB of peak
+reservations. Followers do not occupy loader lanes while the base is pending;
+an unrelated restore can use another configured lane.
+
+The base buffer is released after every registered member acquires or abandons
+it. This is bounded request-cohort I/O sharing, not a retained host-memory tier,
+and it never shares mutable recurrent pages. The behavior is **implemented**
+and GPU-free tested at SparkCache `a1511d2`; no live model artifact qualifies
+it.
+
 ## Installation and qualified entry points
 
 Install the package artifact that matches the intended evidence:
@@ -184,6 +203,12 @@ covering queue wait, manifest lookup, read and verification, reconstruction,
 device submission, and CUDA synchronization. Timing is diagnostic and cannot
 make an entry eligible.
 
+Released opaque-page base-read cohorts emit
+`sparkcache-page-base-restore-flight/v1` summaries with authenticated base
+identity, participants, physical and avoided reads, bytes, duration,
+cancellations, outcome, worker generation, and storage mode. Prompt content is
+not logged.
+
 Repeated restores do not rewrite payload objects. Publication writes immutable
 objects for row tails, page deltas, and periodic flat compactions.
 Operators should monitor NVMe Data Units Written against publication volume.
@@ -224,6 +249,12 @@ snapshot's complete digest before the parked request may resume.
   are **implemented** and GPU-free tested, not live qualified. Their 13-object
   813,068,464-byte geometry is a
   format result, not a latency claim.
+- Opaque-page base-read cohorts at SparkCache `a1511d2` are **implemented** and
+  GPU-free tested, not live qualified. Existing exact-prefix C16 evidence does
+  not qualify cross-result-root base I/O sharing.
+- The heat/write-control work in PR #36 is **research-only** and independent of
+  this runtime stack. It reports hypothetical admission and write pressure; it
+  does not enforce serving budgets or affect restore eligibility.
 - More than 16 waiting followers, C24/C32 cohorts, unrelated-cold C16 behavior,
   and decode interference are outside the qualified bounds. Existing
   measurements for the latter two are **research-only**.
@@ -241,6 +272,7 @@ snapshot's complete digest before the parked request may resume.
 |---|---|
 | `sparkcache/spark_context_cache_connector.py` | scheduler admission, worker I/O, restore coordination, and vLLM callbacks |
 | `sparkcache/persistent_context_cache/cache_manifest.py` | manifests, aliases, immutable objects, lookup, invalidation, capacity, and garbage collection |
+| `sparkcache/page_base_read_flights.py` | bounded request-cohort sharing for authenticated opaque-page base reads |
 | `sparkcache/spark_context_cache_cuda_hybrid_restore.py` | SparkCache CUDA object reads, slab planning, and page placement |
 | `sparkcache/runtime_patches/` | exact-hash vLLM source contracts and GPU-free patch tests |
 | `sparkcache/native/` | C++/CUDA ABI, parser, reference implementation, kernel, and probes |

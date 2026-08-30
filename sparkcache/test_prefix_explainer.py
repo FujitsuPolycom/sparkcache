@@ -86,7 +86,8 @@ def test_prefix_explorer_describes_present_storage_and_restore_behavior() -> Non
         "descriptor segment contains at most 16 chunk descriptors",
         "4,096-token boundaries",
         "at most 64 aliases",
-        "share authenticated row segments across different roots",
+        "share authenticated row segments",
+        "coalesce identical opaque-page base reads",
         "sparkcache-tail-manifest/v1",
         "sparkcache-hybrid-page-delta/v1",
         "sparkcache-page-delta-manifest/v2",
@@ -96,6 +97,9 @@ def test_prefix_explorer_describes_present_storage_and_restore_behavior() -> Non
         "13 authenticated delta objects",
         "at most two deltas",
         "Different row roots may coalesce one authenticated trunk restore",
+        "Different page-delta results may coalesce one authenticated base read",
+        "one physical read per rank",
+        "Followers stay outside loader lanes while the base is pending",
         "16 distinct request tails sharing one restored 128K block_pages_v1 prefix",
         "no live model artifact qualifies it",
         "request-private GPU tail",
@@ -129,9 +133,12 @@ def test_readme_links_explorer_and_states_capabilities() -> None:
         "Tail-only opaque-page deltas | **qualified**",
         "64 MiB flat page macro objects | **implemented**",
         "Different-root shared row segments | **implemented**",
+        "Shared opaque-page base reads | **implemented**",
+        "sparkcache-page-base-restore-flight/v1",
         "16 distinct request tails shared one restored 128K `block_pages_v1` prefix",
         "sha256:ed60be066d6d9eadea267bc4597a0687869f3ddb95a3e5c6f86649893a838eb8",
         "Flat `sparkcache-page-snapshot-manifest/v2` objects at SparkCache `229d7d6`",
+        "Opaque-page base-read cohorts at SparkCache `a1511d2`",
     )
     for fragment in required:
         assert fragment in readme

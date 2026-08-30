@@ -224,39 +224,31 @@ when placement completes and intentionally excludes that bookkeeping.
 - **Immutable block-page tails — implemented.** The
   `sparkcache-hybrid-page-delta/v1` codec reuses only byte-identical page
   prefixes and binds the base snapshot, layout, block counts, and semantic
-  token boundaries. A boundary inside an HMA page replaces that complete page
-  while retaining earlier byte-identical pages. At an exact recurrent-page
-  boundary, vLLM may retain the replay-boundary page outside the advancing
-  request block table. Its `SchedulerOutput.recurrent_boundary_blocks` hand-off
-  names the pinned physical block by request, group, and token boundary.
-  `recurrent_boundary_granularity` advertises SparkCache's 256-token publication
-  boundary to the exact vLLM scheduler without changing vLLM's native hash
-  geometry.
-  SparkCache defers a recurrent request until a later cached scheduler step,
-  when the preceding forward's hand-off can be observed. It latches one matching
-  entry for every recurrent group, including a partial-tail CoW target when the
-  boundary lies inside a recurrent page. Valid entries for an earlier checkpoint
-  are ignored while the request advances; outputs with no target-boundary entry
-  leave publication pending. Incomplete, future, contradictory, or changed
-  target evidence cancels it. A store is emitted only after every recurrent
-  group has a proven pinned block at the exact publication boundary. SparkCache
-  never substitutes an accumulated request-table ID because vLLM may have
-  replaced that source block while producing the durable CoW target. The
-  `sparkcache-page-delta-manifest/v2` schema embeds its authenticated base graph
-  and groups delta bytes into immutable objects of at most 64 MiB. A
-  1,575,821,491-byte delta therefore uses at most 24 physical delta objects
-  instead of 1,024 objects derived from logical token chunks. Ordered restore
-  batches retain at most four object payloads in addition to one assembled
-  delta buffer. Version 1 manifests remain readable. Cache identity, digest
-  salts, the 256-token logical boundary, and the `page-tail-cow-v1` namespace
-  are unchanged. Capacity maintenance retains shared objects after predecessor
-  roots are removed. Restore reconstructs the verified full snapshot before
-  Python/Torch or SparkCache CUDA placement. GPU-free regression coverage
-  exists; live model-serving qualification does not. Direct placement from
-  base and delta extents is unsupported by this schema. A graph contains at
-  most two deltas. The following extension publishes a fresh flat snapshot,
-  bounding
-  reconstruction work and metadata ancestry.
+  token boundaries. Hash-proven recurrent hand-offs cover exact replay pages
+  and partial-tail replacement without changing 256-token identity geometry.
+  `sparkcache-page-delta-manifest/v2` groups authenticated delta bytes into
+  objects of at most 64 MiB and keeps version 1 readable. A graph contains at
+  most two deltas before compaction. The exact local `ed60…` artifact qualifies
+  byte-correct 128K-to-256K tail publication and restore; timing and
+  write-volume bounds are not established.
+- **Flat opaque-page macro objects — implemented.**
+  `sparkcache-page-snapshot-manifest/v2` stores complete page snapshots in
+  authenticated objects of at most 64 MiB while preserving logical identity
+  and admission geometry. Version 1 flat manifests remain readable.
+  SparkCache CUDA restore counts complete authenticated arena bytes, including
+  the snapshot header, while copy spans cover payload bytes. GPU-free coverage
+  exists; live model-serving qualification does not.
+- **Different-root row-segment sharing — implemented.** Distinct
+  `per_token_rows` result roots may share one authenticated descriptor prefix
+  when every rank proves the same chunk sequence. GPU-free coverage exists;
+  live model-serving qualification does not.
+- **Shared opaque-page base reads — implemented.** Concurrent page-delta roots
+  that name identical authenticated base evidence may share one rank-local
+  immutable base buffer. Private deltas, reconstruction, and placement remain
+  request-owned. Cohorts are bounded to two flights, 16 cumulative members,
+  1 GiB per flight, and 2 GiB peak reservations. Followers remain outside
+  loader lanes while the base is pending. GPU-free coverage exists; live
+  model-serving qualification does not.
 - **Concurrent shared GPU prefix — implemented.** One leader restores a
   persistent digest. After every rank succeeds, up to sixteen waiting followers
   attach through vLLM block references. Two leases may remain reusable for
@@ -280,6 +272,10 @@ when placement completes and intentionally excludes that bookkeeping.
 - **Buddy replication — research-only.** Transaction, credit, idempotency,
   expiry, and reconnect state are implemented. No socket, NIXL, or RDMA
   carrier is included.
+- **Heat and SSD write-control model — research-only.** The independent
+  offline design models bounded heat, shadow admission, staged writes, and
+  SMART Data Units Written deltas. It is excluded from package and serving
+  imports and does not enforce publication or eviction decisions.
 
 ## Support evidence
 
