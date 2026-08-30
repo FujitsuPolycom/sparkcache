@@ -1,7 +1,5 @@
 # SparkCache
 
-## What SparkCache is
-
 > [!WARNING]
 > **Alpha research software.** Use SparkCache for evaluation. APIs, cache
 > formats, deployment patches, and supported profiles may change.
@@ -10,8 +8,8 @@ SparkCache is a persistent, rank-local NVMe context cache for vLLM's
 KV-Connector-V1 interface. Each tensor-parallel worker stores and restores only
 the model state owned by its physical rank.
 
-Normal restore reads each rank's local filesystem. SparkCache does not send KV
-payload over a cache network. vLLM collectives may still use Ethernet, a
+Sparkcache KV/context Restore reads each rank's local filesystem. SparkCache does not send KV
+payload over a network link. vLLM collectives may still use Ethernet, a
 switched fabric, or a switchless ring.
 
 Deployment labels use TP for tensor-parallel degree and DCP for
