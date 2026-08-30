@@ -180,8 +180,19 @@ source boundary, retaining at most 64 aliases. Alias graphs participate in TTL,
 LRU, capacity accounting, invalidation, and orphan collection.
 
 Opaque hybrid page storage, identified by `block_pages_v1`, encodes a complete
-boundary snapshot and partitions its bytes across chunk files. Those byte
-partitions are not independently usable token ranges.
+boundary snapshot. New flat publications use the authenticated
+`sparkcache-page-snapshot-manifest/v2` root and partition that opaque byte
+stream into content-addressed objects of at most 64 MiB. The root separately
+records the 256-token logical chunk size and count used by identity and
+admission; physical extents are not independently usable token ranges.
+
+Version 1 flat manifests, which store one encoded `.spcc` file per logical
+chunk, remain readable. The v2 representation does not change `CacheIdentity`,
+digest salts, logical chunk geometry, or either the default flat namespace or
+the opt-in `page-tail-cow-v1` namespace. An older reader does not reinterpret a
+v2 root as v1: strict manifest validation makes it a cache miss. Consequently,
+a mixed-version rollback can lose a reusable cache entry but cannot serve it
+under the wrong storage contract.
 
 Concurrent requests for one persistent digest are coalesced around one restore.
 After every worker finishes, patched vLLM retains the verified multi-group block
@@ -251,9 +262,12 @@ Native loading requires an explicit library path and SHA-256. CUDA 13 builds
 run a GPU-free byte-exact reference test and a CUDA hybrid-page probe before
 model-serving qualification.
 
-SparkCache direct CUDA restore reads `.spcc` objects into alternating mapped arenas,
-hashes complete files in place, validates authenticated extents, and overlaps
-read work with CUDA submission.
+SparkCache CUDA restore reads `.spcc` objects into alternating mapped
+arenas, hashes complete files in place, validates authenticated extents, and
+overlaps read work with CUDA submission. For a flat v2 page root it also
+re-authenticates the persisted manifest identity before placement, submits one
+bounded object at a time, and verifies the complete snapshot digest before the
+parked request may resume.
 
 ## Repository map and development validation
 
@@ -308,6 +322,19 @@ readable; cache identity, digest salts, and the `page-tail-cow-v1` namespace do
 not change. Restore still materializes one authenticated delta buffer and the
 verified reconstructed snapshot before placement. Direct placement from base
 and delta extents is unsupported by this schema.
+
+Flat page publication uses the same 64-MiB extent ceiling. Publication retains
+at most two extent payloads per durable batch; Python restore retains at most
+four extent payloads in addition to the assembled snapshot. SparkCache CUDA
+restore avoids that assembled snapshot and authenticates one extent in a
+mapped arena before submitting its copy spans. A flat 813,068,464-byte
+snapshot therefore requires 13 payload objects rather than 512 logical-chunk
+files; the manifest remains the atomic visibility point.
+
+Flat macro publication and its SparkCache CUDA restore path are
+**implemented and GPU-free tested, not live qualified**. The object-count
+geometry above follows the format contract; it is not a claim of measured
+latency improvement.
 
 Opaque HMA snapshots cannot be shortened by truncating chunk lists. SparkCache
 therefore uses the page-semantic format and distinct namespace described above.

@@ -46,6 +46,7 @@ _PAGE_DELTA_MANIFEST_SCHEMA_V2 = "sparkcache-page-delta-manifest/v2"
 _PAGE_DELTA_MANIFEST_SCHEMAS = frozenset(
     (_PAGE_DELTA_MANIFEST_SCHEMA, _PAGE_DELTA_MANIFEST_SCHEMA_V2)
 )
+_PAGE_SNAPSHOT_MANIFEST_SCHEMA = "sparkcache-page-snapshot-manifest/v2"
 # The v2 physical geometry is independent of the 256-token digest and
 # admission boundary. A 64-MiB extent reduces a 1.58-GB delta to 24 objects;
 # bounded batches cap temporary payload bytes at 128 MiB while publishing and
@@ -54,6 +55,15 @@ _PAGE_DELTA_OBJECT_BYTES = 64 * 1024 * 1024
 _MAX_PAGE_DELTA_OBJECT_BYTES = 64 * 1024 * 1024
 _PAGE_DELTA_WRITE_BATCH_SIZE = 2
 _PAGE_DELTA_READ_BATCH_SIZE = 4
+# Flat opaque page snapshots use the same bounded physical geometry as page
+# deltas. Their logical cache identity and admission geometry remain the
+# identity's 256-token chunks; only the content-addressed storage objects are
+# coalesced. A distinct root schema lets legacy flat manifests remain readable
+# while runtimes that do not understand macro objects cleanly reject v2 roots.
+_PAGE_SNAPSHOT_OBJECT_BYTES = 64 * 1024 * 1024
+_MAX_PAGE_SNAPSHOT_OBJECT_BYTES = 64 * 1024 * 1024
+_PAGE_SNAPSHOT_WRITE_BATCH_SIZE = 2
+_PAGE_SNAPSHOT_READ_BATCH_SIZE = 4
 # Two delta roots cap reconstruction at two full-snapshot applications. A
 # following extension is compacted by the connector into a fresh flat root.
 _MAX_PAGE_DELTA_DEPTH = 2
@@ -159,6 +169,13 @@ def _is_page_delta_root(value: Any) -> bool:
     )
 
 
+def _is_page_snapshot_root(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and value.get("schema") == _PAGE_SNAPSHOT_MANIFEST_SCHEMA
+    )
+
+
 @dataclass(frozen=True)
 class CacheIdentity:
     target_checkpoint: str
@@ -196,9 +213,10 @@ class CacheIdentity:
     # identity. Non-empty schemas explicitly name the records required by a
     # storage mode whose opaque payloads do not map to the policy-derived set.
     record_schema: tuple[str, ...] = ()
-    # Empty preserves the snapshot-v1 wire identity. Tail-only publication is
-    # opt-in because its authenticated object graph must never be interpreted
-    # as a flat snapshot written by a runtime that does not understand it.
+    # Empty preserves the full-snapshot wire identity. Physical flat-manifest
+    # encodings may evolve under strict schema validation; an older runtime
+    # then cleanly misses them. Tail-only publication remains opt-in because
+    # its reusable-base semantics require a distinct identity namespace.
     publication_schema: str = ""
 
     def __post_init__(self) -> None:
@@ -1289,6 +1307,113 @@ def _validate_page_delta_root(
     return manifest["base_root"], tuple(descriptors)
 
 
+def _validate_page_snapshot_root(
+    manifest: Any,
+    *,
+    identity: CacheIdentity,
+    context_digest: str,
+) -> tuple[Mapping[str, Any], ...]:
+    """Validate one flat opaque page snapshot without reading its objects."""
+
+    if not isinstance(manifest, dict):
+        raise CacheFormatError("page snapshot manifest is not an object")
+    _strict_keys(
+        manifest,
+        {
+            "schema",
+            "format_abi",
+            "storage_mode",
+            "identity",
+            "context_digest",
+            "committed_tokens",
+            "snapshot_encoded_bytes",
+            "snapshot_object_bytes",
+            "snapshot_objects",
+            "snapshot_sha256",
+            "logical_chunk_tokens",
+            "logical_chunk_count",
+            "metadata_sha256",
+        },
+        "page snapshot manifest",
+    )
+    authenticated = dict(manifest)
+    metadata_digest = authenticated.pop("metadata_sha256")
+    try:
+        _validate_digest(metadata_digest, "page snapshot metadata_sha256")
+        _validate_digest(manifest["snapshot_sha256"], "page snapshot sha256")
+    except ValueError as error:
+        raise CacheFormatError(str(error)) from error
+    if _sha256(_canonical_json(authenticated)) != metadata_digest:
+        raise CacheFormatError("page snapshot metadata checksum mismatch")
+    if (
+        manifest["schema"] != _PAGE_SNAPSHOT_MANIFEST_SCHEMA
+        or type(manifest["format_abi"]) is not int
+        or manifest["format_abi"] != FORMAT_ABI
+        or manifest["storage_mode"] != "block_pages_v1"
+        or identity.publication_schema not in ("", "page-tail-cow-v1")
+        or identity.required_records
+        != frozenset((StateRecord.TARGET_CKV, StateRecord.LOGICAL_POSITIONS))
+        or manifest["identity"] != identity.to_wire()
+        or manifest["context_digest"] != context_digest
+    ):
+        raise _IncompatibleManifestError("page snapshot manifest identity differs")
+
+    committed_tokens = manifest["committed_tokens"]
+    encoded_bytes = manifest["snapshot_encoded_bytes"]
+    object_bytes = manifest["snapshot_object_bytes"]
+    logical_chunk_count = manifest["logical_chunk_count"]
+    if (
+        type(committed_tokens) is not int
+        or committed_tokens <= 0
+        or committed_tokens % identity.chunk_tokens
+        or type(encoded_bytes) is not int
+        or encoded_bytes <= 0
+        or type(object_bytes) is not int
+        or not 0 < object_bytes <= _MAX_PAGE_SNAPSHOT_OBJECT_BYTES
+        or manifest["logical_chunk_tokens"] != identity.chunk_tokens
+        or type(logical_chunk_count) is not int
+        or logical_chunk_count != committed_tokens // identity.chunk_tokens
+    ):
+        raise CacheFormatError("page snapshot object geometry differs")
+
+    objects = manifest["snapshot_objects"]
+    if not isinstance(objects, list) or not objects:
+        raise CacheFormatError("page snapshot object descriptors are invalid")
+    expected_start = 0
+    descriptors: list[Mapping[str, Any]] = []
+    for index, descriptor in enumerate(objects):
+        if not isinstance(descriptor, dict):
+            raise CacheFormatError("page snapshot object descriptor is not an object")
+        _strict_keys(
+            descriptor,
+            {"sha256", "bytes", "encoded_start", "encoded_end"},
+            "page snapshot object descriptor",
+        )
+        try:
+            _validate_digest(descriptor["sha256"], "page snapshot object sha256")
+        except ValueError as error:
+            raise CacheFormatError(str(error)) from error
+        size = descriptor["bytes"]
+        start = descriptor["encoded_start"]
+        end = descriptor["encoded_end"]
+        if (
+            type(size) is not int
+            or type(start) is not int
+            or type(end) is not int
+            or size <= 0
+            or start != expected_start
+            or end != start + size
+            or (index < len(objects) - 1 and size != object_bytes)
+            or size > object_bytes
+        ):
+            raise CacheFormatError("page snapshot object descriptor geometry differs")
+        descriptors.append(descriptor)
+        expected_start = end
+    if expected_start != encoded_bytes:
+        raise CacheFormatError("page snapshot object coverage differs")
+    return tuple(descriptors)
+
+
 def _decode_chunk(
     encoded: bytes,
     *,
@@ -1371,6 +1496,29 @@ def _read_page_delta_object_batch(
         return ()
     with ThreadPoolExecutor(
         max_workers=min(len(descriptors), _PAGE_DELTA_READ_BATCH_SIZE)
+    ) as pool:
+        return tuple(pool.map(read_one, descriptors))
+
+
+def _read_page_snapshot_object_batch(
+    object_root: Path,
+    descriptors: Sequence[Mapping[str, Any]],
+) -> tuple[bytes, ...]:
+    """Read one bounded batch of authenticated flat-snapshot extents."""
+
+    def read_one(descriptor: Mapping[str, Any]) -> bytes:
+        encoded = (object_root / f"{descriptor['sha256']}.spcc").read_bytes()
+        if (
+            len(encoded) != descriptor["bytes"]
+            or _sha256(encoded) != descriptor["sha256"]
+        ):
+            raise CacheFormatError("page snapshot object checksum mismatch")
+        return encoded
+
+    if not descriptors:
+        return ()
+    with ThreadPoolExecutor(
+        max_workers=min(len(descriptors), _PAGE_SNAPSHOT_READ_BATCH_SIZE)
     ) as pool:
         return tuple(pool.map(read_one, descriptors))
 
@@ -1656,8 +1804,10 @@ class ManifestStore:
             manifest = json.loads(path.read_bytes())
             segments: tuple[str, ...] = ()
             schema_name = manifest.get("schema") if isinstance(manifest, dict) else None
-            if schema_name == _TAIL_MANIFEST_SCHEMA or schema_name in (
-                _PAGE_DELTA_MANIFEST_SCHEMAS
+            if (
+                schema_name == _TAIL_MANIFEST_SCHEMA
+                or schema_name in _PAGE_DELTA_MANIFEST_SCHEMAS
+                or schema_name == _PAGE_SNAPSHOT_MANIFEST_SCHEMA
             ):
                 identity_wire = dict(manifest.get("identity", {}))
                 if "record_schema" in identity_wire:
@@ -1682,8 +1832,14 @@ class ManifestStore:
                         key,
                         expected_identity=identity,
                     )
-                else:
+                elif schema_name in _PAGE_DELTA_MANIFEST_SCHEMAS:
                     descriptors = self._page_graph_descriptors(
+                        manifest,
+                        identity=identity,
+                        context_digest=key.context_digest,
+                    )
+                else:
+                    descriptors = _validate_page_snapshot_root(
                         manifest,
                         identity=identity,
                         context_digest=key.context_digest,
@@ -2343,6 +2499,12 @@ class ManifestStore:
                 context_digest=base_digest,
                 depth=depth + 1,
             )
+        elif _is_page_snapshot_root(base_root):
+            base_chunks = _validate_page_snapshot_root(
+                base_root,
+                identity=identity,
+                context_digest=base_digest,
+            )
         else:
             base_chunks = _validate_manifest_metadata(
                 base_root,
@@ -2357,9 +2519,7 @@ class ManifestStore:
     def _page_delta_root_count(manifest: Mapping[str, Any]) -> int:
         count = 0
         root: Any = manifest
-        while (
-            _is_page_delta_root(root)
-        ):
+        while _is_page_delta_root(root):
             count += 1
             root = root.get("base_root")
         return count
@@ -2408,9 +2568,7 @@ class ManifestStore:
         expected_start = 0
         object_root = self.root / "chunks"
         for first in range(0, len(descriptors), _PAGE_DELTA_READ_BATCH_SIZE):
-            batch = tuple(
-                descriptors[first : first + _PAGE_DELTA_READ_BATCH_SIZE]
-            )
+            batch = tuple(descriptors[first : first + _PAGE_DELTA_READ_BATCH_SIZE])
             payloads = _read_page_delta_object_batch(object_root, batch)
             for descriptor, payload in zip(batch, payloads, strict=True):
                 start = int(descriptor["encoded_start"])
@@ -2422,6 +2580,36 @@ class ManifestStore:
                 expected_start = end
         if expected_start != encoded_bytes or digest.hexdigest() != encoded_sha256:
             raise CacheFormatError("page delta payload checksum mismatch")
+        return result
+
+    def _read_page_snapshot_objects(
+        self,
+        descriptors: Sequence[Mapping[str, Any]],
+        *,
+        encoded_bytes: int,
+        encoded_sha256: str,
+    ) -> bytearray:
+        """Reassemble flat page extents with bounded concurrent read memory."""
+
+        if encoded_bytes <= 0 or not descriptors:
+            raise CacheFormatError("page snapshot object coverage is empty")
+        result = bytearray(encoded_bytes)
+        digest = hashlib.sha256()
+        expected_start = 0
+        object_root = self.root / "chunks"
+        for first in range(0, len(descriptors), _PAGE_SNAPSHOT_READ_BATCH_SIZE):
+            batch = tuple(descriptors[first : first + _PAGE_SNAPSHOT_READ_BATCH_SIZE])
+            payloads = _read_page_snapshot_object_batch(object_root, batch)
+            for descriptor, payload in zip(batch, payloads, strict=True):
+                start = int(descriptor["encoded_start"])
+                end = int(descriptor["encoded_end"])
+                if start != expected_start or end != start + len(payload):
+                    raise CacheFormatError("page snapshot object coverage differs")
+                result[start:end] = payload
+                digest.update(payload)
+                expected_start = end
+        if expected_start != encoded_bytes or digest.hexdigest() != encoded_sha256:
+            raise CacheFormatError("page snapshot payload checksum mismatch")
         return result
 
     def publish_prefix_aliases(
@@ -2736,6 +2924,105 @@ class ManifestStore:
                 ),
             )
 
+    def commit_page_snapshot(
+        self,
+        *,
+        identity: CacheIdentity,
+        context_digest: str,
+        span_tokens: int,
+        snapshot: bytes,
+    ) -> CommitReceipt:
+        """Publish one flat opaque page snapshot as authenticated extents.
+
+        Physical extents are independent of the identity's logical chunk
+        geometry. The root retains the exact 256-token boundary and chunk
+        count used by lookup/admission, while restore authenticates both each
+        extent and the reassembled byte stream before any page placement.
+        """
+
+        _validate_digest(context_digest, "context_digest")
+        if identity.publication_schema not in ("", "page-tail-cow-v1"):
+            raise ValueError(
+                "page snapshot publication requires the flat or page-tail"
+                " publication schema"
+            )
+        if identity.required_records != frozenset(
+            (StateRecord.TARGET_CKV, StateRecord.LOGICAL_POSITIONS)
+        ):
+            raise ValueError(
+                "page snapshot publication requires target and logical-position records"
+            )
+        if (
+            type(span_tokens) is not int
+            or span_tokens <= 0
+            or span_tokens % identity.chunk_tokens
+        ):
+            raise ValueError("page snapshot span must cover complete logical chunks")
+        if not isinstance(snapshot, bytes) or not snapshot:
+            raise ValueError("page snapshot payload must be nonempty bytes")
+
+        with _RootGuard(self.root, shared=True, blocking=True):
+            descriptors: list[dict[str, Any]] = []
+            objects: list[tuple[Path, bytes]] = []
+            snapshot_view = memoryview(snapshot)
+            for start in range(0, len(snapshot), _PAGE_SNAPSHOT_OBJECT_BYTES):
+                end = min(len(snapshot), start + _PAGE_SNAPSHOT_OBJECT_BYTES)
+                encoded = snapshot_view[start:end].tobytes()
+                object_digest = _sha256(encoded)
+                descriptors.append(
+                    {
+                        "sha256": object_digest,
+                        "bytes": len(encoded),
+                        "encoded_start": start,
+                        "encoded_end": end,
+                    }
+                )
+                objects.append(
+                    (
+                        self.root / "chunks" / f"{object_digest}.spcc",
+                        encoded,
+                    )
+                )
+                if len(objects) == _PAGE_SNAPSHOT_WRITE_BATCH_SIZE:
+                    _publish_immutable_batch(objects)
+                    objects.clear()
+            if objects:
+                _publish_immutable_batch(objects)
+
+            root = {
+                "schema": _PAGE_SNAPSHOT_MANIFEST_SCHEMA,
+                "format_abi": FORMAT_ABI,
+                "storage_mode": "block_pages_v1",
+                "identity": identity.to_wire(),
+                "context_digest": context_digest,
+                "committed_tokens": span_tokens,
+                "snapshot_encoded_bytes": len(snapshot),
+                "snapshot_object_bytes": _PAGE_SNAPSHOT_OBJECT_BYTES,
+                "snapshot_objects": descriptors,
+                "snapshot_sha256": _sha256(snapshot),
+                "logical_chunk_tokens": identity.chunk_tokens,
+                "logical_chunk_count": span_tokens // identity.chunk_tokens,
+            }
+            root["metadata_sha256"] = _sha256(_canonical_json(root))
+            encoded_root = _canonical_json(root)
+            _publish_immutable(
+                self._manifest_path(identity, context_digest),
+                encoded_root,
+            )
+            return CommitReceipt(
+                manifest_digest=_sha256(encoded_root),
+                committed_tokens=span_tokens,
+                encoded_bytes=len(encoded_root)
+                + sum(int(item["bytes"]) for item in descriptors),
+                allocated_bytes_upper_bound=sum(
+                    (size + 4095) // 4096 * 4096
+                    for size in (
+                        len(encoded_root),
+                        *(int(item["bytes"]) for item in descriptors),
+                    )
+                ),
+            )
+
     def commit_page_extension(
         self,
         *,
@@ -2878,12 +3165,29 @@ class ManifestStore:
         result_block_counts: Sequence[int],
         result_boundary_tokens: int,
         _depth: int = 0,
-    ) -> bytes:
+    ) -> bytes | bytearray:
         """Materialize an authenticated flat or delta-backed page snapshot."""
 
         if not lookup.is_hit or lookup._manifest is None:
             raise ValueError("cannot restore a cache miss")
         manifest = lookup._manifest
+        if _is_page_snapshot_root(manifest):
+            identity_wire = dict(manifest["identity"])
+            if "record_schema" in identity_wire:
+                identity_wire["record_schema"] = tuple(identity_wire["record_schema"])
+            identity = CacheIdentity(**identity_wire)
+            descriptors = _validate_page_snapshot_root(
+                manifest,
+                identity=identity,
+                context_digest=manifest["context_digest"],
+            )
+            if manifest["committed_tokens"] != result_boundary_tokens:
+                raise CacheFormatError("page snapshot restore boundary differs")
+            return self._read_page_snapshot_objects(
+                descriptors,
+                encoded_bytes=manifest["snapshot_encoded_bytes"],
+                encoded_sha256=manifest["snapshot_sha256"],
+            )
         if not _is_page_delta_root(manifest):
             chunks = self.restore(lookup)
             if chunks is None:
@@ -2914,7 +3218,9 @@ class ManifestStore:
             root_kind=(
                 "page_delta"
                 if _is_page_delta_root(base_root)
-                else "manifest"
+                else (
+                    "page_snapshot" if _is_page_snapshot_root(base_root) else "manifest"
+                )
             ),
         )
         base_snapshot = self.restore_page_snapshot(
@@ -3063,8 +3369,15 @@ class ManifestStore:
                     context_digest=context_digest,
                 )
             is_page_delta = _is_page_delta_root(manifest)
+            is_page_snapshot = _is_page_snapshot_root(manifest)
             if is_page_delta:
                 chunks = self._page_graph_descriptors(
+                    manifest,
+                    identity=identity,
+                    context_digest=context_digest,
+                )
+            elif is_page_snapshot:
+                chunks = _validate_page_snapshot_root(
                     manifest,
                     identity=identity,
                     context_digest=context_digest,
@@ -3118,7 +3431,11 @@ class ManifestStore:
                 "hit",
                 manifest_digest=_sha256(encoded),
                 _manifest=manifest,
-                root_kind="page_delta" if is_page_delta else "manifest",
+                root_kind=(
+                    "page_delta"
+                    if is_page_delta
+                    else ("page_snapshot" if is_page_snapshot else "manifest")
+                ),
             )
         except _IncompatibleManifestError:
             return LookupResult(False, "incompatible")
@@ -3285,8 +3602,10 @@ class ManifestStore:
             try:
                 manifest = json.loads(raw)
                 schema_name = manifest.get("schema")
-                if schema_name == _TAIL_MANIFEST_SCHEMA or schema_name in (
-                    _PAGE_DELTA_MANIFEST_SCHEMAS
+                if (
+                    schema_name == _TAIL_MANIFEST_SCHEMA
+                    or schema_name in _PAGE_DELTA_MANIFEST_SCHEMAS
+                    or schema_name == _PAGE_SNAPSHOT_MANIFEST_SCHEMA
                 ):
                     identity_wire = dict(manifest["identity"])
                     if "record_schema" in identity_wire:
@@ -3301,8 +3620,14 @@ class ManifestStore:
                             context_digest=context_digest,
                         )
                         descriptors = resolved["chunks"]
-                    else:
+                    elif schema_name in _PAGE_DELTA_MANIFEST_SCHEMAS:
                         descriptors = self._page_graph_descriptors(
+                            manifest,
+                            identity=identity,
+                            context_digest=context_digest,
+                        )
+                    else:
+                        descriptors = _validate_page_snapshot_root(
                             manifest,
                             identity=identity,
                             context_digest=context_digest,
@@ -3345,8 +3670,8 @@ class ManifestStore:
     def restore(self, lookup: LookupResult) -> tuple[ContextChunk, ...] | None:
         if not lookup.is_hit or lookup._manifest is None:
             raise ValueError("cannot restore a cache miss")
-        if lookup.root_kind == "page_delta":
-            raise ValueError("page delta restore requires restore_page_snapshot")
+        if lookup.root_kind in ("page_delta", "page_snapshot"):
+            raise ValueError("page restore requires restore_page_snapshot")
         required = _required_records_for_identity_wire(
             lookup._manifest.get("identity", {})
         )

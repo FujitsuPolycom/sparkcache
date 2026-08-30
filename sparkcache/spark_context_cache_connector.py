@@ -782,9 +782,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         # checkpoint/test adapters that seed that tuple remain compatible.
         self._store_token_ids: dict[str, tuple[int, ...]] = {}
         self._store_bases: dict[str, tuple[str, int]] = {}
-        self._store_recurrent_boundaries: dict[
-            str, tuple[tuple[int, int], ...]
-        ] = {}
+        self._store_recurrent_boundaries: dict[str, tuple[tuple[int, int], ...]] = {}
         self.counters: dict[str, int] = {
             "store_committed": 0,
             "store_failed": 0,
@@ -2960,7 +2958,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 payload_verified = False
                 if lookup.is_hit:
                     try:
-                        if lookup.root_kind == "page_delta":
+                        if lookup.root_kind in ("page_delta", "page_snapshot"):
                             if self._page_layout is None:
                                 raise RuntimeError(
                                     "block-page layout was not registered"
@@ -2969,7 +2967,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                             self._store.restore_page_snapshot(
                                 lookup,
                                 layout=self._page_layout,
-                                result_block_counts=manifest["result_block_counts"],
+                                result_block_counts=manifest.get(
+                                    "result_block_counts", ()
+                                ),
                                 result_boundary_tokens=manifest["committed_tokens"],
                             )
                             payload_verified = True
@@ -3507,7 +3507,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             )
             return True
         restore_started = time.perf_counter_ns()
-        if lookup.root_kind == "page_delta":
+        if lookup.root_kind in ("page_delta", "page_snapshot"):
             encoded_pages = self._store.restore_page_snapshot(
                 lookup,
                 layout=layout,
@@ -4017,13 +4017,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 return
             commit_started = time.perf_counter()
             try:
-                chunks: Sequence[ContextChunk]
-                if isinstance(snapshot, _HybridStoreSnapshot):
-                    chunks = _HybridSnapshotChunks(snapshot, self._chunk_tokens)
-                else:
-                    chunks = _SnapshotChunks(
-                        snapshot, self._dcp_degree, self._chunk_tokens
-                    )
+                chunks = (
+                    None
+                    if isinstance(snapshot, _HybridStoreSnapshot)
+                    else _SnapshotChunks(snapshot, self._dcp_degree, self._chunk_tokens)
+                )
                 if snapshot.plan.base_context_digest and (
                     snapshot.plan.digest
                     != self._digest(
@@ -4057,14 +4055,15 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                             result_snapshot=snapshot.encoded_pages,
                         )
                     except PageDeltaDepthExceeded:
-                        receipt = self._store.commit(
+                        receipt = self._store.commit_page_snapshot(
                             identity=snapshot.identity,
                             context_digest=snapshot.plan.digest,
-                            chunks=chunks,
                             span_tokens=snapshot.plan.span_tokens,
+                            snapshot=snapshot.encoded_pages,
                         )
                         self.counters["page_delta_compactions"] += 1
                 elif snapshot.plan.base_context_digest:
+                    assert chunks is not None
                     receipt = self._store.commit_extension(
                         identity=snapshot.identity,
                         base_context_digest=snapshot.plan.base_context_digest,
@@ -4072,7 +4071,15 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         identity_salt=self._context_digest_salt,
                         tail_chunks=chunks,
                     )
+                elif isinstance(snapshot, _HybridStoreSnapshot):
+                    receipt = self._store.commit_page_snapshot(
+                        identity=snapshot.identity,
+                        context_digest=snapshot.plan.digest,
+                        span_tokens=snapshot.plan.span_tokens,
+                        snapshot=snapshot.encoded_pages,
+                    )
                 else:
+                    assert chunks is not None
                     receipt = self._store.commit(
                         identity=snapshot.identity,
                         context_digest=snapshot.plan.digest,
@@ -4232,11 +4239,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         """Compatibility helper for offline callers; not the request path."""
 
         snapshot = self._snapshot_store(plan)
-        chunks: Sequence[ContextChunk]
-        if isinstance(snapshot, _HybridStoreSnapshot):
-            chunks = _HybridSnapshotChunks(snapshot, self._chunk_tokens)
-        else:
-            chunks = _SnapshotChunks(snapshot, self._dcp_degree, self._chunk_tokens)
+        chunks = (
+            None
+            if isinstance(snapshot, _HybridStoreSnapshot)
+            else _SnapshotChunks(snapshot, self._dcp_degree, self._chunk_tokens)
+        )
         if plan.base_context_digest and (
             plan.digest != self._digest(list(plan.token_ids), plan.span_tokens)
         ):
@@ -4261,14 +4268,15 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     result_snapshot=snapshot.encoded_pages,
                 )
             except PageDeltaDepthExceeded:
-                receipt = self._store.commit(
+                receipt = self._store.commit_page_snapshot(
                     identity=snapshot.identity,
                     context_digest=plan.digest,
-                    chunks=chunks,
                     span_tokens=plan.span_tokens,
+                    snapshot=snapshot.encoded_pages,
                 )
                 self.counters["page_delta_compactions"] += 1
         elif plan.base_context_digest:
+            assert chunks is not None
             receipt = self._store.commit_extension(
                 identity=snapshot.identity,
                 base_context_digest=plan.base_context_digest,
@@ -4276,7 +4284,15 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 identity_salt=self._context_digest_salt,
                 tail_chunks=chunks,
             )
+        elif isinstance(snapshot, _HybridStoreSnapshot):
+            receipt = self._store.commit_page_snapshot(
+                identity=snapshot.identity,
+                context_digest=plan.digest,
+                span_tokens=plan.span_tokens,
+                snapshot=snapshot.encoded_pages,
+            )
         else:
+            assert chunks is not None
             receipt = self._store.commit(
                 identity=snapshot.identity,
                 context_digest=plan.digest,

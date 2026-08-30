@@ -468,7 +468,12 @@ class HybridPageRoundTripTests(unittest.TestCase):
                     / f"{plan.digest}.json"
                 ).read_bytes()
             )
-            self.assertNotIn("schema", root_manifest)
+            self.assertEqual(
+                root_manifest["schema"],
+                "sparkcache-page-snapshot-manifest/v2",
+            )
+            self.assertEqual(root_manifest["logical_chunk_count"], 4)
+            self.assertEqual(len(root_manifest["snapshot_objects"]), 1)
             self.assertEqual(connector.counters["page_delta_compactions"], 1)
             with self.assertRaisesRegex(RuntimeError, "digest differs"):
                 connector._store_one(
