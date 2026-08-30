@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import threading
 import time
 from types import SimpleNamespace
@@ -13,20 +14,664 @@ from sparkcache.persistent_context_cache.cache_manifest import (
     CacheIdentity,
     ManifestStore,
 )
+from sparkcache.spark_context_cache_codec import context_prefix_digest
 from sparkcache.spark_context_cache_hybrid import (
     PageGroup,
     PageLayer,
     PageLayout,
+    decode_page_snapshot,
+    encode_page_delta,
     encode_page_snapshot,
+    plan_page_delta,
     plan_page_snapshot,
 )
 from sparkcache.spark_context_cache_cuda_hybrid_restore import (
     build_page_copy_spans,
     build_page_object_spans,
     execute_cuda_hybrid_restore,
+    plan_cuda_page_delta_restore,
     plan_page_slabs,
 )
 from sparkcache.spark_context_cache_cuda_placement import RestoreState
+
+
+def _page_delta_fixture(tmp_path, monkeypatch):
+    layout = PageLayout(
+        (PageGroup(256, (PageLayer("page", "torch.uint8", (128,), 128),)),)
+    )
+    base_blocks = 8
+    result_blocks = 16
+    base_payload = b"".join(bytes((index,)) * 128 for index in range(base_blocks))
+    result_payload = base_payload[:128] + b"".join(
+        bytes((64 + index,)) * 128 for index in range(1, result_blocks)
+    )
+    base = encode_page_snapshot(layout, (base_blocks,), {"page": base_payload})
+    result = encode_page_snapshot(layout, (result_blocks,), {"page": result_payload})
+    delta = encode_page_delta(
+        layout,
+        base,
+        result,
+        base_block_counts=(base_blocks,),
+        result_block_counts=(result_blocks,),
+        base_boundary_tokens=base_blocks * 256,
+        result_boundary_tokens=result_blocks * 256,
+    )
+    base_plan = plan_page_snapshot(layout, base, (base_blocks,))
+    delta_plan = plan_page_delta(
+        layout,
+        delta,
+        base_block_counts=(base_blocks,),
+        result_block_counts=(result_blocks,),
+        base_boundary_tokens=base_blocks * 256,
+        result_boundary_tokens=result_blocks * 256,
+    )
+    object_bytes = max(base_plan.header_bytes, delta_plan.header_bytes) + 1
+    monkeypatch.setattr(cache_manifest, "_PAGE_SNAPSHOT_OBJECT_BYTES", object_bytes)
+    monkeypatch.setattr(cache_manifest, "_PAGE_DELTA_OBJECT_BYTES", object_bytes)
+    identity = CacheIdentity(
+        target_checkpoint="1" * 64,
+        draft_checkpoint="2" * 64,
+        quantization_layout="test-block-pages-v1",
+        rope_layout="test-rope-v1",
+        tp_degree=1,
+        dcp_degree=1,
+        record_schema=("target_ckv", "logical_positions"),
+        publication_schema="page-tail-cow-v1",
+    )
+    tokens = tuple(range(result_blocks * 256))
+    salt = "native-page-delta"
+    base_digest = context_prefix_digest(
+        tokens, salt, token_count=base_blocks * 256
+    )
+    result_digest = context_prefix_digest(
+        tokens, salt, token_count=result_blocks * 256
+    )
+    store = ManifestStore(tmp_path)
+    store.commit_page_snapshot(
+        identity=identity,
+        context_digest=base_digest,
+        span_tokens=base_blocks * 256,
+        snapshot=base,
+    )
+    store.commit_page_extension(
+        identity=identity,
+        base_context_digest=base_digest,
+        token_ids=tokens,
+        identity_salt=salt,
+        layout=layout,
+        base_block_counts=(base_blocks,),
+        result_block_counts=(result_blocks,),
+        base_boundary_tokens=base_blocks * 256,
+        result_boundary_tokens=result_blocks * 256,
+        result_snapshot=result,
+    )
+    lookup = store.lookup(identity, result_digest, verify_chunks=False)
+    assert lookup.is_hit and lookup.root_kind == "page_delta"
+    return SimpleNamespace(
+        store=store,
+        identity=identity,
+        salt=salt,
+        result_digest=result_digest,
+        layout=layout,
+        base=base,
+        result=result,
+        lookup=lookup,
+        object_bytes=object_bytes,
+        result_blocks=result_blocks,
+        result_tokens=result_blocks * 256,
+    )
+
+
+class _PageCaptureArena:
+    arena_mode = cuda_hybrid.cuda.ARENA_MAPPED_HOST
+
+    def __init__(self, arena_bytes: int) -> None:
+        self.payload = bytearray(arena_bytes)
+        self.capacity_bytes = arena_bytes
+
+
+class _PageCaptureTransaction:
+    def __init__(self, arena_bytes: int) -> None:
+        self.arenas = (
+            _PageCaptureArena(arena_bytes),
+            _PageCaptureArena(arena_bytes),
+        )
+        self.submissions = []
+        self.submit_count = 0
+        self.state = RestoreState.PARKED
+        self.can_resume = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, *_args):
+        if exc_type is not None:
+            self.state = RestoreState.ABORTED
+            self.can_resume = False
+        return None
+
+    def acquire_arena(self, index):
+        return self.arenas[index]
+
+    def submit_page_slab(self, *, arena_index, arena_used_bytes, spans):
+        self.submit_count += 1
+        source = self.arenas[arena_index].payload
+        self.submissions.extend(
+            (
+                span.snapshot_offset_bytes,
+                span.destination_index,
+                span.destination_byte_offset,
+                bytes(
+                    source[
+                        span.arena_offset_bytes : span.arena_offset_bytes
+                        + span.byte_count
+                    ]
+                ),
+            )
+            for span in spans
+        )
+
+    def finish(self):
+        self.state = RestoreState.FINISHED
+        self.can_resume = True
+        return SimpleNamespace(
+            source_bytes=sum(len(item[3]) for item in self.submissions),
+            slabs_submitted=self.submit_count,
+            scatter_kernel_launches=self.submit_count,
+            slot_uploads=1,
+            destination_table_uploads=1,
+            device_error=0,
+            staged_h2d_bytes=0,
+        )
+
+
+class _PageCaptureAdapter:
+    def __init__(self, arena_bytes: int) -> None:
+        self.transaction = _PageCaptureTransaction(arena_bytes)
+
+    def begin_parked_page_restore(self, *_args, **_kwargs):
+        return self.transaction
+
+
+def test_page_delta_planner_authenticates_graph_and_applies_delta_precedence(
+    tmp_path, monkeypatch
+) -> None:
+    fixture = _page_delta_fixture(tmp_path, monkeypatch)
+
+    plan = plan_cuda_page_delta_restore(
+        fixture.lookup,
+        cache_root=tmp_path,
+        layout=fixture.layout,
+        group_slots=(tuple(range(fixture.result_blocks)),),
+        expected_span_tokens=fixture.result_tokens,
+        arena_bytes=fixture.object_bytes,
+    )
+
+    assert plan.result_snapshot_sha256 == hashlib.sha256(fixture.result).hexdigest()
+    assert sum(span.byte_count for span in plan.source_spans) == (
+        len(fixture.result) - plan.page_plan.header_bytes
+    )
+    assert [span.snapshot_offset_bytes for span in plan.source_spans] == sorted(
+        span.snapshot_offset_bytes for span in plan.source_spans
+    )
+    manifest = fixture.lookup._manifest
+    assert manifest is not None
+    base_objects = manifest["base_root"]["snapshot_objects"]
+    used_paths = {span.source.path for span in plan.source_spans}
+    assert any(
+        tmp_path / "chunks" / f"{descriptor['sha256']}.spcc" in used_paths
+        for descriptor in base_objects
+    )
+    assert all(
+        tmp_path / "chunks" / f"{descriptor['sha256']}.spcc" not in used_paths
+        for descriptor in base_objects[2:]
+    )
+
+
+def test_nested_page_deltas_resolve_newest_over_middle_over_flat_base(
+    tmp_path, monkeypatch
+) -> None:
+    fixture = _page_delta_fixture(tmp_path, monkeypatch)
+    middle_plan = plan_page_snapshot(
+        fixture.layout,
+        fixture.result,
+        (fixture.result_blocks,),
+    )
+    middle_payload = fixture.result[middle_plan.header_bytes :]
+    final_blocks = 24
+    final_payload = middle_payload[: 3 * 128] + b"".join(
+        bytes((128 + index,)) * 128 for index in range(3, final_blocks)
+    )
+    final_snapshot = encode_page_snapshot(
+        fixture.layout,
+        (final_blocks,),
+        {"page": final_payload},
+    )
+    second_delta = encode_page_delta(
+        fixture.layout,
+        fixture.result,
+        final_snapshot,
+        base_block_counts=(fixture.result_blocks,),
+        result_block_counts=(final_blocks,),
+        base_boundary_tokens=fixture.result_tokens,
+        result_boundary_tokens=final_blocks * 256,
+    )
+    second_plan = plan_page_delta(
+        fixture.layout,
+        second_delta,
+        base_block_counts=(fixture.result_blocks,),
+        result_block_counts=(final_blocks,),
+        base_boundary_tokens=fixture.result_tokens,
+        result_boundary_tokens=final_blocks * 256,
+    )
+    arena_bytes = max(fixture.object_bytes, second_plan.header_bytes + 1)
+    monkeypatch.setattr(cache_manifest, "_PAGE_DELTA_OBJECT_BYTES", arena_bytes)
+    tokens = tuple(range(final_blocks * 256))
+    final_digest = context_prefix_digest(
+        tokens,
+        fixture.salt,
+        token_count=final_blocks * 256,
+    )
+    fixture.store.commit_page_extension(
+        identity=fixture.identity,
+        base_context_digest=fixture.result_digest,
+        token_ids=tokens,
+        identity_salt=fixture.salt,
+        layout=fixture.layout,
+        base_block_counts=(fixture.result_blocks,),
+        result_block_counts=(final_blocks,),
+        base_boundary_tokens=fixture.result_tokens,
+        result_boundary_tokens=final_blocks * 256,
+        result_snapshot=final_snapshot,
+    )
+    lookup = fixture.store.lookup(
+        fixture.identity,
+        final_digest,
+        verify_chunks=False,
+    )
+    assert lookup.is_hit and lookup._manifest is not None
+
+    plan = plan_cuda_page_delta_restore(
+        lookup,
+        cache_root=tmp_path,
+        layout=fixture.layout,
+        group_slots=(tuple(range(final_blocks)),),
+        expected_span_tokens=final_blocks * 256,
+        arena_bytes=arena_bytes,
+    )
+
+    reconstructed_payload = b"".join(
+        span.source.path.read_bytes()[
+            span.source_offset_bytes : span.source_offset_bytes + span.byte_count
+        ]
+        for span in plan.source_spans
+    )
+    final_plan = plan_page_snapshot(
+        fixture.layout,
+        final_snapshot,
+        (final_blocks,),
+    )
+    assert reconstructed_payload == final_snapshot[final_plan.header_bytes :]
+    used_paths = {span.source.path for span in plan.source_spans}
+    outer = lookup._manifest
+    middle = outer["base_root"]
+    flat = middle["base_root"]
+    roots = [
+        {tmp_path / "chunks" / f"{item['sha256']}.spcc" for item in objects}
+        for objects in (
+            flat["snapshot_objects"],
+            middle["delta_objects"],
+            outer["delta_objects"],
+        )
+    ]
+    assert all(used_paths.intersection(paths) for paths in roots)
+    assert plan.result_snapshot_sha256 == hashlib.sha256(final_snapshot).hexdigest()
+
+
+def test_page_delta_direct_restore_skips_overridden_base_objects_and_full_buffer(
+    tmp_path, monkeypatch
+) -> None:
+    fixture = _page_delta_fixture(tmp_path, monkeypatch)
+    manifest = fixture.lookup._manifest
+    assert manifest is not None
+    base_objects = manifest["base_root"]["snapshot_objects"]
+    skipped_base_paths = {
+        (tmp_path / "chunks" / f"{descriptor['sha256']}.spcc").resolve()
+        for descriptor in base_objects[2:]
+    }
+
+    adapter = _PageCaptureAdapter(fixture.object_bytes)
+    monkeypatch.setattr(
+        cuda_hybrid.cuda,
+        "arena_memoryview",
+        lambda arena, *, length: memoryview(arena.payload)[:length],
+    )
+    original_read = cuda_hybrid._pread_exact_into
+    read_paths = []
+    maximum_read = 0
+
+    def bounded_read(path, encoded_bytes, target):
+        nonlocal maximum_read
+        read_paths.append(path.resolve())
+        maximum_read = max(maximum_read, encoded_bytes)
+        return original_read(path, encoded_bytes, target)
+
+    monkeypatch.setattr(cuda_hybrid, "_pread_exact_into", bounded_read)
+
+    result = execute_cuda_hybrid_restore(
+        adapter=adapter,
+        request_id="page-delta-direct",
+        lookup=fixture.lookup,
+        cache_root=tmp_path,
+        layout=fixture.layout,
+        group_slots=(tuple(range(fixture.result_blocks)),),
+        expected_span_tokens=fixture.result_tokens,
+        arena_bytes=fixture.object_bytes,
+        io_workers=4,
+    )
+
+    restored_payload = b"".join(
+        item[3] for item in sorted(adapter.transaction.submissions)
+    )
+    final_plan = plan_page_snapshot(
+        fixture.layout,
+        fixture.result,
+        (fixture.result_blocks,),
+    )
+    assert restored_payload == fixture.result[final_plan.header_bytes :]
+    assert maximum_read <= fixture.object_bytes < len(fixture.result)
+    assert skipped_base_paths.isdisjoint(read_paths)
+    assert result.source_bytes == len(fixture.result)
+    assert result.skipped_base_object_bytes > 0
+    assert adapter.transaction.state is RestoreState.FINISHED
+    assert adapter.transaction.can_resume
+
+
+def test_page_delta_direct_restore_maps_multiple_groups_and_layers(
+    tmp_path, monkeypatch
+) -> None:
+    layout = PageLayout(
+        (
+            PageGroup(
+                2,
+                (
+                    PageLayer("a", "u8", (8,), 8),
+                    PageLayer("b", "u8", (4,), 4),
+                ),
+            ),
+            PageGroup(1, (PageLayer("state", "u8", (6,), 6),)),
+        )
+    )
+    base_counts = (2, 2)
+    result_counts = (4, 3)
+    base_payloads = {
+        "a": b"A" * 8 + b"B" * 8,
+        "b": b"C" * 4 + b"D" * 4,
+        "state": b"E" * 6 + b"F" * 6,
+    }
+    result_payloads = {
+        "a": b"A" * 8 + b"X" * 8 + b"Y" * 8 + b"Z" * 8,
+        "b": b"C" * 4 + b"L" * 4 + b"M" * 4 + b"N" * 4,
+        "state": base_payloads["state"] + b"G" * 6,
+    }
+    base = encode_page_snapshot(layout, base_counts, base_payloads)
+    result = encode_page_snapshot(layout, result_counts, result_payloads)
+    delta = encode_page_delta(
+        layout,
+        base,
+        result,
+        base_block_counts=base_counts,
+        result_block_counts=result_counts,
+        base_boundary_tokens=256,
+        result_boundary_tokens=512,
+    )
+    object_bytes = max(
+        plan_page_snapshot(layout, base, base_counts).header_bytes,
+        plan_page_delta(
+            layout,
+            delta,
+            base_block_counts=base_counts,
+            result_block_counts=result_counts,
+            base_boundary_tokens=256,
+            result_boundary_tokens=512,
+        ).header_bytes,
+    ) + 1
+    monkeypatch.setattr(cache_manifest, "_PAGE_SNAPSHOT_OBJECT_BYTES", object_bytes)
+    monkeypatch.setattr(cache_manifest, "_PAGE_DELTA_OBJECT_BYTES", object_bytes)
+    identity = CacheIdentity(
+        target_checkpoint="3" * 64,
+        draft_checkpoint="4" * 64,
+        quantization_layout="multi-group-pages-v1",
+        rope_layout="multi-group-rope-v1",
+        tp_degree=1,
+        dcp_degree=1,
+        record_schema=("target_ckv", "logical_positions"),
+        publication_schema="page-tail-cow-v1",
+    )
+    tokens = tuple(range(512))
+    salt = "native-multi-group-page-delta"
+    base_digest = context_prefix_digest(tokens, salt, token_count=256)
+    result_digest = context_prefix_digest(tokens, salt, token_count=512)
+    store = ManifestStore(tmp_path)
+    store.commit_page_snapshot(
+        identity=identity,
+        context_digest=base_digest,
+        span_tokens=256,
+        snapshot=base,
+    )
+    store.commit_page_extension(
+        identity=identity,
+        base_context_digest=base_digest,
+        token_ids=tokens,
+        identity_salt=salt,
+        layout=layout,
+        base_block_counts=base_counts,
+        result_block_counts=result_counts,
+        base_boundary_tokens=256,
+        result_boundary_tokens=512,
+        result_snapshot=result,
+    )
+    lookup = store.lookup(identity, result_digest, verify_chunks=False)
+    assert lookup.is_hit
+    adapter = _PageCaptureAdapter(object_bytes)
+    monkeypatch.setattr(
+        cuda_hybrid.cuda,
+        "arena_memoryview",
+        lambda arena, *, length: memoryview(arena.payload)[:length],
+    )
+
+    execute_cuda_hybrid_restore(
+        adapter=adapter,
+        request_id="page-delta-multi-group",
+        lookup=lookup,
+        cache_root=tmp_path,
+        layout=layout,
+        group_slots=((1, 2, 3, 4), (5, 6, 7)),
+        expected_span_tokens=512,
+        arena_bytes=object_bytes,
+        io_workers=4,
+    )
+
+    expected = decode_page_snapshot(layout, result, result_counts)
+    layer_names = [layer.name for group in layout.groups for layer in group.layers]
+    for destination_index, layer_name in enumerate(layer_names):
+        placed = b"".join(
+            item[3]
+            for item in sorted(
+                adapter.transaction.submissions,
+                key=lambda item: (item[1], item[2]),
+            )
+            if item[1] == destination_index
+        )
+        assert placed == expected[layer_name]
+
+
+def test_page_delta_planner_rejects_identity_layout_and_object_hash_mismatch(
+    tmp_path, monkeypatch
+) -> None:
+    fixture = _page_delta_fixture(tmp_path, monkeypatch)
+    lookup_type = type(fixture.lookup)
+    forged_lookup = lookup_type(
+        True,
+        "hit",
+        manifest_digest="0" * 64,
+        _manifest=fixture.lookup._manifest,
+        root_kind="page_delta",
+    )
+    with pytest.raises(
+        cuda_hybrid.CudaHybridRestoreError,
+        match="identity is not authenticated",
+    ):
+        plan_cuda_page_delta_restore(
+            forged_lookup,
+            cache_root=tmp_path,
+            layout=fixture.layout,
+            group_slots=(tuple(range(fixture.result_blocks)),),
+            expected_span_tokens=fixture.result_tokens,
+            arena_bytes=fixture.object_bytes,
+        )
+
+    wrong_layout = PageLayout(
+        (PageGroup(256, (PageLayer("page", "torch.uint8", (64,), 64),)),)
+    )
+    with pytest.raises(
+        cuda_hybrid.CudaHybridRestoreError,
+        match="layout differs",
+    ):
+        plan_cuda_page_delta_restore(
+            fixture.lookup,
+            cache_root=tmp_path,
+            layout=wrong_layout,
+            group_slots=(tuple(range(fixture.result_blocks)),),
+            expected_span_tokens=fixture.result_tokens,
+            arena_bytes=fixture.object_bytes,
+        )
+
+    manifest = fixture.lookup._manifest
+    assert manifest is not None
+    descriptor = manifest["delta_objects"][0]
+    object_path = tmp_path / "chunks" / f"{descriptor['sha256']}.spcc"
+    healthy = object_path.read_bytes()
+    damaged = bytearray(healthy)
+    damaged[-1] ^= 1
+    object_path.write_bytes(damaged)
+    with pytest.raises(
+        cuda_hybrid.CudaHybridRestoreError,
+        match="SHA-256 mismatch",
+    ):
+        plan_cuda_page_delta_restore(
+            fixture.lookup,
+            cache_root=tmp_path,
+            layout=fixture.layout,
+            group_slots=(tuple(range(fixture.result_blocks)),),
+            expected_span_tokens=fixture.result_tokens,
+            arena_bytes=fixture.object_bytes,
+        )
+
+
+def test_page_delta_late_hash_failure_aborts_parked_native_restore(
+    tmp_path, monkeypatch
+) -> None:
+    fixture = _page_delta_fixture(tmp_path, monkeypatch)
+    manifest = fixture.lookup._manifest
+    assert manifest is not None
+    descriptor = manifest["delta_objects"][-1]
+    object_path = tmp_path / "chunks" / f"{descriptor['sha256']}.spcc"
+    damaged = bytearray(object_path.read_bytes())
+    damaged[-1] ^= 1
+    object_path.write_bytes(damaged)
+    adapter = _PageCaptureAdapter(fixture.object_bytes)
+    monkeypatch.setattr(
+        cuda_hybrid.cuda,
+        "arena_memoryview",
+        lambda arena, *, length: memoryview(arena.payload)[:length],
+    )
+
+    with pytest.raises(
+        cuda_hybrid.CudaHybridRestoreError,
+        match="SHA-256 mismatch",
+    ):
+        execute_cuda_hybrid_restore(
+            adapter=adapter,
+            request_id="page-delta-late-corruption",
+            lookup=fixture.lookup,
+            cache_root=tmp_path,
+            layout=fixture.layout,
+            group_slots=(tuple(range(fixture.result_blocks)),),
+            expected_span_tokens=fixture.result_tokens,
+            arena_bytes=fixture.object_bytes,
+            io_workers=4,
+        )
+
+    assert adapter.transaction.submit_count > 0
+    assert adapter.transaction.state is RestoreState.ABORTED
+    assert not adapter.transaction.can_resume
+
+
+def test_page_delta_final_snapshot_hash_rejects_self_consistent_bad_tail(
+    tmp_path, monkeypatch
+) -> None:
+    fixture = _page_delta_fixture(tmp_path, monkeypatch)
+    manifest = json.loads(json.dumps(fixture.lookup._manifest))
+    descriptor = manifest["delta_objects"][-1]
+    old_path = tmp_path / "chunks" / f"{descriptor['sha256']}.spcc"
+    damaged = bytearray(old_path.read_bytes())
+    damaged[-1] ^= 1
+    new_digest = hashlib.sha256(damaged).hexdigest()
+    (tmp_path / "chunks" / f"{new_digest}.spcc").write_bytes(damaged)
+    descriptor["sha256"] = new_digest
+    aggregate = b"".join(
+        (
+            tmp_path / "chunks" / f"{item['sha256']}.spcc"
+        ).read_bytes()
+        for item in manifest["delta_objects"]
+    )
+    manifest["delta_sha256"] = hashlib.sha256(aggregate).hexdigest()
+    manifest.pop("metadata_sha256")
+    manifest["metadata_sha256"] = hashlib.sha256(
+        cache_manifest._canonical_json(manifest)
+    ).hexdigest()
+    encoded_manifest = cache_manifest._canonical_json(manifest)
+    manifest_path = (
+        tmp_path
+        / "manifests"
+        / fixture.identity.storage_key
+        / f"{fixture.result_digest}.json"
+    )
+    manifest_path.write_bytes(encoded_manifest)
+    forged_lookup = type(fixture.lookup)(
+        True,
+        "hit",
+        manifest_digest=hashlib.sha256(encoded_manifest).hexdigest(),
+        _manifest=manifest,
+        root_kind="page_delta",
+    )
+    adapter = _PageCaptureAdapter(fixture.object_bytes)
+    monkeypatch.setattr(
+        cuda_hybrid.cuda,
+        "arena_memoryview",
+        lambda arena, *, length: memoryview(arena.payload)[:length],
+    )
+
+    with pytest.raises(
+        cuda_hybrid.CudaHybridRestoreError,
+        match="reconstructed snapshot checksum mismatch",
+    ):
+        execute_cuda_hybrid_restore(
+            adapter=adapter,
+            request_id="page-delta-semantic-corruption",
+            lookup=forged_lookup,
+            cache_root=tmp_path,
+            layout=fixture.layout,
+            group_slots=(tuple(range(fixture.result_blocks)),),
+            expected_span_tokens=fixture.result_tokens,
+            arena_bytes=fixture.object_bytes,
+            io_workers=4,
+        )
+
+    assert adapter.transaction.submit_count > 0
+    assert adapter.transaction.state is RestoreState.ABORTED
+    assert not adapter.transaction.can_resume
 
 
 def test_page_copy_spans_cover_payload_once_in_layout_order() -> None:

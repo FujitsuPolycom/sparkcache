@@ -841,6 +841,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             "page_base_flight_participants": 0,
             "page_base_physical_reads": 0,
             "page_base_reads_avoided": 0,
+            "native_page_delta_load_verified": 0,
+            "native_page_delta_base_bytes_skipped": 0,
             "shared_prefix_leases_published": 0,
             "shared_prefix_leases_attached": 0,
             "shared_prefix_leases_expired": 0,
@@ -3422,7 +3424,15 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     ]:
         """Pre-register bases and defer followers until shared bytes are ready."""
 
-        if self._storage_mode != "block_pages_v1" or self._page_layout is None:
+        if (
+            self._storage_mode != "block_pages_v1"
+            or self._page_layout is None
+            or self._native_restore_enabled
+        ):
+            # Direct page-delta restore authenticates and places only source
+            # object fragments that survive delta precedence. Registering a
+            # materialized-base flight here would defer followers for bytes
+            # the native path intentionally never constructs or publishes.
             return list(load_plans), [], {}
         identity = self._identity(self._worker_rank())
         grouped: dict[PageBaseReadFlightKey, list[_ReqPlan]] = {}
@@ -3840,7 +3850,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         )
         if len(groups) != len(layout.groups):
             raise HybridCodecError("request block tables disagree with page groups")
-        if self._native_restore_enabled and lookup.root_kind != "page_delta":
+        if self._native_restore_enabled:
             if not self._native_adapters or not callable(
                 self._native_execute_hybrid_restore
             ):
@@ -3886,12 +3896,26 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self.counters["native_hybrid_load_verified"] = (
                 self.counters.get("native_hybrid_load_verified", 0) + 1
             )
+            if lookup.root_kind == "page_delta":
+                self.counters["native_page_delta_load_verified"] = (
+                    self.counters.get("native_page_delta_load_verified", 0) + 1
+                )
+                self.counters["native_page_delta_base_bytes_skipped"] = (
+                    self.counters.get(
+                        "native_page_delta_base_bytes_skipped",
+                        0,
+                    )
+                    + int(getattr(result, "skipped_base_object_bytes", 0))
+                )
             logger.info(
                 "spark-context-cache: SparkCache CUDA restore verified %d bytes"
+                " read_source_bytes=%d skipped_base_bytes=%d"
                 " slabs=%d read_hash=%.1f ms placement=%.1f ms"
                 " (arena_wait=%.1f ms host_copy=%.1f ms submit_call=%.1f ms)"
                 " finish=%.1f ms",
                 result.source_bytes,
+                int(getattr(result, "read_source_bytes", 0)),
+                int(getattr(result, "skipped_base_object_bytes", 0)),
                 result.slabs,
                 result.read_and_hash_ms,
                 result.copy_and_submit_ms,
