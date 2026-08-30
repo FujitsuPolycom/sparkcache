@@ -308,9 +308,11 @@ Tail-only publication for `block_pages_v1` is also **implemented** with
 GPU-free regression coverage and no live model-serving qualification. The
 page-semantic `sparkcache-hybrid-page-delta/v1` codec binds
 the exact base snapshot and recurrent/sliding boundary and reuses only
-byte-identical opaque pages. Restore reconstructs and verifies the complete
-snapshot before Python or native page placement. Arbitrary earlier-prefix
-aliases cannot be derived from opaque page snapshots.
+byte-identical opaque pages. Python/Torch restore reconstructs and verifies the
+complete snapshot. SparkCache CUDA restore instead resolves authenticated
+base-plus-delta source spans and verifies the final snapshot digest while the
+request remains parked. Arbitrary earlier-prefix aliases cannot be derived
+from opaque page snapshots.
 
 Page-delta publication writes `sparkcache-page-delta-manifest/v2` metadata over
 authenticated byte extents of at most 64 MiB. This physical grouping reduces
@@ -319,17 +321,25 @@ objects for a 1,575,821,491-byte delta. Reads retain at most four extent
 payloads in addition to one assembled delta buffer. The logical admission and
 digest boundary remains 256 tokens. Version 1 page-delta manifests remain
 readable; cache identity, digest salts, and the `page-tail-cow-v1` namespace do
-not change. Restore still materializes one authenticated delta buffer and the
-verified reconstructed snapshot before placement. Direct placement from base
-and delta extents is unsupported by this schema.
+not change. The optional SparkCache CUDA path accepts version 2 graphs rooted
+in a version 2 flat page snapshot. It authenticates the persisted result root,
+embedded roots, and header-bearing objects before planning; applies newest
+delta precedence; omits fully overridden base objects; and reads remaining
+objects in bounded batches. It copies only final logical payload fragments into
+mapped arenas and checks the reconstructed snapshot SHA-256 before completing
+the parked transaction. It never constructs a full Python result buffer. This
+uses the existing page-copy-span ABI and changes neither persisted geometry nor
+the native library ABI.
 
 Persistent base-segment read sharing for `block_pages_v1` page-delta roots is
 **implemented and GPU-free tested; serving qualification is not established**.
-Requests whose
+This coordination applies to the materializing Python/Torch path. Requests whose
 authenticated result roots name the same base root may share one verified,
 immutable base-snapshot buffer per rank. Every request independently reads and
 authenticates its private delta, reconstructs its result snapshot, and performs
-request-private placement. Mutable recurrent pages are never shared.
+request-private placement. Native direct restores bypass these byte-buffer
+flights because they do not materialize or publish a base buffer. Mutable
+recurrent pages are never shared.
 
 One process admits at most two base-read cohorts and 16 cumulative participants
 per cohort. A base must declare at most 1 GiB, and peak byte reservations across

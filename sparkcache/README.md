@@ -250,12 +250,15 @@ when placement completes and intentionally excludes that bookkeeping.
   delta buffer. Version 1 manifests remain readable. Cache identity, digest
   salts, the 256-token logical boundary, and the `page-tail-cow-v1` namespace
   are unchanged. Capacity maintenance retains shared objects after predecessor
-  roots are removed. Restore reconstructs the verified full snapshot before
-  Python/Torch or SparkCache CUDA placement. GPU-free regression coverage
-  exists; live model-serving qualification does not. Direct placement from
-  base and delta extents is unsupported by this schema. A graph contains at
-  most two deltas. The following extension publishes a fresh flat snapshot,
-  bounding
+  roots are removed. Python/Torch restore reconstructs the verified full
+  snapshot. SparkCache CUDA restore accepts version 2 graphs rooted in a
+  version 2 flat page snapshot, resolves newest-delta precedence over
+  authenticated source extents, skips fully overridden base objects, and
+  streams only final fragments through bounded mapped-arena submissions. The
+  final snapshot SHA-256 must match before the parked request completes; no
+  full Python result buffer is constructed. GPU-free regression coverage
+  exists; live model-serving qualification does not. A graph contains at most
+  two deltas. The following extension publishes a fresh flat snapshot, bounding
   reconstruction work and metadata ancestry.
 - **Concurrent shared GPU prefix — implemented.** One leader restores a
   persistent digest. After every rank succeeds, up to sixteen waiting followers

@@ -143,7 +143,6 @@ from sparkcache.spark_context_cache_connector import (  # noqa: E402
     SparkContextCacheConnector,
     _ReqPlan,
 )
-from sparkcache.spark_context_cache_hybrid import decode_page_snapshot  # noqa: E402
 from sparkcache.spark_context_cache_store import (  # noqa: E402
     CapacityPolicy,
     EntryKey,
@@ -572,39 +571,54 @@ class HybridPageRoundTripTests(unittest.TestCase):
             self.assertTrue(torch.equal(compressed[[6, 7]], expected_compressed))
             self.assertTrue(torch.equal(state[[9]], expected_state))
 
-            materialized = []
+            direct_restores = []
 
-            def native_placement(**kwargs):
-                materialized.append(kwargs["encoded_pages"])
+            def native_restore(**kwargs):
+                direct_restores.append(kwargs["lookup"])
                 return types.SimpleNamespace(
-                    source_bytes=len(kwargs["encoded_pages"]),
+                    source_bytes=1234,
+                    read_and_hash_ms=1.0,
                     copy_and_submit_ms=1.0,
                     finish_ms=1.0,
+                    slabs=2,
+                    arena_wait_ms=0.1,
+                    host_copy_ms=0.8,
+                    submit_call_ms=0.1,
                 )
 
             connector._native_restore_enabled = True
             connector._native_adapters = [object()]
-            connector._native_execute_hybrid_placement = native_placement
-            self.assertTrue(
-                connector._load_one(
-                    _ReqPlan(
-                        "page-native-load",
-                        result_digest,
-                        1024,
-                        destination[0],
-                        False,
-                        block_ids_by_group=destination,
-                    )
+            connector._native_execute_hybrid_restore = native_restore
+            connector._native_execute_hybrid_placement = mock.Mock(
+                side_effect=AssertionError(
+                    "page-delta native restore must not receive materialized bytes"
                 )
             )
-            self.assertEqual(len(materialized), 1)
+            with mock.patch.object(
+                connector._store,
+                "restore_page_snapshot",
+                side_effect=AssertionError(
+                    "page-delta native restore must not materialize a snapshot"
+                ),
+            ):
+                self.assertTrue(
+                    connector._load_one(
+                        _ReqPlan(
+                            "page-native-load",
+                            result_digest,
+                            1024,
+                            destination[0],
+                            False,
+                            block_ids_by_group=destination,
+                        )
+                    )
+                )
+            self.assertEqual(len(direct_restores), 1)
+            self.assertEqual(direct_restores[0].root_kind, "page_delta")
+            connector._native_execute_hybrid_placement.assert_not_called()
             self.assertEqual(
-                decode_page_snapshot(
-                    connector._page_layout,
-                    materialized[0],
-                    (2, 1),
-                )["state"],
-                expected_state.view(torch.uint8).numpy().tobytes(),
+                connector.counters["native_page_delta_load_verified"],
+                1,
             )
             sweep = connector.sweep_integrity()
             self.assertEqual(sweep["invalidated"], 0)
@@ -1473,6 +1487,24 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
             for index in range(16)
         ]
         return connector, evidence, plans
+
+    def test_native_page_delta_restore_does_not_register_materialized_base_flights(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector, _evidence, plans = self._page_base_queue_fixture(
+                Path(directory)
+            )
+            connector._native_restore_enabled = True
+
+            runnable, deferred, keys = connector._prepare_page_base_read_cohorts(
+                plans
+            )
+
+            self.assertEqual(runnable, plans)
+            self.assertEqual(deferred, [])
+            self.assertEqual(keys, {})
+            connector._store.page_delta_base_read_evidence.assert_not_called()
 
     def test_start_load_kv_c16_reads_one_pre_registered_page_base(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

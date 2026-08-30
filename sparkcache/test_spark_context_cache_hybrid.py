@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import unittest
 
 from sparkcache.spark_context_cache_hybrid import (
@@ -11,6 +12,7 @@ from sparkcache.spark_context_cache_hybrid import (
     apply_page_delta,
     encode_page_delta,
     encode_page_snapshot,
+    plan_page_delta,
     plan_page_snapshot,
     split_snapshot,
 )
@@ -35,6 +37,76 @@ def _layout() -> PageLayout:
 
 
 class HybridPageCodecTests(unittest.TestCase):
+    def test_page_delta_plan_describes_tail_sources_without_reading_the_base(
+        self,
+    ) -> None:
+        layout = PageLayout(
+            (
+                PageGroup(
+                    2,
+                    (
+                        PageLayer("a", "u8", (4,), 4),
+                        PageLayer("b", "u8", (2,), 2),
+                    ),
+                ),
+            )
+        )
+        base = encode_page_snapshot(
+            layout,
+            (2,),
+            {"a": b"A" * 8, "b": b"B" * 4},
+        )
+        result = encode_page_snapshot(
+            layout,
+            (4,),
+            {
+                "a": b"A" * 8 + b"C" * 8,
+                "b": b"B" * 4 + b"D" * 4,
+            },
+        )
+        delta = encode_page_delta(
+            layout,
+            base,
+            result,
+            base_block_counts=(2,),
+            result_block_counts=(4,),
+            base_boundary_tokens=4,
+            result_boundary_tokens=8,
+        )
+
+        plan = plan_page_delta(
+            layout,
+            delta,
+            base_block_counts=(2,),
+            result_block_counts=(4,),
+            base_boundary_tokens=4,
+            result_boundary_tokens=8,
+            total_bytes=len(delta),
+        )
+
+        self.assertEqual(
+            plan.base_snapshot_sha256,
+            hashlib.sha256(base).hexdigest(),
+        )
+        self.assertEqual(
+            plan.result_snapshot_sha256,
+            hashlib.sha256(result).hexdigest(),
+        )
+        self.assertEqual(plan.reused_pages_by_group, (2,))
+        self.assertEqual(
+            [
+                (
+                    tail.layer_name,
+                    tail.group_index,
+                    tail.destination_byte_offset,
+                    tail.source_end - tail.source_start,
+                )
+                for tail in plan.tails
+            ],
+            [("a", 0, 8, 8), ("b", 0, 4, 4)],
+        )
+        self.assertEqual(plan.total_bytes, len(delta))
+
     def test_page_delta_reuses_byte_identical_pages_and_round_trips(self) -> None:
         layout = PageLayout(
             (
