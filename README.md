@@ -180,7 +180,7 @@ source boundary, retaining at most 64 aliases. Alias graphs participate in TTL,
 LRU, capacity accounting, invalidation, and orphan collection.
 
 Opaque hybrid page storage, identified by `block_pages_v1`, encodes a complete
-boundary snapshot. New flat publications use the authenticated
+boundary snapshot. Schema-capable flat publication uses the authenticated
 `sparkcache-page-snapshot-manifest/v2` root and partition that opaque byte
 stream into content-addressed objects of at most 64 MiB. The root separately
 records the 256-token logical chunk size and count used by identity and
@@ -189,8 +189,8 @@ admission; physical extents are not independently usable token ranges.
 Version 1 flat manifests, which store one encoded `.spcc` file per logical
 chunk, remain readable. The v2 representation does not change `CacheIdentity`,
 digest salts, logical chunk geometry, or either the default flat namespace or
-the opt-in `page-tail-cow-v1` namespace. An older reader does not reinterpret a
-v2 root as v1: strict manifest validation makes it a cache miss. Consequently,
+the opt-in `page-tail-cow-v1` namespace. A schema-incompatible reader does not
+reinterpret a v2 root as v1: strict manifest validation makes it a cache miss. Consequently,
 a mixed-version rollback can lose a reusable cache entry but cannot serve it
 under the wrong storage contract.
 
@@ -275,7 +275,7 @@ parked request may resume.
 |---|---|
 | `sparkcache/spark_context_cache_connector.py` | scheduler admission, worker I/O, all-rank availability, restore coalescing, shared-prefix coordination, and vLLM callbacks |
 | `sparkcache/persistent_context_cache/cache_manifest.py` | exact manifests, row-prefix aliases, immutable chunks, lookup, invalidation, capacity, and garbage collection |
-| `sparkcache/spark_context_cache_native_hybrid_restore.py` | authenticated direct reads, slab planning, and mapped-arena page placement |
+| `sparkcache/spark_context_cache_cuda_hybrid_restore.py` | authenticated CUDA reads, slab planning, and mapped-arena page placement |
 | `sparkcache/spark_context_cache_restore_timing.py` | machine-readable asynchronous restore timing |
 | `sparkcache/runtime_patches/` | exact-hash vLLM source contracts and GPU-free patch execution tests |
 | `sparkcache/native/` | C++/CUDA ABI, parser, reference implementation, kernel, and probes |

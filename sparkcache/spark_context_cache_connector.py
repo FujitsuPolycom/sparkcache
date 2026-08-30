@@ -151,30 +151,30 @@ def configure_streaming_snapshot_runtime(
     _STREAMING_RUNTIME_FACTORIES[role] = factory
 
 
-def _load_native_components() -> SimpleNamespace:
-    """Lazy optional import: the Python restore path needs no native bundle."""
+def _load_cuda_components() -> SimpleNamespace:
+    """Load the optional SparkCache CUDA placement components lazily."""
 
-    placement = importlib.import_module(
-        "sparkcache.spark_context_cache_native_placement"
-    )
-    restore = importlib.import_module("sparkcache.spark_context_cache_native_restore")
+    placement = importlib.import_module("sparkcache.spark_context_cache_cuda_placement")
+    restore = importlib.import_module("sparkcache.spark_context_cache_cuda_restore")
     hybrid_restore = importlib.import_module(
-        "sparkcache.spark_context_cache_native_hybrid_restore"
+        "sparkcache.spark_context_cache_cuda_hybrid_restore"
     )
-    binding = importlib.import_module("sparkcache.spark_cache_native")
+    binding = importlib.import_module("sparkcache.spark_cache_cuda")
     return SimpleNamespace(
-        NativePlacementLibrary=placement.NativePlacementLibrary,
-        NativePlacementAdapter=placement.NativePlacementAdapter,
+        CudaPlacementLibrary=placement.CudaPlacementLibrary,
+        CudaPlacementAdapter=placement.CudaPlacementAdapter,
         ArenaMode=placement.ArenaMode,
         RecordKind=placement.RecordKind,
-        execute_native_restore=restore.execute_native_restore,
-        execute_native_hybrid_restore=hybrid_restore.execute_native_hybrid_restore,
-        execute_native_hybrid_placement=(
-            hybrid_restore.execute_native_hybrid_placement
-        ),
+        execute_cuda_restore=restore.execute_cuda_restore,
+        execute_cuda_hybrid_restore=hybrid_restore.execute_cuda_hybrid_restore,
+        execute_cuda_hybrid_placement=(hybrid_restore.execute_cuda_hybrid_placement),
         bind_page_reference=binding.bind_page_reference,
         hybrid_page_cuda_capability=binding.CAP_HYBRID_PAGE_CUDA,
     )
+
+
+# Private compatibility alias for embedders that imported the earlier helper.
+_load_native_components = _load_cuda_components
 
 
 @dataclass
@@ -2175,12 +2175,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         )
         adapter = None
         try:
-            components = _load_native_components()
-            library = components.NativePlacementLibrary.load(
+            components = _load_cuda_components()
+            library = components.CudaPlacementLibrary.load(
                 self._native_library_path,
                 expected_sha256=self._native_library_sha256,
             )
-            adapter = components.NativePlacementAdapter.create(
+            adapter = components.CudaPlacementAdapter.create(
                 library,
                 arena_mode=components.ArenaMode.MAPPED_HOST,
                 arena_bytes=self._native_arena_bytes,
@@ -2207,7 +2207,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         " SparkCache CUDA placement ordinal"
                     )
                 required |= 1 << int(ordinal)
-            native_execute = components.execute_native_restore
+            native_execute = components.execute_cuda_restore
             if not callable(native_execute):
                 raise TypeError("SparkCache CUDA restore orchestrator is not callable")
         except Exception as error:
@@ -2261,8 +2261,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             max_slots += capacities.pop()
         adapters = []
         try:
-            components = _load_native_components()
-            library = components.NativePlacementLibrary.load(
+            components = _load_cuda_components()
+            library = components.CudaPlacementLibrary.load(
                 self._native_library_path,
                 expected_sha256=self._native_library_sha256,
             )
@@ -2276,7 +2276,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     "SparkCache CUDA placement library lacks page scatter"
                 )
             for _lane in range(self._load_thread_limit):
-                adapter = components.NativePlacementAdapter.create(
+                adapter = components.CudaPlacementAdapter.create(
                     library,
                     arena_mode=components.ArenaMode.MAPPED_HOST,
                     arena_bytes=self._native_arena_bytes,
@@ -2287,12 +2287,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 )
                 adapters.append(adapter)
                 adapter.configure_pages(layout, self._layer_tensors)
-            execute_restore = components.execute_native_hybrid_restore
-            execute_placement = components.execute_native_hybrid_placement
+            execute_restore = components.execute_cuda_hybrid_restore
+            execute_placement = components.execute_cuda_hybrid_placement
             if not callable(execute_restore):
-                raise TypeError(
-                    "SparkCache direct CUDA restore orchestrator is not callable"
-                )
+                raise TypeError("SparkCache CUDA restore orchestrator is not callable")
             if not callable(execute_placement):
                 raise TypeError(
                     "SparkCache CUDA page-placement orchestrator is not callable"
@@ -3497,7 +3495,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self.counters.get("native_hybrid_load_verified", 0) + 1
             )
             logger.info(
-                "spark-context-cache: SparkCache direct CUDA restore verified %d bytes"
+                "spark-context-cache: SparkCache CUDA restore verified %d bytes"
                 " slabs=%d read_hash=%.1f ms submit=%.1f ms finish=%.1f ms",
                 result.source_bytes,
                 result.slabs,

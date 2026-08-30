@@ -154,11 +154,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # noqa: E402
 )
 
 
-class NativeHybridDispatchTests(unittest.TestCase):
+class CudaHybridDispatchTests(unittest.TestCase):
     def test_loader_exposes_distinct_direct_and_materialized_page_paths(self) -> None:
-        components = connector_module._load_native_components()
-        direct = components.execute_native_hybrid_restore
-        materialized = components.execute_native_hybrid_placement
+        components = connector_module._load_cuda_components()
+        direct = components.execute_cuda_hybrid_restore
+        materialized = components.execute_cuda_hybrid_placement
 
         self.assertIsNot(direct, materialized)
         self.assertIn("lookup", inspect.signature(direct).parameters)
@@ -1036,7 +1036,7 @@ _LAYERS = {
 }
 
 
-class NativeRestoreSelectionTests(unittest.TestCase):
+class CudaRestoreSelectionTests(unittest.TestCase):
     def test_streaming_snapshot_feature_is_disabled_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(Path(directory), 0)
@@ -1044,7 +1044,9 @@ class NativeRestoreSelectionTests(unittest.TestCase):
         self.assertFalse(connector._streaming_snapshots_enabled)
         self.assertIsNone(connector._streaming_runtime)
 
-    def test_streaming_snapshot_opt_in_fails_before_native_side_effects(self) -> None:
+    def test_streaming_snapshot_opt_in_is_rejected_before_cuda_side_effects(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(
                 RuntimeError, "runtime installation was rejected"
@@ -1055,7 +1057,7 @@ class NativeRestoreSelectionTests(unittest.TestCase):
                     extra_config={"spark_cache_streaming_snapshots": "1"},
                 )
 
-    def test_native_restore_is_disabled_by_default(self) -> None:
+    def test_cuda_restore_is_disabled_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(Path(directory), 0)
 
@@ -1063,7 +1065,7 @@ class NativeRestoreSelectionTests(unittest.TestCase):
         self.assertIsNone(connector._native_adapter)
         self.assertEqual(connector._load_thread_limit, 1)
 
-    def test_disabled_native_mode_ignores_stale_native_settings(self) -> None:
+    def test_disabled_cuda_mode_ignores_invalid_cuda_settings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(
                 Path(directory),
@@ -1081,7 +1083,7 @@ class NativeRestoreSelectionTests(unittest.TestCase):
         self.assertFalse(connector._native_restore_enabled)
         self.assertIsNone(connector._native_adapter)
 
-    def test_native_restore_requires_all_three_attested_settings(self) -> None:
+    def test_cuda_restore_requires_all_three_attested_settings(self) -> None:
         cases = (
             {},
             {"spark_cache_cuda_placement_library": "/tmp/placement.so"},
@@ -1102,7 +1104,7 @@ class NativeRestoreSelectionTests(unittest.TestCase):
                     ):
                         _make_connector(Path(directory), 0, extra_config=settings)
 
-    def test_native_library_hash_failure_stops_registration(self) -> None:
+    def test_cuda_library_hash_rejection_stops_registration(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             artifact = Path(directory) / "placement.so"
             artifact.write_bytes(b"not-the-pinned-library")
@@ -1125,11 +1127,11 @@ class NativeRestoreSelectionTests(unittest.TestCase):
             self.assertEqual(
                 connector._load_thread_limit,
                 1,
-                "native restores must be serialized regardless of requested"
+                "SparkCache CUDA restores must be serialized regardless of requested"
                 " Python load-thread count",
             )
 
-    def test_attested_native_adapter_is_configured_after_cache_registration(
+    def test_attested_cuda_adapter_is_configured_after_cache_registration(
         self,
     ) -> None:
         calls = []
@@ -1153,15 +1155,15 @@ class NativeRestoreSelectionTests(unittest.TestCase):
                 return adapter
 
         components = types.SimpleNamespace(
-            NativePlacementLibrary=FakeLibrary,
-            NativePlacementAdapter=FakeAdapter,
+            CudaPlacementLibrary=FakeLibrary,
+            CudaPlacementAdapter=FakeAdapter,
             ArenaMode=types.SimpleNamespace(MAPPED_HOST=1),
             RecordKind=types.SimpleNamespace(
                 TARGET_CKV=0,
                 SPARSE_INDEXER=1,
                 MTP_DRAFT_KV=2,
             ),
-            execute_native_restore=lambda **_kwargs: None,
+            execute_cuda_restore=lambda **_kwargs: None,
         )
 
         with tempfile.TemporaryDirectory() as directory:
@@ -1179,7 +1181,7 @@ class NativeRestoreSelectionTests(unittest.TestCase):
             )
             with mock.patch.object(
                 connector_module,
-                "_load_native_components",
+                "_load_cuda_components",
                 return_value=components,
             ):
                 connector.register_kv_caches(_fake_cuda_pools())
@@ -1193,7 +1195,7 @@ class NativeRestoreSelectionTests(unittest.TestCase):
         self.assertEqual(create["device_ordinal"], 0)
         self.assertIs(connector._native_adapter, adapter)
 
-    def test_scheduler_role_never_creates_a_native_adapter(self) -> None:
+    def test_scheduler_role_never_creates_a_cuda_adapter(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             artifact = Path(directory) / "placement.so"
             artifact.write_bytes(b"scheduler-does-not-load-this")
@@ -1210,23 +1212,23 @@ class NativeRestoreSelectionTests(unittest.TestCase):
             )
             with mock.patch.object(
                 connector_module,
-                "_load_native_components",
+                "_load_cuda_components",
                 side_effect=AssertionError(
-                    "scheduler role must not load native placement"
+                    "scheduler role must not load SparkCache CUDA placement"
                 ),
             ):
                 connector.register_kv_caches(_fake_cuda_pools())
 
         self.assertIsNone(connector._native_adapter)
 
-    def test_enabled_native_load_never_falls_back_to_python_assembly(
+    def test_enabled_cuda_load_never_falls_back_to_python_assembly(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(Path(directory), 0, 64)
             connector.register_kv_caches(_make_pools(8, 64))
             plan = _ReqPlan(
-                "native-restore",
+                "cuda-restore",
                 "9" * 64,
                 1024,
                 (3, 0, 5, 1),
@@ -1264,13 +1266,13 @@ class NativeRestoreSelectionTests(unittest.TestCase):
             connector._native_execute_restore = execute
             connector._store.restore = mock.Mock(
                 side_effect=AssertionError(
-                    "native selection must not enter Python assembly"
+                    "SparkCache CUDA restore must not enter Python assembly"
                 )
             )
 
             self.assertTrue(connector._load_one(plan))
 
-        self.assertEqual(observed["request_id"], "native-restore")
+        self.assertEqual(observed["request_id"], "cuda-restore")
         self.assertEqual(observed["lookup"], lookup)
         self.assertEqual(
             observed["slots"],
@@ -1285,14 +1287,14 @@ class NativeRestoreSelectionTests(unittest.TestCase):
         )
         self.assertEqual(connector.counters["native_load_verified"], 1)
 
-    def test_native_failure_invalidates_entry_without_python_fallback(
+    def test_cuda_rejection_invalidates_entry_without_python_fallback(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(Path(directory), 0, 64)
             connector.register_kv_caches(_make_pools(8, 64))
             plan = _ReqPlan(
-                "native-failure",
+                "cuda-rejection",
                 "8" * 64,
                 1024,
                 (3, 0, 5, 1),
@@ -1316,7 +1318,7 @@ class NativeRestoreSelectionTests(unittest.TestCase):
             )
             connector._store.restore = mock.Mock(
                 side_effect=AssertionError(
-                    "partial native failure must never fall back"
+                    "rejected SparkCache CUDA restore must not fall back"
                 )
             )
 
@@ -5499,18 +5501,18 @@ class StreamingLifecycleScaffoldingTests(unittest.TestCase):
         self.assertEqual(runtime.finished_filter, {"stream-done"})
         self.assertEqual(connector.get_finished(set()), (None, None))
 
-    def test_shutdown_drains_streaming_before_native_close(self) -> None:
+    def test_shutdown_drains_streaming_before_cuda_close(self) -> None:
         events: list[str] = []
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(Path(directory), 0)
             connector._streaming_runtime = _FakeStreamingRuntime(events=events)
-            native = mock.Mock()
-            native.close.side_effect = lambda: events.append("native-close")
-            connector._native_adapter = native
+            cuda = mock.Mock()
+            cuda.close.side_effect = lambda: events.append("cuda-close")
+            connector._native_adapter = cuda
 
             connector.shutdown()
 
-        self.assertEqual(events, ["streaming-shutdown", "native-close"])
+        self.assertEqual(events, ["streaming-shutdown", "cuda-close"])
         self.assertIsNone(connector._streaming_runtime)
         self.assertIsNone(connector._native_adapter)
 

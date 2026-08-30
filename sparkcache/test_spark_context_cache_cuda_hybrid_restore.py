@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 import sparkcache.persistent_context_cache.cache_manifest as cache_manifest
-import sparkcache.spark_context_cache_native_hybrid_restore as native_hybrid
+import sparkcache.spark_context_cache_cuda_hybrid_restore as cuda_hybrid
 from sparkcache.persistent_context_cache.cache_manifest import (
     CacheIdentity,
     ManifestStore,
@@ -18,13 +18,13 @@ from sparkcache.spark_context_cache_hybrid import (
     encode_page_snapshot,
     plan_page_snapshot,
 )
-from sparkcache.spark_context_cache_native_hybrid_restore import (
+from sparkcache.spark_context_cache_cuda_hybrid_restore import (
     build_page_copy_spans,
     build_page_object_spans,
-    execute_native_hybrid_restore,
+    execute_cuda_hybrid_restore,
     plan_page_slabs,
 )
-from sparkcache.spark_context_cache_native_placement import RestoreState
+from sparkcache.spark_context_cache_cuda_placement import RestoreState
 
 
 def test_page_copy_spans_cover_payload_once_in_layout_order() -> None:
@@ -160,14 +160,14 @@ def test_flat_macro_objects_authenticate_before_direct_page_submission(
 
     adapter = Adapter()
     monkeypatch.setattr(
-        native_hybrid.native,
+        cuda_hybrid.cuda,
         "arena_memoryview",
         lambda arena, *, length: memoryview(arena.payload)[:length],
     )
 
-    result = execute_native_hybrid_restore(
+    result = execute_cuda_hybrid_restore(
         adapter=adapter,
-        request_id="flat-macro-native",
+        request_id="flat-macro-cuda",
         lookup=lookup,
         cache_root=tmp_path,
         layout=layout,
@@ -193,10 +193,10 @@ def test_flat_macro_objects_authenticate_before_direct_page_submission(
     )
     transactions_before_forgery = len(adapter.transactions)
     with pytest.raises(
-        native_hybrid.NativeHybridRestoreError,
+        cuda_hybrid.CudaHybridRestoreError,
         match="identity is not authenticated",
     ):
-        execute_native_hybrid_restore(
+        execute_cuda_hybrid_restore(
             adapter=adapter,
             request_id="flat-macro-forged-lookup",
             lookup=forged_lookup,
@@ -214,10 +214,10 @@ def test_flat_macro_objects_authenticate_before_direct_page_submission(
     damaged[-1] ^= 0xFF
     damaged_path.write_bytes(damaged)
     with pytest.raises(
-        native_hybrid.NativeHybridRestoreError,
+        cuda_hybrid.CudaHybridRestoreError,
         match="SHA-256 mismatch",
     ):
-        execute_native_hybrid_restore(
+        execute_cuda_hybrid_restore(
             adapter=adapter,
             request_id="flat-macro-corrupt",
             lookup=lookup,
@@ -244,10 +244,10 @@ def test_flat_macro_objects_authenticate_before_direct_page_submission(
     wrong_lookup = store.lookup(identity, digest, verify_chunks=False)
     assert wrong_lookup.is_hit
     with pytest.raises(
-        native_hybrid.NativeHybridRestoreError,
+        cuda_hybrid.CudaHybridRestoreError,
         match="snapshot checksum mismatch",
     ):
-        execute_native_hybrid_restore(
+        execute_cuda_hybrid_restore(
             adapter=adapter,
             request_id="flat-macro-wrong-root-digest",
             lookup=wrong_lookup,

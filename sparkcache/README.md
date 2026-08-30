@@ -38,7 +38,7 @@ SparkCache reads and writes only the rank's local filesystem.
 | `persistent_context_cache/cache_manifest.py` | `ManifestStore`; exact manifests, row-prefix aliases, durable publication, lookup, restore, invalidation, and maintenance |
 | `spark_context_cache_cuda_placement.py` | `CudaPlacementAdapter`; attested SparkCache CUDA placement transaction |
 | `spark_context_cache_cuda_restore.py` | bounded read/hash/slab orchestration for SparkCache CUDA placement |
-| `spark_context_cache_native_hybrid_restore.py` | authenticated direct reads and multi-slab mapped-arena placement for opaque HMA pages |
+| `spark_context_cache_cuda_hybrid_restore.py` | authenticated CUDA reads and multi-slab mapped-arena placement for opaque HMA pages |
 | `spark_context_cache_restore_timing.py` | `sparkcache-restore-timing/v1` asynchronous restore records |
 | `streaming/factory.py` | scheduler and worker adapters for write-behind publication |
 | `replication/` | carrier-independent transaction protocol; no network adapter is implemented |
@@ -101,8 +101,8 @@ SparkCache CUDA restore uses these optional connector settings:
 - `spark_cache_cuda_restore_io_workers`.
 
 The equivalent environment variables begin with
-`SPARK_CONTEXT_CACHE_CUDA_`. Legacy `native` configuration, environment, CLI,
-and profile names remain accepted as compatibility aliases. A legacy-only
+`SPARK_CONTEXT_CACHE_CUDA_`. Legacy-key configuration, environment, CLI, and
+profile names remain accepted as compatibility aliases. A legacy-key-only
 configuration warns once per process. Supplying canonical and legacy values
 that disagree rejects startup. Generated configurations use only the CUDA
 names. The terminology change does not alter cache identity or stored bytes.
@@ -266,7 +266,7 @@ when placement completes and intentionally excludes that bookkeeping.
 
 ## Optional paths
 
-- **SparkCache direct CUDA restore — implemented.** Requires the checksum-attested
+- **SparkCache CUDA restore — implemented.** Requires the checksum-attested
   `libspark_cache_placement` artifact and remains disabled unless the launch
   supplies its path, SHA-256, and a supported mapped-host arena size. The
   `glm53-flash-hybrid` profile supports authenticated multi-slab page restore;
@@ -291,7 +291,7 @@ and chunk geometry.
 
 GLM-5.3 Flash opaque pages are qualified at TP4/DCP1 with BF16 DFlash2 using
 seven draft tokens. Source revision
-`2b86fb9d02fa3595cca5caa864b81aedce44b8bb` qualifies SparkCache direct CUDA restore,
+`2b86fb9d02fa3595cca5caa864b81aedce44b8bb` qualifies SparkCache CUDA restore,
 multi-group recovery, and shared GPU-prefix reuse through C16 under a
 32-sequence scheduler ceiling. Sparse row-prefix aliases have GPU-free coverage
 but no live model-serving qualification.
