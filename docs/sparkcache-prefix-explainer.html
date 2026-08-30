@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="An interactive explanation of SparkCache exact-prefix discovery, row-prefix aliases, verified restore, and bounded shared GPU-prefix reuse.">
+  <meta name="description" content="An interactive explanation of SparkCache verified prefix discovery, copy-on-write publication, shared trunks, and bounded GPU-prefix reuse.">
   <title>SparkCache · Prefix reuse explorer</title>
   <style>
     :root {
@@ -47,7 +47,7 @@
     a:hover { color: #a9d5ff; }
     :focus-visible { outline: 3px solid var(--amber); outline-offset: 3px; }
     code, .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
-    code { color: #c7e7ff; }
+    code { color: #c7e7ff; overflow-wrap: anywhere; }
     .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 
     .shell { width: min(1180px, calc(100% - 32px)); margin: 0 auto; padding: 62px 0 80px; }
@@ -71,7 +71,7 @@
     .hero-note strong { display: block; margin-bottom: 6px; color: var(--amber); font-size: .76rem; letter-spacing: .1em; text-transform: uppercase; }
     .hero-note p { margin: 0; color: var(--muted); font-size: .91rem; }
 
-    .status-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 36px 0 64px; }
+    .status-strip { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin: 36px 0 64px; }
     .status-pill { min-height: 82px; padding: 15px 16px; border: 1px solid var(--line); border-radius: 14px; background: rgba(7, 21, 34, .72); }
     .status-pill .value { display: block; color: var(--ink); font-size: 1.05rem; font-weight: 800; }
     .status-pill .label { color: var(--faint); font-size: .78rem; }
@@ -226,6 +226,18 @@
     .ref { flex: 1; height: 24px; border: 1px solid #36556a; border-radius: 5px; background: #102c3e; color: #aac1d1; text-align: center; font: 700 .64rem/22px "SFMono-Regular", Consolas, monospace; }
     .alias-caption { margin: 17px 0 0; padding-top: 13px; border-top: 1px solid var(--line); color: var(--muted); font-size: .83rem; }
 
+    .publication-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+    .publication-card { padding: 20px; border: 1px solid var(--line); border-radius: 14px; background: rgba(4, 16, 26, .52); }
+    .publication-card h3 { margin: 0 0 6px; font-size: 1rem; }
+    .publication-card > p { margin: 0; color: var(--muted); font-size: .8rem; }
+    .publication-flow { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; gap: 7px; align-items: center; margin: 18px 0 14px; }
+    .publication-node { min-height: 62px; padding: 9px 6px; border: 1px solid #315a75; border-radius: 8px; background: #0a2537; color: #c9deea; text-align: center; font: 750 .64rem "SFMono-Regular", Consolas, monospace; }
+    .publication-node.base { border-color: #39749b; color: var(--blue); }
+    .publication-node.delta { border-color: #7a5a2d; color: var(--amber); }
+    .publication-node.result { border-color: #267365; color: var(--cyan); }
+    .publication-arrow { color: var(--cyan); font-weight: 900; text-align: center; }
+    .status-pair { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+
     .flow { display: grid; grid-template-columns: 1fr auto 1.15fr auto 1fr; gap: 12px; align-items: stretch; }
     .flow-card { padding: 18px; border: 1px solid var(--line); border-radius: 12px; background: rgba(4, 16, 26, .52); }
     .flow-card .icon { display: grid; width: 34px; height: 34px; margin-bottom: 12px; place-items: center; border-radius: 9px; background: var(--cyan-dim); color: var(--cyan); font-weight: 900; }
@@ -266,6 +278,15 @@
     .rank-band { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 12px; }
     .rank-band span { padding: 7px 4px; border: 1px solid #28556a; border-radius: 6px; color: #b9d4e5; background: #0b2a3c; font: .64rem "SFMono-Regular", Consolas, monospace; text-align: center; }
     .share-note { margin-top: 14px; padding: 11px 12px; border-left: 3px solid var(--amber); background: rgba(73, 55, 29, .44); color: #dfc89f; font-size: .76rem; }
+    .trunk-share { margin-top: 18px; padding: 20px; border: 1px solid var(--line); border-radius: 14px; background: rgba(4, 16, 26, .52); }
+    .trunk-share h3 { margin: 0 0 6px; font-size: 1rem; }
+    .trunk-share > p { margin: 0; color: var(--muted); font-size: .8rem; }
+    .trunk-visual { display: grid; grid-template-columns: minmax(180px, .75fr) auto minmax(0, 1.25fr); gap: 10px; align-items: center; margin: 18px 0 12px; }
+    .trunk-node { padding: 18px 12px; border: 1px solid #267365; border-radius: 10px; background: #10382f; color: var(--cyan); text-align: center; font: 800 .72rem "SFMono-Regular", Consolas, monospace; }
+    .root-fan { display: grid; gap: 7px; }
+    .root-row { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
+    .root-prefix, .root-tail { padding: 9px 7px; border: 1px solid #39749b; border-radius: 7px; background: #102d4c; color: var(--blue); text-align: center; font: 700 .66rem "SFMono-Regular", Consolas, monospace; }
+    .root-tail { border-color: #7a5a2d; background: #302719; color: var(--amber); }
 
     .evidence-table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; }
     .evidence-table { width: 100%; border-collapse: collapse; min-width: 700px; background: rgba(4, 16, 26, .52); }
@@ -280,7 +301,7 @@
     .source-links { display: flex; flex-wrap: wrap; gap: 12px; }
 
     @media (max-width: 850px) {
-      .hero, .lab-grid, .alias-visual, .context-example, .share-layout { grid-template-columns: 1fr; }
+      .hero, .lab-grid, .alias-visual, .context-example, .share-layout, .publication-grid { grid-template-columns: 1fr; }
       .status-strip { grid-template-columns: 1fr 1fr; }
       .stage { min-height: 0; border-right: 0; border-bottom: 1px solid var(--line); }
       .flow { grid-template-columns: 1fr; }
@@ -288,6 +309,8 @@
       .safety-grid, .evidence-grid { grid-template-columns: 1fr; }
       .lease-flow { grid-template-columns: 1fr; }
       .lease-arrow { transform: rotate(90deg); justify-self: center; }
+      .publication-flow, .trunk-visual { grid-template-columns: 1fr; }
+      .publication-arrow { transform: rotate(90deg); }
       .section-head { display: block; }
       .section-head p { margin-top: 8px; }
     }
@@ -320,7 +343,7 @@
       <div>
         <span class="eyebrow">Persistent context for vLLM</span>
         <h1>Reuse the longest <em>verified prefix</em></h1>
-        <p class="lede">SparkCache finds the longest stored prompt boundary available on every physical rank. One verified restore can then supply bounded shared GPU blocks to concurrent requests while each request computes its own tail.</p>
+        <p class="lede">SparkCache finds the longest stored prompt boundary available on every physical rank. It can publish only a conversation extension, share one authenticated row trunk across different roots, and attach concurrent requests to verified GPU blocks.</p>
       </div>
       <aside class="hero-note">
         <strong>Example configuration</strong>
@@ -332,6 +355,7 @@
       <div class="status-pill"><span class="status-tag">Implemented</span><span class="value">256 tokens</span><span class="label">logical identity and admission boundary</span></div>
       <div class="status-pill"><span class="status-tag">Implemented</span><span class="value">Longest exact</span><span class="label">stored boundary advertised by every rank</span></div>
       <div class="status-pill"><span class="status-tag">Implemented</span><span class="value">Row aliases</span><span class="label">sparse authenticated metadata over durable row chunks</span></div>
+      <div class="status-pill"><span class="status-tag">Implemented</span><span class="value">COW tails</span><span class="label">immutable row tails and authenticated page deltas</span></div>
       <div class="status-pill"><span class="status-tag limited">Qualified</span><span class="value">1 → 16</span><span class="label">one GLM restore served a 16-request cohort</span></div>
     </div>
 
@@ -434,35 +458,63 @@
           <div class="descriptor-map" aria-label="A 768-token alias selects three authenticated row chunks">
             <div class="descriptor-node alias-node">alias · 768 tokens</div><div class="descriptor-arrow" aria-hidden="true">→</div><div class="descriptor-node payload-node">authenticated descriptors → rows A + B + C</div>
           </div>
-          <p class="alias-caption"><code>sparkcache-prefix-alias/v1</code> metadata selects an earlier row boundary through authenticated descriptor segments. It references durable chunks without copying their payload bytes.</p>
+          <p class="alias-caption">An authenticated descriptor segment contains at most 16 chunk descriptors. By default, <code>sparkcache-prefix-alias/v1</code> selects 4,096-token boundaries plus the source boundary and retains at most 64 aliases. The aliases reference durable chunks without copying payload bytes.</p>
         </article>
         <article class="aliases">
           <h3><span class="status-tag limited">Qualified exact snapshots</span> <code>block_pages_v1</code></h3>
           <p class="mini-copy">SparkCache encodes one opaque hybrid-memory-allocator (HMA) page snapshot for an exact boundary, then partitions that encoded byte stream across chunk files.</p>
           <div class="alias-row"><span class="alias-name">snapshot</span><div class="refs"><span class="ref">header</span><span class="ref">all layer pages</span><span class="ref">all groups</span></div></div>
           <div class="alias-row"><span class="alias-name">on disk</span><div class="refs"><span class="ref">byte 1/4</span><span class="ref">byte 2/4</span><span class="ref">byte 3/4</span><span class="ref">byte 4/4</span></div></div>
-          <p class="alias-caption"><strong>Alias truncation is unsupported.</strong> Each file is a byte partition of the whole snapshot, not token-local KV. Removing a file cannot create a valid earlier GLM prefix.</p>
+          <p class="alias-caption"><strong>Alias truncation is unsupported.</strong> Each file is a byte partition of the whole snapshot, not token-local KV. Removing a file cannot create an earlier GLM prefix. Conversation extensions instead use authenticated page-semantic deltas.</p>
         </article>
       </div>
     </section>
 
+    <section aria-labelledby="publication-title">
+      <div class="section-head">
+        <h2 id="publication-title"><span class="num">04</span> Publish immutable conversation extensions</h2>
+        <p>Persistent copy-on-write publication reuses a verified base and writes immutable extension data. It is distinct from request-private GPU blocks used during inference.</p>
+      </div>
+      <div class="publication-grid">
+        <article class="publication-card">
+          <div class="status-pair"><span class="status-tag">Implemented</span><span class="status-tag limited">Research-only qualification</span></div>
+          <h3>Row-oriented tail publication</h3>
+          <p>The opt-in <code>tail-cow-v1</code> publication identity writes only rows after the selected all-rank boundary. A partial terminal chunk is replaced as a new immutable object; durable trunk chunks are never modified.</p>
+          <div class="publication-flow" aria-label="Verified row trunk, immutable replacement tail, and extended row root">
+            <div class="publication-node base">verified row trunk</div><div class="publication-arrow" aria-hidden="true">→</div><div class="publication-node delta">replacement + extension rows</div><div class="publication-arrow" aria-hidden="true">→</div><div class="publication-node result">authenticated tail root</div>
+          </div>
+          <p><code>sparkcache-tail-manifest/v1</code> binds the base boundary and descriptor chains. GPU-free regressions cover extension, corruption rejection, capacity accounting, and reconstruction; live serving qualification remains research-only.</p>
+        </article>
+        <article class="publication-card">
+          <div class="status-pair"><span class="status-tag">Implemented</span><span class="status-tag limited">Research-only qualification</span></div>
+          <h3>Opaque-page delta publication</h3>
+          <p><code>sparkcache-hybrid-page-delta/v1</code> binds an exact base snapshot, layout, block counts, and recurrent or sliding boundary. It reuses only byte-identical pages and authenticates every changed page.</p>
+          <div class="publication-flow" aria-label="Verified page snapshot, authenticated page delta, and reconstructed complete snapshot">
+            <div class="publication-node base">verified page snapshot</div><div class="publication-arrow" aria-hidden="true">→</div><div class="publication-node delta">authenticated page delta</div><div class="publication-arrow" aria-hidden="true">→</div><div class="publication-node result">verified full snapshot</div>
+          </div>
+          <p>Restore reconstructs and verifies the complete snapshot before placement. A graph admits at most two deltas; another extension publishes a flat snapshot. Live GLM latency and write-volume qualification remains research-only.</p>
+        </article>
+      </div>
+      <p class="context-note">Selecting <code>tail-cow-v1</code> uses distinct row-tail and page-delta cache identities. Existing <code>snapshot-v1</code> entries keep their namespace and full-snapshot publication behavior.</p>
+    </section>
+
     <section aria-labelledby="flow-title">
       <div class="section-head">
-        <h2 id="flow-title"><span class="num">04</span> Scheduler selection and rank verification</h2>
-        <p><span class="status-tag">Implemented</span> Workers advertise compact digest metadata. During restore, every rank reads and verifies its own shard from local storage; SparkCache sends no KV payload through a cache transport.</p>
+        <h2 id="flow-title"><span class="num">05</span> Scheduler selection and rank verification</h2>
+        <p><span class="status-tag">Implemented</span> When enabled, SparkCache CUDA restore owns verified reconstruction and device transfer. Every rank reads its local shard; SparkCache sends no KV payload through a cache transport.</p>
       </div>
       <div class="flow">
         <article class="flow-card"><div class="icon">1</div><h3>Scheduler</h3><p>Hashes tokens once, records the wire-compatible digest at each eligible boundary, and scans longest-first. A candidate is an exact manifest or a permitted row-prefix alias.</p></article>
         <div class="arrow" aria-hidden="true">→</div>
         <article class="flow-card"><div class="icon">4×</div><h3>All-rank availability</h3><p>A digest is eligible only when every expected physical TP rank advertises a compatible reusable entry from the same worker-process generation.</p><div class="ranks"><span class="rank">rank 0</span><span class="rank">rank 1</span><span class="rank">rank 2</span><span class="rank">rank 3</span></div></article>
         <div class="arrow" aria-hidden="true">→</div>
-        <article class="flow-card"><div class="icon">✓</div><h3>Worker verification</h3><p>Each rank opens the selected root, checks identity and compatibility, and verifies referenced objects. Restored blocks become usable only after coordinated success.</p></article>
+        <article class="flow-card"><div class="icon">✓</div><h3>Verification and placement</h3><p>Each rank verifies the selected root and referenced objects. The SparkCache CUDA placement component submits verified page bytes to destination GPU blocks; coordinated success makes the restored prefix usable.</p></article>
       </div>
     </section>
 
     <section aria-labelledby="safety-title">
       <div class="section-head">
-        <h2 id="safety-title"><span class="num">05</span> Verified-or-recompute restore</h2>
+        <h2 id="safety-title"><span class="num">06</span> Verified-or-recompute restore</h2>
         <p>Context is restored only after identity, quorum, compatibility, and chunk integrity checks pass.</p>
       </div>
       <div class="safety-grid">
@@ -474,7 +526,7 @@
 
     <section aria-labelledby="shared-title">
       <div class="section-head">
-        <h2 id="shared-title"><span class="num">06</span> Restore once, attach by reference</h2>
+        <h2 id="shared-title"><span class="num">07</span> Restore once, attach request-private GPU tails</h2>
         <p><span class="status-tag limited">Qualified through C16</span> C1, C8, and C16 mean one, eight, and sixteen concurrent requests. Each physical rank restores its local shard once for a shared persistent digest.</p>
       </div>
       <div class="share-layout">
@@ -504,27 +556,42 @@
             <div class="lease-node verified"><b>verified GPU prefix</b><div class="request-fan" id="request-fan"></div></div>
           </div>
           <div class="rank-band" aria-label="Independent rank-local restores"><span>rank 0 · one shard</span><span>rank 1 · one shard</span><span>rank 2 · one shard</span><span>rank 3 · one shard</span></div>
-          <div class="share-note">Each request owns its ordinary block references and computes a private tail. A partial physical page is copied into a dedicated immutable block before follower attachment.</div>
+          <div class="share-note">Each request owns ordinary block references and computes a request-private GPU tail. A partial physical page is copied into a dedicated immutable block before follower attachment. These GPU blocks are separate from persistent copy-on-write tail objects on NVMe.</div>
         </div>
+      </div>
+      <div class="trunk-share">
+        <div class="status-pair"><span class="status-tag">Implemented</span><span class="status-tag limited">Research-only qualification</span></div>
+        <h3>Different row roots may coalesce one authenticated trunk restore</h3>
+        <p>For <code>per_token_rows</code>, requests with different selected roots may name the same verified descriptor prefix. SparkCache restores that common segment once while each request retains its own root identity and computes its private tail.</p>
+        <div class="trunk-visual" aria-label="Illustrative 96K shared row trunk feeding distinct 32K request tails">
+          <div class="trunk-node">96K-token authenticated row trunk<br><small>one segment flight per rank</small></div>
+          <div class="lease-arrow" aria-hidden="true">→</div>
+          <div class="root-fan">
+            <div class="root-row"><div class="root-prefix">root A reference</div><div class="root-tail">private 32K-token tail A</div></div>
+            <div class="root-row"><div class="root-prefix">root B reference</div><div class="root-tail">private 32K-token tail B</div></div>
+            <div class="root-row"><div class="root-prefix">roots C–P</div><div class="root-tail">private tails C–P</div></div>
+          </div>
+        </div>
+        <p>Every physical rank must agree on the shared descriptor sequence. A disagreement rejects shared-trunk attachment and recomputes the affected request. GPU-free C16 regressions cover coalescing, cancellation, disagreement, and unrelated cold requests; live model-serving qualification remains research-only.</p>
       </div>
     </section>
 
     <section aria-labelledby="limits-title">
       <div class="section-head">
-        <h2 id="limits-title"><span class="num">07</span> Storage-mode boundaries</h2>
+        <h2 id="limits-title"><span class="num">08</span> Storage-mode boundaries</h2>
         <p>Implemented prefix reuse depends on payload semantics. Logical 256-token geometry alone does not make every stored object independently reusable.</p>
       </div>
       <div class="safety-grid">
         <article class="safety-card"><strong><span class="status-tag">Implemented</span> Exact stored boundaries</strong><p>Every supported storage mode may reuse an exact snapshot published for an earlier aligned request boundary when all ranks advertise it.</p></article>
         <article class="safety-card"><strong><span class="status-tag">Implemented</span> Sparse row-prefix aliases</strong><p>A row source manifest produces bounded descriptor chains and selected earlier-prefix aliases. GPU-free regressions pass; live model-serving qualification remains absent.</p></article>
-        <article class="safety-card"><strong><span class="status-tag limited">Unsupported</span> Tail-only publication</strong><p>A grown conversation may publish another complete snapshot. Row tail publication is unsupported. HMA tail-only storage requires a page-semantic format and distinct cache namespace.</p></article>
+        <article class="safety-card"><strong><span class="status-tag limited">Unsupported</span> Opaque-page prefix aliases</strong><p>An HMA snapshot cannot be shortened by truncating byte-partitioned chunk files. Page deltas support extensions from an exact base; they do not create arbitrary earlier-prefix aliases.</p></article>
       </div>
     </section>
 
     <section aria-labelledby="deployment-title">
       <div class="section-head">
-        <h2 id="deployment-title"><span class="num">08</span> Practical effects at C1, C8, and C16</h2>
-        <p><span class="status-tag limited">Qualified</span> These measurements use the exact GLM-5.3 TP4/DCP1 source runtime identified in the linked validation record. Client and per-rank cache-service timings are labeled separately.</p>
+        <h2 id="deployment-title"><span class="num">09</span> Practical effects at C1, C8, and C16</h2>
+        <p><span class="status-tag limited">Qualified</span> The compact measurements below come from <a href="../GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md"><code>GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md</code></a>. Client and per-rank cache-service timings are labeled separately.</p>
       </div>
       <div class="evidence-table-wrap">
         <table class="evidence-table">
@@ -540,11 +607,11 @@
         </table>
       </div>
       <p class="context-note">The 16-request qualification used vLLM <code>--max-num-seqs 32</code>. Every request completed, each rank performed one external restore, and the semantic canary passed.</p>
-      <p class="context-note">Unrelated-cold C16 and decode-interference remain unqualified. See the <a href="../GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md">SparkCache CUDA restore and concurrency validation</a> for exact runtime identities and receipts.</p>
+      <p class="context-note"><span class="status-tag limited">Research-only</span> Unrelated-cold C16 and decode-interference have no qualification evidence. See the <a href="../GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md">SparkCache CUDA restore and concurrency validation</a> for exact runtime identities and receipts.</p>
     </section>
 
     <footer>
-      <p>Implemented behavior, qualification boundaries, and unsupported storage modes · 2026-08-29.</p>
+      <p>Implemented behavior, qualification boundaries, research work, and unsupported storage modes.</p>
       <div class="source-links">
         <a href="https://github.com/FujitsuPolycom/sparkcache/tree/main">main</a>
         <a href="../ROADMAP.md">research roadmap</a>
@@ -561,7 +628,7 @@
         { label: "Step 3 · availability", title: "Find the longest advertised root", copy: "The scheduler scans boundary digests longest-first. It selects the first exact manifest or permitted row alias advertised by every expected physical rank." },
         { label: "Step 4 · verification", title: "Read and verify the selected root", copy: "Workers open only the selected root, verify identity and record compatibility, and authenticate every referenced object before restored blocks can be released." },
         { label: "Step 5 · coordinated outcome", title: "Restore together or recompute together", copy: "All ranks commit to the same outcome. If one shard cannot be verified, the external restore is cancelled everywhere; no rank continues with partially trusted KV state." },
-        { label: "Step 6 · continuation", title: "Prefill the uncached tail", copy: "After a successful restore, vLLM computes the aligned tail plus the live remainder. Publishing the grown request writes another complete snapshot; tail-only publication is unsupported." }
+        { label: "Step 6 · continuation", title: "Prefill the uncached tail", copy: "After a successful restore, vLLM computes the aligned tail plus the live remainder. The default snapshot-v1 identity may publish a complete snapshot; opt-in tail-cow-v1 publication writes an authenticated immutable extension over the selected base." }
       ];
 
       const scenarios = {

@@ -25,6 +25,9 @@ Python-placement restore. The source deployment separately qualifies native
 [the public image record](deploy/glm53_flash/IMAGE_ANNOUNCEMENT.md),
 [the GLM-5.3 validation](GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md), and
 [the SparkCache CUDA restore record](GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md).
+The [interactive prefix-reuse explorer](docs/sparkcache-prefix-explainer.html)
+shows logical boundaries, verified selection, copy-on-write publication, shared
+row trunks, and bounded GPU-prefix attachment.
 
 The public image does not contain the model checkpoints. SparkCache CUDA restore and
 shared GPU-prefix qualification belong to a later source-bound runtime that has
