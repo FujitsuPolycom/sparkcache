@@ -1,12 +1,13 @@
 # SparkCache
 
 > [!WARNING]
-> **Alpha research software.** Use SparkCache for evaluation. APIs, cache
-> formats, deployment patches, and supported profiles may change.
+> **Evaluation use only.** Serving support is limited to the exact artifacts,
+> models, topologies, and source contracts marked **qualified** below. APIs,
+> cache formats, deployment patches, and supported profiles may change.
 
 SparkCache is a persistent, rank-local NVMe context cache for vLLM's
-KV-Connector-V1 interface. It lets later requests reuse the longest verified
-stored prefix instead of repeating the corresponding prefill. Each
+KV-Connector-V1 interface. It lets subsequent requests reuse the longest
+verified stored prefix instead of repeating the corresponding prefill. Each
 tensor-parallel worker stores and restores only the model state owned by its
 physical rank.
 
