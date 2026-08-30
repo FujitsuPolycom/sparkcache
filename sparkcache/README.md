@@ -208,14 +208,16 @@ when placement completes and intentionally excludes that bookkeeping.
   chunks.
 - **Immutable block-page tails — implemented.** The
   `sparkcache-hybrid-page-delta/v1` codec reuses only byte-identical page
-  prefixes and binds the base snapshot, layout, block counts, and
-  recurrent/sliding boundary. `sparkcache-page-delta-manifest/v1` embeds its
-  authenticated base graph, allowing capacity maintenance to retain shared
-  objects after predecessor roots are removed. Restore reconstructs the verified
-  full snapshot before Python or native page placement. GPU-free regression
-  coverage exists; live model-serving qualification does not. A graph contains
-  at most two deltas. The following extension publishes a fresh flat snapshot,
-  bounding reconstruction work and metadata ancestry.
+  prefixes and binds the base snapshot, layout, block counts, and semantic
+  token boundaries. A boundary inside an HMA page replaces that complete page
+  while retaining earlier byte-identical pages. The
+  `sparkcache-page-delta-manifest/v1` schema embeds its authenticated base
+  graph, allowing capacity maintenance to retain shared objects after
+  predecessor roots are removed. Restore reconstructs the verified full
+  snapshot before Python or native page placement. GPU-free regression coverage
+  exists; live model-serving qualification does not. A graph contains at most
+  two deltas. The following extension publishes a fresh flat snapshot, bounding
+  reconstruction work and metadata ancestry.
 - **Concurrent shared GPU prefix — implemented.** One leader restores a
   persistent digest. After every rank succeeds, up to sixteen waiting followers
   attach through vLLM block references. Two leases may remain reusable for
