@@ -1623,14 +1623,16 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> tuple[tuple[int, int], ...] | None:
         """Validate vLLM's exact recurrent replay-boundary block hand-off.
 
-        vLLM may expose a full-page boundary or a partial-tail CoW target on a
-        later scheduler output than the request which began the store. Absent
-        per-request metadata therefore preserves ``latched`` and keeps the
-        store pending. None means supplied metadata is incomplete,
-        contradictory, or conflicts with an earlier latch, so this publication
-        attempt must be poisoned. SparkCache never derives a replacement from
-        another request-table entry because it can name overwritten running or
-        speculative state instead of vLLM's pinned CoW target.
+        vLLM may expose an earlier aligned checkpoint while the request is
+        still advancing toward this store boundary, followed by a partial-tail
+        CoW target on a later scheduler output. Valid older entries and absent
+        per-request metadata therefore preserve ``latched`` and keep the store
+        pending. None means supplied metadata is incomplete, malformed, ahead
+        of the plan, or conflicts with an earlier same-boundary latch, so this
+        publication attempt must be poisoned. SparkCache never derives a
+        replacement from another request-table entry because it can name
+        overwritten running or speculative state instead of vLLM's pinned CoW
+        target.
         """
 
         def reject(reason: str) -> None:
@@ -1657,9 +1659,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             return latched
         if not isinstance(entries, (list, tuple)):
             return reject("request value is not a sequence")
+        if not entries:
+            return reject("request has no recurrent boundary entries")
 
         overrides: list[tuple[int, int]] = []
-        seen_groups: set[int] = set()
+        seen_target_groups: set[int] = set()
         for entry in entries:
             if not isinstance(entry, (list, tuple)) or len(entry) != 3:
                 return reject("entry is not a group, block, boundary triple")
@@ -1668,18 +1672,22 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 return reject("entry values are not integers")
             if not 0 <= group_index < len(self._group_topology):
                 return reject("group index is outside the registered topology")
-            if group_index in seen_groups:
-                return reject("multiple blocks claim the same recurrent group")
             topology = self._group_topology[group_index]
             if topology["reuse_policy"] != "recurrent_align":
                 return reject("group is not an aligned recurrent cache")
             if block_id <= 0:
                 return reject("physical block is vLLM's null block")
-            if entry_boundary != boundary_tokens:
-                return reject("entry boundary differs from the store plan")
-            seen_groups.add(group_index)
+            if entry_boundary < boundary_tokens:
+                continue
+            if entry_boundary > boundary_tokens:
+                return reject("entry boundary is ahead of the store plan")
+            if group_index in seen_target_groups:
+                return reject("multiple blocks claim the same recurrent group")
+            seen_target_groups.add(group_index)
             overrides.append((group_index, block_id))
-        if seen_groups != required_groups:
+        if not overrides:
+            return latched
+        if seen_target_groups != required_groups:
             return reject("entries do not cover every aligned recurrent group")
         validated = tuple(sorted(overrides))
         if latched and validated != latched:

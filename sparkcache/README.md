@@ -232,9 +232,11 @@ when placement completes and intentionally excludes that bookkeeping.
   SparkCache defers a new recurrent request until a later cached scheduler step,
   when the preceding forward's hand-off can be observed. It latches one matching
   entry for every recurrent group, including a partial-tail CoW target when the
-  boundary lies inside a recurrent page. Outputs with no entry leave publication
-  pending; incomplete, contradictory, or changed evidence cancels it. A store is
-  emitted only after every recurrent group has a proven pinned block. SparkCache
+  boundary lies inside a recurrent page. Valid entries for an earlier checkpoint
+  are ignored while the request advances; outputs with no target-boundary entry
+  leave publication pending. Incomplete, future, contradictory, or changed
+  target evidence cancels it. A store is emitted only after every recurrent
+  group has a proven pinned block at the exact publication boundary. SparkCache
   never substitutes an accumulated request-table ID because vLLM may have
   replaced that source block while producing the durable CoW target. The
   `sparkcache-page-delta-manifest/v2` schema embeds its authenticated base graph

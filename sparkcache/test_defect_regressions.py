@@ -1238,10 +1238,18 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
             output.num_scheduled_tokens[request.req_id] = (
                 self.NONALIGNED_PROMPT_TOKENS
             )
+            output.recurrent_boundary_blocks = {
+                request.req_id: [(1, self.BOUNDARY_BLOCK, self.BOUNDARY)]
+            }
 
             first_metadata = connector.build_connector_meta(output)
             self.assertEqual(first_metadata.plans, [])
             self.assertIn(request.req_id, connector._store_progress)
+            self.assertNotIn(request.req_id, connector._store_recurrent_boundaries)
+            self.assertEqual(
+                connector.counters["recurrent_boundary_metadata_rejected"],
+                0,
+            )
             pending = connector.build_connector_meta(
                 self._cached_scheduler_output(
                     num_computed_tokens=self.NONALIGNED_PROMPT_TOKENS,
@@ -1337,6 +1345,11 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
             middle = self._cached_scheduler_output(
                 num_computed_tokens=2304,
                 num_scheduled_tokens=2304,
+                recurrent_boundary_blocks={
+                    "dflash-recurrent-boundary": [
+                        (1, self.BOUNDARY_BLOCK - 1, 2304)
+                    ]
+                },
             )
             self.assertEqual(connector.build_connector_meta(middle).plans, [])
             self.assertIn("dflash-recurrent-boundary", connector._store_progress)
@@ -1423,7 +1436,7 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
     def test_contradictory_boundary_metadata_skips_publication(self) -> None:
         invalid_entries = (
             [],
-            [(1, self.BOUNDARY_BLOCK, self.BOUNDARY - 256)],
+            [(1, self.BOUNDARY_BLOCK, self.BOUNDARY + 256)],
             [(2, self.BOUNDARY_BLOCK, self.BOUNDARY)],
             [(1, self.BOUNDARY_BLOCK, self.BOUNDARY), (1, 43, self.BOUNDARY)],
             [(1, 0, self.BOUNDARY)],
