@@ -95,13 +95,14 @@ def test_prefix_explorer_describes_present_storage_and_restore_behavior() -> Non
         "13 authenticated delta objects",
         "at most two deltas",
         "Different row roots may coalesce one authenticated trunk restore",
-        "one exact C16 common-trunk/distinct-tail cohort",
+        "16 distinct request tails sharing one restored 128K block_pages_v1 prefix",
+        "no live model artifact qualifies it",
         "request-private GPU tail",
         "persistent copy-on-write tail objects",
         "When enabled, SparkCache CUDA restore owns verified reconstruction and device transfer",
         "SparkCache CUDA placement component",
         "GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md",
-        "SparkRing PR #147",
+        "sha256:ed60be066d6d9eadea267bc4597a0687869f3ddb95a3e5c6f86649893a838eb8",
     )
     for fragment in required:
         assert fragment.casefold() in visible.casefold()
@@ -119,17 +120,17 @@ def test_prefix_explorer_uses_canonical_status_vocabulary() -> None:
         ), status
 
 
-def test_readme_links_explorer_and_states_current_capabilities() -> None:
+def test_readme_links_explorer_and_states_capabilities() -> None:
     readme = README.read_text(encoding="utf-8")
 
     required = (
         "[interactive prefix-reuse explorer](docs/sparkcache-prefix-explainer.html)",
         "Tail-only opaque-page deltas | **qualified**",
         "64 MiB flat page macro objects | **implemented**",
-        "Different-root shared row trunks | **qualified**",
-        "SparkCache `65b6642` with SparkRing `d93cb3d`",
+        "Different-root shared row segments | **implemented**",
+        "16 distinct request tails shared one restored 128K `block_pages_v1` prefix",
         "sha256:ed60be066d6d9eadea267bc4597a0687869f3ddb95a3e5c6f86649893a838eb8",
-        "Flat 64 MiB snapshot objects from PR #40 are **implemented**",
+        "Flat `sparkcache-page-snapshot-manifest/v2` objects at SparkCache `90946fd6`",
     )
     for fragment in required:
         assert fragment in readme

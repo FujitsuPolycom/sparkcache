@@ -26,7 +26,7 @@ bounded workload named by its evidence record.
 | `sparkcache==0.1.0a2`, GLM-5.2 TP4/DCP4 | 225,536 restored tokens | 3.17–4.17 s cache service per rank | [package validation](GLM52_A2_LIVE_VALIDATION.md) |
 | GLM-5.3 TP4/DCP1 source runtime at `da4d7be6` | 131,072 tokens, C1 | 131–250 ms cold SparkCache CUDA restore per rank; 104–165 ms host-warm | [CUDA restore validation](GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md) |
 | Same GLM-5.3 source runtime | 131,072-token prefix, C16 | one 813 MB restore per rank instead of 16; standard-chat client p50 3.363 s → 2.980 s | [CUDA restore and concurrency validation](GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md) |
-| SparkCache `65b6642` with SparkRing `d93cb3d` | 256K restore and C16 shared trunk | 128K→256K page tail used 13 authenticated delta objects; semantic generation and the bounded C16 cohort completed | [SparkRing PR #147](https://github.com/FujitsuPolycom/sparkring/pull/147) |
+| Exact local GLM-5.3 page-tail/CUDA image | 256K restore and C16 shared exact prefix | 128K→256K page tail used 13 authenticated delta objects; 16 distinct request tails shared one restored 128K `block_pages_v1` prefix | [ed60 validation](https://github.com/FujitsuPolycom/sparkring/pull/147) |
 
 C1, C8, and C16 mean one, eight, and sixteen concurrent requests. Client
 latency and cache-service time are different measurements; the evidence records
@@ -48,11 +48,11 @@ Status words are deliberate:
 | Sparse row-prefix aliases | **implemented** | Authenticated `per_token_rows` descriptor segments; no live serving qualification |
 | Tail-only row publication | **implemented** | Opt-in `tail-cow-v1`; GPU-free tested, no live serving qualification |
 | Opaque HMA page snapshots | **qualified** | Exact DeepSeek-V4 and GLM deployments linked above |
-| Tail-only opaque-page deltas | **qualified** | Byte-correct 128K→256K publication and restore on the exact PR #147 artifact; latency and write-volume bounds are not established |
-| 64 MiB flat page macro objects | **implemented** | `sparkcache-page-snapshot-manifest/v2`; GPU-free tested, not live qualified |
+| Tail-only opaque-page deltas | **qualified** | Byte-correct `sparkcache-page-delta-manifest/v2` publication and restore on local image `ed60…`; latency and write-volume bounds are not established |
+| 64 MiB flat page macro objects | **implemented** | `sparkcache-page-snapshot-manifest/v2` at SparkCache `90946fd6`; GPU-free tested, not live qualified; [review evidence](https://github.com/FujitsuPolycom/sparkcache/pull/40) |
 | SparkCache CUDA restore and placement | **qualified** | Exact GLM-5.3 TP4/DCP1 source artifacts in the linked records |
 | Shared exact-prefix GPU blocks | **qualified** | Up to 16 waiting followers in the recorded GLM-5.3 runtime |
-| Different-root shared row trunks | **qualified** | One exact C16 common-trunk/distinct-tail cohort in PR #147; broader workloads remain outside qualification |
+| Different-root shared row segments | **implemented** | Authenticated `per_token_rows` descriptor-prefix sharing; GPU-free tested, not live qualified |
 | Streaming snapshots | **research-only** | GLM-5.2 DCP4 inventory; disabled for opaque page profiles |
 | Buddy replication | **research-only** | Protocol and receiver state exist; no network carrier is included |
 
@@ -99,7 +99,7 @@ model-serving qualification is absent.
 `block_pages_v1` stores complete hybrid-memory-allocator page snapshots. Flat
 v2 roots use `sparkcache-page-snapshot-manifest/v2` and content-addressed
 objects of at most 64 MiB. An 813,068,464-byte flat snapshot therefore needs 13
-payload objects rather than 512 logical-chunk files. Legacy flat manifests
+payload objects rather than 512 logical-chunk files. Version 1 flat manifests
 remain readable. Physical grouping does not change the 256-token identity or
 admission geometry.
 
@@ -112,12 +112,14 @@ falls inside a physical page. Delta and flat payload objects are at most
 graph before compaction publishes a fresh flat root.
 
 Tail-only opaque-page publication is **qualified** for byte-correct behavior on
-the exact PR #147 artifact. Flat macro publication is **implemented** and
+the exact local `ed60…` image using `sparkcache-page-delta-manifest/v2`; the
+[evidence record](https://github.com/FujitsuPolycom/sparkring/pull/147) binds
+its sources and limits. Flat macro publication is **implemented** and
 GPU-free tested but not live qualified. Arbitrary earlier opaque-page aliases
 are **unsupported** because truncating an encoded snapshot does not create a
 valid earlier context.
 
-### Shared GPU prefixes and row trunks
+### Shared GPU prefixes and row segments
 
 Concurrent requests for one persistent digest coalesce around one restore.
 After all workers succeed, patched vLLM may retain the verified multi-group
@@ -127,14 +129,14 @@ a dedicated immutable block before attachment.
 
 The recorded runtime permits at most 16 waiting followers, keeps at most two
 prefixes eligible for 15 seconds, and releases lease references under allocation
-pressure. It is **qualified** through C16 for the linked GLM-5.3 artifact.
+pressure. It is **qualified** through C16 for the exact local `ed60…` image:
+16 distinct request tails shared one restored 128K `block_pages_v1` prefix.
 
 For `per_token_rows`, different selected roots can also name one identical
-authenticated descriptor prefix. The exact PR #147 artifact completed one C16
-common-trunk/distinct-tail cohort with one external trunk restore per rank.
-Every rank must prove the same descriptor sequence; a mismatch causes the
-affected request to recompute. This is **qualified** only for that bounded
-cohort.
+authenticated descriptor prefix. Every rank must prove the same descriptor
+sequence; a mismatch causes the affected request to recompute. Different-root
+row-segment sharing is **implemented** and GPU-free tested, but no live model
+artifact qualifies it.
 
 ## Installation and qualified entry points
 
@@ -200,7 +202,7 @@ copying, cleanup, and recovery behavior are derived and tested.
 | vLLM build `e2666d9a6` | **qualified** | DeepSeek-V4 and GLM-5.2 builders in `patches/vllm-e2666d9a6/` |
 | `local-inference-lab/vllm@da4d7be6c97434f6942292ed8abbf4b32dc44355` | **qualified** | GLM-5.3 HMA recovery, SparkCache CUDA restore, and shared-prefix attachment |
 | `local-inference-lab/vllm@e10536aadf02a18fccddda7ec939c33147e8b0b3` | **implemented** | Adaptive-MTP integration and ten-file lease contract; no four-rank qualification |
-| `local-inference-lab/vllm@0b67266a0f37d6146a8403fb8482403c62f412d5` | **qualified** | Exact 31-file Python overlay over the `da4d7be6` compiled extensions in PR #147; a source-built `0b67266a` wheel is **unsupported** |
+| `local-inference-lab/vllm@0b67266a0f37d6146a8403fb8482403c62f412d5` | **qualified** | Exact 31-file Python overlay over the `da4d7be6` compiled extensions on local image `ed60…`; a source-built `0b67266a` wheel is **unsupported**; [evidence](https://github.com/FujitsuPolycom/sparkring/pull/147) |
 
 `libspark_cache_placement` is the optional C++/CUDA component. Its page ABI
 uses mapped host arenas, authenticated extents, and a CUDA scatter kernel.
@@ -210,13 +212,17 @@ snapshot's complete digest before the parked request may resume.
 
 ## Qualification boundaries
 
-- The PR #147 qualification is bound to SparkCache `65b6642`, SparkRing
-  `d93cb3d98305041081cf572521602625185112ae`, and local image ID
-  `sha256:ed60be066d6d9eadea267bc4597a0687869f3ddb95a3e5c6f86649893a838eb8`.
+- The exact local GLM-5.3 page-tail/CUDA artifact is image ID
+  `sha256:ed60be066d6d9eadea267bc4597a0687869f3ddb95a3e5c6f86649893a838eb8`,
+  built from SparkCache `65b6642` and SparkRing
+  `d93cb3d98305041081cf572521602625185112ae`; its
+  [evidence record](https://github.com/FujitsuPolycom/sparkring/pull/147)
+  is the qualification authority.
   It does not qualify a published OCI digest, response quality, general
   restore latency, or write endurance.
-- Flat 64 MiB snapshot objects from PR #40 are **implemented** and GPU-free
-  tested, not live qualified. Their 13-object 813,068,464-byte geometry is a
+- Flat `sparkcache-page-snapshot-manifest/v2` objects at SparkCache `90946fd6`
+  are **implemented** and GPU-free tested, not live qualified. Their 13-object
+  813,068,464-byte geometry is a
   format result, not a latency claim.
 - More than 16 waiting followers, C24/C32 cohorts, unrelated-cold C16 behavior,
   and decode interference are outside the qualified bounds. Existing
@@ -259,5 +265,3 @@ defects and compatibility requests through the
 [issue tracker](https://github.com/FujitsuPolycom/sparkcache/issues), including
 the package or source revision, vLLM contract, model profile, topology, and
 relevant receipt paths.
-
-

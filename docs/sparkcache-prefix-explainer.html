@@ -343,7 +343,7 @@
       <div>
         <span class="eyebrow">Persistent context for vLLM</span>
         <h1>Reuse the longest <em>verified prefix</em></h1>
-        <p class="lede">SparkCache finds the longest stored prompt boundary available on every physical rank. It can publish only a conversation extension, share one authenticated row trunk across different roots, and attach concurrent requests to verified GPU blocks.</p>
+        <p class="lede">SparkCache finds the longest stored prompt boundary available on every physical rank. It can publish only a conversation extension, model authenticated row-segment sharing across different roots, and attach concurrent requests to verified GPU blocks.</p>
       </div>
       <aside class="hero-note">
         <strong>Example configuration</strong>
@@ -355,7 +355,7 @@
       <div class="status-pill"><span class="status-tag">Implemented</span><span class="value">256 tokens</span><span class="label">logical identity and admission boundary</span></div>
       <div class="status-pill"><span class="status-tag">Implemented</span><span class="value">Longest exact</span><span class="label">stored boundary advertised by every rank</span></div>
       <div class="status-pill"><span class="status-tag">Implemented</span><span class="value">Row aliases</span><span class="label">sparse authenticated metadata over durable row chunks</span></div>
-      <div class="status-pill"><span class="status-tag limited">Qualified</span><span class="value">Page tails</span><span class="label">byte-correct 128K→256K delta on the exact PR #147 artifact</span></div>
+      <div class="status-pill"><span class="status-tag limited">Qualified</span><span class="value">Page tails</span><span class="label">byte-correct 128K→256K page-delta/v2 on local image ed60…</span></div>
       <div class="status-pill"><span class="status-tag limited">Qualified</span><span class="value">1 → 16</span><span class="label">one GLM restore served a 16-request cohort</span></div>
     </div>
 
@@ -486,7 +486,7 @@
           <p><code>sparkcache-tail-manifest/v1</code> binds the base boundary and descriptor chains. GPU-free regressions cover extension, corruption rejection, capacity accounting, and reconstruction. No live serving qualification exists for row tails.</p>
         </article>
         <article class="publication-card">
-          <div class="status-pair"><span class="status-tag limited">Qualified · exact PR #147 artifact</span></div>
+          <div class="status-pair"><span class="status-tag limited">Qualified · page-delta/v2 on ed60…</span></div>
           <h3>Opaque-page delta publication</h3>
           <p><code>sparkcache-hybrid-page-delta/v1</code> binds an exact base snapshot, layout, block counts, and recurrent or sliding boundary. <code>sparkcache-page-delta-manifest/v2</code> groups changed bytes into authenticated objects of at most 64 MiB.</p>
           <div class="publication-flow" aria-label="Verified page snapshot, authenticated page delta, and reconstructed complete snapshot">
@@ -560,7 +560,7 @@
         </div>
       </div>
       <div class="trunk-share">
-        <div class="status-pair"><span class="status-tag limited">Qualified · bounded C16 artifact</span></div>
+        <div class="status-pair"><span class="status-tag">Implemented · GPU-free tested</span></div>
         <h3>Different row roots may coalesce one authenticated trunk restore</h3>
         <p>For <code>per_token_rows</code>, requests with different selected roots may name the same verified descriptor prefix. SparkCache restores that common segment once while each request retains its own root identity and computes its private tail.</p>
         <div class="trunk-visual" aria-label="Illustrative 96K shared row trunk feeding distinct 32K request tails">
@@ -572,7 +572,7 @@
             <div class="root-row"><div class="root-prefix">roots C–P</div><div class="root-tail">private tails C–P</div></div>
           </div>
         </div>
-        <p>Every physical rank must agree on the shared descriptor sequence. A disagreement rejects shared-trunk attachment and recomputes the affected request. SparkCache <code>65b6642</code> with SparkRing <code>d93cb3d</code> completed one exact C16 common-trunk/distinct-tail cohort with one external trunk restore per rank. Broader trunk workloads remain outside qualification.</p>
+        <p>Every physical rank must agree on the shared descriptor sequence. A disagreement rejects shared-segment attachment and recomputes the affected request. Different-root row-segment sharing is implemented and GPU-free tested; no live model artifact qualifies it.</p>
       </div>
     </section>
 
@@ -603,12 +603,12 @@
             <tr><td><strong>131,072 tokens · C1</strong></td><td>reconstruction pipeline vs cold direct restore</td><td>1.29–1.46 s vs 131–250 ms cache service per rank</td></tr>
             <tr><td><strong>131,072 tokens · C16</strong></td><td>independent vs shared restore</td><td>16 × 813 MB became 1 × 813 MB per rank; the host-warm restore took 104–165 ms per rank; standard-chat client p50 fell from 3.363 s to 2.980 s</td></tr>
             <tr><td><strong>131,072 tokens · pretokenized C16</strong></td><td>standalone measurement</td><td>2.698 s client p50 and 2.701 s maximum; not compared with chat timing</td></tr>
-            <tr><td><strong>262,144 tokens · exact PR #147 artifact</strong></td><td>128K→256K page tail and C16 shared trunk</td><td>verified 256K restore, 13 authenticated delta objects, and one external trunk restore per rank for the bounded C16 cohort</td></tr>
+            <tr><td><strong>262,144 tokens · local image ed60…</strong></td><td>128K→256K page tail and C16 shared exact prefix</td><td>verified 256K restore, 13 authenticated delta objects, and 16 distinct request tails sharing one restored 128K <code>block_pages_v1</code> prefix</td></tr>
           </tbody>
         </table>
       </div>
       <p class="context-note">The 16-request qualification used vLLM <code>--max-num-seqs 32</code>. Every request completed, each rank performed one external restore, and the semantic canary passed.</p>
-      <p class="context-note"><span class="status-tag limited">Qualified</span> The 256K and shared-trunk row above is bound to SparkCache <code>65b6642</code>, SparkRing <code>d93cb3d</code>, local image ID <code>sha256:ed60be066d6d9eadea267bc4597a0687869f3ddb95a3e5c6f86649893a838eb8</code>, and <a href="https://github.com/FujitsuPolycom/sparkring/pull/147">SparkRing PR #147</a>. It does not qualify a published OCI digest or general latency.</p>
+      <p class="context-note"><span class="status-tag limited">Qualified</span> The exact local GLM-5.3 page-tail/CUDA artifact is image ID <code>sha256:ed60be066d6d9eadea267bc4597a0687869f3ddb95a3e5c6f86649893a838eb8</code>, built from SparkCache <code>65b6642</code> and SparkRing <code>d93cb3d</code>. Its <a href="https://github.com/FujitsuPolycom/sparkring/pull/147">evidence record</a> does not qualify a published OCI digest or general latency.</p>
       <p class="context-note"><span class="status-tag limited">Research-only</span> Unrelated-cold C16 and decode-interference have no qualification evidence. See the <a href="../GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md">SparkCache CUDA restore and concurrency validation</a> for exact runtime identities and receipts.</p>
     </section>
 

@@ -5,7 +5,7 @@ Date: 2026-08-29
 ## Status
 
 SparkCache CUDA restore, verified multi-group recovery, bounded shared GPU-prefix
-reuse, C2/C8/C16 completion, shared-trunk C16 completion, and continued
+reuse, C2/C8/C16 completion, shared exact-prefix C16 completion, and continued
 generation are **qualified** for the exact GLM-5.3 Flash TP4/DCP1 runtime
 identified below.
 
@@ -13,10 +13,13 @@ The qualification does not cover unrelated-cold C16 behavior, interference
 with unrelated decode traffic, C24/C32 cohorts, more than sixteen waiting
 followers, another checkpoint, another topology, or another vLLM source tree.
 Those cases remain outside the qualification evidence. This `da4d7be6` record
-does not qualify tail-only publication. The exact SparkCache `65b6642` and
-SparkRing `d93cb3d` artifact in
-[SparkRing PR #147](https://github.com/FujitsuPolycom/sparkring/pull/147)
-separately qualifies byte-correct 128K→256K page-tail publication and restore.
+does not qualify tail-only publication. The exact local GLM-5.3 page-tail/CUDA
+artifact, image ID
+`sha256:ed60be066d6d9eadea267bc4597a0687869f3ddb95a3e5c6f86649893a838eb8`
+built from SparkCache `65b6642` and SparkRing `d93cb3d`, separately qualifies
+byte-correct 128K→256K page-tail publication and restore; its
+[evidence record](https://github.com/FujitsuPolycom/sparkring/pull/147) binds
+the complete identities and limitations.
 Arbitrary earlier opaque-page aliases remain **unsupported**.
 
 The committed semantic receipts used a suffix-only predicate: content ending
@@ -130,7 +133,7 @@ moving tokenizer work outside the timed interval:
 | C2 | 1 | 0.541 s | 0.541 s | 0.737 s |
 | C8, retained lease | 0 | 0.407 s | 1.211 s | 1.218 s |
 | C16 | 1 | 0.735 s | 2.698 s | 2.701 s |
-| C16, common trunk and distinct tails | 1 | 2.407 s | 3.894 s | 3.896 s |
+| C16, shared exact prefix and distinct tails | 1 | 2.407 s | 3.894 s | 3.896 s |
 
 The pretokenized C16 restore used 104.2--165.3 ms of cache service per rank
 and at most 3.2 ms of restore-queue wait. Every request completed, queues
@@ -221,6 +224,6 @@ Source revision `2b86fb9d02fa3595cca5caa864b81aedce44b8bb` passed:
   remain outside the qualification evidence.
 - Sparse row-prefix aliases are implemented and GPU-free tested, but this GLM
   record does not qualify them because GLM uses opaque page storage.
-- This `da4d7be6` record does not qualify tail-only publication; the exact
-  PR #147 artifact provides that bounded page-tail qualification.
+- This `da4d7be6` record does not qualify tail-only publication; local image
+  `ed60…` provides that bounded page-tail qualification.
 - No cross-TP canonical shard format or network storage backend is implemented.
