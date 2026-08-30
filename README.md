@@ -25,6 +25,8 @@ Python-placement restore. The source deployment separately qualifies native
 [the public image record](deploy/glm53_flash/IMAGE_ANNOUNCEMENT.md),
 [the GLM-5.3 validation](GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md), and
 [the SparkCache CUDA restore record](GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md).
+Physical-page delta publication and restart restore have separate
+[research-only PR535 evidence](GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md).
 
 The public image does not contain the model checkpoints. SparkCache CUDA restore and
 shared GPU-prefix qualification belong to a later source-bound runtime that has
@@ -39,6 +41,7 @@ no published OCI digest.
 | Sparse row-prefix aliases | **implemented** | Authenticated metadata over `per_token_rows`; GPU-free regression coverage |
 | Opaque hybrid-memory-allocator page snapshots | **qualified** | Listed DeepSeek-V4 and GLM deployments only |
 | Native direct page restore | **qualified** | Exact GLM-5.3 TP4/DCP1 source deployment recorded below |
+| Physical-page delta publication and direct restore | **research-only** | Exact GLM-5.3 PR535 TP4/DCP1 run; production tail-only use remains unqualified |
 | Concurrent shared GPU-prefix reuse | **qualified** | Up to 16 waiting followers, two retained prefixes, 15-second retention; GLM-5.3 through 16 concurrent requests |
 | Streaming snapshots | **research-only** | GLM-5.2 DCP4 inventory; disabled for opaque page profiles |
 | Buddy replication | **research-only** | Protocol and receiver state exist; no network carrier is included |
@@ -304,8 +307,8 @@ and extension chunks after an all-rank reusable boundary. It uses a distinct
 cache namespace. Default `snapshot-v1` deployments retain their existing wire
 identity and full-snapshot publication behavior.
 
-Tail-only publication for `block_pages_v1` is also **implemented** with
-GPU-free regression coverage and no live model-serving qualification. The
+Tail-only publication for `block_pages_v1` is **research-only with exact live
+TP4 evidence** and remains unqualified for production. The
 page-semantic `sparkcache-hybrid-page-delta/v1` codec binds
 the exact base snapshot and recurrent/sliding boundary and reuses only
 byte-identical opaque pages. Python/Torch restore reconstructs and verifies the
@@ -330,6 +333,15 @@ mapped arenas and checks the reconstructed snapshot SHA-256 before completing
 the parked transaction. It never constructs a full Python result buffer. This
 uses the existing page-copy-span ABI and changes neither persisted geometry nor
 the native library ABI.
+
+An exact GLM-5.3 PR535 TP4/DCP1 run published a 252,534,308-byte four-object
+delta from a 98,304-token base to a 131,072-token result. After a full engine
+restart, all four ranks verified and restored 859,160,739 result bytes in
+1,574.575--1,662.062 ms cache-service time, and the client returned exact
+`blue` in 1.983 seconds. A C2 `red` plus `blue` check also passed, but both
+native requests read the shared base independently. See the
+[physical-page delta research record](GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md)
+for exact identities, conditions, phase timings, and limitations.
 
 Persistent base-segment read sharing for `block_pages_v1` page-delta roots is
 **implemented and GPU-free tested; serving qualification is not established**.
@@ -386,10 +398,11 @@ CUDA completion took 128.729–132.732 ms. The
 retains every structured rank record and the available response and artifact
 hashes.
 
-This evidence covers flat snapshots only. Tail-only page deltas, segment-level
-sharing, concurrent restore, and general deployment qualification remain
-unproven. This two-request result does not replace the single-reader
-qualification. Source `eabe7fd0c878db7384ef87fe80a1e96b9bedcf67`, which lacks
+This flat evidence does not cover tail-only page deltas. The separate PR535
+record above supplies research-only exact-output C1 and C2 page-delta evidence;
+native segment sharing and general deployment qualification remain unproven.
+This two-request flat result does not replace the single-reader qualification.
+Source `eabe7fd0c878db7384ef87fe80a1e96b9bedcf67`, which lacks
 the prior-CUDA-work ordering, remains semantically rejected by its
 [research receipt](evidence/glm53-flash-dflash7-bf16/flat-v2-four-reader-semantic-rejection-eabe7fd.json).
 
@@ -401,8 +414,9 @@ latency improvement.
 Opaque HMA snapshots cannot be shortened by truncating chunk lists. SparkCache
 therefore uses the page-semantic format and distinct namespace described above.
 At most two page deltas may form one graph; the following publication compacts
-the context into a fresh flat snapshot. Live GLM latency and write-volume
-qualification for this path remains outstanding.
+the context into a fresh flat snapshot. One exact PR535 TP4/DCP1 run now has
+research-only latency, write-volume, restart, and C2 semantic evidence;
+production qualification remains outstanding.
 
 Sparse row-prefix aliases are **implemented** but have no live model-serving
 qualification. Their behavior is covered by GPU-free publication, discovery,
