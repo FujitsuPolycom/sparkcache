@@ -1,0 +1,68 @@
+{
+  "schema": "sparkcache-vllm-overlay-source-receipt/v1",
+  "status": "implemented",
+  "source": {
+    "repository": "https://github.com/local-inference-lab/vllm.git",
+    "commit": "0b67266a0f37d6146a8403fb8482403c62f412d5",
+    "tree": "ba9484ccb33aa56e90ff2f447f15ca9b9da97639",
+    "line_endings": "LF"
+  },
+  "adaptive_mtp_source_boundary": {
+    "commit": "e10536aadf02a18fccddda7ec939c33147e8b0b3",
+    "tree": "f7864d18865573dd162d3b850b4aa26acf320ab7"
+  },
+  "included_commits_after_da4d7be": [
+    "766acf0e218a075432e6c45755cd561ab765ec2d",
+    "0ca18da0a7feab3ddd2fee5eb6992981a0b76afa",
+    "8590bf9cb569dd99968be7279fc130570077313f",
+    "c5f47c6dc255128ac0d6e7bbb4368dc082910966",
+    "d65b96b169919385c12437d8498605adbee419e1",
+    "dbb2242baa23e1f811fe0efb611b4c68d77d3a32",
+    "e823e48c0dbfbc8d60c9c384179f258b91477241",
+    "f71e0deaa64625b53613dc9b40321d38c1ffd598",
+    "e10536aadf02a18fccddda7ec939c33147e8b0b3",
+    "eda08cc3a0b3959826d3d0a7317e9106ec15cf83",
+    "852537e6a359e9b9790381a4254d8b7642b971be",
+    "0b67266a0f37d6146a8403fb8482403c62f412d5"
+  ],
+  "kda_live_tensor_commits": [
+    "eda08cc3a0b3959826d3d0a7317e9106ec15cf83",
+    "852537e6a359e9b9790381a4254d8b7642b971be",
+    "0b67266a0f37d6146a8403fb8482403c62f412d5"
+  ],
+  "patches": [
+    {
+      "path": "020-sparkcache-vmm-exemption.patch",
+      "sha256": "370b498eebf44b4e52a2d2751fa249ad4bd3d0b6fd951b063a161fb06febbe99",
+      "target": "vllm/config/vllm.py",
+      "preimage_sha256": "cc03756d9bebf2a128828e5fbf7e9766446884dfce016c34381bce0aa78bfd9e",
+      "postimage_sha256": "9f64f5041f7f9d953e9f6bc53de8733b3eb4035c0753056a1f646346702a0994"
+    },
+    {
+      "path": "030-sparkcache-hma-load-failure.patch",
+      "sha256": "0202df4b5db7bd35540eebdef51fcbe2bb01845b952964080e1fe903ee19b404",
+      "target": "vllm/v1/core/sched/scheduler.py",
+      "preimage_sha256": "05c05f4b372c7a4bf76399b38b338eab657c69406b7019ab02101d2ab0c7764c",
+      "postimage_sha256": "337893b6b088d12eb38d8d70c866242d085134442289b4f4574a1f162c9f11c8"
+    },
+    {
+      "path": "040-sparkcache-shared-prefix-lease.patch",
+      "sha256": "6c6d6bdc2d6e35742ef37715e88697b1f972d23b28948690c4d8d835edcaf01b",
+      "target": "vllm/v1/core/kv_cache_manager.py",
+      "preimage_sha256": "02c71da26bbac81629248ee42b0a71bd2db817d339894d647d2ff6b66fd5ad19",
+      "postimage_sha256": "ee03dc9ce2b720c0be6e9f572d23580ba96eff68fe3406250557e83071654af0"
+    },
+    {
+      "path": "041-sparkcache-shared-prefix-attach.patch",
+      "sha256": "b98e6bc06990f608fc5f0828c11b8eb453fbec0f8fbbf24ba45254810b7e67c3",
+      "target": "vllm/v1/core/sched/scheduler.py",
+      "preimage_sha256": "337893b6b088d12eb38d8d70c866242d085134442289b4f4574a1f162c9f11c8",
+      "postimage_sha256": "6d397c97f31e67a75efc01b5ddd89fa58db425de14fa43965ef2d6146b6b9bdb"
+    }
+  ],
+  "contract": {
+    "path": "sparkcache/runtime_patches/vllm-kv-block-lease-contract-glm53-b12x-kda-adaptive-mtp.json",
+    "sha256": "6defde9551cbb586fd09bb2d3020495531b6573397875a767eaae1dbad126024"
+  },
+  "result": "All four patches apply in order to the LF source tree, and the eleven-file SparkCache contract verifies the resulting source bytes, including the live-tensor B12X KDA implementation."
+}

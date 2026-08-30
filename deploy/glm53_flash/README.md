@@ -155,6 +155,30 @@ External DFlash, static embedded MTP, and adaptive embedded MTP use distinct
 a different cache namespace and recomputes instead of reusing entries from an
 incompatible speculative policy.
 
+### Source-built runtime with live-tensor B12X KDA binding
+
+`Containerfile.b12x-kda-adaptive-mtp` overlays SparkCache on a parent built
+from `local-inference-lab/vllm@0b67266a0f37d6146a8403fb8482403c62f412d5`.
+The runtime contains internal MTP5, acceptance-based adaptive draft depth, and
+the B12X KDA implementation that binds metadata once and operates on live
+layer tensors. Construction support is **implemented**; four-rank serving is
+**unqualified**.
+
+```bash
+python deploy/glm53_flash/build_image.py \
+  --containerfile deploy/glm53_flash/Containerfile.b12x-kda-adaptive-mtp \
+  --base-image sparkring-glm53-runtime:b12x-kda-adaptive-mtp-0b67266a-arm64 \
+  --base-image-id sha256:<64-lowercase-hex> \
+  --source-sha256 <64-lowercase-hex> \
+  --output-image sparkring-glm53-sparkcache:b12x-kda-adaptive-mtp-0b67266a-arm64
+```
+
+The dedicated patch directory and eleven-file contract reject any attested
+vLLM file whose preimage or postimage differs from the pinned revision. The
+overlay leaves SparkCache wire values, digest salts, chunk geometry, and
+cache-identity fields unchanged. Adaptive and static embedded MTP profiles use
+separate draft-state identity digests.
+
 The connector must use role `kv_both`, load-failure policy `recompute`, model
 profile `glm53-flash-hybrid`, and exact lowercase SHA-256 identities for both
 checkpoints. `build_kv_transfer_config` validates configuration syntax and

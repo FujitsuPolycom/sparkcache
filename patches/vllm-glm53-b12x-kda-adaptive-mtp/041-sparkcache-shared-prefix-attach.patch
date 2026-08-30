@@ -1,0 +1,164 @@
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -215,6 +215,9 @@ class Scheduler(SchedulerInterface):
+         # KV Connector: requests in process of async KV loading or recving
+         self.finished_recving_kv_req_ids: set[str] = set()
+         self.failed_recving_kv_req_ids: set[str] = set()
++        # lease_key -> (leader request id, non-empty scheduler step whose
++        # worker completion proves every dedicated partial-page copy ran)
++        self._pending_shared_prefix_leases: dict[str, tuple[str, int]] = {}
+ 
+         # Grammar compilation failures to finish as per-request errors in
+         # update_from_output.
+@@ -537,6 +540,10 @@ class Scheduler(SchedulerInterface):
+         scheduled_timestamp = time.monotonic()
+ 
+         self.kv_cache_manager.new_step_starts()
++        # Shared-prefix leases are optional, bounded cache work.  Expiring
++        # them is O(2) and releases only the scheduler-owned pin; requests
++        # already attached to those blocks keep their ordinary references.
++        self.kv_cache_manager.expire_shared_prefix_leases()
+ 
+         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
+         # all prefill compute unless saturated.
+@@ -831,6 +838,47 @@ class Scheduler(SchedulerInterface):
+                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
+                 did_prefix_cache_lookup = False
+ 
++                # A connector may offer an exact block-table lease after a
++                # prior async restore completed on every worker.  Attach it
++                # before hash lookup: hybrid Mamba/EAGLE tables are not always
++                # rediscoverable as an ordinary local prefix hit even though
++                # the verified blocks are still resident.
++                if request.num_computed_tokens == 0 and self.connector is not None:
++                    get_lease = getattr(
++                        self.connector, "get_shared_prefix_lease_candidate", None
++                    )
++                    candidate = get_lease(request) if get_lease is not None else None
++                    if candidate is not None:
++                        lease_key, lease_tokens = candidate
++                        attached_tokens = 0
++                        if 0 < lease_tokens <= request.num_tokens:
++                            attached_tokens = (
++                                self.kv_cache_manager.attach_shared_prefix_lease(
++                                    lease_key, request_id
++                                )
++                            )
++                        if attached_tokens:
++                            # Preserve vLLM's full-hit rule: the final prompt
++                            # token is recomputed to produce sampling logits.
++                            request.num_computed_tokens = min(
++                                attached_tokens, request.num_tokens - 1
++                            )
++                            attached = getattr(
++                                self.connector,
++                                "shared_prefix_lease_attached",
++                                None,
++                            )
++                            if attached is not None:
++                                attached(request_id, lease_key)
++                        else:
++                            rejected = getattr(
++                                self.connector,
++                                "shared_prefix_lease_rejected",
++                                None,
++                            )
++                            if rejected is not None:
++                                rejected(request_id, lease_key)
++
+                 # Get already-cached tokens.
+                 if request.num_computed_tokens == 0:
+                     did_prefix_cache_lookup = True
+@@ -1336,7 +1384,7 @@ class Scheduler(SchedulerInterface):
+ 
+         # Advance the fence only for non-empty steps (those that actually
+         # write KV and have their output processed later in update_from_output).
+-        if self.defer_block_free and total_num_scheduled_tokens > 0:
++        if total_num_scheduled_tokens > 0:
+             self.sched_step_seq += 1
+ 
+         with record_function_or_nullcontext("schedule: update_after_schedule"):
+@@ -1776,9 +1824,11 @@ class Scheduler(SchedulerInterface):
+ 
+         # Every GPU write enqueued by this and earlier steps has completed, so it is
+         # safe to return deferred-free blocks to the pool.
+-        if self.defer_block_free and scheduler_output.total_num_scheduled_tokens > 0:
++        if scheduler_output.total_num_scheduled_tokens > 0:
+             self.processed_step_seq += 1
+-            self._drain_deferred_frees()
++            if self.defer_block_free:
++                self._drain_deferred_frees()
++            self._finalize_shared_prefix_leases()
+ 
+         perf_stats: PerfStats | None = None
+         if self.perf_metrics and self.perf_metrics.is_enabled():
+@@ -2809,6 +2859,35 @@ class Scheduler(SchedulerInterface):
+             # This will cache the blocks iff caching is enabled.
+             self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
+ 
++            # Publication is deliberately after both the all-worker receive
++            # completion and cache_blocks().  A connector can now name this
++            # exact verified prefix for bounded by-reference sharing.
++            publish = getattr(
++                self.connector, "get_shared_prefix_lease_to_publish", None
++            )
++            lease = publish(request) if publish is not None else None
++            if lease is not None:
++                lease_key, lease_tokens, ttl_seconds = lease
++                published = self.kv_cache_manager.publish_shared_prefix_lease(
++                    lease_key,
++                    request.request_id,
++                    lease_tokens,
++                    ttl_seconds,
++                    max_entries=2,
++                    reserved_blocks=self._request_remaining_blocks(request),
++                )
++                if published:
++                    self._pending_shared_prefix_leases[lease_key] = (
++                        request.request_id,
++                        self.sched_step_seq + 1,
++                    )
++                else:
++                    callback = getattr(
++                        self.connector, "shared_prefix_lease_rejected", None
++                    )
++                    if callback is not None:
++                        callback(request.request_id, lease_key)
++
+             # on a full prompt hit, we need to re-compute the last token
+             # in order to be able to sample the next token
+             if request.num_computed_tokens == request.num_tokens:
+@@ -2816,6 +2895,32 @@ class Scheduler(SchedulerInterface):
+ 
+         self.finished_recving_kv_req_ids.remove(request.request_id)
+ 
++    def _finalize_shared_prefix_leases(self) -> None:
++        """Make copied hot pages attachable only after worker completion."""
++        connector = self.connector
++        for lease_key, (request_id, fence_step) in tuple(
++            self._pending_shared_prefix_leases.items()
++        ):
++            if fence_step > self.processed_step_seq:
++                continue
++            self._pending_shared_prefix_leases.pop(lease_key, None)
++            ready = self.kv_cache_manager.mark_shared_prefix_lease_ready(lease_key)
++            accepted = False
++            if ready and connector is not None:
++                callback = getattr(
++                    connector, "shared_prefix_lease_published", None
++                )
++                if callback is not None:
++                    accepted = callback(request_id, lease_key) is not False
++            if not ready or not accepted:
++                self.kv_cache_manager.discard_shared_prefix_lease(lease_key)
++                if connector is not None:
++                    callback = getattr(
++                        connector, "shared_prefix_lease_rejected", None
++                    )
++                    if callback is not None:
++                        callback(request_id, lease_key)
++
+     def _try_promote_blocked_waiting_request(self, request: Request) -> bool:
+         """
+         Try to promote a blocked waiting request back to schedulable states.

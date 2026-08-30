@@ -1,0 +1,97 @@
+ARG BASE_IMAGE=invalid.invalid/supply-an-immutable-base-image
+ARG NATIVE_BUILDER=pytorch/manylinuxaarch64-builder@sha256:f91599c49f526c77d01b68286f2bf943a5fd6a432d7e3f0afcc5784825908fe9
+
+FROM ${NATIVE_BUILDER} AS sparkcache-native
+COPY sparkcache/native /build/sparkcache-native
+RUN cmake -S /build/sparkcache-native \
+      -B /build/sparkcache-native/build-cuda \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_CUDA_ARCHITECTURES=121 \
+      -DSPARK_CACHE_PLACEMENT_ENABLE_CUDA=ON \
+ && cmake --build /build/sparkcache-native/build-cuda \
+      --target spark_cache_placement -j"$(nproc)" \
+ && test -s /build/sparkcache-native/build-cuda/libspark_cache_placement.so \
+ && sha256sum /build/sparkcache-native/build-cuda/libspark_cache_placement.so \
+      > /build/sparkcache-native/build-cuda/libspark_cache_placement.so.sha256
+
+FROM ${BASE_IMAGE}
+
+ARG BASE_IMAGE
+ARG SPARKCACHE_SOURCE_SHA256
+ARG BASE_IMAGE_ID
+ARG BASE_IMAGE_LICENSES
+ARG SPARKCACHE_REVISION
+COPY sparkcache /opt/sparkcache-src/sparkcache
+COPY --from=sparkcache-native \
+  /build/sparkcache-native/build-cuda/libspark_cache_placement.so \
+  /opt/sparkcache-src/sparkcache/native/build-cuda/libspark_cache_placement.so
+COPY --from=sparkcache-native \
+  /build/sparkcache-native/build-cuda/libspark_cache_placement.so.sha256 \
+  /opt/sparkcache-src/sparkcache/native/build-cuda/libspark_cache_placement.so.sha256
+COPY patches/vllm-glm53-b12x-kda-adaptive-mtp /opt/sparkcache-vllm-patches
+COPY deploy/deployment_contract/source.py /opt/sparkcache-source-identity.py
+COPY LICENSE /usr/share/licenses/SparkCache/LICENSE
+
+RUN set -eu; \
+    case "$BASE_IMAGE_ID" in sha256:[0-9a-f][0-9a-f]*) ;; \
+      *) echo "BASE_IMAGE_ID must be an immutable sha256 image ID" >&2; exit 1 ;; \
+    esac; \
+    actual_source="$(python3 -c 'import importlib.util, pathlib; spec = importlib.util.spec_from_file_location("source_identity", "/opt/sparkcache-source-identity.py"); module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module); print(module.source_tree_sha256(pathlib.Path("/opt/sparkcache-src/sparkcache")))')"; \
+    test "$actual_source" = "$SPARKCACHE_SOURCE_SHA256"; \
+    root=/usr/local/lib/python3.12/dist-packages; \
+    config="$root/vllm/config/vllm.py"; \
+    before="$(sha256sum "$config" | awk '{print $1}')"; \
+    case "$before" in \
+      cc03756d9bebf2a128828e5fbf7e9766446884dfce016c34381bce0aa78bfd9e) \
+        patch --batch --forward -p1 -d "$root" \
+          < /opt/sparkcache-vllm-patches/020-sparkcache-vmm-exemption.patch ;; \
+      9f64f5041f7f9d953e9f6bc53de8733b3eb4035c0753056a1f646346702a0994) ;; \
+      *) echo "unsupported installed vllm.py SHA-256: $before" >&2; exit 1 ;; \
+    esac; \
+    test "$(sha256sum "$config" | awk '{print $1}')" = \
+      9f64f5041f7f9d953e9f6bc53de8733b3eb4035c0753056a1f646346702a0994; \
+    scheduler="$root/vllm/v1/core/sched/scheduler.py"; \
+    before="$(sha256sum "$scheduler" | awk '{print $1}')"; \
+    case "$before" in \
+      05c05f4b372c7a4bf76399b38b338eab657c69406b7019ab02101d2ab0c7764c) \
+        patch --batch --forward -p1 -d "$root" \
+          < /opt/sparkcache-vllm-patches/030-sparkcache-hma-load-failure.patch ;; \
+      337893b6b088d12eb38d8d70c866242d085134442289b4f4574a1f162c9f11c8) ;; \
+      *) echo "unsupported installed scheduler.py SHA-256: $before" >&2; exit 1 ;; \
+    esac; \
+    test "$(sha256sum "$scheduler" | awk '{print $1}')" = \
+      337893b6b088d12eb38d8d70c866242d085134442289b4f4574a1f162c9f11c8; \
+    kv_manager="$root/vllm/v1/core/kv_cache_manager.py"; \
+    before="$(sha256sum "$kv_manager" | awk '{print $1}')"; \
+    case "$before" in \
+      02c71da26bbac81629248ee42b0a71bd2db817d339894d647d2ff6b66fd5ad19) \
+        patch --batch --forward -p1 -d "$root" \
+          < /opt/sparkcache-vllm-patches/040-sparkcache-shared-prefix-lease.patch ;; \
+      ee03dc9ce2b720c0be6e9f572d23580ba96eff68fe3406250557e83071654af0) ;; \
+      *) echo "unsupported installed kv_cache_manager.py SHA-256: $before" >&2; exit 1 ;; \
+    esac; \
+    test "$(sha256sum "$kv_manager" | awk '{print $1}')" = \
+      ee03dc9ce2b720c0be6e9f572d23580ba96eff68fe3406250557e83071654af0; \
+    before="$(sha256sum "$scheduler" | awk '{print $1}')"; \
+    case "$before" in \
+      337893b6b088d12eb38d8d70c866242d085134442289b4f4574a1f162c9f11c8) \
+        patch --batch --forward -p1 -d "$root" \
+          < /opt/sparkcache-vllm-patches/041-sparkcache-shared-prefix-attach.patch ;; \
+      6d397c97f31e67a75efc01b5ddd89fa58db425de14fa43965ef2d6146b6b9bdb) ;; \
+      *) echo "unsupported shared-prefix scheduler.py SHA-256: $before" >&2; exit 1 ;; \
+    esac; \
+    test "$(sha256sum "$scheduler" | awk '{print $1}')" = \
+      6d397c97f31e67a75efc01b5ddd89fa58db425de14fa43965ef2d6146b6b9bdb; \
+    python3 /opt/sparkcache-src/sparkcache/runtime_patches/verify_lease_contract.py \
+      --vllm-root "$root" \
+      --contract /opt/sparkcache-src/sparkcache/runtime_patches/vllm-kv-block-lease-contract-glm53-b12x-kda-adaptive-mtp.json
+
+ENV PYTHONPATH=/opt/sparkcache-src
+LABEL org.opencontainers.image.source="https://github.com/FujitsuPolycom/sparkcache" \
+      org.opencontainers.image.revision="${SPARKCACHE_REVISION}" \
+      org.opencontainers.image.base.name="${BASE_IMAGE}" \
+      org.opencontainers.image.licenses="${BASE_IMAGE_LICENSES}" \
+      org.sparkcache.deployment-profile="glm53-flash-b12x-kda-adaptive-mtp-source-built" \
+      org.sparkcache.parent-image-id="${BASE_IMAGE_ID}" \
+      org.sparkcache.source-sha256="${SPARKCACHE_SOURCE_SHA256}" \
+      org.sparkcache.source-revision="${SPARKCACHE_REVISION}"
