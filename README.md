@@ -13,7 +13,8 @@ the request normally. Optional cache work never becomes a serving dependency.
 
 The [interactive prefix-reuse explorer](docs/sparkcache-prefix-explainer.html)
 shows longest-prefix selection, row descriptor segments, copy-on-write tails,
-64 MiB page objects, and bounded shared-prefix attachment.
+64 MiB page objects, and the boundary between implemented sharing mechanisms
+and qualified serving behavior.
 
 ## Qualified outcomes
 
@@ -24,13 +25,16 @@ bounded workload named by its evidence record.
 |---|---:|---|---|
 | `sparkcache==0.1.0a1`, DeepSeek-V4 TP2/DCP1 and TP4/DCP1 | 73,728 restored tokens | 413.9–517.0 ms cache service per rank | [release-wheel validation](MULTI_MODEL_LIVE_VALIDATION.md) |
 | `sparkcache==0.1.0a2`, GLM-5.2 TP4/DCP4 | 225,536 restored tokens | 3.17–4.17 s cache service per rank | [package validation](GLM52_A2_LIVE_VALIDATION.md) |
-| GLM-5.3 TP4/DCP1 source runtime at `da4d7be6` | 131,072 tokens, C1 | 131–250 ms cold SparkCache CUDA restore per rank; 104–165 ms host-warm | [CUDA restore validation](GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md) |
-| Same GLM-5.3 source runtime | 131,072-token prefix, C16 | one 813 MB restore per rank instead of 16; standard-chat client p50 3.363 s → 2.980 s | [CUDA restore and concurrency validation](GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md) |
-| Exact local GLM-5.3 page-tail/CUDA image | 256K restore and C16 shared exact prefix | 128K→256K page tail used 13 authenticated delta objects; 16 distinct request tails shared one restored 128K `block_pages_v1` prefix | [ed60 validation](https://github.com/FujitsuPolycom/sparkring/pull/147) |
+| GLM-5.3 DFlash7 TP4/DCP1 source runtime at `da4d7be6` | `snapshot-v1`, 131,072 tokens, C1 | 131–250 ms cold SparkCache CUDA restore per rank; continued generation reached the recorded marker | [CUDA restore validation](GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md) |
+| GLM-5.3 DFlash7 TP4/DCP1 local image `cc2c0e2…` | `snapshot-v1`, `sparkcache-page-snapshot-manifest/v2`, 131,072 tokens, C1 | 13 authenticated objects; all-rank SparkCache CUDA restore took 1.55–1.70 s and returned the exact codeword before and after restart | [CUDA restore validation](GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md) |
 
-C1, C8, and C16 mean one, eight, and sixteen concurrent requests. Client
-latency and cache-service time are different measurements; the evidence records
-keep them separate.
+C1, C8, and C16 mean one, eight, and sixteen concurrent requests. At the tested
+20 GiB KV-cache setting, C2×128K is an observed capacity candidate, not a
+qualified SparkCache workload. C6×128K admitted one request at a time and
+serialized completion over 61–313 seconds. C8×64K and C16×32K are planned and
+unqualified. Sixteen independent 128K requests are unsupported at that capacity
+unless they share a GPU-resident trunk or the deployment provides more KV
+capacity.
 
 ## Capability status
 
@@ -48,12 +52,12 @@ Status words are deliberate:
 | Sparse row-prefix aliases | **implemented** | Authenticated `per_token_rows` descriptor segments; no live serving qualification |
 | Tail-only row publication | **implemented** | Opt-in `tail-cow-v1`; GPU-free tested, no live serving qualification |
 | Opaque HMA page snapshots | **qualified** | Exact DeepSeek-V4 and GLM deployments linked above |
-| Tail-only opaque-page deltas | **qualified** | Byte-correct `sparkcache-page-delta-manifest/v2` publication and restore on local image `ed60…`; latency and write-volume bounds are not established |
-| 64 MiB flat page macro objects | **implemented** | `sparkcache-page-snapshot-manifest/v2` at SparkCache `229d7d6`; GPU-free tested, not live qualified; [review evidence](https://github.com/FujitsuPolycom/sparkcache/pull/40) |
+| Tail-only opaque-page deltas | **research-only** | Implemented and GPU-free tested; C2 restored-delta responses failed exact semantics while recomputation succeeded |
+| 64 MiB flat page macro objects | **qualified** | `sparkcache-page-snapshot-manifest/v2` at SparkCache `229d7d6`; exact 13-object, 131,072-token C1 restart case on local image `cc2c0e2…`; [review evidence](https://github.com/FujitsuPolycom/sparkcache/pull/40) |
 | SparkCache CUDA restore and placement | **qualified** | Exact GLM-5.3 TP4/DCP1 source artifacts in the linked records |
-| Shared exact-prefix GPU blocks | **qualified** | Up to 16 waiting followers in the recorded GLM-5.3 runtime |
+| Shared exact-prefix GPU blocks | **implemented** | Bounded vLLM lease path; earlier timing receipts are diagnostic, not exact-output semantic qualification |
 | Different-root shared row segments | **implemented** | Authenticated `per_token_rows` descriptor-prefix sharing; GPU-free tested, not live qualified |
-| Shared opaque-page base reads | **implemented** | `sparkcache-page-base-restore-flight/v1` cohorts at SparkCache `a1511d2`; GPU-free tested, not live qualified; [review evidence](https://github.com/FujitsuPolycom/sparkcache/pull/42) |
+| Shared opaque-page base reads | **research-only** | A 16-member host-base coalescer is implemented and GPU-free tested at SparkCache `a1511d2`; C2 multi-root restored-delta semantics failed; [review evidence](https://github.com/FujitsuPolycom/sparkcache/pull/42) |
 | Streaming snapshots | **research-only** | GLM-5.2 DCP4 inventory; disabled for opaque page profiles |
 | Buddy replication | **research-only** | Protocol and receiver state exist; no network carrier is included |
 | Heat and SSD write-control model | **research-only** | Independent offline design in [PR #36](https://github.com/FujitsuPolycom/sparkcache/pull/36); excluded from serving and package imports |
@@ -113,13 +117,13 @@ falls inside a physical page. Delta and flat payload objects are at most
 64 MiB; version 1 delta roots remain readable. At most two deltas form one
 graph before compaction publishes a fresh flat root.
 
-Tail-only opaque-page publication is **qualified** for byte-correct behavior on
-the exact local `ed60…` image using `sparkcache-page-delta-manifest/v2`; the
-[evidence record](https://github.com/FujitsuPolycom/sparkring/pull/147) binds
-its sources and limits. Flat macro publication is **implemented** and
-GPU-free tested but not live qualified. Arbitrary earlier opaque-page aliases
-are **unsupported** because truncating an encoded snapshot does not create a
-valid earlier context.
+Tail-only opaque-page publication is implemented and GPU-free tested, but its
+serving status is **research-only**. In the exact DFlash7 C2 live case,
+reconstructed page-delta roots completed restore yet failed the exact codeword
+check; the recomputation control returned the expected codewords. Flat
+`snapshot-v1` publication remains the qualified path. Arbitrary earlier
+opaque-page aliases are **unsupported** because truncating an encoded snapshot
+does not create a valid earlier context.
 
 ### Shared GPU prefixes and row segments
 
@@ -129,10 +133,11 @@ block table as a bounded shared-prefix lease. Each follower owns ordinary block
 references and computes a request-private GPU tail. A partial page is copied to
 a dedicated immutable block before attachment.
 
-The recorded runtime permits at most 16 waiting followers, keeps at most two
+The implementation permits at most 16 waiting followers, keeps at most two
 prefixes eligible for 15 seconds, and releases lease references under allocation
-pressure. It is **qualified** through C16 for the exact local `ed60…` image:
-16 distinct request tails shared one restored 128K `block_pages_v1` prefix.
+pressure. Those limits describe the implementation, not a semantic concurrency
+qualification. Earlier C16 receipts establish timing and completion only; they
+did not use the exact-output codeword oracle.
 
 For `per_token_rows`, different selected roots can also name one identical
 authenticated descriptor prefix. Every rank must prove the same descriptor
@@ -153,9 +158,10 @@ an unrelated restore can use another configured lane.
 
 The base buffer is released after every registered member acquires or abandons
 it. This is bounded request-cohort I/O sharing, not a retained host-memory tier,
-and it never shares mutable recurrent pages. The behavior is **implemented**
-and GPU-free tested at SparkCache `a1511d2`; no live model artifact qualifies
-it.
+and it never shares mutable recurrent pages. The 16-member coordinator is
+implemented and GPU-free tested at SparkCache `a1511d2`. Its serving status is
+**research-only** because the exact C2 multi-root restored-delta case failed
+semantic comparison while the same requests succeeded through recomputation.
 
 ## Installation and qualified entry points
 
@@ -225,9 +231,9 @@ copying, cleanup, and recovery behavior are derived and tested.
 |---|---|---|
 | `vllm-project/vllm@fcc614141e5e9ab18cb304c476f7feed2a9552e3` | **implemented** | Exact inputs in `patches/vllm/`; no standalone public runtime builder |
 | vLLM build `e2666d9a6` | **qualified** | DeepSeek-V4 and GLM-5.2 builders in `patches/vllm-e2666d9a6/` |
-| `local-inference-lab/vllm@da4d7be6c97434f6942292ed8abbf4b32dc44355` | **qualified** | GLM-5.3 HMA recovery, SparkCache CUDA restore, and shared-prefix attachment |
+| `local-inference-lab/vllm@da4d7be6c97434f6942292ed8abbf4b32dc44355` | **qualified** | GLM-5.3 full-snapshot HMA recovery and SparkCache CUDA restore; shared-prefix attachment is implemented but lacks exact-output concurrency qualification |
 | `local-inference-lab/vllm@e10536aadf02a18fccddda7ec939c33147e8b0b3` | **implemented** | Adaptive-MTP integration and ten-file lease contract; no four-rank qualification |
-| `local-inference-lab/vllm@0b67266a0f37d6146a8403fb8482403c62f412d5` | **qualified** | Exact 31-file Python overlay over the `da4d7be6` compiled extensions on local image `ed60…`; a source-built `0b67266a` wheel is **unsupported**; [evidence](https://github.com/FujitsuPolycom/sparkring/pull/147) |
+| `local-inference-lab/vllm@0b67266a0f37d6146a8403fb8482403c62f412d5` | **implemented** | Exact 31-file Python overlay over the `da4d7be6` compiled extensions; full-snapshot C1 is qualified on the named local artifacts, while tail-delta and multi-root concurrency remain research-only; a source-built `0b67266a` wheel is **unsupported** |
 
 `libspark_cache_placement` is the optional C++/CUDA component. Its page ABI
 uses mapped host arenas, authenticated extents, and a CUDA scatter kernel.
@@ -237,27 +243,26 @@ snapshot's complete digest before the parked request may resume.
 
 ## Qualification boundaries
 
-- The exact local GLM-5.3 page-tail/CUDA artifact is image ID
-  `sha256:ed60be066d6d9eadea267bc4597a0687869f3ddb95a3e5c6f86649893a838eb8`,
-  built from SparkCache `65b6642` and SparkRing
-  `d93cb3d98305041081cf572521602625185112ae`; its
-  [evidence record](https://github.com/FujitsuPolycom/sparkring/pull/147)
-  is the qualification authority.
-  It does not qualify a published OCI digest, response quality, general
-  restore latency, or write endurance.
+- Full `snapshot-v1` opaque-page restore is **qualified** at 131,072 tokens and
+  C1 for the exact GLM-5.3 DFlash7 TP4/DCP1 artifacts named in the validation
+  record.
 - Flat `sparkcache-page-snapshot-manifest/v2` objects at SparkCache `229d7d6`
-  are **implemented** and GPU-free tested, not live qualified. Their 13-object
-  813,068,464-byte geometry is a
-  format result, not a latency claim.
-- Opaque-page base-read cohorts at SparkCache `a1511d2` are **implemented** and
-  GPU-free tested, not live qualified. Existing exact-prefix C16 evidence does
-  not qualify cross-result-root base I/O sharing.
+  are qualified only for local image
+  `sha256:cc2c0e2f812f4b78d5b91f863aaf46fd8e8e505844245aa50911af1fb8e061c0`:
+  13 objects, all-rank SparkCache CUDA restore in 1.55–1.70 seconds, and the
+  exact codeword before and after restart. No published OCI digest is qualified.
+- Tail-only page deltas and opaque-page base-read cohorts are **research-only**.
+  The implementation and GPU-free tests remain, but the exact C2 restored-delta
+  case failed semantics while recomputation succeeded.
 - The heat/write-control work in PR #36 is **research-only** and independent of
   this runtime stack. It reports hypothetical admission and write pressure; it
   does not enforce serving budgets or affect restore eligibility.
-- More than 16 waiting followers, C24/C32 cohorts, unrelated-cold C16 behavior,
-  and decode interference are outside the qualified bounds. Existing
-  measurements for the latter two are **research-only**.
+- At 20 GiB of KV cache, C2×128K is only an observed safe capacity candidate.
+  C6×128K admitted one request at a time and completed serially in 61–313
+  seconds. C8×64K and C16×32K are planned and unqualified. Sixteen independent
+  128K requests are unsupported without GPU trunk sharing or additional KV
+  capacity. Multi-root cached concurrency is not qualified at any of those
+  points.
 - Cross-topology and heterogeneous-TP reuse are **unsupported**. Identity is
   bound to topology and physical rank; there is no canonical cross-shard
   format.

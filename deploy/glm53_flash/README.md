@@ -10,8 +10,9 @@ records:
   records an 8,192-token persistent restore through the Python page-placement
   path at 147.2--194.0 ms per rank.
 - [`GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md`](../../GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md)
-  records SparkCache direct CUDA restore of a 131,072-token prefix, multi-group
-  recovery, and bounded shared GPU-prefix reuse through C16.
+  records SparkCache CUDA restore of a 131,072-token full snapshot, multi-group
+  recovery, and the exact 13-object flat-v2 C1 restart case. Its concurrency
+  receipts are diagnostic rather than exact-output semantic qualification.
 
 Qualification applies only to the checkpoint revisions, source contracts,
 topology, settings, and immutable artifacts named in those records. It does
@@ -23,10 +24,12 @@ The qualified 8,192-token Python-placement artifact is public at digest
 Its immutable parent and build provenance are recorded in
 [`IMAGE_ANNOUNCEMENT.md`](IMAGE_ANNOUNCEMENT.md).
 
-Native 131,072-token restore and shared GPU-prefix reuse are qualified only for
-the source-bound runtime named in the native validation record. No public OCI
-digest carries that runtime. [`PUBLISHING.md`](PUBLISHING.md) requires every
-rebuilt digest to complete its own four-rank qualification.
+The 131,072-token full-snapshot restore is qualified only for the source-bound
+runtime and local image named in the SparkCache CUDA validation record. No
+public OCI digest carries that runtime. [`PUBLISHING.md`](PUBLISHING.md)
+requires every rebuilt digest to complete its own four-rank qualification.
+Tail deltas, host-base read coalescing, and multi-root concurrent restore are
+research-only.
 
 ## Stored state and prefix behavior
 
@@ -48,13 +51,16 @@ are **implemented** only for `per_token_rows`. Creating an earlier GLM prefix
 by truncating an opaque page manifest is **unsupported**. Tail-only GLM
 publication requires a page-semantic format and a distinct cache namespace.
 
-Concurrent requests for the same persistent digest use one restore leader.
+The implementation lets concurrent requests for the same persistent digest use
+one restore leader.
 After all workers report successful restoration, patched vLLM retains the
 leader's normalized multi-group block table as a bounded shared-prefix lease.
 The implementation permits sixteen waiting followers, two retained leases,
 and a fifteen-second lease lifetime. Partial physical pages are copied into
 dedicated immutable blocks before followers can attach. Lease rejection skips
-the optimization and lets requests restore or recompute normally.
+the optimization and lets requests restore or recompute normally. These are
+implementation bounds; the exact-output evidence in the validation record does not qualify
+concurrent shared-prefix serving.
 
 ## Checkpoint and runtime identity
 
@@ -203,9 +209,15 @@ SparkCache CUDA restore is disabled unless the launch supplies all of:
 - a 64, 128, or 256 MiB
   `SPARK_CONTEXT_CACHE_CUDA_PLACEMENT_ARENA_BYTES` value.
 
-The qualified 128K runtime used two host restore workers, two SparkCache CUDA placement
-lanes, and two 256 MiB mapped-host arenas per rank. Streaming snapshots remain
-unsupported for opaque page storage.
+The qualified 128K C1 runtime used two host restore workers, two SparkCache CUDA
+placement lanes, and two 256 MiB mapped-host arenas per rank. Streaming
+snapshots remain unsupported for opaque page storage.
+
+At the tested 20 GiB KV-cache setting, C2×128K is an observed capacity
+candidate, not a qualified cached workload. C6×128K admitted only one request
+at a time and serialized completion over 61–313 seconds. C8×64K and C16×32K
+are planned and unqualified. C16×128K is unsupported without GPU trunk sharing
+or additional KV capacity.
 
 The matching four-Spark launch and artifact-verification procedure is pinned
 at
@@ -234,8 +246,9 @@ python -m deploy.glm53_flash.concurrency_benchmark \
 ```
 
 The default fixture reproduces the recorded 131,072-token persistent prefix.
-See the SparkCache CUDA restore validation record for exact runtime identities, results,
-and committed receipts.
+The benchmark records timing and completion, but a serving qualification also
+requires the exact-output oracle used by the validation record. See that
+record for exact runtime identities, results, and status boundaries.
 
 ## Compatibility
 

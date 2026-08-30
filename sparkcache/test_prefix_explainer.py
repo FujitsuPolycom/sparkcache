@@ -94,20 +94,22 @@ def test_prefix_explorer_describes_present_storage_and_restore_behavior() -> Non
         "sparkcache-page-snapshot-manifest/v2",
         "objects of at most 64 MiB",
         "813,068,464 bytes",
-        "13 authenticated delta objects",
+        "13 payload objects",
         "at most two deltas",
         "Different row roots may coalesce one authenticated trunk restore",
         "Different page-delta results may coalesce one authenticated base read",
         "one physical read per rank",
         "Followers stay outside loader lanes while the base is pending",
-        "16 distinct request tails sharing one restored 128K block_pages_v1 prefix",
-        "no live model artifact qualifies it",
+        "C2 multi-root restored-delta case failed exact semantics",
+        "C2×128K is an observed safe candidate",
+        "C8×64K and C16×32K are planned and unqualified",
+        "C16×128K is unsupported without GPU trunk sharing or additional KV capacity",
         "request-private GPU tail",
         "persistent copy-on-write tail objects",
         "When enabled, SparkCache CUDA restore owns verified reconstruction and device transfer",
         "SparkCache CUDA placement component",
         "GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md",
-        "sha256:ed60be066d6d9eadea267bc4597a0687869f3ddb95a3e5c6f86649893a838eb8",
+        "sha256:cc2c0e2f812f4b78d5b91f863aaf46fd8e8e505844245aa50911af1fb8e061c0",
     )
     for fragment in required:
         assert fragment.casefold() in visible.casefold()
@@ -130,15 +132,16 @@ def test_readme_links_explorer_and_states_capabilities() -> None:
 
     required = (
         "[interactive prefix-reuse explorer](docs/sparkcache-prefix-explainer.html)",
-        "Tail-only opaque-page deltas | **qualified**",
-        "64 MiB flat page macro objects | **implemented**",
+        "Tail-only opaque-page deltas | **research-only**",
+        "64 MiB flat page macro objects | **qualified**",
         "Different-root shared row segments | **implemented**",
-        "Shared opaque-page base reads | **implemented**",
+        "Shared opaque-page base reads | **research-only**",
         "sparkcache-page-base-restore-flight/v1",
-        "16 distinct request tails shared one restored 128K `block_pages_v1` prefix",
-        "sha256:ed60be066d6d9eadea267bc4597a0687869f3ddb95a3e5c6f86649893a838eb8",
+        "C2×128K is an observed capacity candidate",
+        "C8×64K and C16×32K are planned and unqualified",
+        "sha256:cc2c0e2f812f4b78d5b91f863aaf46fd8e8e505844245aa50911af1fb8e061c0",
         "Flat `sparkcache-page-snapshot-manifest/v2` objects at SparkCache `229d7d6`",
-        "Opaque-page base-read cohorts at SparkCache `a1511d2`",
+        "Tail-only page deltas and opaque-page base-read cohorts are **research-only**",
     )
     for fragment in required:
         assert fragment in readme

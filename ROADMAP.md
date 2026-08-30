@@ -25,10 +25,11 @@ page cache identities while leaving the default snapshot identity unchanged.
 
 GPU-free coverage proves copy-on-write extension, bounded page-delta
 compaction, recurrent/sliding boundary geometry, corruption removal,
-reference-aware maintenance, and verified reconstruction. Live GLM-5.3
-qualification must still measure publication bytes, cold restore latency,
-SparkCache CUDA-placement latency after page reconstruction, SSD writes, and continued
-generation across repeated conversation extensions.
+reference-aware maintenance, and verified reconstruction. The exact GLM-5.3
+DFlash7 C2 restored-delta case completed structural restore but failed its
+codeword oracle while recomputation succeeded. Qualification therefore still
+requires exact-output continued generation, publication bytes, cold restore
+latency, SparkCache CUDA-placement latency after reconstruction, and SSD writes.
 
 ### Per-entry retention controls
 
@@ -56,10 +57,12 @@ confirm completion.
 
 ### SparkCache CUDA restore expansion
 
-**Status: research-only qualification work.** Native multi-group page restore
-is implemented and source-runtime-qualified for the recorded GLM-5.3 TP4/DCP1
-profile. Tail page deltas reconstruct a fully verified snapshot before Python
-or SparkCache CUDA placement, but that path has no live performance qualification.
+**Status: research-only qualification work.** Multi-group full-snapshot page
+restore is implemented and source-runtime-qualified for the recorded GLM-5.3
+TP4/DCP1 profile at 131,072 tokens and C1. Flat-v2 macro objects are qualified
+for the exact 13-object local C1 artifact. Tail page deltas reconstruct a fully
+verified snapshot before Python or SparkCache CUDA placement, but the C2 live
+case failed exact semantics and does not qualify that path.
 
 DeepSeek-V4 opaque HMA pages retain their verified Python restore path. CUDA
 support for that profile must describe all five page groups, preserve each

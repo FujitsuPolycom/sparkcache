@@ -1,33 +1,32 @@
-# GLM-5.3 SparkCache CUDA restore and shared-prefix validation
+# GLM-5.3 SparkCache CUDA full-snapshot validation
 
-Date: 2026-08-29
+Date: 2026-08-30
 
 ## Status
 
-SparkCache CUDA restore, verified multi-group recovery, bounded shared GPU-prefix
-reuse, C2/C8/C16 completion, shared exact-prefix C16 completion, and continued
-generation are **qualified** for the exact GLM-5.3 Flash TP4/DCP1 runtime
-identified below.
+Full `snapshot-v1` opaque-page restore is **qualified** at 131,072 tokens and C1
+for the exact GLM-5.3 Flash DFlash7 TP4/DCP1 artifacts identified below. The
+qualification covers verified all-rank placement, multi-group recovery, and
+continued generation.
 
-The qualification does not cover unrelated-cold C16 behavior, interference
-with unrelated decode traffic, C24/C32 cohorts, more than sixteen waiting
-followers, another checkpoint, another topology, or another vLLM source tree.
-Those cases remain outside the qualification evidence. This `da4d7be6` record
-does not qualify tail-only publication. The exact local GLM-5.3 page-tail/CUDA
-artifact, image ID
-`sha256:ed60be066d6d9eadea267bc4597a0687869f3ddb95a3e5c6f86649893a838eb8`
-built from SparkCache `65b6642` and SparkRing `d93cb3d`, separately qualifies
-byte-correct 128K→256K page-tail publication and restore; its
-[evidence record](https://github.com/FujitsuPolycom/sparkring/pull/147) binds
-the complete identities and limitations.
-Arbitrary earlier opaque-page aliases remain **unsupported**.
+The flat `sparkcache-page-snapshot-manifest/v2` artifact is also qualified for
+one exact C1 case: 813,068,464 encoded bytes in 13 authenticated objects, an
+all-rank SparkCache CUDA restore of 1.55–1.70 seconds, and the exact expected
+codeword before and after restart. This result is bound to local image
+`sha256:cc2c0e2f812f4b78d5b91f863aaf46fd8e8e505844245aa50911af1fb8e061c0`
+and SparkCache `229d7d6158261e9510ab99d7e82d532abb9ade01`. No public OCI digest is
+qualified by this record.
 
-The committed semantic receipts used a suffix-only predicate: content ending
-in `SPARKCACHE_GLM53_OK` was recorded as `semantic_match: true`. They prove
-continued generation and the expected suffix, but they do not prove that the
-visible response contained exactly `SPARKCACHE_GLM53_OK`. Exact-output semantic
-qualification requires a receipt produced by the equality validator in
-`deploy/glm53_flash/qualification_request.py`.
+Tail-only opaque-page deltas, 16-member host-base read coalescing, and
+multi-root concurrent restore are **research-only**. In the exact DFlash7 C2
+case, both restored page-delta responses failed the codeword oracle while the
+same requests succeeded through recomputation. Completion, timing, and
+structural verification do not override that semantic result.
+
+Earlier C2/C8/C16 receipts used a suffix-only predicate. They remain useful
+performance diagnostics, but they do not qualify semantic concurrency or
+shared GPU-prefix attachment. Arbitrary earlier opaque-page aliases remain
+**unsupported**.
 
 ## Qualified runtime identity
 
@@ -64,8 +63,27 @@ The 131,072-token single-request measurement used source-tree SHA-256
 `368cc18dbccc262a1f2a1f1eef5aced90690031abd1f2fedf3d192e60a67012b`
 and parent/runtime image
 `sha256:7c007cf673c35f5818da7fea8faa343304baed00f489efdcbd027d6616b8a290`.
-The shared-prefix qualification used source revision `2b86fb9d...` and
-source-tree SHA-256 `b3e84d...` identified in the table above.
+The historical shared-prefix diagnostics used source revision `2b86fb9d...`
+and source-tree SHA-256 `b3e84d...` identified in the table above.
+
+### Qualified flat-v2 artifact
+
+| Attribute | Value |
+|---|---|
+| SparkCache source revision | `229d7d6158261e9510ab99d7e82d532abb9ade01` |
+| Local image ID | `sha256:cc2c0e2f812f4b78d5b91f863aaf46fd8e8e505844245aa50911af1fb8e061c0` |
+| Parent image ID | `sha256:ed60be066d6d9eadea267bc4597a0687869f3ddb95a3e5c6f86649893a838eb8` |
+| Publication identity | `snapshot-v1` |
+| Root schema | `sparkcache-page-snapshot-manifest/v2` |
+| Persistent prefix | 131,072 tokens and 813,068,464 encoded bytes per rank |
+| Physical objects | 13 authenticated objects per rank, each at most 64 MiB |
+| Serving topology | GLM-5.3 Flash DFlash7, TP4/DCP1, one rank per DGX Spark |
+| Qualified workload | C1 publication, restart, all-rank restore, and exact codeword |
+
+The measured all-rank SparkCache CUDA restore was 1.55–1.70 seconds. The
+codeword oracle matched exactly before restart and after restoration. The
+result qualifies this artifact and workload only; it does not qualify a
+registry artifact, tail-delta roots, or concurrent restored roots.
 
 ## Implemented restore path
 
@@ -100,16 +118,16 @@ scheduler work, live-token execution, and DFlash generation. A separate
 historical canary found the expected marker suffix, and HTTP health remained
 200.
 
-### Eight concurrent 16K prefixes
+### Eight concurrent 16K prefixes: diagnostic timing
 
 The Python/Torch placement path produced 1.54--1.57 second submission spikes;
 eight clients completed in 9.45--10.64 seconds. SparkCache CUDA placement submitted in
 6--15 ms, and two restore lanes completed eight clients in approximately
 1.2--2.1 seconds. This diagnostic isolates page placement as the dominant
-serialized cost in that workload; it is not a separate deployment
-qualification.
+serialized cost in that workload. The timing is diagnostic and does not
+qualify semantic concurrency.
 
-## Concurrency and shared GPU blocks
+## Historical concurrency diagnostics
 
 The independent-restore baseline issued a complete external restore for every
 request: two per rank for C2, eight for C8, and sixteen for C16.
@@ -120,7 +138,7 @@ request: two per rank for C2, eight for C8, and sixteen for C16.
 | C8 | 0.947 s | 2.017 s | 3.129 s |
 | C16 | 1.063 s | 3.363 s | 5.335 s |
 
-Bounded shared-prefix leases changed the rank-local work from sixteen complete
+Bounded shared-prefix leases changed the observed rank-local work from sixteen complete
 813 MiB restores to one. The standard chat C16 measurement completed every
 request at 2.980 seconds p50 and 5.064 seconds maximum. This measurement
 includes sixteen large prompt-tokenization operations.
@@ -140,7 +158,7 @@ and at most 3.2 ms of restore-queue wait. Every request completed, queues
 drained to zero, no engine exited, and the historical post-run canary found the
 expected marker suffix.
 
-Qualified receipts:
+Diagnostic shared-prefix receipts:
 
 - `evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-128k-c2-pretokenized.json`;
 - `evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-128k-c8-pretokenized.json`;
@@ -156,7 +174,7 @@ Baseline receipts:
 - `evidence/glm53-flash-dflash7-bf16/native-128k-c16-hot-b00c6d4.json`;
 - `evidence/glm53-flash-dflash7-bf16/post-b00c6d4-semantic.json`.
 
-## Shared-prefix ownership
+## Implemented shared-prefix ownership
 
 One request leads restoration for a persistent digest. Followers wait without
 allocating another external restore. A lease becomes visible only after every
@@ -173,7 +191,21 @@ The implementation permits sixteen waiting followers per leader, retains at
 most two reusable leases, and expires a lease after fifteen seconds. Allocation
 pressure releases lease references before refusing ordinary serving blocks.
 Failure to create or attach a lease skips sharing; it does not make unverified
-state eligible.
+state eligible. These bounds describe the implementation. They have no
+exact-output semantic concurrency qualification in this record.
+
+## Capacity observations and planned bounds
+
+The exact DFlash7 runtime used a 20 GiB KV-cache setting. C2×128K is an observed
+safe capacity candidate, not a qualified cached workload. C6×128K admitted only
+one request at a time, used approximately 39–41% of GPU KV capacity for that
+request, and serialized completion over 61–313 seconds. It therefore does not
+establish C6 capacity or concurrency support.
+
+C8×64K and C16×32K are planned qualification points and have no live evidence.
+Sixteen independent 131,072-token requests are unsupported at 20 GiB unless
+requests share a GPU-resident trunk or the deployment provides more KV
+capacity.
 
 ## Verified-or-recompute recovery
 
@@ -204,9 +236,9 @@ performance results:
 - `evidence/glm53-flash-dflash7-bf16/hotlease-599b65a-128k-c16.json`.
 
 The retention-interval experiment did not produce all-group local-prefix hits
-and is not part of the deployment contract. The qualified implementation uses
+and is not part of the deployment contract. The implementation uses
 explicit vLLM block references instead of depending on ordinary hash
-rediscovery.
+rediscovery; this record does not qualify that path semantically.
 
 ## Repository validation
 
@@ -218,12 +250,16 @@ Source revision `2b86fb9d02fa3595cca5caa864b81aedce44b8bb` passed:
 
 ## Qualification limits
 
-- The shared-prefix measurements establish C2, C8, and C16 behavior under a
-  C32 scheduler ceiling; they do not establish C24 or C32 performance.
-- The unrelated-cold C16 matrix and unrelated-decode interference measurement
-  remain outside the qualification evidence.
+- The qualified workload is C1 full-snapshot restore at 131,072 tokens.
+- Historical C2/C8/C16 timing and completion receipts are diagnostic because
+  they do not carry exact-output semantic proof.
+- Tail-delta publication, shared host-base reads, shared GPU-prefix attachment,
+  and multi-root cached concurrency are research-only.
+- At 20 GiB, C2×128K is an observed capacity candidate; C8×64K and C16×32K are
+  planned and unqualified; C16×128K is unsupported without GPU trunk sharing
+  or additional KV capacity.
 - Sparse row-prefix aliases are implemented and GPU-free tested, but this GLM
   record does not qualify them because GLM uses opaque page storage.
-- This `da4d7be6` record does not qualify tail-only publication; local image
-  `ed60…` provides that bounded page-tail qualification.
+- Neither the `da4d7be6` record nor local images `ed60…`, `cc2c0e2…`, and
+  `35b58a7…` qualify tail-only publication or restored-delta concurrency.
 - No cross-TP canonical shard format or network storage backend is implemented.

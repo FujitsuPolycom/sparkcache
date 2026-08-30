@@ -228,28 +228,32 @@ when placement completes and intentionally excludes that bookkeeping.
   and partial-tail replacement without changing 256-token identity geometry.
   `sparkcache-page-delta-manifest/v2` groups authenticated delta bytes into
   objects of at most 64 MiB and keeps version 1 readable. A graph contains at
-  most two deltas before compaction. The exact local `ed60…` artifact qualifies
-  byte-correct 128K-to-256K tail publication and restore; timing and
-  write-volume bounds are not established.
-- **Flat opaque-page macro objects — implemented.**
+  most two deltas before compaction. GPU-free tests cover byte reconstruction,
+  but serving use is research-only: the exact DFlash7 C2 restored-delta case
+  failed its codeword check while recomputation succeeded.
+- **Flat opaque-page macro objects — qualified for one exact artifact.**
   `sparkcache-page-snapshot-manifest/v2` stores complete page snapshots in
   authenticated objects of at most 64 MiB while preserving logical identity
   and admission geometry. Version 1 flat manifests remain readable.
   SparkCache CUDA restore counts complete authenticated arena bytes, including
-  the snapshot header, while copy spans cover payload bytes. GPU-free coverage
-  exists; live model-serving qualification does not.
+  the snapshot header, while copy spans cover payload bytes. Local image
+  `sha256:cc2c0e2f812f4b78d5b91f863aaf46fd8e8e505844245aa50911af1fb8e061c0`
+  restored the 131,072-token, 13-object snapshot on every rank in 1.55–1.70
+  seconds and returned the exact codeword before and after restart. That C1
+  result does not qualify a published OCI artifact or concurrent restores.
 - **Different-root row-segment sharing — implemented.** Distinct
   `per_token_rows` result roots may share one authenticated descriptor prefix
   when every rank proves the same chunk sequence. GPU-free coverage exists;
   live model-serving qualification does not.
-- **Shared opaque-page base reads — implemented.** Concurrent page-delta roots
+- **Shared opaque-page base reads — research-only.** Concurrent page-delta roots
   that name identical authenticated base evidence may share one rank-local
   immutable base buffer. Private deltas, reconstruction, and placement remain
   request-owned. Cohorts are bounded to two flights, 16 cumulative members,
   1 GiB per flight, and 2 GiB peak reservations. Followers remain outside
-  loader lanes while the base is pending. GPU-free coverage exists; live
-  model-serving qualification does not.
-- **Concurrent shared GPU prefix — implemented.** One leader restores a
+  loader lanes while the base is pending. The coordinator is implemented and
+  GPU-free tested, but the C2 live case did not produce correct restored-delta
+  responses.
+- **Concurrent shared GPU prefix — implemented, not semantically qualified.** One leader restores a
   persistent digest. After every rank succeeds, up to sixteen waiting followers
   attach through vLLM block references. Two leases may remain reusable for
   fifteen seconds. Partial physical pages are copied into immutable blocks
@@ -285,12 +289,17 @@ SparkRing serving recipe `R7`, are qualified at TP4/DCP4. Per-token row storage
 also has GPU-free coverage at TP1, TP2, and TP4 with DCP degrees that divide TP
 and chunk geometry.
 
-GLM-5.3 Flash opaque pages are qualified at TP4/DCP1 with BF16 DFlash2 using
-seven draft tokens. Source revision
-`2b86fb9d02fa3595cca5caa864b81aedce44b8bb` qualifies SparkCache CUDA restore,
-multi-group recovery, and shared GPU-prefix reuse through C16 under a
-32-sequence scheduler ceiling. Sparse row-prefix aliases have GPU-free coverage
-but no live model-serving qualification.
+GLM-5.3 Flash opaque full snapshots are qualified at TP4/DCP1 with BF16 DFlash2
+using seven draft tokens. Source revision
+`2b86fb9d02fa3595cca5caa864b81aedce44b8bb` qualifies the recorded
+`snapshot-v1` SparkCache CUDA restore and multi-group recovery at 131,072
+tokens. SparkCache `229d7d6` and local image `cc2c0e2…` additionally qualify the
+13-object `sparkcache-page-snapshot-manifest/v2` C1 restart case. Tail deltas,
+host-base read coalescing, and multi-root concurrent restore are research-only.
+At 20 GiB of KV cache, C2×128K is an observed capacity candidate, not a
+qualified cached workload. C6×128K admitted only one request at a time and
+serialized completion over 61–313 seconds. C8×64K and C16×32K remain planned
+and unqualified. C16×128K requires GPU trunk sharing or additional KV capacity.
 
 See:
 
@@ -300,8 +309,9 @@ See:
   TP4/DCP4 evidence;
 - `../GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md` for the GLM-5.3 Python
   page-placement record;
-- `../GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md` for GLM-5.3 SparkCache
-  CUDA restore, recovery, and C2/C8/C16 shared-prefix evidence. The historical
+- `../GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md` for GLM-5.3
+  full-snapshot SparkCache CUDA restore, exact C1 restart evidence, diagnostic
+  concurrency receipts, and research-only boundaries. The historical
   filename remains stable for existing links;
 - `../deploy/deepseek_v4/DCP_SUPPORT.md` for the HMA DCP limitation; and
 - `../ROADMAP.md` for research-only and unsupported work.
