@@ -522,28 +522,24 @@ def _execute_page_object_restore(
                     (index, page_object, bytearray(page_object.encoded_bytes))
                     for index, page_object in batch
                 ]
-                try:
-                    started = time.perf_counter()
-                    tuple(
-                        read_pool.map(
-                            read_and_authenticate,
-                            (
-                                (page_object, buffer)
-                                for _index, page_object, buffer in staged
-                            ),
-                        )
+                started = time.perf_counter()
+                tuple(
+                    read_pool.map(
+                        read_and_authenticate,
+                        (
+                            (page_object, buffer)
+                            for _index, page_object, buffer in staged
+                        ),
                     )
-                    read_ms += 1e3 * (time.perf_counter() - started)
-                    # Every object in the bounded batch is authenticated before
-                    # any of its bytes reach a mapped CUDA arena. Reading into
-                    # request-private host buffers lets storage work overlap the
-                    # preceding arena's in-flight placement without exposing an
-                    # unauthenticated partial batch to the GPU.
-                    for index, page_object, buffer in staged:
-                        submit_authenticated_object(index, page_object, buffer)
-                finally:
-                    for _index, _page_object, buffer in staged:
-                        buffer.clear()
+                )
+                read_ms += 1e3 * (time.perf_counter() - started)
+                # Every object in the bounded batch is authenticated before
+                # any of its bytes reach a mapped CUDA arena. Reading into
+                # request-private host buffers lets storage work overlap the
+                # preceding arena's in-flight placement without exposing an
+                # unauthenticated partial batch to the GPU.
+                for index, page_object, buffer in staged:
+                    submit_authenticated_object(index, page_object, buffer)
         started = time.perf_counter()
         stats = transaction.finish()
         finish_ms = 1e3 * (time.perf_counter() - started)
