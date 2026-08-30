@@ -40,7 +40,9 @@ class NativePlacementCallError(RuntimeError):
     """An attested SparkCache CUDA function returned a non-success status."""
 
     def __init__(self, action: str, status: int, detail: str = "") -> None:
-        message = f"SparkCache CUDA placement failed to {action}: status={status}"
+        message = (
+            f"SparkCache CUDA placement did not complete {action}: status={status}"
+        )
         if detail:
             message += f": {detail}"
         super().__init__(message)

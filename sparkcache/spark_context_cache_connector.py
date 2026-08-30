@@ -2301,7 +2301,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     adapter.close()
             raise RuntimeError(
                 "spark-context-cache: SparkCache CUDA restore configuration"
-                f" failed: {error}"
+                f" did not complete: {error}"
             ) from error
         self._native_adapters = adapters
         self._native_adapter = adapters[0]

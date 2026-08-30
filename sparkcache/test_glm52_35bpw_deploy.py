@@ -624,7 +624,7 @@ def test_legacy_profile_names_warn_and_emit_canonical_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(glm_profile, "_LEGACY_CUDA_RESTORE_WARNING_EMITTED", False)
-    with pytest.warns(FutureWarning, match="CUDA restore"):
+    with pytest.warns(FutureWarning, match="legacy SparkCache CUDA profile names"):
         transformed = transform_inspection(
             _source_inspection(),
             native_restore=True,

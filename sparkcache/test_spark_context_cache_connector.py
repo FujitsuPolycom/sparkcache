@@ -1120,7 +1120,11 @@ class CudaRestoreSelectionTests(unittest.TestCase):
                 },
             )
 
-            with self.assertRaisesRegex(RuntimeError, "SHA-256 mismatch"):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "SparkCache CUDA restore configuration was rejected:.*"
+                "SHA-256 mismatch",
+            ):
                 connector.register_kv_caches(_fake_cuda_pools())
 
             self.assertIsNone(connector._native_adapter)

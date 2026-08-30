@@ -232,7 +232,7 @@ when placement completes and intentionally excludes that bookkeeping.
   `recurrent_boundary_granularity` advertises SparkCache's 256-token publication
   boundary to the exact vLLM scheduler without changing vLLM's native hash
   geometry.
-  SparkCache defers a new recurrent request until a later cached scheduler step,
+  SparkCache defers a recurrent request until a later cached scheduler step,
   when the preceding forward's hand-off can be observed. It latches one matching
   entry for every recurrent group, including a partial-tail CoW target when the
   boundary lies inside a recurrent page. Valid entries for an earlier checkpoint

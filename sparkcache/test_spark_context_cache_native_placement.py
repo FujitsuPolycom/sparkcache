@@ -278,7 +278,10 @@ def test_native_finish_failure_aborts_and_never_releases_parked_request(tmp_path
     adapter, loaded = _configured_adapter(tmp_path, mock)
     restore = adapter.begin_parked_restore("request-8", (2, 4))
 
-    with pytest.raises(NativePlacementCallError, match="finish restore"):
+    with pytest.raises(
+        NativePlacementCallError,
+        match="SparkCache CUDA placement did not complete finish restore",
+    ):
         restore.finish()
 
     assert restore.state is RestoreState.ABORTED

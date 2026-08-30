@@ -72,8 +72,8 @@ def _resolve_compat_option(
         if not _LEGACY_CUDA_RESTORE_WARNING_EMITTED:
             _LEGACY_CUDA_RESTORE_WARNING_EMITTED = True
             warnings.warn(
-                "SparkCache native-restore profile names are deprecated; use"
-                " SparkCache CUDA restore names",
+                "legacy SparkCache CUDA profile names are deprecated; use"
+                " canonical SparkCache CUDA restore names",
                 FutureWarning,
                 stacklevel=3,
             )

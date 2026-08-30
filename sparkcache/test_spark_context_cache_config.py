@@ -182,7 +182,9 @@ class ParseConnectorConfigTests(unittest.TestCase):
         )
         with (
             mock.patch.object(cfg, "_LEGACY_CUDA_RESTORE_WARNING_EMITTED", False),
-            self.assertWarnsRegex(FutureWarning, "CUDA restore"),
+            self.assertWarnsRegex(
+                FutureWarning, "legacy SparkCache CUDA configuration names"
+            ),
         ):
             config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
         self.assertTrue(config.cuda_restore_enabled)
@@ -240,11 +242,11 @@ class ParseConnectorConfigTests(unittest.TestCase):
         with (
             mock.patch.object(cfg, "_LEGACY_CUDA_RESTORE_WARNING_EMITTED", False),
             mock.patch.dict(os.environ, environment),
-            self.assertWarnsRegex(FutureWarning, "CUDA restore"),
+            self.assertWarnsRegex(
+                FutureWarning, "legacy SparkCache CUDA configuration names"
+            ),
         ):
-            config = cfg.parse_connector_config(
-                vllm, vllm.kv_transfer_config, None
-            )
+            config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
         self.assertTrue(config.cuda_restore_enabled)
         self.assertEqual(config.cuda_restore_io_workers, 3)
 

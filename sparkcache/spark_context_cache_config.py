@@ -60,8 +60,8 @@ def _warn_legacy_cuda_restore_config() -> None:
             return
         _LEGACY_CUDA_RESTORE_WARNING_EMITTED = True
     warnings.warn(
-        "SparkCache native-restore configuration names are deprecated; use the"
-        " SparkCache CUDA restore configuration names",
+        "legacy SparkCache CUDA configuration names are deprecated; use the"
+        " canonical SparkCache CUDA restore configuration names",
         FutureWarning,
         stacklevel=3,
     )
