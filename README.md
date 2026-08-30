@@ -53,7 +53,7 @@ Status words are deliberate:
 | Tail-only row publication | **implemented** | Opt-in `tail-cow-v1`; GPU-free tested, no live serving qualification |
 | Opaque HMA page snapshots | **qualified** | Exact DeepSeek-V4 and GLM deployments linked above |
 | Tail-only opaque-page deltas | **research-only** | Implemented and GPU-free tested; C2 restored-delta responses failed exact semantics while recomputation succeeded |
-| 64 MiB flat page macro objects | **qualified** | Schema and header-accounting implementation originated at SparkCache `229d7d6`; exact C1 runtime is SparkCache `a1511d2`, tree `4d5b8e…`, image `35b58a7…`; [review evidence](https://github.com/FujitsuPolycom/sparkcache/pull/40) |
+| 64 MiB flat page macro objects | **qualified** | Exact C1 evidence remains SparkCache `a1511d2` / image `35b58a7…` with sequential reads; PR43 head `b553c48` implements bounded two-arena parallel read and is GPU-free tested, not live qualified |
 | SparkCache CUDA restore and placement | **qualified** | Exact GLM-5.3 TP4/DCP1 source artifacts in the linked records |
 | Shared exact-prefix GPU blocks | **implemented** | Bounded vLLM lease path; earlier timing receipts are diagnostic, not exact-output semantic qualification |
 | Different-root shared row segments | **implemented** | Authenticated `per_token_rows` descriptor-prefix sharing; GPU-free tested, not live qualified |
@@ -109,12 +109,20 @@ payload objects rather than 512 logical-chunk files. Version 1 flat manifests
 remain readable. Physical grouping does not change the 256-token identity or
 admission geometry.
 
-The qualified v2 CUDA path reads and hashes its 13 macro objects sequentially.
-That phase measured 1.35–1.50 seconds within the 1.55–1.70-second all-rank
-restore. The result is correct but slower than the identified legacy
+The qualified `35b58a7…` v2 artifact reads and hashes its 13 macro objects
+sequentially. That phase measured 1.35–1.50 seconds within the 1.55–1.70-second
+all-rank restore. The result is correct but slower than the identified legacy
 512-object path, which used bounded parallel reads within each arena slab.
-Existing legacy roots remain readable; the connector does not offer an
-operator setting that publishes additional legacy roots.
+
+PR43 head `b553c487bc273ad3efefa4052dc06376543dcd9d` implements bounded flat-v2
+parallel read: it authenticates the first object before parsing the header,
+then reads and authenticates at most two objects concurrently into the two
+placement-owned arenas. Digest accumulation and CUDA submission remain in
+manifest order after both reads succeed. `spark_cache_cuda_restore_io_workers`
+may reduce the path to one worker; values above two remain capped by arena
+ownership. This scheduling is implemented and GPU-free tested, not live
+qualified. Existing legacy roots remain readable; the connector does not offer
+an operator setting that publishes additional legacy roots.
 
 Conversation extensions use `sparkcache-hybrid-page-delta/v1` page semantics
 and `sparkcache-page-delta-manifest/v2` roots. The delta binds the exact base,
@@ -261,6 +269,9 @@ snapshot's complete digest before the parked request may resume.
   13 objects, sequential read/hash in 1.35–1.50 seconds, all-rank SparkCache
   CUDA restore in 1.55–1.70 seconds, and the exact codeword before and after
   restart. No published OCI digest is qualified.
+- Bounded two-arena flat-v2 parallel read at PR43 head `b553c48` is
+  **implemented** and GPU-free tested, not live qualified. It does not transfer
+  the `35b58a7…` semantic or timing result to the PR43 artifact.
 - Tail-only page deltas and opaque-page base-read cohorts are **research-only**.
   The implementation and GPU-free tests remain, but the exact C2 restored-delta
   case failed semantics while recomputation succeeded.

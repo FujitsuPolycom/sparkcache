@@ -99,6 +99,22 @@ reads within each arena slab. Existing legacy roots remain readable and follow
 that restore branch, but connector publication writes flat-v2 roots and exposes
 no operator setting for legacy publication.
 
+### Bounded parallel-read implementation after the qualified artifact
+
+SparkCache PR43 head `b553c487bc273ad3efefa4052dc06376543dcd9d` replaces the
+sequential remaining-object loop with bounded two-arena reads. It authenticates the
+first object before parsing the snapshot header, then reads and authenticates
+at most two remaining objects concurrently into the two placement-owned arenas.
+Complete-snapshot SHA-256 accumulation and CUDA submission remain in manifest
+order and begin only after every read in the pair succeeds. The configured I/O
+worker count may reduce concurrency to one; values above two remain capped by
+arena ownership.
+
+This scheduling is **implemented** and GPU-free tested. It is not present in
+image `35b58a7…` and has no live semantic or performance qualification. The
+safe retained qualification remains the sequential 1.55–1.70-second C1 restore
+described above.
+
 ## Implemented restore path
 
 SparkCache CUDA restore reads immutable `.spcc` objects directly into alternating
@@ -265,6 +281,8 @@ Source revision `2b86fb9d02fa3595cca5caa864b81aedce44b8bb` passed:
 ## Qualification limits
 
 - The qualified workload is C1 full-snapshot restore at 131,072 tokens.
+- PR43 bounded two-arena flat-v2 read is implemented and GPU-free tested, not
+  live qualified. It does not inherit the `35b58a7…` result.
 - Historical C2/C8/C16 timing and completion receipts are diagnostic because
   they do not carry exact-output semantic proof.
 - Tail-delta publication, shared host-base reads, shared GPU-prefix attachment,

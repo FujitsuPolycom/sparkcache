@@ -245,6 +245,11 @@ when placement completes and intentionally excludes that bookkeeping.
   seconds and returned the exact codeword before and after restart. Sequential
   object read/hash consumed 1.35–1.50 seconds. That C1 result does not qualify a
   published OCI artifact or concurrent restores.
+  PR43 head `b553c48` implements bounded parallel reads into the two
+  placement-owned arenas. The first object is authenticated before header
+  parsing; remaining objects are read at most two at a time, then digested and
+  submitted in manifest order. This scheduling is GPU-free tested but has no
+  live qualification.
 - **Different-root row-segment sharing — implemented.** Distinct
   `per_token_rows` result roots may share one authenticated descriptor prefix
   when every rank proves the same chunk sequence. GPU-free coverage exists;
@@ -302,6 +307,8 @@ and header accounting; complete source `a1511d2`, tree `4d5b8e…`, and local
 image `35b58a7…` qualify the 13-object
 `sparkcache-page-snapshot-manifest/v2` C1 restart case. Tail deltas, host-base
 read coalescing, and multi-root concurrent restore are research-only.
+PR43 head `b553c48` adds bounded two-arena flat-v2 reads; that implementation is
+GPU-free tested and not live qualified.
 At 20 GiB of KV cache, C2×128K is an observed capacity candidate, not a
 qualified cached workload. C6×128K admitted only one request at a time and
 serialized completion over 61–313 seconds. C8×64K and C16×32K remain planned

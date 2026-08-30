@@ -66,6 +66,11 @@ reconstruct a fully verified snapshot before Python or SparkCache CUDA
 placement, but the C2 live case failed exact semantics and does not qualify that
 path.
 
+PR43 head `b553c48` implements bounded two-arena flat-v2 reads and has GPU-free
+coverage. A live artifact must repeat the exact C1 restart/codeword workload
+before the parallel-read scheduling can replace the retained sequential
+qualification.
+
 DeepSeek-V4 opaque HMA pages retain their verified Python restore path. CUDA
 support for that profile must describe all five page groups, preserve each
 group's semantic reuse window, and prove byte identity before changing its
