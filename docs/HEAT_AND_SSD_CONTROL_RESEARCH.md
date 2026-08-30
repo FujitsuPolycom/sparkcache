@@ -47,7 +47,7 @@ SparkCache persists rank-local KV context to local NVMe through
   directory fsync per batch. Identical content at the destination is
   verified and **not** overwritten, but the temporary staging bytes are
   still written first, so re-committing an unchanged chunk costs its full
-  encoded size of host writes while retaining zero new bytes.
+  encoded size of host writes while retaining zero additional bytes.
 - Capacity is governed by `CapacityPolicy` (high watermark
   `spark_cache_max_bytes`, low watermark defaulting to 90% of the high
   watermark, optional TTL seconds). `ManifestStore.maintain` evicts whole
@@ -152,14 +152,14 @@ window settles near 10 with 8-bit precision until saturation. Keys that
 collide in one slot add their estimates (false sharing); the design accepts
 this because admission decisions are comparative, not absolute.
 
-### Failure behavior
+### Rejection and bounded behavior
 
 - Malformed keys (digest shape), non-power-of-two capacity, or a decay
   window below 1 raise `ResearchFormatError` at construction or use.
 - The ring has no I/O and no locks: a single-process caller is assumed.
 - Any byte-level snapshot round trip is schema-checked; a mismatch raises
   `ResearchFormatError` rather than guessing.
-- Counters are exact-lossy by design. There is no failure mode in which a
+- Counters are exact-lossy by design. There is no transition in which a
   counter drives a correctness decision, because per the isolation contract
   no correctness decision ever reads it.
 
@@ -383,7 +383,7 @@ Events are recorded per publication with the fields of schema
 ```
 
 - `kind` is one of `commit` (exact chunks plus manifest), `alias_publication`
-  (alias files plus new descriptor segments), `metadata_touch` (recency
+  (alias files plus added descriptor segments), `metadata_touch` (recency
   metadata), or `repair` (invalidation-driven republish).
 - `unique_object_bytes` is the encoded size of objects that did not exist
   before publication and remain reachable afterward. `CommitReceipt` does
@@ -573,7 +573,7 @@ Files:
 | `research/heat_ssd_control/write_budget.py` | `DUW_UNIT_BYTES`, `WriteEvent`, `event_to_json`, `WriteBudget`, `WriteLedger`, `BudgetReport`, `write_amplification`, `parse_smart_log_page`, `SmartHealthSample`, `DuwMonitor`, `DuwDelta`, sample JSON schema `sparkcache-research-ssd-sample/v1` |
 | `research/heat_ssd_control/test_prototype.py` | GPU-free behavior, malformed-input, atomic-ledger, and production-import isolation regressions |
 
-Failure behavior across all modules:
+Rejection behavior across all modules:
 
 - Malformed external inputs — digest shape, negative counts, misaligned byte
   arrays, wrong schema strings, short log pages, or a counter reset in a

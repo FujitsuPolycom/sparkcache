@@ -113,7 +113,7 @@ def test_hit_ring_saturates_and_decay_counts_saturated_accesses() -> None:
         ring.record_hit(key)
     assert ring.estimate(key) == 255
 
-    # The 256th access starts a new decayed epoch even though the old counter
+    # The 256th access starts a decayed epoch even though the previous counter
     # was saturated: 255 >> 1, followed by the in-flight increment.
     assert ring.record_hit(key) == 128
     assert json.loads(ring.snapshot())["increments_since_decay"] == 0

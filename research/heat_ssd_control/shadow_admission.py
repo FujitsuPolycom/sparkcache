@@ -58,7 +58,7 @@ class TraceReport:
         window_hits: accesses served by the window band.
         main_hits: accesses served by the main band; the shadow's hits.
         misses: accesses not resident in either band.
-        admitted: new keys that entered or replaced in the main cache.
+        admitted: keys that entered or replaced entries in the main cache.
         rejected: keys that lost the admission comparison.
         final_resident: entries remaining across both bands.
 
