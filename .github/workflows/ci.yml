@@ -37,6 +37,7 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e ".[test]"
       - run: python -m pytest sparkcache -q
+      - run: python -m pytest research -q
       - run: python -m pytest deploy -q
 
   package:
