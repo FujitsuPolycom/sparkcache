@@ -1,15 +1,26 @@
 # SparkCache
 
 > [!WARNING]
-> SparkCache is alpha research software. Pin exact package, image, and source
-> revisions when reproducing a deployment.
+> SparkCache is experimental software. Pin package, image, and source revisions
+> when you need a reproducible deployment.
 
-SparkCache saves completed vLLM prompt context on local storage. A later
-request can restore the longest matching prompt prefix instead of computing it
-again, including after the model process restarts.
+SparkCache gives vLLM persistent memory for previously computed prompts. It
+saves reusable context to local storage.
 
-Each worker stores only the model state owned by its physical rank. Ordinary
-cache reads and writes stay on that rank's filesystem.
+SparkCache can restore the longest matching prefix later—even after vLLM
+evicts that prefix from its GPU KV cache, or after the model process, container,
+or server restarts.
+
+Repeated conversations, shared system prompts, and growing documents can skip
+much of the repeated prompt processing.
+
+The cache follows the model's distributed layout: every worker reads and
+writes only the state owned by its physical rank. Normal cache traffic stays
+on local storage rather than crossing the network.
+
+Cached model state—the data vLLM needs to continue from a saved context—is
+restored only after its identity, compatibility, and contents are verified.
+If those checks do not pass, vLLM computes the prompt normally.
 
 ## Capabilities
 
