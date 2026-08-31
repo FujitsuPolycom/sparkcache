@@ -46,9 +46,9 @@ rewrite it.
 - Cache-identity compatibility: any change to `CacheIdentity` wire values,
   digest salts, or chunk geometry must miss cleanly against existing on-disk
   entries, never alias them. State the namespace impact in the commit text.
-- Fail-closed over fail-fast-and-continue: a path that cannot prove restored
-  state is correct must degrade to a cache miss and recompute; it must never
-  serve unverified bytes. Serving must never wait on cache work.
+- Verified or recomputed: a path that cannot prove restored state is correct
+  must become a cache miss and recompute; it must never serve unverified bytes.
+  Serving must never wait on cache work.
 - Every behavioral change lands with a GPU-free regression test; the suite
   (`python -m pytest sparkcache -q`) must pass before commit.
 - Defects are tracked in `DEFECTS.md` with stable identifiers that are never

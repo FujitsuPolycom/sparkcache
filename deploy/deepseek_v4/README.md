@@ -1,6 +1,6 @@
 # DeepSeek-V4 deployment tooling
 
-This directory contains fail-closed deployment and validation tools for
+This directory contains verified-or-recompute deployment and validation tools for
 DeepSeek-V4 SparkCache profiles.
 
 ## TP4/DCP1 qualified profile
@@ -15,13 +15,13 @@ DeepSeek-V4 SparkCache profiles.
   size 256;
 - 524,288-token request limit and 32 sequences;
 - 200 GiB high / 180 GiB low rank-local NVMe watermarks; and
-- Python verified restore with streaming and native placement disabled.
+- Python verified restore with streaming and SparkCache CUDA placement disabled.
 
 The launcher rejects DCP2/DCP4 because neither DSpark nor the opaque five-group
 HMA page format defines safe DCP ownership. See `DCP_SUPPORT.md`.
 
 Use `TP4_RUNBOOK.md` for checkpoint manifests, cluster preflight, overlay
-generation, create-only inspection, cutover, and restart/restore gates. The
+generation, create-only inspection, cutover, and restart/restore checks. The
 qualified measurements and exact runtime identifiers are in
 `../../DEEPSEEK_V4_TP4_LIVE_VALIDATION.md`.
 
@@ -36,7 +36,7 @@ qualified measurements and exact runtime identifiers are in
 | `tp4_launch.py` | create one guarded rank with read-only model/source/overlay binds and disjoint writable cache/JIT roots |
 | `semantic_gate.py` | create or verify deterministic semantic references with a short request that publishes every physical rank's manifest inventory (a quorum prime) and an immediate echo sentinel |
 | `capacity_gate.py` | exercise physical-byte accounting, high/low eviction, open-transaction exclusion, and orphan collection in a disposable root |
-| `corruption_gate.py` | copy one serving entry, corrupt one copied chunk, require a fail-closed lookup, and invalidate only the copy |
+| `corruption_gate.py` | copy one serving entry, corrupt one copied chunk, require rejection and recomputation, and invalidate only the copy |
 
 Every output path used by checkpoint, overlay, and corruption tools is created
 exclusively. Existing paths are not overwritten.

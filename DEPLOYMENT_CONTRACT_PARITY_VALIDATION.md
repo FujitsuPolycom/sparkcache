@@ -8,11 +8,11 @@ extraction.
 On 2026-08-21, the extracted deployment-contract revision
 `a4bfcf689f6164b2339a107d519f914fc6e7e4a6` was compared with the monolithic
 profile-adapter revision
-`76287b3c6d6909f4884462fe17d144e222ca3155`. The gate compared complete
+`76287b3c6d6909f4884462fe17d144e222ca3155`. The check compared complete
 transformed Docker inspection objects and complete generated Docker command
 lists. Canonical JSON used sorted object keys and compact separators.
 
-The gate was read-only on every remote host. It did not create, stop, restart,
+The check was read-only on every remote host. It did not create, stop, restart,
 or modify a container, route, interface, or cache entry.
 
 ## Four-Spark discovery
@@ -28,7 +28,7 @@ Sparks. Discovery reported:
 
 The four running containers `deepseek0731-sparkcache-r0` through
 `deepseek0731-sparkcache-r3` used image ID prefix `50036224411e` and remained
-up throughout the gate.
+up throughout the check.
 
 ## Model-specific inspection transformations
 
@@ -65,7 +65,7 @@ lists matched exactly.
 | Two-Spark DeepSeek-V4-Flash-0731 TP2/DCP1 | 1 | 476 | `d9fefff416766c41473b44b55e278f6f82ae878e1eb111a34439aee034e4c74f` |
 
 The two-Spark service used its existing LMCache transfer configuration; this
-part of the gate qualifies model-neutral Docker command preservation, not a
+part of the check qualifies model-neutral Docker command preservation, not a
 SparkCache TP2 profile transformation.
 
 ## Health and conclusion

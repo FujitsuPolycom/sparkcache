@@ -1749,7 +1749,7 @@ class ManifestTransaction:
 
 
 class ManifestStore:
-    """Atomic local-NVMe manifest publisher and fail-closed reader."""
+    """Atomic local-NVMe publisher and verified-or-miss reader."""
 
     def __init__(self, root: Path | str) -> None:
         self.root = Path(root)

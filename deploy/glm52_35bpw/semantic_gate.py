@@ -1,4 +1,4 @@
-"""Store/restart/hit gate for the GLM-5.2 fixed-MTP4 serving recipe (``R7``)."""
+"""Store/restart/hit check for the GLM-5.2 fixed-MTP4 serving recipe (``R7``)."""
 
 from __future__ import annotations
 

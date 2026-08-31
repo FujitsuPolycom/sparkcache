@@ -236,12 +236,12 @@ def _validated_shared_page_base(
     # The only producer is _read_authenticated_page_base, which hashes every
     # immutable object before publication. Re-hashing here would turn every
     # follower into another full-base authentication pass and defeat the
-    # native flight; descriptor and length checks reject cross-base reuse.
+    # SparkCache CUDA flight; descriptor and length checks reject cross-base reuse.
     if not isinstance(result, PageBaseReadResult) or not isinstance(
         result.value, tuple
     ):
         raise CudaHybridRestoreError(
-            "native page-base reader returned an incompatible representation"
+            "SparkCache CUDA page-base reader returned an incompatible representation"
         )
     authenticated = result.value
     if (
@@ -256,7 +256,7 @@ def _validated_shared_page_base(
         or result.encoded_bytes != sum(item.encoded_bytes for item in objects)
     ):
         raise CudaHybridRestoreError(
-            "native page-base reader returned incompatible authenticated objects"
+            "SparkCache CUDA page-base reader returned incompatible authenticated objects"
         )
     return authenticated
 
@@ -449,7 +449,7 @@ def plan_cuda_page_delta_restore(
                 )
             except PageBaseReadError as error:
                 raise CudaHybridRestoreError(
-                    f"native shared page-base read was rejected: {error}"
+                    f"SparkCache CUDA shared page-base read was rejected: {error}"
                 ) from error
             authenticated_base_objects = _validated_shared_page_base(
                 shared_base,

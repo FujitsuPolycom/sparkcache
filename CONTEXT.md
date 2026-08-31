@@ -1,51 +1,49 @@
 # SparkCache domain context
 
-## Deployment vocabulary
+## Connector configuration
 
-### Connector configuration
+Connector configuration is the validated interpretation of vLLM parallel
+settings, SparkCache options, environment fallbacks, model-profile policy,
+cache capacity, and KV-group topology.
 
-Connector configuration is the immutable, validated interpretation of vLLM
-parallel settings, SparkCache extra configuration, environment fallbacks,
-model-profile policy, cache capacity, and KV-group topology. The
-`sparkcache/spark_context_cache_config.py` module owns this interpretation and
-constructs cache identities only after both DCP-local and physical TP shard
-ranks are explicit.
+`sparkcache/spark_context_cache_config.py` owns this interpretation. It creates
+a cache identity only after DCP-local and physical TP shard ranks are explicit.
 
-Scheduler and worker connectors consume the same connector configuration so
-their wire identities and deployment constraints cannot drift.
+Scheduler and worker connectors consume the same configuration. Their wire
+identities and deployment constraints cannot drift.
 
-### Deployment contract
+## Deployment contract
 
-A deployment contract is the complete set of model-neutral mechanics that
-turn a Docker inspection record into a reproducible serving launch. It covers
-inspection structure, vLLM command normalization, environment parsing, port
-validity, immutable source identities, overlay receipts, and create-only
+A deployment contract contains the model-neutral mechanics that turn one
+Docker inspection record into a repeatable launch.
+
+It covers inspection structure, vLLM command normalization, environment
+parsing, ports, immutable source identities, overlay receipts, and create-only
 container launch behavior.
 
-The `deploy/deployment_contract/` module owns these mechanics. Its interface
-must preserve deterministic output, fail-closed validation, and the public
-imports and command-line behavior used by existing deployments.
+`deploy/deployment_contract/` owns these mechanics. Its output must be
+deterministic, preserve verified-or-recompute behavior, and retain public
+imports used by existing deployment tools.
 
-### Profile adapter
+## Profile adapter
 
-A profile adapter applies model-specific policy to a deployment contract.
-DeepSeek-V4 and GLM-5.2 adapters own their accepted model arguments,
-checkpoint and cache identities, tensor and decode-context parallel geometry,
-quantization rules, environment requirements, and model-specific overlay
-hashes. The GLM-5.3 Flash directory owns a narrower derived-image and connector-
-configuration contract; its SparkRing launcher owns inspection-to-launch and
-checkpoint-mount validation. Shared deployment mechanics must not weaken or
-replace those rules.
+A profile adapter adds model-specific policy to a deployment contract. It owns
+accepted model arguments, checkpoints, cache identity, parallel geometry,
+quantization rules, environment requirements, and overlay hashes.
 
-### Transformed inspection
+Shared deployment code must not infer or weaken profile policy. Adapters,
+launch procedures, and live test records live under `deploy/`.
+
+## Transformed inspection
 
 A transformed inspection is a deep copy of one Docker inspection record with
-the exact command, environment, labels, and mounts required by a profile
-adapter. Transformations do not mutate the source record.
+the command, environment, labels, and mounts required by a profile adapter.
+The transformation never mutates its input.
 
-### Overlay receipt
+## Overlay receipt
 
-An overlay receipt is a deterministic JSON record that binds generated vLLM
-source files to their exact preimages, transformations, resulting hashes, and
-SparkCache source-tree digest. A launcher rejects missing, incompatible, or
-modified receipt inputs.
+An overlay receipt is deterministic JSON that binds generated vLLM files to
+their exact inputs, transformations, output hashes, and SparkCache source-tree
+digest.
+
+A launcher rejects a missing, incompatible, or modified receipt input.

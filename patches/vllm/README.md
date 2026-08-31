@@ -9,7 +9,7 @@ patches required by SparkCache:
   expandable segments because this connector does not register KV-cache GPU
   memory with an external device.
 
-Both patches are pinned fail-closed to official
+Both patches accept only the pinned official
 `vllm-project/vllm@fcc614141e5e9ab18cb304c476f7feed2a9552e3`.
 `preimages.json` records the exact upstream file hashes.
 

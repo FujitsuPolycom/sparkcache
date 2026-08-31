@@ -173,11 +173,11 @@ def test_semantic_hit_rejects_changed_combined_body(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "gate",
+    "semantic_module",
     (deepseek_semantic_gate, glm_semantic_gate),
 )
 def test_model_cli_reports_inconclusive_result(
-    gate,
+    semantic_module,
     monkeypatch,
     capsys,
     tmp_path: Path,
@@ -195,7 +195,7 @@ def test_model_cli_reports_inconclusive_result(
     def inconclusive(*_args, **_kwargs):
         raise error
 
-    monkeypatch.setattr(gate, "run_miss", inconclusive)
+    monkeypatch.setattr(semantic_module, "run_miss", inconclusive)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -208,7 +208,7 @@ def test_model_cli_reports_inconclusive_result(
     )
 
     with pytest.raises(SystemExit) as raised:
-        gate.main()
+        semantic_module.main()
 
     assert raised.value.code == 2
     assert json.loads(capsys.readouterr().out) == error.as_result()

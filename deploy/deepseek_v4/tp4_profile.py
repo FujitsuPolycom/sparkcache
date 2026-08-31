@@ -43,9 +43,7 @@ _PORT_ENVIRONMENT_RE = re.compile(r"(?:^|_)PORT\d*\Z")
 
 def _require_sha256(value: str, role: str) -> str:
     if _SHA256_RE.fullmatch(value) is None:
-        raise ProfileTransformError(
-            f"{role} must be 64 lowercase hexadecimal digits"
-        )
+        raise ProfileTransformError(f"{role} must be 64 lowercase hexadecimal digits")
     return value
 
 
@@ -229,7 +227,9 @@ def _validate_arguments(arguments: list[str]) -> int:
         "--disable-prefix-caching",
     ):
         if forbidden in arguments:
-            raise ProfileTransformError(f"source command contains unsupported {forbidden}")
+            raise ProfileTransformError(
+                f"source command contains unsupported {forbidden}"
+            )
     for required_flag in ("--enable-auto-tool-choice",):
         if arguments.count(required_flag) != 1:
             raise ProfileTransformError(f"source command requires {required_flag}")
@@ -241,7 +241,9 @@ def _validate_arguments(arguments: list[str]) -> int:
         kernel = json.loads(_one(arguments, "--kernel-config"))
         speculative = json.loads(_one(arguments, "--speculative-config"))
     except json.JSONDecodeError as error:
-        raise ProfileTransformError("source DeepSeek JSON argument is invalid") from error
+        raise ProfileTransformError(
+            "source DeepSeek JSON argument is invalid"
+        ) from error
     if kernel.get("enable_cutedsl_warmup") is not False:
         raise ProfileTransformError("source DeepSeek kernel config must disable warmup")
     expected_speculative = {
@@ -249,7 +251,9 @@ def _validate_arguments(arguments: list[str]) -> int:
         "num_speculative_tokens": serving["speculation_tokens"],
         "moe_backend": serving["speculation_moe_backend"],
     }
-    if any(speculative.get(key) != value for key, value in expected_speculative.items()):
+    if any(
+        speculative.get(key) != value for key, value in expected_speculative.items()
+    ):
         raise ProfileTransformError("source DeepSeek DSpark configuration differs")
     if speculative.get("draft_sample_method", "greedy") != "greedy":
         raise ProfileTransformError("source DeepSeek DSpark sampling must be greedy")
@@ -293,7 +297,7 @@ def build_kv_transfer_config(checkpoint_sha256: str) -> dict[str, Any]:
             "spark_cache_store": True,
             "spark_cache_restore": True,
             "spark_cache_streaming_snapshots": False,
-            "spark_cache_native_restore": False,
+            "spark_cache_cuda_restore": False,
             "spark_cache_max_bytes": cache["max_bytes"],
             "spark_cache_low_watermark_bytes": cache["low_watermark_bytes"],
             "spark_cache_ttl_seconds": cache["ttl_seconds"],
@@ -311,7 +315,9 @@ def _reserved_ports(environment: Iterable[str]) -> frozenset[int]:
         try:
             value = int(raw)
         except ValueError as error:
-            raise ProfileTransformError(f"environment port {name} is invalid") from error
+            raise ProfileTransformError(
+                f"environment port {name} is invalid"
+            ) from error
         validated = _port(value, name)
         assert validated is not None
         reserved.add(validated)
@@ -342,9 +348,7 @@ def transform_inspection(
     reserved = _reserved_ports(source_environment)
     api_port = _port(api_port, "api_port")
     master_port = _port(master_port, "master_port")
-    effective_api = api_port or (
-        int(_one(arguments, "--port")) if rank == 0 else None
-    )
+    effective_api = api_port or (int(_one(arguments, "--port")) if rank == 0 else None)
     effective_master = master_port or int(_one(arguments, "--master-port"))
     if effective_api is not None and effective_api == effective_master:
         raise ProfileTransformError("api_port and master_port must differ")

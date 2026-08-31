@@ -1,47 +1,40 @@
 # Deployment contract
 
-Status: **implemented**.
+**Status: implemented.** This package contains the model-neutral code that
+turns a Docker inspection record into a repeatable SparkCache launch.
 
-The deployment-contract module owns model-neutral mechanics used to transform
-Docker inspection records into reproducible SparkCache launches. DeepSeek-V4
-and GLM-5.2 profile adapters call this interface while retaining their own
-model, topology, quantization, cache-identity, and accepted-source policy.
+A profile supplies model, topology, quantization, cache identity, and accepted
+source policy. The shared package does not guess or relax those choices.
 
-## Interface
+## Modules
 
-| Module | Behavior |
-| --- | --- |
-| `command.py` | deterministic JSON encoding, vLLM command normalization, and value-bearing option parsing |
-| `inspection.py` | Docker environment parsing and single-record inspection loading |
-| `ports.py` | numeric port-range validation |
-| `source.py` | file SHA-256 and line-ending-independent deployable-source identity |
-| `patches.py` | exact-preimage, exact-postimage Git patch application |
-| `receipts.py` | overlay schema, inventory, source identity, and generated-file verification |
-| `container.py` | deterministic Docker command construction and execution |
-| `semantic.py` | deterministic miss, restart/hit, and post-restore semantic gates |
+| Module | Purpose |
+|---|---|
+| `command.py` | Normalize vLLM commands and encode deterministic JSON. |
+| `inspection.py` | Read one Docker inspection record and its environment. |
+| `ports.py` | Validate numeric port ranges. |
+| `source.py` | Hash files and calculate line-ending-independent source identities. |
+| `patches.py` | Apply Git patches with exact input and output checks. |
+| `receipts.py` | Create and verify overlay inventories and generated-file hashes. |
+| `container.py` | Build and execute deterministic Docker commands. |
+| `semantic.py` | Run deterministic miss, restart/restore, and continued-output checks. |
 
-`deploy/deepseek_v4/` and `deploy/glm52_35bpw/` are profile adapters at this
-seam. They must reject any source inspection that violates their explicit
-model contract. The shared module does not infer or relax model policy.
+Compatibility imports remain available from existing profile modules. Receipt
+schema identifiers and encoded receipt bytes are unchanged.
 
-Compatibility imports remain available from the model-specific modules used
-by existing scripts. Receipt schema identifiers and serialized receipt bytes
-are unchanged.
+## Semantic checks
 
-The semantic response reader records the final `content` answer separately
-from an evidence body that concatenates the assistant message fields
-`reasoning`, `reasoning_content`, and `content` in that order. It also records
-the choice's `finish_reason`. A token-limited response
-(`finish_reason == "length"`) or a response without a non-whitespace assistant
-body raises `SemanticGateInconclusive`; `SemanticGateInconclusive.as_result()`
-provides a JSON-compatible `INCONCLUSIVE` report. Successful miss and hit
-result dictionaries retain their established fields. The miss reference
-stores the combined body so the hit gate can require deterministic evidence.
-Exact expected-answer checks use final `content` and still determine semantic
-success. References written before the optional `assistant_body` field remain
-readable.
+The response reader keeps final `content` separate from the combined assistant
+body. The combined body contains `reasoning`, `reasoning_content`, and
+`content`, in that order.
 
-## Validation
+A length-limited response or an empty assistant body returns an `INCONCLUSIVE`
+report. It is not treated as a successful or failed semantic comparison.
+
+Exact expected-answer checks use final `content`. Existing references without
+the optional `assistant_body` field remain readable.
+
+## Test
 
 ```bash
 python -m pytest deploy/deployment_contract -q

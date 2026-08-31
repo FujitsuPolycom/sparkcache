@@ -24,7 +24,7 @@ whose SHA-256 begins with `87c17d8d`.
 The wheel passed `twine check`, an isolated dependency-free installation
 probe, runtime-resource inspection, and exact-image imports on all six hosts
 used by the tests. The runtime wheel contains no repository test modules or
-native research probes.
+C++/CUDA research probes.
 
 ## DeepSeek-V4 TP2/DCP1 qualification
 
@@ -86,5 +86,5 @@ Conclusion: package installation, canonical connector loading, GLM-5.2 model
 startup, exact-state attestation, and graph capture passed for candidate wheel
 `8e111d42f53e823f10179fbad96235aa0bad6ca8791d729494c12fadb1acedaf`.
 Persistent store and restore are **research-only** for that artifact and
-deployment because host loss interrupted the required gate. The observation
+deployment because host loss interrupted the required check. The observation
 does not identify a wheel, connector, cache, or model-startup defect.

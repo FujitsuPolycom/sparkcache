@@ -13,8 +13,8 @@ values interoperate, and any field difference forks the storage namespace
 into a clean miss (miss-not-alias is the invariant).
 
 The record vocabulary is closed: ``target_ckv``, ``sparse_indexer``,
-``mtp_draft_kv``, plus the non-data ``logical_positions`` and the
-policy-gated ``boundary_hidden``. Profiles map model layers onto these
+``mtp_draft_kv``, plus the non-data ``logical_positions`` and the optional
+``boundary_hidden``. Profiles map model layers onto these
 kinds; unsupported kinds are rejected because the on-disk chunk ABI and the
 SparkCache CUDA placement ABI (at most ``MAX_RECORD_KINDS`` data records per chunk)
 are frozen.
@@ -42,7 +42,7 @@ NATIVE_RECORD_ORDINALS = {
     "boundary_hidden": 3,
 }
 
-# Ceiling from the native chunk descriptor (record_offset/length arrays).
+# Ceiling from the C++/CUDA chunk descriptor (record_offset/length arrays).
 MAX_NATIVE_RECORD_KINDS = 4
 
 _DRAFT_POLICIES = frozenset({"separate", "colocated_target"})
@@ -219,13 +219,13 @@ class ModelProfile:
             } & persisted
             if unmapped:
                 raise ProfileError(
-                    f"profile {self.name}: families lack native ordinals:"
+                    f"profile {self.name}: families lack C++/CUDA ordinals:"
                     f" {', '.join(sorted(unmapped))}"
                 )
             if len(persisted) > MAX_NATIVE_RECORD_KINDS:
                 raise ProfileError(
                     f"profile {self.name}: {len(persisted)} persisted families"
-                    f" exceed the native ABI ceiling of"
+                    f" exceed the C++/CUDA ABI ceiling of"
                     f" {MAX_NATIVE_RECORD_KINDS}"
                 )
 

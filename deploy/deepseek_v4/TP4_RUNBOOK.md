@@ -19,10 +19,10 @@ or transport ports.
 - SparkCache: Python hybrid-memory-allocator (HMA) block-page codec, restore,
   and bounded LRU enabled
 - Capacity: 200 GiB high and 180 GiB low watermark per rank-local root
-- Not qualified: DCP2/DCP4, shared writers, streaming snapshots, native direct
-  restore, expert parallelism, or an unpinned checkpoint/runtime
+- Not qualified: DCP2/DCP4, shared writers, streaming snapshots, SparkCache
+  CUDA restore, expert parallelism, or an unpinned checkpoint/runtime
 
-The launcher fails closed when any of these inputs drift. Do not weaken a
+The launcher rejects startup when any of these inputs drift. Do not weaken a
 check to make an unfamiliar image start; derive and test a profile for that
 exact runtime.
 The published base image inherits GLM CUDA-graph exact-state attestation
@@ -88,7 +88,7 @@ docker inspect <accepted-rank-container> \
 The four inspections are the launch source of truth. Preserve them with the
 checkpoint manifest and record the exact image ID. First prove this homogeneous
 four-rank image can serve with SparkCache disabled. Evidence collected from
-ranks with non-identical image IDs does not satisfy this gate.
+ranks with non-identical image IDs does not satisfy this requirement.
 
 ## 3. Stage and verify the overlays
 
@@ -170,14 +170,14 @@ profile, command, master address/port, model bind, and read-only overlay
 receipts; require physical node ranks 0, 1, 2, and 3 exactly once. Only rank 0
 may publish the API port.
 
-## 5. Coordinated cutover and persistence gate
+## 5. Coordinated cutover and persistence check
 
 Archive the rollback stack's inspections, logs, and single-writer receipts.
 Stop or start all four serving ranks as one coordinated operation; a partial
 collective is not a healthy fallback. Start the four created candidates close
 together and wait for rank 0 `/health` plus `/v1/models`.
 
-Run the existing semantic gate on a miss, wait until all four physical ranks
+Run the existing semantic check on a miss, wait until all four physical ranks
 publish the same digest for all five HMA groups, and save logs:
 
 ```bash
@@ -197,7 +197,7 @@ python3 -m deploy.deepseek_v4.semantic_gate hit \
 
 A response with an empty assistant body or `finish_reason` equal to `length`
 prints a structured `INCONCLUSIVE` result and exits with status 2. An
-inconclusive result does not satisfy the persistence gate.
+inconclusive result does not satisfy the persistence check.
 
 Qualification requires all of the following, not merely matching output:
 
@@ -207,7 +207,7 @@ Qualification requires all of the following, not merely matching output:
 - miss and hit semantic output are byte-identical; and
 - the fresh post-restore canary is correct.
 
-The hit gate sends a short canary before the long request. That first worker
+The hit check sends a short canary before the long request. That first worker
 round trip transports each restarted rank's discovery report to the scheduler;
 without it, the scheduler must conservatively treat the first long request as
 a quorum miss even though every worker has already discovered its manifest.
@@ -216,7 +216,7 @@ can deterministically answer the same trivial arithmetic prompt differently
 under async and synchronous scheduling, which makes arithmetic unsuitable as
 a cache-corruption oracle.
 
-## 6. Large-context and failure gates
+## 6. Large-context and failure checks
 
 Increase aligned prompt sizes in stages (32K, 64K, 128K, then the largest
 safe size). Use deterministic content and a distant-fact answer so the
@@ -224,7 +224,7 @@ completion proves that early and late prompt regions survived. Record prompt
 tokens, encoded bytes per rank, miss latency, restore latency, manifest
 digest, and the five HMA group page counts.
 
-The semantic gate scales deterministically with `--records`. Use a separate
+The semantic check scales deterministically with `--records`. Use a separate
 reference per size; the hit phase reads and verifies the recorded size:
 
 ```bash
@@ -238,7 +238,7 @@ python3 -m deploy.deepseek_v4.semantic_gate miss \
 Before calling the deployment durable, also test:
 
 1. Capacity pressure in a separate empty root with `capacity_gate.py`.
-2. A copied cache root with one chunk corrupted: restore must fail closed and
+2. A copied cache root with one chunk corrupted: restore must reject it and
    recompute; never corrupt the only serving copy.
 3. One-rank restart generation change: stale quorum reports must be withdrawn
    until the restarted rank reports the current generation.
@@ -258,8 +258,8 @@ short semantic, and collective-rank checks.
 |---|---|---|
 | overlay preimage mismatch | image/runtime drift | stop and derive a pinned chain for the exact source |
 | only some ranks remain alive | broken collective launch | capture logs, stop all ranks, relaunch together |
-| correct answer without four restore logs | semantic coincidence or native prefix hit | do not qualify; prove external restore |
+| correct answer without four restore logs | semantic coincidence or vLLM prefix hit | do not qualify; prove external restore |
 | quorum vanishes after one rank restarts | expected generation reset | wait for all four current-generation reports |
 | DCP2/DCP4 requested | unsupported opaque-page layout | keep DCP1; design and test an explicit sharding codec |
 | high watermark briefly exceeded | post-commit reclamation, not allocation reservation | inspect maintenance result and free space |
-| corrupted chunk | integrity gate working | require recompute and no restored partial state |
+| corrupted chunk | integrity check working | require recompute and no restored partial state |

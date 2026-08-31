@@ -1,4 +1,4 @@
-"""Small live-NVMe gate for SparkCache quota and eviction behavior."""
+"""Small live-NVMe check for SparkCache quota and eviction behavior."""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ def _chunk(label: int) -> ContextChunk:
 
 def run(root: Path) -> dict[str, Any]:
     if root.exists() and any(root.iterdir()):
-        raise RuntimeError(f"capacity gate root is not empty: {root}")
+        raise RuntimeError(f"capacity check root is not empty: {root}")
     root.mkdir(parents=True, exist_ok=True)
     store = ManifestStore(root)
     identity = _identity()
@@ -86,9 +86,9 @@ def run(root: Path) -> dict[str, Any]:
     )
     hits = [store.lookup(identity, digest, verify_chunks=False).is_hit for digest in digests]
     if hits != [False, False, True]:
-        raise RuntimeError(f"capacity gate selected the wrong LRU survivors: {hits}")
+        raise RuntimeError(f"capacity check selected the wrong LRU survivors: {hits}")
     if not report.capacity_satisfied or report.bytes_after > 5 * _MIB:
-        raise RuntimeError("capacity gate did not satisfy the high watermark")
+        raise RuntimeError("capacity check did not satisfy the high watermark")
     return {
         "schema": "sparkcache-capacity-gate/v1",
         "bytes_before": report.bytes_before,

@@ -1,9 +1,11 @@
 # Contributing to SparkCache
 
 SparkCache accepts focused bug fixes, compatibility improvements,
-documentation corrections, and tests. The repository is a personal project,
-so maintainers may decline changes that add operational machinery without
-improving cache correctness, portability, or usability.
+documentation corrections, and tests.
+
+The repository is a personal project. Changes should improve cache
+correctness, portability, or usability rather than add unrelated operational
+machinery.
 
 ## Development setup
 
@@ -34,10 +36,11 @@ version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", 
 python tools/verify_distribution.py "dist/sparkcache-${version}-py3-none-any.whl" --version "$version"
 ```
 
-Tests that require a DGX Spark or a patched vLLM runtime must state the model,
-checkpoint revision, runtime image or revision, topology, command, measured
-result, and conclusion. A successful test on one topology does not qualify a
-different topology.
+Live tests must state the model, checkpoint revision, runtime image or source
+revision, topology, command, measured result, and conclusion.
+
+A successful test on one topology says nothing about a different topology
+unless that topology is tested separately.
 
 ## Correctness requirements
 
@@ -54,9 +57,10 @@ different topology.
 ## Documentation and change descriptions
 
 Follow the **Write without hidden context** rule in `AGENTS.md`. Describe the
-system as it exists and label capability status as `implemented`, `qualified`,
-`research-only`, or `unsupported`. Evidence must identify its conditions,
-measurement, result, and conclusion.
+system as it exists and use `implemented`, `qualified`, `research-only`, or
+`unsupported` when a status label is useful.
+
+Evidence must identify its conditions, measurement, result, and conclusion.
 
 A pull request description and its commits must state:
 

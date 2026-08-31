@@ -220,6 +220,6 @@ def test_manifest_length_change_aborts_before_native_submit(tmp_path):
             required_data_record_mask=0b11,
         )
 
-    # Length validation happens while planning, before the native transaction
+    # Length validation happens while planning, before the SparkCache CUDA transaction
     # owns any destination memory.
     assert adapter.transactions == []

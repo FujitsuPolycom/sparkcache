@@ -150,7 +150,7 @@ class DefectD6QuorumDeltaReportingTests(unittest.TestCase):
             self.assertNotIn(removed, scheduler._quorum)
             self.assertEqual(scheduler._quorum[added], {0})
 
-    def test_reordered_deltas_fail_closed_then_converge(self) -> None:
+    def test_reordered_deltas_are_rejected_then_converge(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             scheduler = _make_connector(
                 Path(directory),
@@ -303,7 +303,7 @@ class DefectD6QuorumDeltaReportingTests(unittest.TestCase):
 
 
 class DeadInterfaceRemovalTests(unittest.TestCase):
-    """D-10: native and streaming code expose one model-serving interface each."""
+    """D-10: C++/CUDA and streaming code expose one model-serving interface each."""
 
     def test_native_binding_and_runtime_interfaces_have_one_owner(self) -> None:
         self.assertIs(native_package.PlacementConfig, canonical_cuda.PlacementConfig)
@@ -576,7 +576,7 @@ class HybridReuseWindowTests(unittest.TestCase):
             (13,),
         )
 
-    def test_null_or_duplicate_blocks_in_selected_window_fail_closed(self) -> None:
+    def test_null_or_duplicate_blocks_in_selected_window_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = self._windowed_connector(Path(directory), 128)
 

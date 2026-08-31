@@ -17,9 +17,9 @@ The Spark inter-rank collective layer is abbreviated `SIRCL` below.
 | `git apply` succeeds from a checkout but fails from a staged archive. | Patch files retain one line-ending representation on every controller. | Overlay preparation canonicalizes patch input to LF and verifies the exact postimage. Never bypass the preimage or postimage hash. |
 | The staged SparkCache source digest differs between Windows and Linux. | Filesystem path ordering and checkout line endings are platform-independent. | Source receipts canonicalize CRLF to LF and sort by POSIX relative path. Stage an immutable commit archive and require the same digest on every rank. |
 | Only some ranks remain running after a power event or failed start. | Starting one rank repairs an incomplete collective. | Stop and start all physical ranks as one coordinated operation. Preserve failed containers under rollback names and generate all replacements with `docker create` before the cutover. |
-| The miss semantic gate succeeds, but no durable hit is available after restart. | The HTTP response waits for background cache publication. | Do not restart until every rank logs a matching snapshot and commit digest and its manifest/chunks pass filesystem checks. The miss command returning is not the store barrier. |
+| The miss semantic check succeeds, but no durable hit is available after restart. | The HTTP response waits for background cache publication. | Do not restart until every rank logs a matching snapshot and commit digest and its manifest/chunks pass filesystem checks. The miss command returning is not the store barrier. |
 | A hit returns the right text without a four-rank external restore. | Semantic equality alone proves SparkCache persistence. | After a coordinated restart, require four-rank manifest discovery, the scheduler quorum-hit log, a restore log on every rank, the exact response, and a post-restore canary. |
 
-For the qualification baseline, keep streaming snapshots and native direct
+For the qualification baseline, keep streaming snapshots and SparkCache CUDA
 restore disabled. The bounded rank-local NVMe policy remains 200 GiB high,
 180 GiB low, and TTL zero.

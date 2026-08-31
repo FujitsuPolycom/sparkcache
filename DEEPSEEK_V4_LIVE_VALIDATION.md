@@ -18,7 +18,7 @@ and 8 tokens. The 256-token group keeps full history;
 the other groups expose reusable windows of 128, 128, 8, and 128 tokens.
 SparkCache stored opaque pages only for the full-history range or the final
 reusable window at the exact persistent boundary. Null or duplicate physical
-block identifiers fail closed.
+block identifiers are rejected and recomputed.
 
 Both hosts independently built the ARM64 derived image
 `sha256:e91b4788760789741060f6345e96ba387cb00b35d6e1ce865c5963404409b147`
@@ -29,13 +29,13 @@ The image contains connector source
 and runs with four data-only mounts; maintained runtime overlays are baked
 into the image.
 
-The bounded-capacity gate used derived image
+The bounded-capacity check used derived image
 `sparkring/dsv4-sparkcache:aa0bbca-capacity-v7`, image ID
 `sha256:780ddbb41c1fa34be0680b29da70b2b413959d52f684d5f919757a2dc79fcc37`,
 on both hosts. It retained the same model, vLLM, TP2/DCP1, FP8-KV, and DSpark
-configuration as the semantic gate.
+configuration as the semantic check.
 
-## Gate and result
+## Check and result
 
 The deterministic semantic request contained 6,958 prompt tokens. Two numeric
 facts were separated by thousands of padding tokens, and the model had to add
@@ -60,7 +60,7 @@ semantic request produced:
 - `Explain SparkCache in three sentences.` returned three coherent sentences;
 - both rank containers healthy after the request.
 
-## Bounded NVMe capacity gate
+## Bounded NVMe capacity check
 
 Each rank-local root `/cache/sparkcache-dsv4` was configured with
 `spark_cache_max_bytes=214748364800` (200 GiB),
@@ -102,7 +102,7 @@ The persisted `a79c32a50f0e` entry restored 6,912 tokens in 90.2 ms on rank 0
 and 105.7 ms on rank 1, returned exactly `SPARKCACHE_OK:9540`, and left the
 `42` canary coherent.
 
-The deterministic physical-NVMe capacity gate
+The deterministic physical-NVMe capacity check
 `deploy/deepseek_v4/capacity_gate.py` was also run in a separate empty root on
 both hosts from that qualified image. It published three entries, verified that
 maintenance skipped while another transaction remained open, aborted that
@@ -115,7 +115,7 @@ policy. Both hosts reported the same result:
 - three chunks were deleted, including the aborted transaction's orphan; and
 - the resulting store satisfied both the high and low watermarks.
 
-The gate exercises actual filesystem allocation accounting, LRU selection,
+The check exercises actual filesystem allocation accounting, LRU selection,
 open-transaction exclusion, and orphan collection. It does not simulate
 filling a 200 GiB root or qualify model-serving load behavior.
 
@@ -124,7 +124,7 @@ filling a 200 GiB root or qualify model-serving load behavior.
 This evidence qualifies one TP2/DCP1 development appliance. Model-serving load
 behavior and arbitrary DeepSeek-V4 deployments are unsupported. Block-page
 storage has bounded NVMe maintenance for end-of-prefill asynchronous
-snapshots. Native restore, streaming snapshots, and DCP-sharded block pages
+snapshots. SparkCache CUDA restore, streaming snapshots, and DCP-sharded block pages
 are unsupported by this profile. The qualified service used the Python
 asynchronous restore path; every chunk was
 checksum-verified before its pages were installed.
