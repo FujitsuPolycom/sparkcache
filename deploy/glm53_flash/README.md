@@ -12,6 +12,9 @@ records:
 - [`GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md`](../../GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md)
   records SparkCache direct CUDA restore of a 131,072-token prefix, multi-group
   recovery, and bounded shared GPU-prefix reuse through C16.
+- [`GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md`](../../GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md)
+  records research-only physical-page delta restore and different-root
+  shared-base reads for one exact PR535 TP4 image.
 
 Qualification applies only to the checkpoint revisions, source contracts,
 topology, settings, and immutable artifacts named in those records. It does
@@ -23,8 +26,9 @@ The qualified 8,192-token Python-placement artifact is public at digest
 Its immutable parent and build provenance are recorded in
 [`IMAGE_ANNOUNCEMENT.md`](IMAGE_ANNOUNCEMENT.md).
 
-Native 131,072-token restore and shared GPU-prefix reuse are qualified only for
-the source-bound runtime named in the native validation record. No public OCI
+SparkCache CUDA restore of a 131,072-token prefix and shared GPU-prefix reuse
+are qualified only for the source-bound runtime named in the SparkCache CUDA
+validation record. No public OCI
 digest carries that runtime. [`PUBLISHING.md`](PUBLISHING.md) requires every
 rebuilt digest to complete its own four-rank qualification.
 
@@ -45,8 +49,10 @@ every rank.
 Opaque page chunks are authenticated byte partitions of one complete boundary
 snapshot; they are not independent 256-token KV objects. Sparse prefix aliases
 are **implemented** only for `per_token_rows`. Creating an earlier GLM prefix
-by truncating an opaque page manifest is **unsupported**. Tail-only GLM
-publication requires a page-semantic format and a distinct cache namespace.
+by truncating an opaque page manifest is **unsupported**. Opt-in physical-page
+delta publication uses the distinct `page-tail-cow-v1` identity, authenticates
+the complete base-plus-delta graph, and is **research-only** for production
+serving. The PR535 validation record identifies its exact C1 and C8 evidence.
 
 Concurrent requests for the same persistent digest use one restore leader.
 After all workers report successful restoration, patched vLLM retains the
@@ -106,7 +112,8 @@ docker pull ghcr.io/fujitsupolycom/sparkring-glm53-sparkcache@sha256:cd4045bba2a
 Its parent is
 `ghcr.io/fujitsupolycom/sparkring-glm53-runtime@sha256:864adfe68f458223e186a19844ac80c7adc7365e5db1f25e109b85fc19850dcd`.
 The public artifact remains bound to SparkCache revision `3860a2250193a6679ac6bac857af53e0757841f8`;
-it does not contain the later native/shared-prefix source described above.
+it does not contain the later SparkCache CUDA/shared-prefix source described
+above.
 
 Build from the repository root after recording the exact local parent image
 ID and SparkCache source-tree digest:

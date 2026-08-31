@@ -19,8 +19,8 @@ or transport ports.
 - SparkCache: Python hybrid-memory-allocator (HMA) block-page codec, restore,
   and bounded LRU enabled
 - Capacity: 200 GiB high and 180 GiB low watermark per rank-local root
-- Not qualified: DCP2/DCP4, shared writers, streaming snapshots, native direct
-  restore, expert parallelism, or an unpinned checkpoint/runtime
+- Not qualified: DCP2/DCP4, shared writers, streaming snapshots, SparkCache
+  CUDA restore, expert parallelism, or an unpinned checkpoint/runtime
 
 The launcher fails closed when any of these inputs drift. Do not weaken a
 check to make an unfamiliar image start; derive and test a profile for that

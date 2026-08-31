@@ -64,6 +64,46 @@ and parent/runtime image
 The shared-prefix qualification used source revision `2b86fb9d...` and
 source-tree SHA-256 `b3e84d...` identified in the table above.
 
+### Qualified flat-v2 snapshot artifact
+
+The following artifact qualifies only C1 publication, restart, all-rank
+restore, and exact-codeword validation for one 131,072-token flat snapshot.
+
+| Attribute | Value |
+|---|---|
+| SparkCache source revision | `a1511d26a1fe2b17b24561bc52e376bf7f54b06a` |
+| SparkCache source tree | `4d5b8eb8c5c13793ee7a1e67b2b34bd38fcf4ddb` |
+| SparkCache source-tree SHA-256 | `6651f2823c816fac93779cbca54a8f19c0ed262830953149f3a87d189d1f833b` |
+| Flat-v2 header-accounting implementation origin | `229d7d6158261e9510ab99d7e82d532abb9ade01` |
+| Local image ID | `sha256:35b58a7bf414059c65b8f74e4e4b17ee6a81b7008e1bffbc9bd298b5e08c739e` |
+| Parent image ID | `sha256:cc2c0e2f812f4b78d5b91f863aaf46fd8e8e505844245aa50911af1fb8e061c0` |
+| Publication identity | `snapshot-v1` |
+| Root schema | `sparkcache-page-snapshot-manifest/v2` |
+| Persistent prefix | 131,072 tokens and 813,068,464 encoded bytes per rank |
+| Physical objects | 13 authenticated objects per rank, each at most 64 MiB |
+| Serving topology | GLM-5.3 Flash DFlash7, TP4/DCP1, one rank per DGX Spark |
+
+All-rank SparkCache CUDA restore took 1.55--1.70 seconds. Sequential
+macro-object reads and hashing consumed 1.35--1.50 seconds. The exact codeword
+matched before restart and after restoration. This result does not qualify a
+registry artifact, page-delta roots, or concurrent restored roots.
+
+### Rejected four-reader flat-v2 artifact
+
+SparkCache `eabe7fd0c878db7384ef87fe80a1e96b9bedcf67` implements bounded
+four-reader prefetch for flat-v2 objects. ARM64 image
+`sha256:df4e09a32cdbf1c0e69cc7c4c9e95d890d6c7a1e3eaac84f969912a16fd27dd3`
+structurally verified 813,068,464 bytes in 13 objects on every rank. Read and
+authentication took 484.1--528.8 ms, placement took 323.7--330.9 ms, and cache
+service took 1,231.7--1,331.2 ms.
+
+The restored response was `spark`; the deterministic oracle required `red`.
+A one-token-changed prompt of the same length recomputed `red`. Structural
+validation therefore did not establish semantic correctness. The image is
+rejected for deployment and does not replace the qualified single-reader
+artifact. The exact evidence is retained in
+[`flat-v2-four-reader-semantic-rejection-eabe7fd.json`](evidence/glm53-flash-dflash7-bf16/flat-v2-four-reader-semantic-rejection-eabe7fd.json).
+
 ## Implemented restore path
 
 SparkCache CUDA restore reads immutable `.spcc` objects directly into alternating

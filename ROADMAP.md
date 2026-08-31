@@ -25,10 +25,12 @@ page cache identities while leaving the default snapshot identity unchanged.
 
 GPU-free coverage proves copy-on-write extension, bounded page-delta
 compaction, recurrent/sliding boundary geometry, corruption removal,
-reference-aware maintenance, and verified reconstruction. Live GLM-5.3
-qualification must still measure publication bytes, cold restore latency,
-SparkCache CUDA-placement latency after page reconstruction, SSD writes, and continued
-generation across repeated conversation extensions.
+reference-aware maintenance, and verified reconstruction. The exact PR535
+GLM-5.3 TP4 record covers a 98,304-to-131,072-token delta restart and seven
+concurrent persistent 16,384-token restores sharing one base read per rank.
+Production qualification still requires repeated conversation extensions,
+publication-byte and SSD-write accounting, corruption recovery, and broader
+concurrency and geometry coverage.
 
 ### Per-entry retention controls
 
@@ -56,10 +58,12 @@ confirm completion.
 
 ### SparkCache CUDA restore expansion
 
-**Status: research-only qualification work.** Native multi-group page restore
-is implemented and source-runtime-qualified for the recorded GLM-5.3 TP4/DCP1
-profile. Tail page deltas reconstruct a fully verified snapshot before Python
-or SparkCache CUDA placement, but that path has no live performance qualification.
+**Status: research-only qualification work.** SparkCache CUDA multi-group page
+restore is implemented and source-runtime-qualified for the recorded GLM-5.3
+TP4/DCP1 full-snapshot profile. Direct page-delta placement and authenticated
+shared-base reads have exact research evidence for the PR535 TP4 image recorded
+in `GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md`; they are not production
+qualified.
 
 DeepSeek-V4 opaque HMA pages retain their verified Python restore path. CUDA
 support for that profile must describe all five page groups, preserve each

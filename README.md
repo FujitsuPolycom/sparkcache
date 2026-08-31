@@ -35,6 +35,10 @@ decode-context-parallel degree.
 | Streaming snapshots | **research-only** | GLM-5.2 DCP4 inventory; disabled for opaque page profiles |
 | Buddy replication | **research-only** | Protocol and receiver state exist; no network carrier is included |
 
+The [interactive prefix-reuse explorer](docs/sparkcache-prefix-explainer.html)
+shows longest-boundary selection, immutable tail publication, authenticated
+shared-base reads, and bounded GPU-prefix attachment.
+
 ## Verified persistent-restore model
 
 SparkCache uses a verified-or-recompute rule. Restored blocks reach inference

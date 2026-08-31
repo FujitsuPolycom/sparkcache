@@ -20,6 +20,6 @@ The Spark inter-rank collective layer is abbreviated `SIRCL` below.
 | The miss semantic gate succeeds, but no durable hit is available after restart. | The HTTP response waits for background cache publication. | Do not restart until every rank logs a matching snapshot and commit digest and its manifest/chunks pass filesystem checks. The miss command returning is not the store barrier. |
 | A hit returns the right text without a four-rank external restore. | Semantic equality alone proves SparkCache persistence. | After a coordinated restart, require four-rank manifest discovery, the scheduler quorum-hit log, a restore log on every rank, the exact response, and a post-restore canary. |
 
-For the qualification baseline, keep streaming snapshots and native direct
+For the qualification baseline, keep streaming snapshots and SparkCache CUDA
 restore disabled. The bounded rank-local NVMe policy remains 200 GiB high,
 180 GiB low, and TTL zero.
