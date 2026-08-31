@@ -7,8 +7,8 @@ import pytest
 
 from sparkcache.persistent_context_cache import cache_manifest
 from sparkcache.persistent_context_cache.cache_manifest import ManifestStore
+from sparkcache.profile_adapters.glm52_streaming import Glm52ReadyViewTranslator
 from sparkcache.streaming.publisher import (
-    Glm52ReadyViewTranslator,
     JournalState,
     ManifestSnapshotJournalWriter,
 )

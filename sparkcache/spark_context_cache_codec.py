@@ -30,7 +30,7 @@ _POSITION_STRUCT = struct.Struct("<I")
 
 class CodecError(ValueError):
     """Deterministic packing/unpacking failure. Callers convert this to a
-    fail-closed cache miss; it must never crash a serving process."""
+    cache miss and recomputation; it must never crash a serving process."""
 
 
 def _u32_array(values: Iterable[int], label: str) -> array:
@@ -185,17 +185,10 @@ class LayerPlan:
             raise CodecError(f"layer {self.name} has no per-token bytes")
 
 
-# Classification rules of the GLM-5.2 reference profile; the defaults for
-# callers that predate configurable profiles.
-DEFAULT_CLASSIFICATION_RULES: tuple[tuple[str, str], ...] = (
-    ("indexer", "sparse_indexer"),
-    ("draft", "mtp_draft_kv"),
-    ("mtp", "mtp_draft_kv"),
-    ("spec", "mtp_draft_kv"),
-)
-DEFAULT_REQUIRED_FAMILIES = frozenset(
-    {"target_ckv", "sparse_indexer", "mtp_draft_kv"}
-)
+# Generic callers classify an unrecognized layer as target state. Deployment
+# profiles supply any model-specific naming rules and required record families.
+DEFAULT_CLASSIFICATION_RULES: tuple[tuple[str, str], ...] = ()
+DEFAULT_REQUIRED_FAMILIES = frozenset({"target_ckv"})
 
 
 def classify_layer(

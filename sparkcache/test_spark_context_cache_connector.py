@@ -1,7 +1,7 @@
 """GPU-free tests for the SparkRing persistent context-cache connector.
 
 Simulates a four-rank DCP4 store -> pool wipe -> restore cycle with real
-byte comparisons on CPU torch tensors, plus the fail-closed sabotage paths.
+byte comparisons on CPU torch tensors, plus verified-or-recompute sabotage paths.
 vLLM is stubbed the same way as the sibling backend suites.
 """
 
@@ -26,6 +26,7 @@ from unittest import mock
 import torch
 
 import sparkcache.spark_context_cache_codec as codec
+from sparkcache.spark_context_cache_profiles import resolve_profile
 from sparkcache.spark_context_cache_restore_timing import (
     RESTORE_TIMING_PREFIX,
     RestoreTiming,
@@ -187,7 +188,12 @@ class CodecTests(unittest.TestCase):
             codec.local_slots_for_positions((33,), (7, 2), 4, 4)
 
     def test_record_round_trip_and_trailing_rejection(self) -> None:
-        plans = codec.build_layer_plans({"a.attn": 8, "b.indexer": 4, "c.draft": 2})
+        profile = resolve_profile("glm52-nvfp4")
+        plans = codec.build_layer_plans(
+            {"a.attn": 8, "b.indexer": 4, "c.draft": 2},
+            required_families=profile.required_families,
+            classification_rules=profile.classification_rules,
+        )
         rows = 3
         payload = codec.pack_record(
             plans, "target_ckv", {"a.attn": bytes(range(24))}, rows
@@ -198,8 +204,13 @@ class CodecTests(unittest.TestCase):
             codec.unpack_record(plans, "target_ckv", payload + b"x", rows)
 
     def test_layer_plans_require_all_kinds(self) -> None:
+        profile = resolve_profile("glm52-nvfp4")
         with self.assertRaises(codec.CodecError):
-            codec.build_layer_plans({"a.attn": 8, "b.indexer": 4})
+            codec.build_layer_plans(
+                {"a.attn": 8, "b.indexer": 4},
+                required_families=profile.required_families,
+                classification_rules=profile.classification_rules,
+            )
 
     def test_digest_binds_identity_salt(self) -> None:
         tokens = list(range(64))
@@ -673,14 +684,14 @@ class HybridPageRoundTripTests(unittest.TestCase):
             connector._native_execute_hybrid_restore = native_restore
             connector._native_execute_hybrid_placement = mock.Mock(
                 side_effect=AssertionError(
-                    "page-delta native restore must not receive materialized bytes"
+                    "page-delta SparkCache CUDA restore must not receive materialized bytes"
                 )
             )
             with mock.patch.object(
                 connector._store,
                 "restore_page_snapshot",
                 side_effect=AssertionError(
-                    "page-delta native restore must not materialize a snapshot"
+                    "page-delta SparkCache CUDA restore must not materialize a snapshot"
                 ),
             ):
                 self.assertTrue(
@@ -847,6 +858,7 @@ def _make_connector(
 ) -> SparkContextCacheConnector:
     values = {
         "spark_cache_root": str(root),
+        "spark_cache_model_profile": "glm52-nvfp4",
         "spark_cache_min_span_tokens": "256",
         "spark_cache_target_checkpoint_sha256": "1" * 64,
         "spark_cache_draft_checkpoint_sha256": "2" * 64,
@@ -6722,7 +6734,7 @@ class StreamingSnapshotConnectorSeamTests(unittest.TestCase):
                 settings=types.SimpleNamespace(),
             )
             # Finish reporting itself is GPU-free.  Keep the real adapter and
-            # lease registry, while replacing unrelated native-ring progress.
+            # lease registry, while replacing unrelated C++/CUDA-ring progress.
             worker_adapter._bound = True
             worker_adapter._runtime = object()
             worker_adapter._leases = BlockLeaseRegistry(
@@ -6965,6 +6977,7 @@ class DCP2RoundTripTests(unittest.TestCase):
             # A distinct DCP degree must produce a distinct cache identity.
             dcp2_values = {
                 "spark_cache_root": str(Path(directory) / "dcp2"),
+                "spark_cache_model_profile": "glm52-nvfp4",
                 "spark_cache_min_span_tokens": "256",
                 "spark_cache_target_checkpoint_sha256": "a" * 64,
                 "spark_cache_draft_checkpoint_sha256": "b" * 64,
@@ -7021,6 +7034,7 @@ class DCP2RoundTripTests(unittest.TestCase):
         root = Path(directory) / f"rank{tp_rank}"
         values = {
             "spark_cache_root": str(root),
+            "spark_cache_model_profile": "glm52-nvfp4",
             "spark_cache_min_span_tokens": "256",
             "spark_cache_target_checkpoint_sha256": "1" * 64,
             "spark_cache_draft_checkpoint_sha256": "2" * 64,
@@ -7286,6 +7300,7 @@ class DCP2RoundTripTests(unittest.TestCase):
         """Build a scheduler-side connector for DCP2 quorum tests."""
         sched_values = {
             "spark_cache_root": str(Path(directory) / "sched"),
+            "spark_cache_model_profile": "glm52-nvfp4",
             "spark_cache_min_span_tokens": "256",
             "spark_cache_target_checkpoint_sha256": "3" * 64,
             "spark_cache_draft_checkpoint_sha256": "4" * 64,
@@ -7335,6 +7350,7 @@ class DCP2RoundTripTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             values = {
                 "spark_cache_root": str(Path(directory)),
+                "spark_cache_model_profile": "glm52-nvfp4",
                 "spark_cache_min_span_tokens": "256",
                 "spark_cache_target_checkpoint_sha256": "5" * 64,
                 "spark_cache_draft_checkpoint_sha256": "6" * 64,
@@ -7471,7 +7487,7 @@ class DCP4CompatibilityTests(unittest.TestCase):
         """An identity dictionary without ``tp_shard_rank`` hashes to a
         different storage key than an identity with a concrete physical rank.
 
-        The fail-closed condition depends on the wire key set, not merely on
+        The verified-or-miss condition depends on the wire key set, not merely on
         the value assigned to ``tp_shard_rank``.
         """
         import hashlib
@@ -7516,7 +7532,7 @@ class DCP4CompatibilityTests(unittest.TestCase):
                 incomplete_storage_key,
                 canonical_identity.storage_key,
                 "Identities without tp_shard_rank must have a different "
-                "storage_key and fail closed.",
+                "storage_key and be rejected.",
             )
 
 
