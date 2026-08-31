@@ -356,8 +356,8 @@ recurrent pages are never shared.
 One process admits at most two base-read cohorts and 16 cumulative participants
 per cohort. A base must declare at most 1 GiB, and peak byte reservations across
 cohorts must fit within 2 GiB. Followers remain outside the load lanes until the
-base read completes. With two load lanes, a later unrelated restore can use the
-other lane while one base read is pending.
+base read completes. With more than one load lane, unrelated restore work can
+continue while one base read is pending.
 The buffer is released when every admitted participant acquires or abandons the
 result; there is no retained host-memory cache or time-based reuse. Requests
 that exceed a sharing bound use an independent restore. One

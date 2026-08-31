@@ -713,8 +713,11 @@ def parse_connector_config(
             "spark-context-cache: spark_cache_scheduler_probe must be"
             f" 'tp0' or 'none' (configured: {scheduler_probe!r})"
         )
+    # Page restores use one CUDA placement adapter and mapped arena per lane.
+    # Eight lanes bound concurrent placement memory while allowing one bounded
+    # request cohort to make progress without serializing every private delta.
     load_thread_limit = min(
-        2,
+        8,
         max(
             1,
             int(

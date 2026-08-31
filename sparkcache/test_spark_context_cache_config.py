@@ -152,10 +152,15 @@ class ParseConnectorConfigTests(unittest.TestCase):
         self.assertEqual(config.capacity_policy.low_watermark_bytes, 900000)
         self.assertEqual(config.capacity_policy.ttl_seconds, 3600)
 
-    def test_load_thread_limit_clamped_to_2(self) -> None:
+    def test_load_thread_limit_accepts_8_for_page_restores(self) -> None:
         vllm, _ = _make_vllm_config({"spark_cache_load_threads": "8"})
         config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
-        self.assertEqual(config.load_thread_limit, 2)
+        self.assertEqual(config.load_thread_limit, 8)
+
+    def test_load_thread_limit_clamped_to_8(self) -> None:
+        vllm, _ = _make_vllm_config({"spark_cache_load_threads": "16"})
+        config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+        self.assertEqual(config.load_thread_limit, 8)
 
     def test_load_thread_limit_native_restore_forces_one(self) -> None:
         vllm, _ = _make_vllm_config(
