@@ -307,7 +307,7 @@ See:
   TP4/DCP4 evidence;
 - `../GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md` for the GLM-5.3 Python
   page-placement record;
-- `../GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md` for GLM-5.3 SparkCache
+- `../GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md` for GLM-5.3 SparkCache
   CUDA restore, recovery, and C2/C8/C16 shared-prefix evidence. The historical
   filename remains stable for existing links;
 - `../deploy/deepseek_v4/DCP_SUPPORT.md` for the HMA DCP limitation; and
