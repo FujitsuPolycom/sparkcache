@@ -36,7 +36,7 @@ def test_prompt_shapes_are_stable_and_distinguish_scenarios() -> None:
     assert identical[0] == identical[1]
     assert shared[0] != shared[1]
     assert all(
-        prompt.startswith("Native 128K restore test.\n" + "benchmark " * 4)
+        prompt.startswith("SparkCache CUDA 128K restore test.\n" + "benchmark " * 4)
         for prompt in shared
     )
     assert "tail-00 tail-00" in shared[0]

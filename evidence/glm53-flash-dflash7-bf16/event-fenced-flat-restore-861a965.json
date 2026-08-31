@@ -1,0 +1,357 @@
+{
+  "schema": "sparkcache-glm53-event-fenced-flat-restore-research/v1",
+  "status": "research-only",
+  "conclusion": "two-exact-oracles-passed",
+  "runtime": {
+    "image_tag": "sparkring-glm53-sparkcache:dflash7-pr43-stream-readiness-research-861a965-arm64",
+    "image_id": "sha256:f2723a71b49509294072f5886b4fe081ac1f87dd1f931cc3cb8f538bc3eb037d",
+    "sparkcache_commit": "861a9651e043709340644b2c7512cf82fc86c701",
+    "sparkcache_tree": "85353fe6a7d7540bcb5d605945fb6fc792f9fdce",
+    "sparkcache_source_sha256": "b2f7277c3c0ee13e07e70aed45fdbc005f57ef4b4d8475af1dd84ef7f176eb88",
+    "vllm_native_commit": "da4d7be6c97434f6942292ed8abbf4b32dc44355",
+    "vllm_python_commit": "0b67266a0f37d6146a8403fb8482403c62f412d5",
+    "vllm_python_tree": "ba9484ccb33aa56e90ff2f447f15ca9b9da97639",
+    "b12x_commit": "b1d541f9e71a35f030d45fae437630fff7507c2a",
+    "vllm_contract_sha256": "8adbdfa3fd4b06b213c3aab45255a0b039f1c9940a4b1fad0efd004d263227c9",
+    "cuda_placement_library_sha256": "d57509052b73853bcc8e3c3f47bb81748d87b9cbd8d908fc20d4c79a09aa400c",
+    "topology": "TP4/DCP1",
+    "model": "glm-5.3-flash-nvfp4-dflash7-stream-readiness-861a965-0b67266-on-da4d7be-b12x-b1d541f-tp4",
+    "publication_schema": "snapshot-v1",
+    "effective_flat_manifest_schema": "sparkcache-page-snapshot-manifest/v2",
+    "cache_root": "/cache/jit/sparkcache-context/dflash7-snapshot-v1-safe",
+    "cache_namespace_impact": "none",
+    "maximum_authenticated_readers": 4,
+    "configured_io_workers": 8,
+    "load_threads": 1,
+    "maximum_pending_restores": 1
+  },
+  "prior_cuda_work_ordering": {
+    "status": "implemented",
+    "commit": "861a9651e043709340644b2c7512cf82fc86c701",
+    "event_scope": "one-per-start-load-callback",
+    "ordering_scope": "Python and SparkCache CUDA destination writes",
+    "record_failure_behavior": "recompute",
+    "gpu_free_tests": [
+      "test_async_restore_waits_for_prior_cuda_work_before_gpu_write",
+      "test_cuda_prerequisite_record_failure_recomputes_without_placement",
+      "test_pre_forward_shares_one_cuda_prerequisite_across_queued_loads"
+    ]
+  },
+  "captured_artifacts": {
+    "image_receipt": {
+      "bytes": 9238,
+      "sha256": "ac0959abee37bc7eab93de03d3fd0298fa8c901653b07292de81d146039cde70"
+    },
+    "archive_receipt": {
+      "bytes": 925,
+      "sha256": "9a7d243d349fa073234021ab2cd326fd8f2a42add2d8a16b2e2ae840af13b348"
+    },
+    "fanout_receipt": {
+      "bytes": 3093,
+      "sha256": "88579a0d9ca8c11447ccff2a3fc019ef29e5e099609a050726acaab17a69cdde"
+    },
+    "runtime_profile": {
+      "bytes": 16503,
+      "sha256": "2ecca7a80390280bd3f2b43bb8cb883b5c496cb3f6b4c79cbad00efb86ef1007"
+    },
+    "all_rank_image_verification": {
+      "bytes": 619,
+      "sha256": "b1eeb1273a4b96daf2da2a5b17be1574b17d2d4344415cc77b49b9b4b77b86ae"
+    },
+    "all_rank_preflight": {
+      "bytes": 73011,
+      "sha256": "6fb487261eabcf088830d08afb1ef6d722be9f16fce4ae1bad68f4736dc5b22e"
+    },
+    "all_rank_start_receipt": {
+      "bytes": 1096,
+      "sha256": "a50784a2ac54eec0bee164c1676b285bb65465e1249fe22847455e75f7d5c099"
+    },
+    "semantic_canary_receipt": {
+      "bytes": 424,
+      "sha256": "df6b0c6892f38154b5a4a693654bee1bceb556564e14a8a7ce43ad48033002b2"
+    },
+    "stored_prefix_request_receipt": {
+      "bytes": 394,
+      "sha256": "1a76f8daec8e020b98099bdf326dbd9fec386304ea1314254a08c5f0e5b249b5"
+    },
+    "distinct_prefix_request_receipt": {
+      "bytes": 394,
+      "sha256": "c9e21368b11658082535a3ca25cbca1b4a93981684688a4274545168baa59b08"
+    },
+    "stored_prefix_log_boundary": {
+      "bytes": 30,
+      "sha256": "77ed985ed5a25647e808e1cc5d02d70148f5ada082a4f620259fdb8a03f78ba0"
+    },
+    "distinct_prefix_log_boundary": {
+      "bytes": 30,
+      "sha256": "27c15206d46e7f2423cc18be0d78f0811eb20ee773d7fdc3f4dc921b9e594ec5"
+    }
+  },
+  "observations": [
+    {
+      "role": "stored-prefix-replay",
+      "captured_after_utc": "2026-08-30T20:53:12.5280514Z",
+      "request_id": "cmpl-9726270f6854a535-0-9c879921",
+      "context_digest": "b4161571df103395e2abae10372a90f35468561ec6c42bf4a7b7f0d0dfda5873",
+      "prompt_sha256": "965acd85cb28f804ab59cdc160688b04efaee14341e0bd27b647673e652ab812",
+      "request_receipt_sha256": "1a76f8daec8e020b98099bdf326dbd9fec386304ea1314254a08c5f0e5b249b5",
+      "response_sha256": "2c68d02422a6c4bdb42bd10221940894e746342bef6a56695fdbcb549074a355",
+      "prompt_tokens": 131073,
+      "restored_tokens": 131072,
+      "completion_tokens": 1,
+      "elapsed_seconds": 1.613022,
+      "http_status": 200,
+      "finish_reason": "length",
+      "expected_oracle": "red",
+      "observed_oracle": "red",
+      "oracle_match": true,
+      "rank_records": [
+        {
+          "rank": 0,
+          "canonical_payload_sha256": "8575656fde8d21055fee381be8e2132815818f8ef8d31efb687a344d543c4eb1",
+          "payload": {
+            "schema": "sparkcache-restore-timing/v1",
+            "request_id": "cmpl-9726270f6854a535-0-9c879921",
+            "digest": "b4161571df10",
+            "span_tokens": 131072,
+            "storage_mode": "block_pages_v1",
+            "outcome": "verified",
+            "chunk_count": 13,
+            "page_bytes": 813068464,
+            "queue_wait_ms": 0.264,
+            "service_ms": 1209.997,
+            "end_to_end_ms": 1210.262,
+            "phase_ms": {
+              "manifest_lookup": 0.504,
+              "prior_cuda_work": 0.030,
+              "restore_read": 452.461,
+              "reassembly_decode": 0.0,
+              "h2d_submit": 327.278,
+              "cuda_sync": 132.732
+            }
+          }
+        },
+        {
+          "rank": 1,
+          "canonical_payload_sha256": "c3123a46ee16a7a26a257fda5aa426a979510193dd5ba9ac6d56599acaa112bb",
+          "payload": {
+            "schema": "sparkcache-restore-timing/v1",
+            "request_id": "cmpl-9726270f6854a535-0-9c879921",
+            "digest": "b4161571df10",
+            "span_tokens": 131072,
+            "storage_mode": "block_pages_v1",
+            "outcome": "verified",
+            "chunk_count": 13,
+            "page_bytes": 813068464,
+            "queue_wait_ms": 0.342,
+            "service_ms": 1254.628,
+            "end_to_end_ms": 1254.970,
+            "phase_ms": {
+              "manifest_lookup": 0.358,
+              "prior_cuda_work": 0.032,
+              "restore_read": 471.380,
+              "reassembly_decode": 0.0,
+              "h2d_submit": 322.843,
+              "cuda_sync": 128.729
+            }
+          }
+        },
+        {
+          "rank": 2,
+          "canonical_payload_sha256": "7b573185546020e5f6402cde149f082861df764586fcee9f0f631231d9d5fc12",
+          "payload": {
+            "schema": "sparkcache-restore-timing/v1",
+            "request_id": "cmpl-9726270f6854a535-0-9c879921",
+            "digest": "b4161571df10",
+            "span_tokens": 131072,
+            "storage_mode": "block_pages_v1",
+            "outcome": "verified",
+            "chunk_count": 13,
+            "page_bytes": 813068464,
+            "queue_wait_ms": 0.105,
+            "service_ms": 1269.755,
+            "end_to_end_ms": 1269.860,
+            "phase_ms": {
+              "manifest_lookup": 0.282,
+              "prior_cuda_work": 0.063,
+              "restore_read": 481.920,
+              "reassembly_decode": 0.0,
+              "h2d_submit": 325.704,
+              "cuda_sync": 129.156
+            }
+          }
+        },
+        {
+          "rank": 3,
+          "canonical_payload_sha256": "17831326f8f197466483437f1e5891143c9ea6e892d10c10b81271edfd877486",
+          "payload": {
+            "schema": "sparkcache-restore-timing/v1",
+            "request_id": "cmpl-9726270f6854a535-0-9c879921",
+            "digest": "b4161571df10",
+            "span_tokens": 131072,
+            "storage_mode": "block_pages_v1",
+            "outcome": "verified",
+            "chunk_count": 13,
+            "page_bytes": 813068464,
+            "queue_wait_ms": 0.189,
+            "service_ms": 1296.936,
+            "end_to_end_ms": 1297.125,
+            "phase_ms": {
+              "manifest_lookup": 0.475,
+              "prior_cuda_work": 0.088,
+              "restore_read": 498.999,
+              "reassembly_decode": 0.0,
+              "h2d_submit": 326.602,
+              "cuda_sync": 131.789
+            }
+          }
+        }
+      ]
+    },
+    {
+      "role": "distinct-stored-prefix-replay",
+      "captured_after_utc": "2026-08-30T20:53:52.9347373Z",
+      "request_id": "cmpl-a0fbe1e38fe03ada-0-a3fc86ee",
+      "context_digest": "6d03abbdf6e6463f2da029f13b9db43e04bda238082dafa83a413da715443ab0",
+      "prompt_sha256": "4bb683a895caaaacb783294e65cb9c4b59c808c1e7b563a48edb6cd52b302dfe",
+      "request_receipt_sha256": "c9e21368b11658082535a3ca25cbca1b4a93981684688a4274545168baa59b08",
+      "response_sha256": "2c68d02422a6c4bdb42bd10221940894e746342bef6a56695fdbcb549074a355",
+      "prompt_tokens": 131073,
+      "restored_tokens": 131072,
+      "completion_tokens": 1,
+      "elapsed_seconds": 1.590435,
+      "http_status": 200,
+      "finish_reason": "length",
+      "expected_oracle": "red",
+      "observed_oracle": "red",
+      "oracle_match": true,
+      "rank_records": [
+        {
+          "rank": 0,
+          "canonical_payload_sha256": "324ffd917bf6698598ae2ea87925ef2e5a2aad1bed2119e23bc86796f6ced824",
+          "payload": {
+            "schema": "sparkcache-restore-timing/v1",
+            "request_id": "cmpl-a0fbe1e38fe03ada-0-a3fc86ee",
+            "digest": "6d03abbdf6e6",
+            "span_tokens": 131072,
+            "storage_mode": "block_pages_v1",
+            "outcome": "verified",
+            "chunk_count": 13,
+            "page_bytes": 813068464,
+            "queue_wait_ms": 0.518,
+            "service_ms": 1228.442,
+            "end_to_end_ms": 1228.960,
+            "phase_ms": {
+              "manifest_lookup": 0.385,
+              "prior_cuda_work": 0.018,
+              "restore_read": 485.359,
+              "reassembly_decode": 0.0,
+              "h2d_submit": 329.009,
+              "cuda_sync": 130.990
+            }
+          }
+        },
+        {
+          "rank": 1,
+          "canonical_payload_sha256": "a40dedcd4d031d530c20a0cb7d4a4d404b61d6382bbb9abd51c5d98bbd3757f2",
+          "payload": {
+            "schema": "sparkcache-restore-timing/v1",
+            "request_id": "cmpl-a0fbe1e38fe03ada-0-a3fc86ee",
+            "digest": "6d03abbdf6e6",
+            "span_tokens": 131072,
+            "storage_mode": "block_pages_v1",
+            "outcome": "verified",
+            "chunk_count": 13,
+            "page_bytes": 813068464,
+            "queue_wait_ms": 0.515,
+            "service_ms": 1298.931,
+            "end_to_end_ms": 1299.446,
+            "phase_ms": {
+              "manifest_lookup": 0.608,
+              "prior_cuda_work": 0.032,
+              "restore_read": 514.746,
+              "reassembly_decode": 0.0,
+              "h2d_submit": 322.691,
+              "cuda_sync": 130.960
+            }
+          }
+        },
+        {
+          "rank": 2,
+          "canonical_payload_sha256": "2b443f62cd68902f57ceaa48c8ab8e4d09ae27a56a259d9c162fc1c8cd36d3de",
+          "payload": {
+            "schema": "sparkcache-restore-timing/v1",
+            "request_id": "cmpl-a0fbe1e38fe03ada-0-a3fc86ee",
+            "digest": "6d03abbdf6e6",
+            "span_tokens": 131072,
+            "storage_mode": "block_pages_v1",
+            "outcome": "verified",
+            "chunk_count": 13,
+            "page_bytes": 813068464,
+            "queue_wait_ms": 0.525,
+            "service_ms": 1249.719,
+            "end_to_end_ms": 1250.244,
+            "phase_ms": {
+              "manifest_lookup": 0.306,
+              "prior_cuda_work": 0.033,
+              "restore_read": 462.661,
+              "reassembly_decode": 0.0,
+              "h2d_submit": 317.709,
+              "cuda_sync": 128.815
+            }
+          }
+        },
+        {
+          "rank": 3,
+          "canonical_payload_sha256": "a41638ce7174c05655f58aac846598d3702a0e58054e17939c8176de610234b3",
+          "payload": {
+            "schema": "sparkcache-restore-timing/v1",
+            "request_id": "cmpl-a0fbe1e38fe03ada-0-a3fc86ee",
+            "digest": "6d03abbdf6e6",
+            "span_tokens": 131072,
+            "storage_mode": "block_pages_v1",
+            "outcome": "verified",
+            "chunk_count": 13,
+            "page_bytes": 813068464,
+            "queue_wait_ms": 0.493,
+            "service_ms": 1259.927,
+            "end_to_end_ms": 1260.420,
+            "phase_ms": {
+              "manifest_lookup": 0.232,
+              "prior_cuda_work": 0.033,
+              "restore_read": 455.112,
+              "reassembly_decode": 0.0,
+              "h2d_submit": 332.381,
+              "cuda_sync": 131.778
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "raw_log_retention": {
+    "rank_log_files_retained": false,
+    "structured_payloads_retained": true,
+    "boundary_artifact_hashes_retained": true,
+    "limitation": "The receipt retains the exact structured timing payloads and capture-boundary hashes. It does not claim byte identity for complete container log windows because those windows were not retained as files."
+  },
+  "scope": {
+    "established": [
+      "Two distinct stored 131,072-token flat prefixes restored on all four ranks.",
+      "Both one-token completion oracles matched exactly.",
+      "Every rank reported verified block-pages restore with 813,068,464 bytes and 13 macro objects.",
+      "Each evaluated rank recorded the prior-CUDA-work prerequisite before destination placement."
+    ],
+    "not_established": [
+      "Tail-only page-delta semantic correctness",
+      "Segment-level shared restore correctness",
+      "Concurrent restore correctness",
+      "A generally qualified or deployable GLM-5.3 runtime"
+    ]
+  },
+  "admission": {
+    "deployable": false,
+    "qualified": false,
+    "reason": "Two exact flat-prefix replays pass, but tail-only page-delta, segment-sharing, and concurrent semantic validation remain incomplete."
+  }
+}
