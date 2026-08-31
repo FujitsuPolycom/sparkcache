@@ -39,6 +39,7 @@ def _make_vllm_config(
 
     values = {
         "spark_cache_root": "/cache/test",
+        "spark_cache_model_profile": "glm52-nvfp4",
         "spark_cache_target_checkpoint_sha256": "1" * 64,
         "spark_cache_draft_checkpoint_sha256": "2" * 64,
         "spark_cache_draft_policy": "separate",
@@ -124,7 +125,7 @@ class ParseConnectorConfigTests(unittest.TestCase):
         self.assertFalse(config.store_enabled)
         self.assertFalse(config.restore_enabled)
 
-    def test_default_root_and_profile(self) -> None:
+    def test_root_and_explicit_profile_from_environment(self) -> None:
         vllm, _ = _make_vllm_config({"spark_cache_root": None})
         vllm.kv_transfer_config.get_from_extra_config = lambda key, default=None: (
             default
@@ -133,6 +134,7 @@ class ParseConnectorConfigTests(unittest.TestCase):
             os.environ,
             {
                 "SPARK_CONTEXT_CACHE_ROOT": "/env/root",
+                "SPARK_CONTEXT_CACHE_MODEL_PROFILE": "glm52-nvfp4",
                 "SPARK_CONTEXT_CACHE_TARGET_CHECKPOINT_SHA256": "1" * 64,
                 "SPARK_CONTEXT_CACHE_DRAFT_CHECKPOINT_SHA256": "2" * 64,
                 "SPARK_CONTEXT_CACHE_DRAFT_POLICY": "separate",
@@ -152,6 +154,7 @@ class ParseConnectorConfigTests(unittest.TestCase):
                 "SPARK_CONTEXT_CACHE_MAX_BYTES": "1000000",
                 "SPARK_CONTEXT_CACHE_LOW_WATERMARK_BYTES": "900000",
                 "SPARK_CONTEXT_CACHE_TTL_SECONDS": "3600",
+                "SPARK_CONTEXT_CACHE_MODEL_PROFILE": "glm52-nvfp4",
                 "SPARK_CONTEXT_CACHE_TARGET_CHECKPOINT_SHA256": "1" * 64,
                 "SPARK_CONTEXT_CACHE_DRAFT_CHECKPOINT_SHA256": "2" * 64,
                 "SPARK_CONTEXT_CACHE_DRAFT_POLICY": "separate",
@@ -161,6 +164,17 @@ class ParseConnectorConfigTests(unittest.TestCase):
         self.assertEqual(config.capacity_policy.max_bytes, 1000000)
         self.assertEqual(config.capacity_policy.low_watermark_bytes, 900000)
         self.assertEqual(config.capacity_policy.ttl_seconds, 3600)
+
+    def test_missing_model_profile_is_rejected_explicitly(self) -> None:
+        vllm, _ = _make_vllm_config()
+        vllm.kv_transfer_config.get_from_extra_config = lambda key, default=None: (
+            default
+        )
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            self.assertRaisesRegex(RuntimeError, "model_profile is required"),
+        ):
+            cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
 
     def test_load_thread_limit_accepts_8_for_page_restores(self) -> None:
         vllm, _ = _make_vllm_config({"spark_cache_load_threads": "8"})
@@ -455,7 +469,7 @@ class IdentityBaseTests(unittest.TestCase):
 
 
 class ErrorPathTests(unittest.TestCase):
-    """Representative fail-closed startup validation paths."""
+    """Representative startup paths that reject unverified configuration."""
 
     def test_dcp_must_divide_tp(self) -> None:
         vllm, _ = _make_vllm_config(tp=4, dcp=3)

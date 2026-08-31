@@ -46,6 +46,7 @@ def _make_connector_pn(
 ) -> SparkContextCacheConnector:
     values = {
         "spark_cache_root": str(root),
+        "spark_cache_model_profile": "glm52-nvfp4",
         "spark_cache_min_span_tokens": "256",
         "spark_cache_target_checkpoint_sha256": "1" * 64,
         "spark_cache_draft_checkpoint_sha256": "2" * 64,
@@ -368,19 +369,34 @@ class SchedulerProbeNoneTests(unittest.TestCase):
 
 
 class ClassificationRuleTests(unittest.TestCase):
-    def test_default_rules_match_reference_layer_names(self) -> None:
+    def test_glm52_profile_rules_match_registered_layer_names(self) -> None:
+        profile = resolve_profile("glm52-nvfp4")
         self.assertEqual(
-            codec.classify_layer("model.layers.0.self_attn.indexer_cache"),
+            codec.classify_layer(
+                "model.layers.0.self_attn.indexer_cache",
+                profile.classification_rules,
+            ),
             "sparse_indexer",
         )
         self.assertEqual(
-            codec.classify_layer("draft.layers.0.self_attn.attn"),
+            codec.classify_layer(
+                "draft.layers.0.self_attn.attn",
+                profile.classification_rules,
+            ),
             "mtp_draft_kv",
         )
         self.assertEqual(
             codec.classify_layer("model.layers.0.self_attn.attn"),
             "target_ckv",
         )
+
+    def test_generic_defaults_do_not_infer_a_model_layout(self) -> None:
+        self.assertEqual(
+            codec.classify_layer("model.layers.0.self_attn.indexer_cache"),
+            "target_ckv",
+        )
+        plans = codec.build_layer_plans({"opaque.cache": 8})
+        self.assertEqual(plans[0].record_kind, "target_ckv")
 
     def test_custom_rules_first_match_wins_and_default_applies(self) -> None:
         rules = (("indexer", "sparse_indexer"),)

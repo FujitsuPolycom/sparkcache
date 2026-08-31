@@ -4,7 +4,7 @@ Both the scheduler and worker connector roles share one parsing path.
 ``parse_connector_config`` reads all SparkCache settings from a
 ``VllmConfig``-like object — extra-config keys, environment variables,
 parallel degrees, model profile, and KV-cache group topology. It validates
-the fail-closed deployment contract and returns an immutable
+the verified-or-recompute deployment contract and returns an immutable
 :class:`ConnectorConfig` carrying every value the connector needs at
 construction.
 
@@ -296,7 +296,7 @@ class ConnectorConfig:
 
     Every core connector field is determined solely by the vLLM config,
     extra-config keys, environment variables, and model profile supplied at
-    construction. The optional streaming factory owns its native artifact,
+    construction. The optional streaming factory owns its C++/CUDA artifact,
     vLLM-root, lease-contract, and timing settings and validates them while the
     connector is still starting. Both scheduler and worker roles receive the
     same :class:`ConnectorConfig` for the same deployment, so cache-identity
@@ -426,12 +426,16 @@ def parse_connector_config(
             f" pipeline_parallel_size={pp_degree}"
         )
     extra = kv_transfer_config.get_from_extra_config
-    profile_name = str(
-        extra(
-            "spark_cache_model_profile",
-            os.environ.get("SPARK_CONTEXT_CACHE_MODEL_PROFILE", "glm52-nvfp4"),
-        )
+    profile_value = extra(
+        "spark_cache_model_profile",
+        os.environ.get("SPARK_CONTEXT_CACHE_MODEL_PROFILE"),
     )
+    if profile_value is None or not str(profile_value).strip():
+        raise RuntimeError(
+            "spark-context-cache: spark_cache_model_profile is required; "
+            "select a registered deployment profile explicitly"
+        )
+    profile_name = str(profile_value).strip()
     try:
         profile = resolve_profile(profile_name)
     except ProfileError as error:

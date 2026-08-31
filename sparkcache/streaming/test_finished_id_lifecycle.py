@@ -12,6 +12,7 @@ from sparkcache.streaming.factory import (
     ModelServingStreamingSettings,
     WorkerStreamingSnapshotAdapter,
 )
+from sparkcache.spark_context_cache_profiles import resolve_profile
 
 
 class _Fence:
@@ -38,7 +39,7 @@ class _PreemptingRuntime:
 
 def _adapter() -> WorkerStreamingSnapshotAdapter:
     adapter = WorkerStreamingSnapshotAdapter(
-        types.SimpleNamespace(),
+        types.SimpleNamespace(_profile=resolve_profile("glm52-nvfp4")),
         settings=ModelServingStreamingSettings(
             native_library_path=Path("/opt/spark/lib/libspcc_snapshot.so"),
             native_library_sha256="a" * 64,
