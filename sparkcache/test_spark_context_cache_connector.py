@@ -346,6 +346,7 @@ class HybridPageRoundTripTests(unittest.TestCase):
             num_prefill_checkpoint_blocks = 1
 
         config = types.SimpleNamespace(
+            num_blocks=10,
             kv_cache_groups=(
                 types.SimpleNamespace(
                     kv_cache_spec=FullAttentionSpec(),
@@ -357,7 +358,7 @@ class HybridPageRoundTripTests(unittest.TestCase):
                     is_eagle_group=False,
                     layer_names=("state",),
                 ),
-            )
+            ),
         )
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(
@@ -782,18 +783,30 @@ def _hybrid_kv_cache_config() -> types.SimpleNamespace:
     class FullAttentionSpec:
         block_size = 512
         storage_block_size = 512
-        page_size_bytes = 528
+
+        def __init__(self, page_size_bytes: int = 528) -> None:
+            self.page_size_bytes = page_size_bytes
 
     class SlidingWindowSpec:
         sliding_window = 512
+        page_size_bytes = 256
 
     class SlidingWindowMLASpec(SlidingWindowSpec):
         pass
 
     return types.SimpleNamespace(
+        num_blocks=10,
         kv_cache_groups=(
             types.SimpleNamespace(
-                kv_cache_spec=FullAttentionSpec(),
+                kv_cache_spec=types.SimpleNamespace(
+                    block_size=512,
+                    storage_block_size=512,
+                    page_size_bytes=528,
+                    kv_cache_specs={
+                        "compressed": FullAttentionSpec(16),
+                        "full": FullAttentionSpec(512),
+                    },
+                ),
                 is_eagle_group=False,
                 layer_names=("compressed", "full"),
             ),
@@ -807,7 +820,7 @@ def _hybrid_kv_cache_config() -> types.SimpleNamespace:
                 is_eagle_group=False,
                 layer_names=("state",),
             ),
-        )
+        ),
     )
 
 
@@ -815,11 +828,12 @@ def _deepseek_tp4_hma_config() -> types.SimpleNamespace:
     class FullAttentionSpec:
         block_size = 256
         storage_block_size = 256
-        page_size_bytes = 2
+        page_size_bytes = 4
 
     class SlidingWindowSpec:
         def __init__(self, window: int):
             self.sliding_window = window
+            self.page_size_bytes = 4
 
     counts = (83, 23, 23, 21, 20)
     block_sizes = (256, 64, 64, 4, 8)
@@ -838,7 +852,7 @@ def _deepseek_tp4_hma_config() -> types.SimpleNamespace:
             spec = types.SimpleNamespace(
                 block_size=block_size,
                 storage_block_size=block_size,
-                page_size_bytes=2,
+                page_size_bytes=4 * count,
                 kv_cache_specs={name: SlidingWindowSpec(window) for name in names},
             )
         groups.append(
@@ -848,7 +862,7 @@ def _deepseek_tp4_hma_config() -> types.SimpleNamespace:
                 layer_names=names,
             )
         )
-    return types.SimpleNamespace(kv_cache_groups=tuple(groups))
+    return types.SimpleNamespace(num_blocks=1024, kv_cache_groups=tuple(groups))
 
 
 def _deepseek_tp4_hma_pools(
@@ -1128,8 +1142,7 @@ class CudaRestoreSelectionTests(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 RuntimeError,
-                "SparkCache CUDA restore configuration was rejected:.*"
-                "SHA-256 mismatch",
+                "SparkCache CUDA restore configuration was rejected:.*SHA-256 mismatch",
             ):
                 connector.register_kv_caches(_fake_cuda_pools())
 
@@ -1428,9 +1441,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
         )
         connector._storage_mode = "block_pages_v1"
         connector._page_layout = types.SimpleNamespace(digest="layout")
-        connector._select_group_blocks_for_span = mock.Mock(
-            return_value=((1,), (2,))
-        )
+        connector._select_group_blocks_for_span = mock.Mock(return_value=((1,), (2,)))
         evidence = PageBaseReadEvidence(
             identity_storage_key="identity",
             base_context_digest="a" * 64,
@@ -1465,9 +1476,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
 
     def test_start_load_kv_c16_reads_one_pre_registered_page_base(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            connector, evidence, plans = self._page_base_queue_fixture(
-                Path(directory)
-            )
+            connector, evidence, plans = self._page_base_queue_fixture(Path(directory))
             started = threading.Event()
             release = threading.Event()
             reads = 0
@@ -1504,7 +1513,9 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                     16,
                 )
                 release.set()
-                self.assertEqual(_drain(connector), set(plan.request_id for plan in plans))
+                self.assertEqual(
+                    _drain(connector), set(plan.request_id for plan in plans)
+                )
 
             self.assertEqual(reads, 1)
             self.assertEqual(connector.counters["load_verified"], 16)
@@ -1528,9 +1539,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
 
     def test_start_load_kv_joins_eight_seven_and_singleton_batches(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            connector, evidence, plans = self._page_base_queue_fixture(
-                Path(directory)
-            )
+            connector, evidence, plans = self._page_base_queue_fixture(Path(directory))
             started = threading.Event()
             release = threading.Event()
             reads = 0
@@ -1567,7 +1576,9 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                     16,
                 )
                 release.set()
-                self.assertEqual(_drain(connector), set(plan.request_id for plan in plans))
+                self.assertEqual(
+                    _drain(connector), set(plan.request_id for plan in plans)
+                )
 
             self.assertEqual(reads, 1)
             self.assertEqual(connector.counters["page_base_flight_participants"], 16)
@@ -1585,9 +1596,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            connector, evidence, plans = self._page_base_queue_fixture(
-                Path(directory)
-            )
+            connector, evidence, plans = self._page_base_queue_fixture(Path(directory))
             unrelated = _ReqPlan(
                 "unrelated-after-singleton",
                 "f" * 64,
@@ -1681,9 +1690,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            connector, evidence, plans = self._page_base_queue_fixture(
-                Path(directory)
-            )
+            connector, evidence, plans = self._page_base_queue_fixture(Path(directory))
             unrelated = _ReqPlan(
                 "unrelated",
                 "f" * 64,
@@ -1749,9 +1756,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            connector, evidence, plans = self._page_base_queue_fixture(
-                Path(directory)
-            )
+            connector, evidence, plans = self._page_base_queue_fixture(Path(directory))
             leader_entered = threading.Event()
             allow_leader_resolve = threading.Event()
             base_read = threading.Event()
@@ -1799,9 +1804,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
 
     def test_two_completed_base_flights_keep_summary_counters_exact(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            connector, evidence, _plans = self._page_base_queue_fixture(
-                Path(directory)
-            )
+            connector, evidence, _plans = self._page_base_queue_fixture(Path(directory))
             evidences = (
                 evidence,
                 dataclasses.replace(
@@ -1854,9 +1857,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
 
     def test_shutdown_releases_pending_c16_base_cohort(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            connector, evidence, plans = self._page_base_queue_fixture(
-                Path(directory)
-            )
+            connector, evidence, plans = self._page_base_queue_fixture(Path(directory))
             read_started = threading.Event()
             release_read = threading.Event()
 
@@ -1956,8 +1957,8 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
 
             connector._lookup_reusable = mock.Mock(side_effect=lookup)
 
-            runnable, deferred, page_base_keys = connector._prepare_page_base_read_cohorts(
-                [*shared, unrelated]
+            runnable, deferred, page_base_keys = (
+                connector._prepare_page_base_read_cohorts([*shared, unrelated])
             )
 
             self.assertEqual(runnable[0].request_id, "shared-0")
@@ -1968,7 +1969,9 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
             )
             self.assertEqual(set(page_base_keys), {plan.request_id for plan in shared})
             self.assertEqual(connector._load_thread_limit, 2)
-            self.assertEqual(connector._page_base_reads.snapshot().registered_members, 16)
+            self.assertEqual(
+                connector._page_base_reads.snapshot().registered_members, 16
+            )
 
     def test_singleton_scheduler_batch_joins_reading_page_base(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2230,14 +2233,14 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                 kv_cache_config=_hybrid_kv_cache_config(),
             )
             pools = {
-                "full": torch.arange(20 * 64 * 8, dtype=torch.int64)
-                .reshape(20, 64, 8)
+                "full": torch.arange(10 * 64 * 8, dtype=torch.int64)
+                .reshape(10, 64, 8)
                 .to(torch.uint8),
-                "compressed": torch.arange(20 * 2 * 8, dtype=torch.int64)
-                .reshape(20, 2, 8)
+                "compressed": torch.arange(10 * 2 * 8, dtype=torch.int64)
+                .reshape(10, 2, 8)
                 .to(torch.uint8),
-                "state": torch.arange(20 * 4 * 16, dtype=torch.float32).reshape(
-                    20, 4, 16
+                "state": torch.arange(10 * 4 * 16, dtype=torch.float32).reshape(
+                    10, 4, 16
                 ),
             }
             connector.register_kv_caches(pools)

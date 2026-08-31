@@ -471,13 +471,15 @@ class HybridReuseWindowTests(unittest.TestCase):
             page_size_bytes = 64
 
         class SlidingWindowSpec:
-            def __init__(self, window: int) -> None:
+            def __init__(self, window: int, page_size_bytes: int) -> None:
                 self.sliding_window = window
+                self.page_size_bytes = page_size_bytes
 
         class SlidingWindowMLASpec(SlidingWindowSpec):
             pass
 
         return types.SimpleNamespace(
+            num_blocks=256,
             kv_cache_groups=(
                 types.SimpleNamespace(
                     kv_cache_spec=FullAttentionSpec(),
@@ -489,7 +491,9 @@ class HybridReuseWindowTests(unittest.TestCase):
                         block_size=64,
                         storage_block_size=64,
                         page_size_bytes=64,
-                        kv_cache_specs={"swa": SlidingWindowMLASpec(sliding_window)},
+                        kv_cache_specs={
+                            "swa": SlidingWindowMLASpec(sliding_window, 64)
+                        },
                     ),
                     is_eagle_group=False,
                     layer_names=("swa",),
@@ -499,7 +503,7 @@ class HybridReuseWindowTests(unittest.TestCase):
                         block_size=4,
                         storage_block_size=4,
                         page_size_bytes=32,
-                        kv_cache_specs={"state": SlidingWindowMLASpec(8)},
+                        kv_cache_specs={"state": SlidingWindowMLASpec(8, 32)},
                     ),
                     is_eagle_group=False,
                     layer_names=("state",),
@@ -509,12 +513,12 @@ class HybridReuseWindowTests(unittest.TestCase):
                         block_size=8,
                         storage_block_size=8,
                         page_size_bytes=32,
-                        kv_cache_specs={"state128": SlidingWindowMLASpec(128)},
+                        kv_cache_specs={"state128": SlidingWindowMLASpec(128, 32)},
                     ),
                     is_eagle_group=False,
                     layer_names=("state128",),
                 ),
-            )
+            ),
         )
 
     @staticmethod
@@ -680,10 +684,12 @@ class HybridReuseWindowTests(unittest.TestCase):
                 kv_cache_config=config,
             )
             pools = {
-                "full": torch.arange(8 * 64, dtype=torch.uint8).reshape(8, 1, 64),
-                "swa": torch.arange(16 * 64, dtype=torch.uint8).reshape(16, 1, 64),
-                "state": torch.arange(100 * 8, dtype=torch.float32).reshape(100, 1, 8),
-                "state128": torch.arange(80 * 8, dtype=torch.float32).reshape(80, 1, 8),
+                "full": torch.arange(256 * 64, dtype=torch.uint8).reshape(256, 1, 64),
+                "swa": torch.arange(256 * 64, dtype=torch.uint8).reshape(256, 1, 64),
+                "state": torch.arange(256 * 8, dtype=torch.float32).reshape(256, 1, 8),
+                "state128": torch.arange(256 * 8, dtype=torch.float32).reshape(
+                    256, 1, 8
+                ),
             }
             connector.register_kv_caches(pools)
             source_groups = (
@@ -762,13 +768,11 @@ class HybridReuseWindowTests(unittest.TestCase):
             root = Path(directory)
             first = self._windowed_connector(root, 128)
             pools = {
-                "full": torch.arange(8 * 1 * 64, dtype=torch.uint8).reshape(8, 1, 64),
-                "swa": torch.arange(8 * 1 * 64, dtype=torch.uint8).reshape(8, 1, 64),
-                "state": torch.arange(80 * 1 * 8, dtype=torch.float32).reshape(
-                    80, 1, 8
-                ),
-                "state128": torch.arange(40 * 1 * 8, dtype=torch.float32).reshape(
-                    40, 1, 8
+                "full": torch.arange(256 * 64, dtype=torch.uint8).reshape(256, 1, 64),
+                "swa": torch.arange(256 * 64, dtype=torch.uint8).reshape(256, 1, 64),
+                "state": torch.arange(256 * 8, dtype=torch.float32).reshape(256, 1, 8),
+                "state128": torch.arange(256 * 8, dtype=torch.float32).reshape(
+                    256, 1, 8
                 ),
             }
             first.register_kv_caches(pools)
@@ -865,6 +869,7 @@ class DefectD16HybridPageBoundaryTests(unittest.TestCase):
             num_prefill_checkpoint_blocks = 1
 
         config = types.SimpleNamespace(
+            num_blocks=256,
             kv_cache_groups=(
                 types.SimpleNamespace(
                     kv_cache_spec=FullAttentionSpec(),
@@ -876,7 +881,7 @@ class DefectD16HybridPageBoundaryTests(unittest.TestCase):
                     is_eagle_group=False,
                     layer_names=("recurrent",),
                 ),
-            )
+            ),
         )
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(
@@ -1020,6 +1025,219 @@ class DefectD16HybridPageBoundaryTests(unittest.TestCase):
             )
 
 
+class DefectD18ManagerPageViewTests(unittest.TestCase):
+    """Manager block IDs address complete physical pages (defect D-18)."""
+
+    def test_block_page_round_trip_groups_split_attention_rows(self) -> None:
+        class FullAttentionSpec:
+            block_size = 2304
+            storage_block_size = 2304
+            page_size_bytes = 36
+
+        class MambaSpec:
+            block_size = 2304
+            storage_block_size = 2304
+            page_size_bytes = 36
+            mamba_cache_mode = "align"
+            tokens_per_state = 2304
+            num_speculative_blocks = 0
+            num_prefill_checkpoint_blocks = 1
+
+        manager_blocks = 8
+        kernel_blocks_per_manager_page = 9
+        config = types.SimpleNamespace(
+            num_blocks=manager_blocks,
+            kv_cache_groups=(
+                types.SimpleNamespace(
+                    kv_cache_spec=FullAttentionSpec(),
+                    is_eagle_group=False,
+                    layer_names=("full",),
+                ),
+                types.SimpleNamespace(
+                    kv_cache_spec=MambaSpec(),
+                    is_eagle_group=False,
+                    layer_names=("recurrent",),
+                ),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                block_size=256,
+                extra_config={"spark_cache_model_profile": "glm53-flash-hybrid"},
+                tp=1,
+                dcp=1,
+                kv_cache_config=config,
+            )
+            pools = {
+                "full": torch.arange(
+                    manager_blocks * kernel_blocks_per_manager_page * 4,
+                    dtype=torch.int32,
+                )
+                .remainder(251)
+                .to(torch.uint8)
+                .reshape(
+                    manager_blocks * kernel_blocks_per_manager_page,
+                    1,
+                    4,
+                ),
+                "recurrent": torch.arange(
+                    manager_blocks * 36,
+                    dtype=torch.int32,
+                )
+                .add(73)
+                .remainder(251)
+                .to(torch.uint8)
+                .reshape(manager_blocks, 1, 36),
+            }
+            connector.register_kv_caches(pools)
+            source_groups = ((3,), (5,))
+            destination_groups = ((6,), (2,))
+            source_full = pools["full"][27:36].clone()
+            source_recurrent = pools["recurrent"][[5]].clone()
+            plan = _ReqPlan(
+                "split-page-store",
+                "d" * 64,
+                2304,
+                source_groups[0],
+                True,
+                block_ids_by_group=source_groups,
+            )
+
+            connector._store_one(plan)
+            pools["full"][54:63].zero_()
+            pools["recurrent"][[2]].zero_()
+
+            self.assertTrue(
+                connector._load_one(
+                    _ReqPlan(
+                        "split-page-restore",
+                        plan.digest,
+                        plan.span_tokens,
+                        destination_groups[0],
+                        False,
+                        block_ids_by_group=destination_groups,
+                    )
+                )
+            )
+            self.assertTrue(torch.equal(pools["full"][54:63], source_full))
+            self.assertTrue(torch.equal(pools["recurrent"][[2]], source_recurrent))
+
+    def test_block_page_round_trip_includes_physical_page_tail(self) -> None:
+        class FullAttentionSpec:
+            block_size = 2304
+            storage_block_size = 2304
+            page_size_bytes = 36
+
+        class UniformTypeKVCacheSpecs:
+            block_size = 2304
+            storage_block_size = 2304
+            page_size_bytes = 36
+            kv_cache_specs = {"full": FullAttentionSpec()}
+
+        manager_blocks = 8
+        config = types.SimpleNamespace(
+            num_blocks=manager_blocks,
+            kv_cache_groups=(
+                types.SimpleNamespace(
+                    kv_cache_spec=UniformTypeKVCacheSpecs(),
+                    is_eagle_group=False,
+                    layer_names=("full",),
+                ),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                block_size=256,
+                extra_config={"spark_cache_model_profile": "glm53-flash-hybrid"},
+                tp=1,
+                dcp=1,
+                kv_cache_config=config,
+            )
+            storage = torch.arange(
+                17 + manager_blocks * FullAttentionSpec.page_size_bytes,
+                dtype=torch.int32,
+            ).to(torch.uint8)
+            backing = storage[17:]
+            logical = torch.as_strided(
+                backing,
+                size=(manager_blocks, 1, 4),
+                stride=(FullAttentionSpec.page_size_bytes, 4, 1),
+            )
+            connector.register_kv_caches({"full": logical})
+            physical = connector._layer_tensors["full"]
+            self.assertEqual(tuple(physical.shape), (manager_blocks, 1, 36))
+
+            source_block = 3
+            destination_block = 6
+            source_page = backing[36 * source_block : 36 * (source_block + 1)].clone()
+            plan = _ReqPlan(
+                "physical-tail-store",
+                "e" * 64,
+                2304,
+                (source_block,),
+                True,
+                block_ids_by_group=((source_block,),),
+            )
+            connector._store_one(plan)
+            backing[36 * destination_block : 36 * (destination_block + 1)].zero_()
+
+            self.assertTrue(
+                connector._load_one(
+                    _ReqPlan(
+                        "physical-tail-restore",
+                        plan.digest,
+                        plan.span_tokens,
+                        (destination_block,),
+                        False,
+                        block_ids_by_group=((destination_block,),),
+                    )
+                )
+            )
+            restored = backing[36 * destination_block : 36 * (destination_block + 1)]
+            self.assertTrue(torch.equal(restored, source_page))
+
+    def test_split_attention_rows_must_evenly_cover_manager_blocks(self) -> None:
+        class FullAttentionSpec:
+            block_size = 2304
+            storage_block_size = 2304
+            page_size_bytes = 36
+
+        manager_blocks = 8
+        config = types.SimpleNamespace(
+            num_blocks=manager_blocks,
+            kv_cache_groups=(
+                types.SimpleNamespace(
+                    kv_cache_spec=FullAttentionSpec(),
+                    is_eagle_group=False,
+                    layer_names=("full",),
+                ),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                block_size=256,
+                extra_config={"spark_cache_model_profile": "glm53-flash-hybrid"},
+                tp=1,
+                dcp=1,
+                kv_cache_config=config,
+            )
+            malformed = torch.zeros(manager_blocks * 9 - 1, 1, 4)
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "71 kernel rows for 8 manager blocks",
+            ):
+                connector.register_kv_caches({"full": malformed})
+
+            self.assertEqual(connector._layer_tensors, {})
+
+
 class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
     """D-17: vLLM identifies off-table recurrent replay boundaries."""
 
@@ -1047,6 +1265,7 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
             num_prefill_checkpoint_blocks = 0
 
         return types.SimpleNamespace(
+            num_blocks=128,
             kv_cache_groups=(
                 types.SimpleNamespace(
                     kv_cache_spec=FullAttentionSpec(),
@@ -1058,7 +1277,7 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
                     is_eagle_group=False,
                     layer_names=("recurrent",),
                 ),
-            )
+            ),
         )
 
     @classmethod
@@ -1143,9 +1362,7 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
                 extra_config={"spark_cache_model_profile": "glm53-flash-hybrid"},
             )
             boundary_metadata = {
-                "dflash-recurrent-boundary": [
-                    (1, self.BOUNDARY_BLOCK, self.BOUNDARY)
-                ]
+                "dflash-recurrent-boundary": [(1, self.BOUNDARY_BLOCK, self.BOUNDARY)]
             }
             first_metadata = scheduler.build_connector_meta(
                 self._scheduler_output(boundary_metadata)
@@ -1153,9 +1370,7 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
             self.assertEqual(first_metadata.plans, [])
             self.assertIn("dflash-recurrent-boundary", scheduler._store_progress)
             self.assertEqual(
-                scheduler._store_recurrent_boundaries[
-                    "dflash-recurrent-boundary"
-                ],
+                scheduler._store_recurrent_boundaries["dflash-recurrent-boundary"],
                 ((1, self.BOUNDARY_BLOCK),),
             )
             output = self._cached_scheduler_output(
@@ -1224,9 +1439,7 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
                 )
             )
             self.assertTrue(torch.equal(pools["full"][[90, 91, 92]], expected_full))
-            self.assertTrue(
-                torch.equal(pools["recurrent"][[93]], expected_recurrent)
-            )
+            self.assertTrue(torch.equal(pools["recurrent"][[93]], expected_recurrent))
 
     def test_nonaligned_boundary_waits_for_partial_tail_cow_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1244,9 +1457,7 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
             output = self._scheduler_output()
             request = output.scheduled_new_reqs[0]
             request.prompt_token_ids = list(range(self.NONALIGNED_PROMPT_TOKENS))
-            output.num_scheduled_tokens[request.req_id] = (
-                self.NONALIGNED_PROMPT_TOKENS
-            )
+            output.num_scheduled_tokens[request.req_id] = self.NONALIGNED_PROMPT_TOKENS
             output.recurrent_boundary_blocks = {
                 request.req_id: [(1, self.BOUNDARY_BLOCK, self.BOUNDARY)]
             }
@@ -1271,9 +1482,7 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
                 self._cached_scheduler_output(
                     num_computed_tokens=self.NONALIGNED_PROMPT_TOKENS + 1,
                     recurrent_boundary_blocks={
-                        request.req_id: [
-                            (1, self.COW_BLOCK, self.NONALIGNED_BOUNDARY)
-                        ]
+                        request.req_id: [(1, self.COW_BLOCK, self.NONALIGNED_BOUNDARY)]
                     },
                 )
             )
@@ -1322,11 +1531,7 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
 
     def test_conflicting_mapping_poisons_latched_publication(self) -> None:
         output = self._scheduler_output(
-            {
-                "dflash-recurrent-boundary": [
-                    (1, self.BOUNDARY_BLOCK, self.BOUNDARY)
-                ]
-            }
+            {"dflash-recurrent-boundary": [(1, self.BOUNDARY_BLOCK, self.BOUNDARY)]}
         )
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(
@@ -1381,9 +1586,7 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
                 num_computed_tokens=2304,
                 num_scheduled_tokens=2304,
                 recurrent_boundary_blocks={
-                    "dflash-recurrent-boundary": [
-                        (1, self.BOUNDARY_BLOCK - 1, 2304)
-                    ]
+                    "dflash-recurrent-boundary": [(1, self.BOUNDARY_BLOCK - 1, 2304)]
                 },
             )
             self.assertEqual(connector.build_connector_meta(middle).plans, [])
@@ -1446,18 +1649,14 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
                     )
                     self.assertEqual(metadata.plans, [])
                     self.assertEqual(
-                        connector.counters[
-                            "recurrent_boundary_metadata_rejected"
-                        ],
+                        connector.counters["recurrent_boundary_metadata_rejected"],
                         0,
                     )
                     self.assertIn(
                         "dflash-recurrent-boundary", connector._store_progress
                     )
                     connector.request_finished(
-                        types.SimpleNamespace(
-                            request_id="dflash-recurrent-boundary"
-                        ),
+                        types.SimpleNamespace(request_id="dflash-recurrent-boundary"),
                         [],
                     )
                     self.assertNotIn(
@@ -1507,9 +1706,7 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
                     )
                     self.assertEqual(metadata.plans, [])
                     self.assertEqual(
-                        connector.counters[
-                            "recurrent_boundary_metadata_rejected"
-                        ],
+                        connector.counters["recurrent_boundary_metadata_rejected"],
                         1,
                     )
 
@@ -1532,9 +1729,7 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
             )
             connector.build_connector_meta(output)
 
-            with mock.patch.object(
-                connector_module.logger, "warning"
-            ) as warning:
+            with mock.patch.object(connector_module.logger, "warning") as warning:
                 metadata = connector.build_connector_meta(
                     self._cached_scheduler_output(
                         num_computed_tokens=self.NONALIGNED_PROMPT_TOKENS,
@@ -1619,11 +1814,7 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
             request_id = "dflash-recurrent-boundary"
             connector.build_connector_meta(
                 self._scheduler_output(
-                    {
-                        request_id: [
-                            (1, self.BOUNDARY_BLOCK, self.BOUNDARY)
-                        ]
-                    }
+                    {request_id: [(1, self.BOUNDARY_BLOCK, self.BOUNDARY)]}
                 )
             )
             self.assertIn(request_id, connector._store_recurrent_boundaries)
@@ -1658,9 +1849,7 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
                 self._cached_scheduler_output(
                     num_computed_tokens=self.PROMPT_TOKENS + 1,
                     recurrent_boundary_blocks={
-                        request_id: [
-                            (1, self.BOUNDARY_BLOCK + 10, self.BOUNDARY)
-                        ]
+                        request_id: [(1, self.BOUNDARY_BLOCK + 10, self.BOUNDARY)]
                     },
                 )
             )

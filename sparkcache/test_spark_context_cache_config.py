@@ -14,6 +14,7 @@ import json
 import os
 import types
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -738,6 +739,42 @@ class KvGroupTopologyTests(unittest.TestCase):
             connector_config.group_topology[0]["recurrent_state"][
                 "tokens_per_state"
             ] = 512
+
+    def test_block_page_identity_separates_complete_manager_pages(self) -> None:
+        class FullAttentionSpec:
+            block_size = 2304
+            storage_block_size = 2304
+            page_size_bytes = 4096
+
+        kv_cache_config = types.SimpleNamespace(
+            num_blocks=8,
+            kv_cache_groups=(
+                types.SimpleNamespace(
+                    kv_cache_spec=FullAttentionSpec(),
+                    is_eagle_group=False,
+                    layer_names=("attention",),
+                ),
+            ),
+        )
+        vllm, _ = _make_vllm_config(
+            {"spark_cache_model_profile": "glm53-flash-hybrid"},
+            dcp=1,
+            tp=1,
+            block_size=2304,
+        )
+        connector_config = cfg.parse_connector_config(
+            vllm, vllm.kv_transfer_config, kv_cache_config
+        )
+        identity = connector_config.build_identity(0, 0)
+
+        self.assertIn(":manager-pages-v1:", identity.quantization_layout)
+        row_indexed_identity = replace(
+            identity,
+            quantization_layout=identity.quantization_layout.replace(
+                ":manager-pages-v1:", ":", 1
+            ),
+        )
+        self.assertNotEqual(identity.storage_key, row_indexed_identity.storage_key)
 
     def test_mamba_non_align_policy_fails_closed(self) -> None:
         class MambaSpec:

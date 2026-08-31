@@ -2021,22 +2021,166 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             # fences or raises without releasing blocks of unknown status.
             runtime.handle_preemptions(kv_connector_metadata)
 
+    def _manager_page_view(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        page_bytes: int,
+    ) -> torch.Tensor:
+        """Expose one complete physical manager page on dimension zero."""
+
+        manager_blocks = int(getattr(self._kv_cache_config, "num_blocks", 0) or 0)
+        if manager_blocks <= 0:
+            raise RuntimeError(
+                "spark-context-cache: block-page storage has no manager blocks"
+            )
+        if tensor.dim() < 2:
+            raise RuntimeError(
+                f"spark-context-cache: layer {name} has unexpected"
+                f" shape {tuple(tensor.shape)}"
+            )
+        kernel_rows = int(tensor.shape[0])
+        if kernel_rows % manager_blocks:
+            raise RuntimeError(
+                "spark-context-cache: layer "
+                f"{name} has {kernel_rows} kernel rows for {manager_blocks}"
+                " manager blocks"
+            )
+        kernel_rows_per_page = kernel_rows // manager_blocks
+        element_size = int(tensor.element_size())
+        logical_page_bytes = (
+            kernel_rows_per_page
+            * math.prod(int(size) for size in tensor.shape[1:])
+            * element_size
+        )
+        manager_page_stride = (
+            int(tensor.stride(0)) * element_size * kernel_rows_per_page
+        )
+        if manager_page_stride <= 0 or not (
+            logical_page_bytes <= page_bytes <= manager_page_stride
+        ):
+            raise RuntimeError(
+                "spark-context-cache: layer "
+                f"{name} page geometry is incompatible: logical={logical_page_bytes}"
+                f" physical={page_bytes} stride={manager_page_stride}"
+            )
+        try:
+            byte_view = tensor.view(torch.uint8)
+            storage_offset = int(byte_view.storage_offset())
+            required_storage_bytes = (
+                storage_offset + (manager_blocks - 1) * manager_page_stride + page_bytes
+            )
+            storage_bytes = int(byte_view.untyped_storage().nbytes())
+            if required_storage_bytes > storage_bytes:
+                raise RuntimeError(
+                    f"physical pages require {required_storage_bytes} bytes"
+                    f" from storage of {storage_bytes} bytes"
+                )
+            return torch.as_strided(
+                byte_view,
+                size=(manager_blocks, 1, page_bytes),
+                stride=(manager_page_stride, page_bytes, 1),
+                storage_offset=storage_offset,
+            )
+        except RuntimeError as error:
+            raise RuntimeError(
+                f"spark-context-cache: layer {name} physical page view is invalid"
+            ) from error
+
+    @staticmethod
+    def _layer_page_bytes(group_spec: Any, layer_name: str) -> int:
+        """Resolve one layer's physical page size from its manager group."""
+
+        layer_specs = getattr(group_spec, "kv_cache_specs", None)
+        if isinstance(layer_specs, Mapping):
+            layer_spec = layer_specs.get(layer_name)
+            if layer_spec is None:
+                raise RuntimeError(
+                    "spark-context-cache: group has no cache specification for"
+                    f" layer {layer_name}"
+                )
+        else:
+            layer_spec = group_spec
+        page_bytes = int(getattr(layer_spec, "page_size_bytes", 0) or 0)
+        if page_bytes <= 0:
+            raise RuntimeError(
+                f"spark-context-cache: layer {layer_name} has no physical page size"
+            )
+        return page_bytes
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        self._layer_tensors = dict(kv_caches)
+        registered_tensors = dict(kv_caches)
+        if self._storage_mode == "block_pages_v1":
+            groups = tuple(getattr(self._kv_cache_config, "kv_cache_groups", ()) or ())
+            manager_blocks = int(getattr(self._kv_cache_config, "num_blocks", 0) or 0)
+            page_bytes_by_layer: dict[str, int] = {}
+            for group in groups:
+                spec = getattr(group, "kv_cache_spec", None)
+                for name in getattr(group, "layer_names", ()) or ():
+                    if name in page_bytes_by_layer:
+                        raise RuntimeError(
+                            "spark-context-cache: layer belongs to multiple"
+                            f" KV-cache groups: {name}"
+                        )
+                    page_bytes_by_layer[name] = self._layer_page_bytes(spec, name)
+            unassigned = set(registered_tensors) - set(page_bytes_by_layer)
+            missing = set(page_bytes_by_layer) - set(registered_tensors)
+            if unassigned or missing:
+                raise RuntimeError(
+                    "spark-context-cache: registered layers disagree with KV-cache"
+                    f" groups: missing={sorted(missing)}, extra={sorted(unassigned)}"
+                )
+            split_kernel_layers = 0
+            physical_tail_layers = 0
+            physical_tail_bytes = 0
+            for name, tensor in registered_tensors.items():
+                if tensor.dim() < 2:
+                    continue
+                kernel_rows = int(tensor.shape[0])
+                if manager_blocks > 0 and kernel_rows % manager_blocks == 0:
+                    kernel_rows_per_page = kernel_rows // manager_blocks
+                    split_kernel_layers += int(kernel_rows_per_page > 1)
+                    logical_page_bytes = (
+                        kernel_rows_per_page
+                        * math.prod(int(size) for size in tensor.shape[1:])
+                        * int(tensor.element_size())
+                    )
+                    tail_bytes = page_bytes_by_layer[name] - logical_page_bytes
+                    if tail_bytes > 0:
+                        physical_tail_layers += 1
+                        physical_tail_bytes += tail_bytes
+            registered_tensors = {
+                name: self._manager_page_view(
+                    name,
+                    tensor,
+                    page_bytes_by_layer[name],
+                )
+                for name, tensor in registered_tensors.items()
+            }
+            logger.info(
+                "spark-context-cache: manager-page inventory blocks=%d layers=%d"
+                " split_kernel_layers=%d physical_tail_layers=%d"
+                " physical_tail_bytes_per_manager_page=%d",
+                manager_blocks,
+                len(registered_tensors),
+                split_kernel_layers,
+                physical_tail_layers,
+                physical_tail_bytes,
+            )
+        self._layer_tensors = registered_tensors
         if self._storage_mode == "block_pages_v1":
             page_groups = []
             assigned: set[str] = set()
-            groups = tuple(getattr(self._kv_cache_config, "kv_cache_groups", ()) or ())
             for group in groups:
                 spec = getattr(group, "kv_cache_spec", None)
                 layers = []
                 for name in sorted(getattr(group, "layer_names", ()) or ()):
-                    if name not in kv_caches:
+                    if name not in registered_tensors:
                         raise RuntimeError(
                             f"spark-context-cache: group layer {name} was not"
                             " registered"
                         )
-                    tensor = kv_caches[name]
+                    tensor = registered_tensors[name]
                     page_shape = tuple(int(size) for size in tensor.shape[1:])
                     layers.append(
                         PageLayer(
@@ -2061,7 +2205,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         ],
                     )
                 )
-            unassigned = set(kv_caches) - assigned
+            unassigned = set(registered_tensors) - assigned
             if unassigned:
                 raise RuntimeError(
                     "spark-context-cache: registered layers lack a KV-cache"
@@ -2069,7 +2213,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 )
             self._page_layout = PageLayout(tuple(page_groups))
         widths = {}
-        for name, tensor in sorted(kv_caches.items()):
+        for name, tensor in sorted(registered_tensors.items()):
             if tensor.dim() < 3:
                 raise RuntimeError(
                     f"spark-context-cache: layer {name} has unexpected"
@@ -3268,10 +3412,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     ]:
         """Pre-register bases and defer followers until shared bytes are ready."""
 
-        if (
-            self._storage_mode != "block_pages_v1"
-            or self._page_layout is None
-        ):
+        if self._storage_mode != "block_pages_v1" or self._page_layout is None:
             return list(load_plans), [], {}
         identity = self._identity(self._worker_rank())
         grouped: dict[PageBaseReadFlightKey, list[_ReqPlan]] = {}
@@ -3315,19 +3456,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             page_base_keys.update((request_id, key) for request_id in member_ids)
             leader_id = registration.leader_request_id
             if registration.flight_state in {"ready", "error"}:
-                priority.extend(
-                    plan for plan in plans if plan.request_id in member_ids
-                )
+                priority.extend(plan for plan in plans if plan.request_id in member_ids)
                 continue
             if registration.flight_state == "registered" and leader_id in member_ids:
                 priority.append(by_request[leader_id])
                 member_ids.remove(leader_id)
-            deferred.extend(
-                plan for plan in plans if plan.request_id in member_ids
-            )
-        independent = [
-            plan for plan in load_plans if plan.request_id not in registered
-        ]
+            deferred.extend(plan for plan in plans if plan.request_id in member_ids)
+        independent = [plan for plan in load_plans if plan.request_id not in registered]
         return [*priority, *independent], deferred, page_base_keys
 
     def _release_page_base_deferred(
