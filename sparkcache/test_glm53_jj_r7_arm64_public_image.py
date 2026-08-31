@@ -12,8 +12,6 @@ RECEIPT = (
     / "jj-r7-arm64-public-image-c4-smoke.json"
 )
 IMAGE_RECORD = ROOT / "deploy" / "glm53_flash" / "JJ_R7_ARM64_IMAGE.md"
-README = ROOT / "README.md"
-PACKAGE_README = ROOT / "sparkcache" / "README.md"
 DEPLOYMENT_GUIDE = ROOT / "deploy" / "glm53_flash" / "README.md"
 HISTORICAL_IMAGE = ROOT / "deploy" / "glm53_flash" / "IMAGE_ANNOUNCEMENT.md"
 HISTORICAL_PUBLISHING = ROOT / "deploy" / "glm53_flash" / "PUBLISHING.md"
@@ -204,9 +202,9 @@ def test_public_arm64_receipt_binds_bounded_c4_smoke() -> None:
 
 def test_public_arm64_docs_route_by_digest_without_overclaiming() -> None:
     image_record = " ".join(IMAGE_RECORD.read_text(encoding="utf-8").split())
-    readme = " ".join(README.read_text(encoding="utf-8").split())
+    deployment = " ".join(DEPLOYMENT_GUIDE.read_text(encoding="utf-8").split())
 
-    for text in (image_record, readme):
+    for text in (image_record, deployment):
         assert MANIFEST in text
         assert QUICKSTART_PATH in text
         assert "implemented and tp4 smoke-verified" in text.casefold()
@@ -216,28 +214,21 @@ def test_public_arm64_docs_route_by_digest_without_overclaiming() -> None:
     assert PARENT in image_record
     assert PARENT_CONFIG in image_record
     assert "does not prove shared-base read coalescing" in image_record
-    assert "not generally qualified" in readme.casefold()
     assert QUICKSTART_DURABLE_URL in image_record
+    assert QUICKSTART_URL in deployment
 
 
 def test_canonical_docs_route_to_public_arm64_manifest() -> None:
-    documents = (README, PACKAGE_README, DEPLOYMENT_GUIDE, IMAGE_RECORD)
+    documents = (DEPLOYMENT_GUIDE, IMAGE_RECORD)
 
     for path in documents:
         text = path.read_text(encoding="utf-8")
         assert MANIFEST in text, path
         assert "not generally qualified" in text.casefold(), path
 
-    readme = README.read_text(encoding="utf-8")
     deployment = DEPLOYMENT_GUIDE.read_text(encoding="utf-8")
-    assert "The canonical public image is" in readme
     assert "canonical public image route" in deployment
-    assert QUICKSTART_URL in readme
     assert QUICKSTART_URL in deployment
-    assert "export GLM53_IMAGE='" + (
-        "ghcr.io/fujitsupolycom/sparkring-glm53-sparkcache@" + MANIFEST
-    ) in readme
-    assert 'docker pull "$GLM53_IMAGE"' in readme
 
 
 def test_historical_image_docs_cannot_be_mistaken_for_current_route() -> None:
@@ -254,7 +245,7 @@ def test_historical_image_docs_cannot_be_mistaken_for_current_route() -> None:
 def test_canonical_docs_exclude_superseded_local_image_identities() -> None:
     canonical = "\n".join(
         path.read_text(encoding="utf-8")
-        for path in (README, PACKAGE_README, DEPLOYMENT_GUIDE, EXPLAINER)
+        for path in (DEPLOYMENT_GUIDE, EXPLAINER)
     )
 
     for stale in (
@@ -271,7 +262,8 @@ def test_canonical_docs_exclude_superseded_local_image_identities() -> None:
 
 
 def test_front_door_names_an_existing_pypi_artifact() -> None:
-    readme = README.read_text(encoding="utf-8")
+    readme_path = ROOT / "README.md"
+    readme = readme_path.read_text(encoding="utf-8")
     prose = " ".join(readme.split())
 
     assert "sparkcache[connector]==0.1.0a2" in readme

@@ -1,113 +1,68 @@
-# Streaming snapshot opt-in requirements
+# Streaming snapshot opt-in contract
 
-**Status: research-only.** The implementation is default-off and restricted to
-the declared GLM-5.2 DCP4 cache inventory. Live profile qualification requires
-a cache-off versus streaming-cache serving comparison.
+**Status: research-only.** Streaming publication is default-off and available
+only through a deployment profile with an attested cache inventory and vLLM
+ownership contract.
 
-`spark_cache_streaming_snapshots` (or
-`SPARK_CONTEXT_CACHE_STREAMING_SNAPSHOTS`) is default-off. The connector
-accepts the explicit `0/1` and `false/true` forms. `0` does not construct a
-ring, import the snapshot CUDA binding, reserve a KV block, alter scheduler
-metadata, or change the synchronous end-of-prefill store path.
+`spark_cache_streaming_snapshots` and
+`SPARK_CONTEXT_CACHE_STREAMING_SNAPSHOTS` accept explicit `0/1` or
+`false/true` values.
 
-An explicit `1` lazy-installs the builtin scheduler or worker factory. It
-fails connector construction unless all of the following attest:
+When disabled, SparkCache does not construct a ring, import the snapshot CUDA
+binding, reserve KV blocks, change scheduler metadata, or alter synchronous
+end-of-prefill publication.
 
-- `spark_cache_streaming_native_library` /
-  `SPARK_CONTEXT_CACHE_STREAMING_NATIVE_LIBRARY` is an absolute path;
-- `spark_cache_streaming_native_library_sha256` /
-  `SPARK_CONTEXT_CACHE_STREAMING_NATIVE_LIBRARY_SHA256` is the pinned
-  lowercase SHA-256;
-- the installed vLLM sources match
-  `runtime_patches/vllm-kv-block-lease-contract.json`;
-- worker cache registration is exactly the proven GLM-5.2 DCP4 inventory:
-  79 target sources at 368 bytes/token and 22 indexer sources at
-  132 bytes/token, with colocated MTP state.
+## Required attestations
 
-The scheduler adapter remains CUDA-free. The worker does not hash/load the
-C++/CUDA library, allocate the arena, retain tensor views, or start its writer
-until `register_kv_caches()` has produced the final canonical inventory.
+Enabling streaming rejects connector construction unless:
 
-## Exact model-serving call seams
+- the snapshot library path is absolute;
+- the configured library SHA-256 matches the file;
+- the installed vLLM sources match the profile's block-lease contract;
+- worker cache registration exactly matches the profile's source inventory;
+- the profile declares record ordering, strides, draft policy, and logical
+  position mapping; and
+- the profile declares a bounded arena size and ring depth.
 
-1. Scheduler admission sends a stable request ID, digest, span, completed
-   watermark, and full block table to every worker. Each worker begins its
-   rank-local `ManifestStore.begin_context(...)` transaction and allocates a
-   nonzero local context sequence.
-2. After each worker prefill step, the model runner must supply the largest
-   completed 256-token-aligned prefix, the producer CUDA stream, and the
-   request's current physical block table. `build_connector_meta()` carries
-   only a promise; `wait_for_save()` converts it to a completed watermark
-   after the corresponding target/MTP forward on that stream.
-3. The worker maps each offered logical batch with `BlockTableRangeMapper`,
-   calls `BlockLeaseRegistry.try_reserve(...)`, then calls C++/CUDA
-   `try_submit(...)` *inside* `LeaseHandle.submit(...)`. The submission
-   callback must return a completion fence before it releases the registry
-   lock; otherwise preemption can recycle source blocks in the submit/event
-   gap.
-4. Once C++/CUDA `poll(...)` returns READY, the worker releases the block lease
-   and claims the generation-checked ring ticket. It lends the immutable view
-   to `ManifestSnapshotJournalWriter`; after the returned completion proves
-   the writer no longer reads the view, the worker releases the ticket.
-5. Only after all expected chunks are durable may it call
-   `commit_manifest()`. Backpressure, cancellation, preemption, writer error,
-   or shutdown must call `abort()`, abandon the C++/CUDA context, and drain or
-   retain leases according to `BlockLeaseRegistry`'s ownership rules.
+The scheduler role remains CUDA-free. The worker loads no library and allocates
+no arena until `register_kv_caches()` supplies the complete tensor inventory.
 
-## Implemented GLM-5.2 profile
+## Serving lifecycle
 
-- `NativeSnapshotRing` owns the attested handle lifecycle, a single source
-  inventory, generation-checked tickets, zero-copy read-only READY views,
-  abandonment, and checked shutdown. The explicit model-serving factory
-  constructs it only from worker `register_kv_caches()`.
-- The standalone matrix configuration is frozen as mapped-host memory, ring
-  depth 2, 64-MiB slots, and a 1,024-row GLM macro payload of exactly
-  32,743,424 bytes.
-  `Glm52ReadyViewTranslator` fixes the 79 target-CKV then 22 sparse-indexer
-  source order; MTP is colocated in target CKV and is not a separate record.
-- `ManifestSnapshotJournalWriter` accepts runtime-owned READY views, performs
-  the bounded per-256-token canonical copy, appends through
-  `ManifestTransaction`, and completes only after durable append. It commits
-  only exact full-span coverage. Backpressure and writer errors abort
-  invisibly; it never claims, releases, or abandons a ring ticket.
-- The connector transports scheduler promises and converts them into completed
-  watermarks only from post-forward `wait_for_save()`, with the current CUDA
-  producer stream.
-- The model-serving factory retains every exact contiguous row alias for the
-  entire ring lifetime and rejects copy-producing/noncontiguous layouts.
-- Scheduler delayed-free, worker lease completion, preemption/resume,
-  serving-preserving transaction abort, manifest-last publication, and committed
-  digest advertisement are covered by the connector/runtime/publisher tests.
+1. The scheduler offers a stable request ID, digest, span, completed watermark,
+   and block table.
+2. Post-forward worker code supplies the actual producer CUDA stream and the
+   largest completed aligned prefix.
+3. The worker maps only the physical blocks needed by each offered range.
+4. Lease reservation and CUDA submission occur in one synchronized operation.
+5. GPU completion releases source-block leases and exposes a read-only ring
+   view to the journal writer.
+6. The ring slot remains owned until the writer no longer reads that view.
+7. The manifest becomes visible only after every expected range is durable.
 
-The standalone C++/CUDA matrix and GPU-free integration tests do not establish
-live GLM performance or zero regression. Qualification requires the cache-off
-versus streaming-cache live-model comparison.
+Backpressure, cancellation, preemption, writer failure, or shutdown abandons
+the optional publication. It does not delay unrelated serving or expose a
+partial manifest.
 
-## READY-view to `ContextChunk` ownership edge
+## Ownership boundary
 
-The translator and writer implement this edge:
+The C++/CUDA payload is a model-profile-defined, layer-major macro batch. The
+profile translator converts it into canonical SparkCache records and derives
+any logical-position record absent from the CUDA payload.
 
-- A C++/CUDA macro-batch record is layer-major across every submitted row.
-  `_SnapshotChunks` requires layer-major bytes for each individual 256-token
-  chunk. Translation takes one 64-row DCP4 slice from each layer and joins the
-  slices in the frozen C++/CUDA source-ordinal order.
-- `ContextChunk` accepts owned `bytes` only. A ring-backed
-  `memoryview` cannot satisfy that contract, so the writer makes one bounded
-  canonical chunk copy while it borrows the claimed view. Its completion
-  becomes observable only after `append_chunk()` has durably returned; the
-  runtime then releases the arena.
-- `LOGICAL_POSITIONS` is not present in the C++/CUDA payload. Translation must
-  derive and pack it; the translator generates the exact interleave-1
-  DCP-rank positions from logical start and shard rank.
-- Numeric C++/CUDA record kinds and source ordinals are proven identical to
-  the connector's `StateRecord`, `LayerPlan`, draft-policy, and boundary-policy
-  ordering. The journal writer enforces DCP4, `live_forward`, and
-  `colocated_target`; model-serving connector registration constructs and
-  attests that exact inventory and retains its aliasing row views for ring
-  lifetime.
+`ContextChunk` owns immutable bytes. A ring-backed view therefore remains
+borrowed until the writer either appends it durably or copies it into its own
+immutable buffer.
 
-GPU-free tests feed a 1,024-row synthetic GLM READY view through the frozen
-layout and require byte-identical canonical encoded chunks, including DCP
-positions and the absence of a separate MTP record. A connector-to-runtime-to-
-publisher boundary test also proves that `_held` and worker stats advertise a
-digest only after the full manifest commit, never on partial append or abort.
+The runtime owns every ring ticket and block lease. The writer owns neither.
+The manifest commit is the only visibility edge.
+
+## Qualification boundary
+
+GPU-free runtime, connector, and byte-comparison tests establish state-machine
+behavior. They do not establish live-model correctness, performance, or lack
+of interference.
+
+Each model-specific streaming profile must record exact source and artifact
+identities plus a cache-off versus cache-on live comparison. Registered
+profiles are documented under [`../../deploy/`](../../deploy/).

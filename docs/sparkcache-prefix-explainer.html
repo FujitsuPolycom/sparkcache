@@ -346,8 +346,8 @@
         <p class="lede">SparkCache finds the longest stored prompt boundary available on every physical rank. It can publish only a conversation extension, share authenticated row segments, coalesce identical opaque-page base reads, and attach concurrent requests to verified GPU blocks.</p>
       </div>
       <aside class="hero-note">
-        <strong>Example configuration</strong>
-        <p>The qualified example uses tensor parallelism degree 4 (TP4) and decode-context parallelism degree 1 (DCP1) across four DGX Spark systems. Each rank owns a different shard and local cache.</p>
+        <strong>Mechanism illustration</strong>
+        <p>The diagrams use four illustrative physical ranks. SparkCache's deployment profile defines the real rank count, model layout, and supported topology.</p>
       </aside>
     </header>
 
@@ -355,8 +355,8 @@
       <div class="status-pill"><span class="status-tag">Implemented</span><span class="value">256 tokens</span><span class="label">logical identity and admission boundary</span></div>
       <div class="status-pill"><span class="status-tag">Implemented</span><span class="value">Longest exact</span><span class="label">stored boundary advertised by every rank</span></div>
       <div class="status-pill"><span class="status-tag">Implemented</span><span class="value">Row aliases</span><span class="label">sparse authenticated metadata over durable row chunks</span></div>
-      <div class="status-pill"><span class="status-tag limited">Qualified</span><span class="value">128K · C1</span><span class="label">full snapshot-v1 restore with exact codeword</span></div>
-      <div class="status-pill"><span class="status-tag limited">Research-only</span><span class="value">C8 page tails</span><span class="label">eight exact persistent restores shared one base read per rank</span></div>
+      <div class="status-pill"><span class="status-tag">Implemented</span><span class="value">Copy-on-write</span><span class="label">immutable row tails and page deltas</span></div>
+      <div class="status-pill"><span class="status-tag">Implemented</span><span class="value">Bounded sharing</span><span class="label">shared bases and verified GPU prefixes</span></div>
     </div>
 
     <section aria-labelledby="problem-title">
@@ -389,7 +389,7 @@
           </div>
           <div class="chunk-grid" aria-label="Logical cache intervals"><div class="chunk-cell">A<small>0–256</small></div><div class="chunk-cell">B<small>256–512</small></div><div class="chunk-cell">C<small>512–768</small></div><div class="chunk-cell">D<small>768–1024</small></div><div class="chunk-cell">E<small>1024–1280</small></div><div class="chunk-cell remainder">+67</div></div>
           <div class="span-summary"><div class="safe-span">five complete logical intervals · 1,280 tokens</div><div class="remainder-span" aria-label="67-token remainder"></div></div>
-          <p class="context-note"><strong>Important:</strong> these 256-token intervals are real for hashing, alignment, manifest positions, and admission. In GLM-5.3 <code>block_pages_v1</code>, they do not correspond to independently usable physical KV objects.</p>
+          <p class="context-note"><strong>Important:</strong> these 256-token intervals are real for hashing, alignment, manifest positions, and admission. For <code>block_pages_v1</code>, they do not imply independently reusable physical page objects.</p>
         </article>
       </div>
     </section>
@@ -461,11 +461,11 @@
           <p class="alias-caption">An authenticated descriptor segment contains at most 16 chunk descriptors. By default, <code>sparkcache-prefix-alias/v1</code> selects 4,096-token boundaries plus the source boundary and retains at most 64 aliases. The aliases reference durable chunks without copying payload bytes.</p>
         </article>
         <article class="aliases">
-          <h3><span class="status-tag limited">Qualified page snapshots</span> <code>block_pages_v1</code></h3>
+          <h3><span class="status-tag">Implemented</span> <code>block_pages_v1</code></h3>
           <p class="mini-copy">SparkCache encodes one opaque hybrid-memory-allocator (HMA) page snapshot for an exact boundary. Flat v2 roots use <code>sparkcache-page-snapshot-manifest/v2</code> and content-addressed objects of at most 64 MiB.</p>
           <div class="alias-row"><span class="alias-name">snapshot</span><div class="refs"><span class="ref">header</span><span class="ref">all layer pages</span><span class="ref">all groups</span></div></div>
-          <div class="alias-row"><span class="alias-name">813 MB flat</span><div class="refs"><span class="ref">64 MiB #1</span><span class="ref">64 MiB #2</span><span class="ref">…</span><span class="ref">tail #13</span></div></div>
-          <p class="alias-caption"><span class="status-tag limited">Qualified · bounded C1 evidence</span> Flat macro objects reduce 512 logical-chunk files to 13 payload objects at 813,068,464 bytes. The exact historical artifact restored the snapshot on every rank in 1.55–1.70 seconds and returned the required codeword before and after restart. Artifact identifiers and a rejected parallel-reader candidate remain in the linked SparkCache CUDA restore record, not in this current-image guide. Legacy flat manifests remain readable. <strong>Opaque-page prefix aliases are unsupported:</strong> truncating an encoded snapshot cannot create an earlier GLM prefix.</p>
+          <div class="alias-row"><span class="alias-name">flat root</span><div class="refs"><span class="ref">64 MiB #1</span><span class="ref">64 MiB #2</span><span class="ref">…</span><span class="ref">bounded tail</span></div></div>
+          <p class="alias-caption">Macro objects avoid one physical file per logical token interval. Legacy flat manifests remain readable. <strong>Opaque-page prefix aliases are unsupported:</strong> truncating a byte-partitioned snapshot cannot create an earlier semantic prefix.</p>
         </article>
       </div>
     </section>
@@ -492,7 +492,7 @@
           <div class="publication-flow" aria-label="Verified page snapshot, authenticated page delta, and reconstructed complete snapshot">
             <div class="publication-node base">verified page snapshot</div><div class="publication-arrow" aria-hidden="true">→</div><div class="publication-node delta">authenticated page delta</div><div class="publication-arrow" aria-hidden="true">→</div><div class="publication-node result">verified full snapshot</div>
           </div>
-          <p>Restore authenticates the complete base-plus-delta graph before placement. A graph admits at most two deltas; another extension publishes a flat snapshot. Bounded exact PR535 TP4 evidence covers restart restore at 131,072 tokens and eight distinct 16,384-token results. General qualification across models, topologies, and workloads remains absent.</p>
+          <p>Restore authenticates the complete base-plus-delta graph before placement. A graph admits at most two deltas; another extension publishes a flat snapshot. Deployment profiles record model-specific qualification.</p>
         </article>
       </div>
       <p class="context-note">Selecting <code>tail-cow-v1</code> uses distinct row-tail and page-delta cache identities. Existing <code>snapshot-v1</code> entries keep their namespace and full-snapshot publication behavior.</p>
@@ -506,7 +506,7 @@
       <div class="flow">
         <article class="flow-card"><div class="icon">1</div><h3>Scheduler</h3><p>Hashes tokens once, records the wire-compatible digest at each eligible boundary, and scans longest-first. A candidate is an exact manifest or a permitted row-prefix alias.</p></article>
         <div class="arrow" aria-hidden="true">→</div>
-        <article class="flow-card"><div class="icon">4×</div><h3>All-rank availability</h3><p>A digest is eligible only when every expected physical TP rank advertises a compatible reusable entry from the same worker-process generation.</p><div class="ranks"><span class="rank">rank 0</span><span class="rank">rank 1</span><span class="rank">rank 2</span><span class="rank">rank 3</span></div></article>
+        <article class="flow-card"><div class="icon">∀</div><h3>All-rank availability</h3><p>A digest is eligible only when every expected physical TP rank advertises a compatible reusable entry from the same worker-process generation.</p><div class="ranks"><span class="rank">rank 0</span><span class="rank">rank 1</span><span class="rank">…</span><span class="rank">rank n</span></div></article>
         <div class="arrow" aria-hidden="true">→</div>
         <article class="flow-card"><div class="icon">✓</div><h3>Verification and placement</h3><p>Each rank verifies the selected root and referenced objects. The SparkCache CUDA placement component submits verified page bytes to destination GPU blocks; coordinated success makes the restored prefix usable.</p></article>
       </div>
@@ -527,7 +527,7 @@
     <section aria-labelledby="shared-title">
       <div class="section-head">
         <h2 id="shared-title"><span class="num">07</span> Bounded sharing mechanisms</h2>
-        <p><span class="status-tag limited">Qualified through C16</span> One verified exact-prefix restore may attach request-private GPU tails to a bounded cohort. Implemented different-root page-delta base sharing has separate bounded exact C8 evidence.</p>
+        <p><span class="status-tag">Implemented</span> One verified exact-prefix restore may attach request-private GPU tails to a bounded cohort. Different result roots may also share an authenticated persistent base read.</p>
       </div>
       <div class="share-layout">
         <aside class="share-controls">
@@ -549,13 +549,13 @@
           <h3>One local copy per rank; ordinary references per request</h3>
           <p>A leader receives verified persistent state. vLLM retains that multi-group block table only after every worker finishes and every partial-page copy completes.</p>
           <div class="lease-flow" aria-label="Persistent snapshot to leader, verified lease, and request-owned tails">
-            <div class="lease-node"><b>rank-local NVMe</b><small>813 MB authenticated snapshot</small></div>
+            <div class="lease-node"><b>rank-local NVMe</b><small>authenticated snapshot</small></div>
             <div class="lease-arrow" aria-hidden="true">→</div>
             <div class="lease-node"><b>leader restore</b><small>private destination blocks</small></div>
             <div class="lease-arrow" aria-hidden="true">→</div>
             <div class="lease-node verified"><b>verified GPU prefix</b><div class="request-fan" id="request-fan"></div></div>
           </div>
-          <div class="rank-band" aria-label="Independent rank-local restores"><span>rank 0 · one shard</span><span>rank 1 · one shard</span><span>rank 2 · one shard</span><span>rank 3 · one shard</span></div>
+          <div class="rank-band" aria-label="Independent rank-local restores"><span>rank 0 · one shard</span><span>rank 1 · one shard</span><span>…</span><span>rank n · one shard</span></div>
           <div class="share-note">Each request owns ordinary block references and computes a request-private GPU tail. A partial physical page is copied into a dedicated immutable block before follower attachment. These GPU blocks are separate from persistent copy-on-write tail objects on NVMe.</div>
         </div>
       </div>
@@ -563,13 +563,13 @@
         <div class="status-pair"><span class="status-tag">Implemented · GPU-free tested</span></div>
         <h3>Different row roots may coalesce one authenticated trunk restore</h3>
         <p>For <code>per_token_rows</code>, requests with different selected roots may name the same verified descriptor prefix. SparkCache restores that common segment once while each request retains its own root identity and computes its private tail.</p>
-        <div class="trunk-visual" aria-label="Illustrative 96K shared row trunk feeding distinct 32K request tails">
-          <div class="trunk-node">96K-token authenticated row trunk<br><small>one segment flight per rank</small></div>
+        <div class="trunk-visual" aria-label="Shared row trunk feeding distinct request tails">
+          <div class="trunk-node">authenticated row trunk<br><small>one segment flight per rank</small></div>
           <div class="lease-arrow" aria-hidden="true">→</div>
           <div class="root-fan">
-            <div class="root-row"><div class="root-prefix">root A reference</div><div class="root-tail">private 32K-token tail A</div></div>
-            <div class="root-row"><div class="root-prefix">root B reference</div><div class="root-tail">private 32K-token tail B</div></div>
-            <div class="root-row"><div class="root-prefix">roots C–P</div><div class="root-tail">private tails C–P</div></div>
+            <div class="root-row"><div class="root-prefix">root A reference</div><div class="root-tail">private tail A</div></div>
+            <div class="root-row"><div class="root-prefix">root B reference</div><div class="root-tail">private tail B</div></div>
+            <div class="root-row"><div class="root-prefix">other roots</div><div class="root-tail">private tails</div></div>
           </div>
         </div>
         <p>Every physical rank must agree on the shared descriptor sequence. A disagreement rejects shared-segment attachment and recomputes the affected request. Different-root row-segment sharing is implemented and GPU-free tested; no live model artifact qualifies it.</p>
@@ -587,7 +587,7 @@
             <div class="root-row"><div class="root-prefix">bounded cohort</div><div class="root-tail">private placement</div></div>
           </div>
         </div>
-          <p>Cohorts admit at most two flights, 16 cumulative participants, 1 GiB per flight, and 2 GiB peak reservations. Followers stay outside load lanes while the base is pending. The immutable buffer is released after every member acquires or abandons it. After one small inference established scheduler manifest readiness, the exact PR535 C8 run admitted all eight persistent restores and shared one 100,868,258-byte base read per rank.</p>
+          <p>Cohorts admit at most two flights, 16 cumulative participants, 1 GiB per flight, and 2 GiB peak reservations. Followers stay outside load lanes while the base is pending. The immutable buffer is released after every member acquires or abandons it.</p>
       </div>
     </section>
 
@@ -605,25 +605,14 @@
 
     <section aria-labelledby="deployment-title">
       <div class="section-head">
-        <h2 id="deployment-title"><span class="num">09</span> Recorded restore behavior</h2>
-        <p>The compact measurements below link each result to its evidence boundary. Qualified full-snapshot results come from <a href="../GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md"><code>GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md</code></a>. Implemented page-delta results have bounded evidence in <a href="../GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md"><code>GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md</code></a>. The public image route is <a href="../deploy/glm53_flash/JJ_R7_ARM64_IMAGE.md"><code>JJ_R7_ARM64_IMAGE.md</code></a>.</p>
+        <h2 id="deployment-title"><span class="num">09</span> Implementation and qualification are separate</h2>
+        <p>This page explains repository behavior. A deployment profile identifies the model layout, runtime, checkpoint, topology, artifact, workload, measurements, and supported limits used for live qualification.</p>
       </div>
-      <div class="evidence-table-wrap">
-        <table class="evidence-table">
-          <caption class="sr-only">Recorded SparkCache restore performance by prompt-prefix size and concurrent request count</caption>
-          <thead><tr><th scope="col">Prefix and concurrency</th><th scope="col">Comparison</th><th scope="col">Recorded effect</th></tr></thead>
-          <tbody>
-            <tr><td><strong>8,192 tokens · C1</strong></td><td>qualified Python page restore</td><td>147.2–194.0 ms cache service per rank</td></tr>
-            <tr><td><strong>131,072 tokens · C1</strong></td><td>qualified full snapshot-v1</td><td>131–250 ms cache service per rank in the source runtime</td></tr>
-            <tr><td><strong>131,072 tokens · C1 · flat v2</strong></td><td>qualified historical artifact</td><td>13 authenticated objects; all-rank CUDA restore took 1.55–1.70 s; exact codeword matched before and after restart</td></tr>
-            <tr><td><strong>16,384 tokens · C8 page deltas</strong></td><td>implemented · bounded PR535 evidence</td><td>eight exact persistent restores; one base read per rank; 1.392–2.338 s client latency</td></tr>
-            <tr><td><strong>Public r7 image · C4</strong></td><td>implemented · TP4 smoke</td><td>four exact restart restores; 100% external restore; 0.562–1.583 s client latency</td></tr>
-            <tr><td><strong>131,072 tokens · C16</strong></td><td>qualified shared exact-prefix restore</td><td>16 × 813 MB became 1 × 813 MB per rank; pretokenized client p50 was 2.698 s</td></tr>
-          </tbody>
-        </table>
+      <div class="safety-grid">
+        <article class="safety-card"><strong><span class="status-tag">Implemented</span> Repository behavior</strong><p>GPU-free tests establish hashing, metadata authentication, reconstruction, bounds, cancellation, and verified-or-recompute behavior.</p></article>
+        <article class="safety-card"><strong><span class="status-tag limited">Qualified</span> Exact deployment</strong><p>Live evidence applies only to the named profile and immutable artifacts under <code>deploy/</code>.</p></article>
+        <article class="safety-card"><strong><span class="status-tag limited">Unsupported</span> Unregistered layout</strong><p>A model or topology without an explicit state-ownership and identity contract cannot use opaque-page or CUDA placement paths.</p></article>
       </div>
-      <p class="context-note"><span class="status-tag">Implemented · bounded capacity</span> The PR535 C8 result used eight 16,384-token roots over one 8,192-token base and eight bounded 256 MiB mapped arenas per rank. It does not establish C8×64K or C16×32K.</p>
-      <p class="context-note"><span class="status-tag">Implemented · bounded evidence</span> A small model inference, not HTTP health alone, establishes scheduler manifest readiness after startup. The public r7 C4 smoke does not prove shared-base coalescing. See the <a href="../GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md">PR535 page-delta record</a> and <a href="../deploy/glm53_flash/JJ_R7_ARM64_IMAGE.md">public image record</a> for distinct evidence boundaries.</p>
     </section>
 
     <footer>
@@ -631,7 +620,7 @@
       <div class="source-links">
         <a href="https://github.com/FujitsuPolycom/sparkcache/tree/main">main</a>
         <a href="../ROADMAP.md">research roadmap</a>
-        <a href="../GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md">SparkCache CUDA restore record</a>
+        <a href="../README.md#deployment-profiles">deployment profiles</a>
       </div>
     </footer>
   </main>

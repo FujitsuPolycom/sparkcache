@@ -4,9 +4,9 @@
 implemented behind the default-off `spark_cache_streaming_snapshots` option.
 Explicit opt-in lazy-installs the builtin adapter for that connector role, then
 is rejected unless the C++/CUDA library, its pinned SHA-256, the
-runtime-pinned vLLM block-lease contract, and the declared GLM-5.2 cache
-inventory all attest. Qualification requires a four-Spark cache-off versus
-streaming-cache live-model comparison.
+runtime-pinned vLLM block-lease contract, and the deployment profile's cache
+inventory all attest. Qualification requires a profile-specific cache-off
+versus streaming-cache live-model comparison.
 
 ## What is implemented
 
@@ -48,9 +48,9 @@ scheduler facade tracks emitted offers so `request_finished()` delays physical
 block reuse only while a gather may still read them. The worker facade is
 constructed at connector startup but does not load C++/CUDA code or allocate the
 ring until `register_kv_caches()` supplies the final canonical tensors. It
-binds the exact 79 target-CKV plus 22 sparse-indexer GLM-5.2 inventory, retains
-the contiguous row aliases for the ring lifetime, and assembles the frozen
-mapped-host/depth-2/64-MiB profile.
+binds the exact inventory declared by the deployment profile, retains its
+contiguous row aliases for the ring lifetime, and assembles the profile's
+attested arena and ring configuration.
 
 ## Stable publisher protocol
 
@@ -168,5 +168,5 @@ neither.
 - No inference callback waits on capacity maintenance or its retries.
 - No manifest is published from a partial context.
 - Standalone C++/CUDA probes and GPU-free connector/runtime/publisher tests do
-  not claim live-model performance or zero regression; the four-Spark serving
-  comparison is required for qualification.
+  not claim live-model performance or zero regression; the deployment
+  profile's live comparison is required for qualification.

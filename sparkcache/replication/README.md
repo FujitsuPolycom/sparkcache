@@ -60,10 +60,9 @@ connection loss.
 
 The durable-publication mode supplies an `on_chunk` callback that publishes
 each content-addressed chunk immediately. The receiver then retains only its
-digest and index until COMMIT. The GPU-free large-context fixture contains
-1,535 rank-local chunks representing 392,960 prompt tokens; its one-byte
-staging allowance proves that approximately 3.14 GB of payload need not
-accumulate in RAM.
+digest and index until COMMIT. GPU-free fixtures use a staging allowance below
+the complete payload size to prove that a large publication need not accumulate
+in receiver memory.
 
 ## Tests
 

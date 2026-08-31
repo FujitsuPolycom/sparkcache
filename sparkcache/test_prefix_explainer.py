@@ -73,7 +73,8 @@ def test_prefix_explorer_html_contract_is_complete() -> None:
     for href in parser.links:
         if "://" in href or href.startswith("#"):
             continue
-        assert (EXPLAINER.parent / href).resolve().is_file(), href
+        path = href.split("#", 1)[0]
+        assert (EXPLAINER.parent / path).resolve().is_file(), href
 
 
 def test_prefix_explorer_describes_present_storage_and_restore_behavior() -> None:
@@ -93,26 +94,18 @@ def test_prefix_explorer_describes_present_storage_and_restore_behavior() -> Non
         "sparkcache-page-delta-manifest/v2",
         "sparkcache-page-snapshot-manifest/v2",
         "objects of at most 64 MiB",
-        "813,068,464 bytes",
-        "13 payload objects",
         "at most two deltas",
         "Different row roots may coalesce one authenticated trunk restore",
         "Different page-delta results may coalesce one authenticated base read",
         "one physical read per rank",
         "Followers stay outside load lanes while the base is pending",
-        "all eight persistent restores and shared one 100,868,258-byte base read per rank",
-        "one small inference established scheduler manifest readiness",
-        "eight bounded 256 MiB mapped arenas per rank",
-        "does not establish C8×64K or C16×32K",
-        "Artifact identifiers and a rejected parallel-reader candidate remain in the linked SparkCache CUDA restore record",
         "request-private GPU tail",
         "persistent copy-on-write tail objects",
         "When enabled, SparkCache CUDA restore owns verified reconstruction and device transfer",
         "SparkCache CUDA placement component",
-        "GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md",
-        "GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md",
-        "JJ_R7_ARM64_IMAGE.md",
-        "four exact restart restores",
+        "Implementation and qualification are separate",
+        "deployment profile identifies the model layout",
+        "live evidence applies only to the named profile",
     )
     for fragment in required:
         assert fragment.casefold() in visible.casefold()
@@ -135,14 +128,15 @@ def test_readme_links_explorer_and_states_capabilities() -> None:
     prose = " ".join(readme.split())
 
     required = (
-        "[Jovian Judgement vLLM work]",
-        "Physical-page delta publication | **implemented**",
-        "Different-root shared-base reads | **implemented**",
-        "Shared GPU exact-prefix blocks | **qualified**",
-        "[GLM-5.3 Jovian Judgement r7 GB10 TP4 quickstart]",
-        "[image record](deploy/glm53_flash/JJ_R7_ARM64_IMAGE.md)",
+        "Content-addressed persistent snapshots | **implemented**",
+        "Longest stored exact-prefix selection | **implemented**",
+        "Sparse row-prefix aliases | **implemented**",
+        "Copy-on-write row and page publication | **implemented**",
+        "SparkCache CUDA page restore | **implemented**",
+        "Shared persistent bases and GPU prefixes | **implemented**",
         "Interactive prefix and publication explorer",
-        "not generally qualified",
+        "Implementation status describes repository behavior",
+        "## Deployment profiles",
     )
     for fragment in required:
         assert fragment in prose

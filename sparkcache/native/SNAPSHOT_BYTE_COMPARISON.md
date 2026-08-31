@@ -1,4 +1,12 @@
-# Snapshot gather byte-comparison check
+# GLM-5.2 snapshot gather byte-comparison record
+
+This document is a model-profile evidence record, not the generic snapshot
+library contract. It retains the exact GLM-5.2 tensor inventory, DCP geometry,
+fixture values, and admission checks used by its named profile.
+
+See [`README.md`](README.md) for the model-independent C++/CUDA interfaces and
+[`../../deploy/glm52_35bpw/STREAMING_SNAPSHOT_PROFILE.md`](../../deploy/glm52_35bpw/STREAMING_SNAPSHOT_PROFILE.md)
+for the deployment boundary.
 
 Status: **implemented** for the GPU-free byte oracle and **unsupported** for
 GPU execution until the model-integrated qualification requirement passes.
