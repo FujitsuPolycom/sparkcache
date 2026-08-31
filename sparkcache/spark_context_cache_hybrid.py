@@ -102,6 +102,73 @@ class PageSnapshotPlan:
     spans: tuple[PagePayloadSpan, ...]
 
 
+@dataclass(frozen=True)
+class PageDeltaTail:
+    """One authenticated delta payload extent and its final layer offset."""
+
+    layer_name: str
+    group_index: int
+    source_start: int
+    source_end: int
+    destination_byte_offset: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class PageDeltaPlan:
+    """Validated delta header geometry without materializing its base."""
+
+    header_bytes: int
+    total_bytes: int
+    base_block_counts: tuple[int, ...]
+    result_block_counts: tuple[int, ...]
+    base_boundary_tokens: int
+    result_boundary_tokens: int
+    base_snapshot_sha256: str
+    result_snapshot_sha256: str
+    reused_pages_by_group: tuple[int, ...]
+    tails: tuple[PageDeltaTail, ...]
+
+
+def page_snapshot_encoded_size(
+    layout: PageLayout,
+    block_counts: Sequence[int],
+) -> int:
+    """Return the exact encoded size without allocating page payload bytes."""
+
+    header = encode_page_snapshot_header(layout, block_counts)
+    counts = tuple(int(count) for count in block_counts)
+    payload_bytes = sum(
+        count * layer.bytes_per_page
+        for group, count in zip(layout.groups, counts, strict=True)
+        for layer in group.layers
+    )
+    return len(header) + payload_bytes
+
+
+def encode_page_snapshot_header(
+    layout: PageLayout,
+    block_counts: Sequence[int],
+) -> bytes:
+    """Encode only the deterministic SPHP1 header for one page snapshot."""
+
+    if len(block_counts) != len(layout.groups):
+        raise HybridCodecError("block-count vector disagrees with page groups")
+    counts = tuple(int(count) for count in block_counts)
+    if any(count <= 0 for count in counts):
+        raise HybridCodecError("every page group must contribute at least one block")
+    header = json.dumps(
+        {
+            "schema": "sparkcache-hybrid-pages/v1",
+            "layout_sha256": layout.digest,
+            "block_counts": counts,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return _MAGIC + _HEADER_LENGTH.pack(len(header)) + header
+
+
 def plan_page_snapshot(
     layout: PageLayout,
     encoded_prefix: bytes | bytearray | memoryview,
@@ -112,7 +179,7 @@ def plan_page_snapshot(
     """Validate the small SPHP1 header and describe payload byte extents.
 
     ``encoded_prefix`` may be the complete snapshot or only the header bytes.
-    Native restore uses the latter after authenticating the containing .spcc
+    SparkCache CUDA restore uses the latter after authenticating the containing .spcc
     object, avoiding a Python slice for every layer payload.
     """
 
@@ -206,16 +273,7 @@ def encode_page_snapshot(
                     f"layer {layer.name} carries {len(payload)} bytes, expected {expected}"
                 )
             parts.append(payload)
-    header = json.dumps(
-        {
-            "schema": "sparkcache-hybrid-pages/v1",
-            "layout_sha256": layout.digest,
-            "block_counts": counts,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return _MAGIC + _HEADER_LENGTH.pack(len(header)) + header + b"".join(parts)
+    return encode_page_snapshot_header(layout, counts) + b"".join(parts)
 
 
 def decode_page_snapshot(
@@ -231,7 +289,6 @@ def decode_page_snapshot(
 
 
 def _validate_delta_boundaries(
-    layout: PageLayout,
     base_boundary_tokens: int,
     result_boundary_tokens: int,
 ) -> None:
@@ -244,11 +301,172 @@ def _validate_delta_boundaries(
         or result_boundary_tokens <= base_boundary_tokens
     ):
         raise HybridCodecError("page delta boundaries are invalid")
-    for group in layout.groups:
-        if base_boundary_tokens % group.block_size:
-            raise HybridCodecError(
-                "page delta base boundary disagrees with group geometry"
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def plan_page_delta(
+    layout: PageLayout,
+    encoded_prefix: bytes | bytearray | memoryview,
+    *,
+    base_block_counts: Sequence[int],
+    result_block_counts: Sequence[int],
+    base_boundary_tokens: int,
+    result_boundary_tokens: int,
+    total_bytes: int | None = None,
+) -> PageDeltaPlan:
+    """Validate a delta header and describe its ordered layer-tail extents.
+
+    ``encoded_prefix`` may contain only the complete header. Callers that
+    authenticate macro objects can therefore plan source ranges without
+    assembling the complete delta or reading its base snapshot.
+    """
+
+    _validate_delta_boundaries(base_boundary_tokens, result_boundary_tokens)
+    prefix_bytes = len(_DELTA_MAGIC) + _HEADER_LENGTH.size
+    view = memoryview(encoded_prefix).cast("B")
+    if len(view) < prefix_bytes or bytes(view[: len(_DELTA_MAGIC)]) != _DELTA_MAGIC:
+        raise HybridCodecError("hybrid page delta has an invalid prefix")
+    (header_length,) = _HEADER_LENGTH.unpack_from(view, len(_DELTA_MAGIC))
+    header_end = prefix_bytes + header_length
+    if header_length <= 0 or header_end > len(view):
+        raise HybridCodecError("hybrid page delta header is truncated")
+    try:
+        header = json.loads(bytes(view[prefix_bytes:header_end]))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise HybridCodecError("hybrid page delta header is invalid") from error
+    expected_keys = {
+        "schema",
+        "layout_sha256",
+        "base_snapshot_sha256",
+        "result_snapshot_sha256",
+        "base_block_counts",
+        "result_block_counts",
+        "base_boundary_tokens",
+        "result_boundary_tokens",
+        "reused_pages_by_group",
+        "layer_tails",
+    }
+    if not isinstance(header, dict) or set(header) != expected_keys:
+        raise HybridCodecError("hybrid page delta header fields differ")
+    raw_base_counts = header["base_block_counts"]
+    raw_result_counts = header["result_block_counts"]
+    if (
+        not isinstance(raw_base_counts, list)
+        or not isinstance(raw_result_counts, list)
+        or any(type(value) is not int for value in raw_base_counts)
+        or any(type(value) is not int for value in raw_result_counts)
+        or type(header["base_boundary_tokens"]) is not int
+        or type(header["result_boundary_tokens"]) is not int
+    ):
+        raise HybridCodecError("hybrid page delta header geometry is invalid")
+    try:
+        base_counts = tuple(int(value) for value in base_block_counts)
+        result_counts = tuple(int(value) for value in result_block_counts)
+    except (TypeError, ValueError) as error:
+        raise HybridCodecError("hybrid page delta block counts are invalid") from error
+    if (
+        len(base_counts) != len(layout.groups)
+        or len(result_counts) != len(layout.groups)
+        or any(
+            base <= 0 or result < base
+            for base, result in zip(base_counts, result_counts, strict=True)
+        )
+    ):
+        raise HybridCodecError("page delta block counts do not extend the base")
+    if (
+        header["schema"] != "sparkcache-hybrid-page-delta/v1"
+        or header["layout_sha256"] != layout.digest
+        or tuple(raw_base_counts) != base_counts
+        or tuple(raw_result_counts) != result_counts
+        or header["base_boundary_tokens"] != base_boundary_tokens
+        or header["result_boundary_tokens"] != result_boundary_tokens
+        or not _is_sha256(header["base_snapshot_sha256"])
+        or not _is_sha256(header["result_snapshot_sha256"])
+    ):
+        raise HybridCodecError("hybrid page delta identity or base differs")
+    reused = header["reused_pages_by_group"]
+    raw_tails = header["layer_tails"]
+    expected_layers = [
+        (group_index, layer)
+        for group_index, group in enumerate(layout.groups)
+        for layer in group.layers
+    ]
+    if (
+        not isinstance(reused, list)
+        or len(reused) != len(layout.groups)
+        or not isinstance(raw_tails, list)
+        or len(raw_tails) != len(expected_layers)
+    ):
+        raise HybridCodecError("hybrid page delta descriptor count differs")
+    if total_bytes is None:
+        total = len(view)
+    elif isinstance(total_bytes, bool) or not isinstance(total_bytes, int):
+        raise HybridCodecError("hybrid page delta total bytes must be an integer")
+    else:
+        total = total_bytes
+    if total < header_end or len(view) > total:
+        raise HybridCodecError("hybrid page delta total length is invalid")
+
+    tails: list[PageDeltaTail] = []
+    source_offset = header_end
+    layer_index = 0
+    for group_index, group in enumerate(layout.groups):
+        reused_pages = reused[group_index]
+        if (
+            type(reused_pages) is not int
+            or not 0 <= reused_pages <= base_counts[group_index]
+        ):
+            raise HybridCodecError("hybrid page delta reuse count is invalid")
+        for layer in group.layers:
+            descriptor = raw_tails[layer_index]
+            layer_index += 1
+            expected_bytes = (
+                result_counts[group_index] - reused_pages
+            ) * layer.bytes_per_page
+            if (
+                not isinstance(descriptor, dict)
+                or set(descriptor) != {"name", "bytes", "sha256"}
+                or descriptor["name"] != layer.name
+                or type(descriptor["bytes"]) is not int
+                or descriptor["bytes"] != expected_bytes
+                or not _is_sha256(descriptor["sha256"])
+            ):
+                raise HybridCodecError("hybrid page delta layer descriptor differs")
+            source_end = source_offset + expected_bytes
+            if source_end > total:
+                raise HybridCodecError("hybrid page delta payload is truncated")
+            tails.append(
+                PageDeltaTail(
+                    layer_name=layer.name,
+                    group_index=group_index,
+                    source_start=source_offset,
+                    source_end=source_end,
+                    destination_byte_offset=reused_pages * layer.bytes_per_page,
+                    sha256=descriptor["sha256"],
+                )
             )
+            source_offset = source_end
+    if source_offset != total:
+        raise HybridCodecError("hybrid page delta has trailing bytes")
+    return PageDeltaPlan(
+        header_bytes=header_end,
+        total_bytes=total,
+        base_block_counts=base_counts,
+        result_block_counts=result_counts,
+        base_boundary_tokens=base_boundary_tokens,
+        result_boundary_tokens=result_boundary_tokens,
+        base_snapshot_sha256=header["base_snapshot_sha256"],
+        result_snapshot_sha256=header["result_snapshot_sha256"],
+        reused_pages_by_group=tuple(reused),
+        tails=tuple(tails),
+    )
 
 
 def encode_page_delta(
@@ -265,15 +483,13 @@ def encode_page_delta(
 
     Reuse is established page-by-page across every layer in a page group. A
     group reuses a page only when the result carries byte-identical opaque
-    state at the same logical page index. The base snapshot digest and both
-    semantic boundaries are bound into the delta header.
+    state at the same logical page index. When the base boundary lies inside
+    a page, changed bytes make that complete terminal page part of the delta;
+    preceding byte-identical pages remain reusable. The base snapshot digest
+    and both semantic boundaries are bound into the delta header.
     """
 
-    _validate_delta_boundaries(
-        layout,
-        base_boundary_tokens,
-        result_boundary_tokens,
-    )
+    _validate_delta_boundaries(base_boundary_tokens, result_boundary_tokens)
     base_counts = tuple(int(value) for value in base_block_counts)
     result_counts = tuple(int(value) for value in result_block_counts)
     if len(base_counts) != len(layout.groups) or len(result_counts) != len(
@@ -354,100 +570,37 @@ def apply_page_delta(
 ) -> bytes:
     """Verify and apply one page-semantic delta to its exact base snapshot."""
 
-    _validate_delta_boundaries(
+    plan = plan_page_delta(
         layout,
-        base_boundary_tokens,
-        result_boundary_tokens,
+        encoded_delta,
+        base_block_counts=base_block_counts,
+        result_block_counts=result_block_counts,
+        base_boundary_tokens=base_boundary_tokens,
+        result_boundary_tokens=result_boundary_tokens,
+        total_bytes=len(encoded_delta),
     )
-    prefix_bytes = len(_DELTA_MAGIC) + _HEADER_LENGTH.size
-    if (
-        len(encoded_delta) < prefix_bytes
-        or encoded_delta[: len(_DELTA_MAGIC)] != _DELTA_MAGIC
-    ):
-        raise HybridCodecError("hybrid page delta has an invalid prefix")
-    (header_length,) = _HEADER_LENGTH.unpack_from(encoded_delta, len(_DELTA_MAGIC))
-    header_end = prefix_bytes + header_length
-    if header_length <= 0 or header_end > len(encoded_delta):
-        raise HybridCodecError("hybrid page delta header is truncated")
-    try:
-        header = json.loads(encoded_delta[prefix_bytes:header_end])
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise HybridCodecError("hybrid page delta header is invalid") from error
-    expected_keys = {
-        "schema",
-        "layout_sha256",
-        "base_snapshot_sha256",
-        "result_snapshot_sha256",
-        "base_block_counts",
-        "result_block_counts",
-        "base_boundary_tokens",
-        "result_boundary_tokens",
-        "reused_pages_by_group",
-        "layer_tails",
-    }
-    if not isinstance(header, dict) or set(header) != expected_keys:
-        raise HybridCodecError("hybrid page delta header fields differ")
-    base_counts = tuple(int(value) for value in base_block_counts)
-    result_counts = tuple(int(value) for value in result_block_counts)
-    if (
-        header["schema"] != "sparkcache-hybrid-page-delta/v1"
-        or header["layout_sha256"] != layout.digest
-        or tuple(header["base_block_counts"]) != base_counts
-        or tuple(header["result_block_counts"]) != result_counts
-        or header["base_boundary_tokens"] != base_boundary_tokens
-        or header["result_boundary_tokens"] != result_boundary_tokens
-        or header["base_snapshot_sha256"] != hashlib.sha256(base_snapshot).hexdigest()
-    ):
+    if plan.base_snapshot_sha256 != hashlib.sha256(base_snapshot).hexdigest():
         raise HybridCodecError("hybrid page delta identity or base differs")
-    reused = header["reused_pages_by_group"]
-    tails = header["layer_tails"]
-    expected_layers = [layer for group in layout.groups for layer in group.layers]
-    if (
-        not isinstance(reused, list)
-        or len(reused) != len(layout.groups)
-        or not isinstance(tails, list)
-        or len(tails) != len(expected_layers)
-    ):
-        raise HybridCodecError("hybrid page delta descriptor count differs")
-    base_payloads = decode_page_snapshot(layout, base_snapshot, base_counts)
-    payload_view = memoryview(encoded_delta)[header_end:]
-    offset = 0
+    base_payloads = decode_page_snapshot(
+        layout,
+        base_snapshot,
+        plan.base_block_counts,
+    )
+    encoded_view = memoryview(encoded_delta)
     result_payloads: dict[str, bytes] = {}
-    layer_index = 0
-    for group_index, group in enumerate(layout.groups):
-        reused_pages = reused[group_index]
-        if (
-            type(reused_pages) is not int
-            or not 0 <= reused_pages <= base_counts[group_index]
-        ):
-            raise HybridCodecError("hybrid page delta reuse count is invalid")
-        for layer in group.layers:
-            descriptor = tails[layer_index]
-            layer_index += 1
-            if (
-                not isinstance(descriptor, dict)
-                or set(descriptor) != {"name", "bytes", "sha256"}
-                or descriptor["name"] != layer.name
-                or type(descriptor["bytes"]) is not int
-                or descriptor["bytes"] < 0
-            ):
-                raise HybridCodecError("hybrid page delta layer descriptor differs")
-            tail_end = offset + descriptor["bytes"]
-            tail = payload_view[offset:tail_end]
-            if len(tail) != descriptor["bytes"] or (
-                hashlib.sha256(tail).hexdigest() != descriptor["sha256"]
-            ):
-                raise HybridCodecError("hybrid page delta payload checksum mismatch")
-            prefix = base_payloads[layer.name][: reused_pages * layer.bytes_per_page]
-            payload = prefix + tail.tobytes()
-            if len(payload) != result_counts[group_index] * layer.bytes_per_page:
-                raise HybridCodecError("hybrid page delta payload geometry differs")
-            result_payloads[layer.name] = payload
-            offset = tail_end
-    if offset != len(payload_view):
-        raise HybridCodecError("hybrid page delta has trailing bytes")
-    result = encode_page_snapshot(layout, result_counts, result_payloads)
-    if hashlib.sha256(result).hexdigest() != header["result_snapshot_sha256"]:
+    layers = [layer for group in layout.groups for layer in group.layers]
+    for tail, layer in zip(plan.tails, layers, strict=True):
+        payload_tail = encoded_view[tail.source_start : tail.source_end]
+        if hashlib.sha256(payload_tail).hexdigest() != tail.sha256:
+            raise HybridCodecError("hybrid page delta payload checksum mismatch")
+        prefix = base_payloads[layer.name][: tail.destination_byte_offset]
+        result_payloads[layer.name] = prefix + payload_tail.tobytes()
+    result = encode_page_snapshot(
+        layout,
+        plan.result_block_counts,
+        result_payloads,
+    )
+    if hashlib.sha256(result).hexdigest() != plan.result_snapshot_sha256:
         raise HybridCodecError("hybrid page delta result checksum mismatch")
     return result
 

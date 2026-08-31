@@ -111,7 +111,7 @@ class ProfileRegistryTests(unittest.TestCase):
                 dcp_degree=1,
                 block_size=64,
                 min_span_tokens=profile.chunk_tokens,
-                native_restore=profile.storage_mode == "per_token_rows",
+                cuda_restore=profile.storage_mode == "per_token_rows",
             )
 
     def test_resolve_profile_error_lists_known_names(self) -> None:
@@ -124,12 +124,12 @@ class ProfileRegistryTests(unittest.TestCase):
         self.assertEqual(profile.required_families, frozenset({"target_ckv"}))
         self.assertEqual(profile.classification_rules, ())
         self.assertIn("block-pages-v1", profile.quantization_layout)
-        with self.assertRaisesRegex(ProfileError, "native restore"):
+        with self.assertRaisesRegex(ProfileError, "SparkCache CUDA restore"):
             profile.validate_for_deployment(
                 dcp_degree=1,
                 block_size=64,
                 min_span_tokens=256,
-                native_restore=True,
+                cuda_restore=True,
             )
 
     def test_glm53_profile_is_distinct_hybrid_namespace(self) -> None:
@@ -148,7 +148,7 @@ class ProfileRegistryTests(unittest.TestCase):
             dcp_degree=1,
             block_size=2304,
             min_span_tokens=4096,
-            native_restore=False,
+            cuda_restore=False,
         )
 
     def test_glm53_profile_rejects_incommensurate_scheduler_block_size(self) -> None:
@@ -158,7 +158,7 @@ class ProfileRegistryTests(unittest.TestCase):
                 dcp_degree=1,
                 block_size=384,
                 min_span_tokens=4096,
-                native_restore=False,
+                cuda_restore=False,
             )
 
 

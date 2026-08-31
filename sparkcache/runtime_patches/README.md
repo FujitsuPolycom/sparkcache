@@ -63,8 +63,12 @@ exact-input overlays under `patches/vllm-glm53-b12x-kda-adaptive-mtp`.
 The three KDA commits after `e10536a` change only the KDA implementation and
 its model tests. Ten SparkCache ownership files remain byte-identical, while
 the eleventh contract file binds the live-tensor B12X KDA implementation.
-The contract has **implemented** status. Four-rank TP4/DCP1 serving remains
-unqualified until a receipt names an immutable image built from this revision.
+The four SparkCache patches produce the exact preimages consumed by the
+recurrent-boundary producer. The contract names one coherent final runtime
+state across all eleven files and is valid only after that producer creates its
+four recurrent postimages. It has **implemented** status. Four-rank TP4/DCP1
+serving remains unqualified until a receipt names an immutable image built from
+this revision.
 
 ```bash
 python -m sparkcache.runtime_patches.verify_lease_contract \
