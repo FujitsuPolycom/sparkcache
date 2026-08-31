@@ -160,15 +160,95 @@ class ParseConnectorConfigTests(unittest.TestCase):
         vllm, _ = _make_vllm_config(
             {
                 "spark_cache_load_threads": "4",
+                "spark_cache_cuda_restore": "1",
+                "spark_cache_cuda_placement_library": _ABS_LIB,
+                "spark_cache_cuda_placement_library_sha256": _SHA,
+                "spark_cache_cuda_placement_arena_bytes": "67108864",
+            }
+        )
+        config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+        self.assertTrue(config.cuda_restore_enabled)
+        self.assertEqual(config.load_thread_limit, 1)
+
+    def test_legacy_cuda_restore_config_is_accepted_with_one_warning(self) -> None:
+        vllm, _ = _make_vllm_config(
+            {
                 "spark_cache_native_restore": "1",
                 "spark_cache_native_library": _ABS_LIB,
                 "spark_cache_native_library_sha256": _SHA,
                 "spark_cache_native_arena_bytes": "67108864",
+                "spark_cache_native_io_workers": "2",
             }
         )
-        config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+        with (
+            mock.patch.object(cfg, "_LEGACY_CUDA_RESTORE_WARNING_EMITTED", False),
+            self.assertWarnsRegex(
+                FutureWarning, "legacy SparkCache CUDA configuration names"
+            ),
+        ):
+            config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+        self.assertTrue(config.cuda_restore_enabled)
         self.assertTrue(config.native_restore_enabled)
-        self.assertEqual(config.load_thread_limit, 1)
+        self.assertEqual(config.cuda_placement_library_path, _ABS_LIB)
+        self.assertEqual(config.cuda_restore_io_workers, 2)
+
+    def test_conflicting_cuda_restore_aliases_are_rejected(self) -> None:
+        cases = (
+            ("spark_cache_cuda_restore", "1", "spark_cache_native_restore", "0"),
+            (
+                "spark_cache_cuda_placement_library",
+                _ABS_LIB,
+                "spark_cache_native_library",
+                str((Path.cwd() / "other.so").resolve()),
+            ),
+            (
+                "spark_cache_cuda_placement_arena_bytes",
+                "67108864",
+                "spark_cache_native_arena_bytes",
+                "134217728",
+            ),
+        )
+        for canonical, canonical_value, legacy, legacy_value in cases:
+            with self.subTest(canonical=canonical):
+                vllm, _ = _make_vllm_config(
+                    {canonical: canonical_value, legacy: legacy_value}
+                )
+                with self.assertRaisesRegex(RuntimeError, "conflicting"):
+                    cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+
+    def test_conflicting_cuda_restore_environment_aliases_are_rejected(self) -> None:
+        vllm, _ = _make_vllm_config()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "SPARK_CONTEXT_CACHE_CUDA_RESTORE": "1",
+                    "SPARK_CONTEXT_CACHE_NATIVE_RESTORE": "0",
+                },
+            ),
+            self.assertRaisesRegex(RuntimeError, "conflicting"),
+        ):
+            cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+
+    def test_legacy_cuda_restore_environment_is_accepted(self) -> None:
+        vllm, _ = _make_vllm_config()
+        environment = {
+            "SPARK_CONTEXT_CACHE_NATIVE_RESTORE": "1",
+            "SPARK_CONTEXT_CACHE_NATIVE_LIBRARY": _ABS_LIB,
+            "SPARK_CONTEXT_CACHE_NATIVE_LIBRARY_SHA256": _SHA,
+            "SPARK_CONTEXT_CACHE_NATIVE_ARENA_BYTES": "67108864",
+            "SPARK_CONTEXT_CACHE_NATIVE_IO_WORKERS": "3",
+        }
+        with (
+            mock.patch.object(cfg, "_LEGACY_CUDA_RESTORE_WARNING_EMITTED", False),
+            mock.patch.dict(os.environ, environment),
+            self.assertWarnsRegex(
+                FutureWarning, "legacy SparkCache CUDA configuration names"
+            ),
+        ):
+            config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+        self.assertTrue(config.cuda_restore_enabled)
+        self.assertEqual(config.cuda_restore_io_workers, 3)
 
     def test_max_pending_restores_default_64(self) -> None:
         vllm, _ = _make_vllm_config()
@@ -485,26 +565,26 @@ class ErrorPathTests(unittest.TestCase):
     def test_native_restore_requires_absolute_path(self) -> None:
         vllm, _ = _make_vllm_config(
             {
-                "spark_cache_native_restore": "1",
-                "spark_cache_native_library": "relative/path.so",
-                "spark_cache_native_library_sha256": _SHA,
-                "spark_cache_native_arena_bytes": "67108864",
+                "spark_cache_cuda_restore": "1",
+                "spark_cache_cuda_placement_library": "relative/path.so",
+                "spark_cache_cuda_placement_library_sha256": _SHA,
+                "spark_cache_cuda_placement_arena_bytes": "67108864",
             }
         )
         with self.assertRaises(RuntimeError) as ctx:
             cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
         self.assertIn(
-            "absolute library path, a 64-character lowercase SHA-256",
+            "absolute CUDA placement library path, a 64-character lowercase SHA-256",
             str(ctx.exception),
         )
 
     def test_native_restore_requires_valid_sha256(self) -> None:
         vllm, _ = _make_vllm_config(
             {
-                "spark_cache_native_restore": "1",
-                "spark_cache_native_library": _ABS_LIB,
-                "spark_cache_native_library_sha256": "short",
-                "spark_cache_native_arena_bytes": "67108864",
+                "spark_cache_cuda_restore": "1",
+                "spark_cache_cuda_placement_library": _ABS_LIB,
+                "spark_cache_cuda_placement_library_sha256": "short",
+                "spark_cache_cuda_placement_arena_bytes": "67108864",
             }
         )
         with self.assertRaises(RuntimeError) as ctx:
@@ -514,10 +594,10 @@ class ErrorPathTests(unittest.TestCase):
     def test_native_restore_requires_valid_arena(self) -> None:
         vllm, _ = _make_vllm_config(
             {
-                "spark_cache_native_restore": "1",
-                "spark_cache_native_library": _ABS_LIB,
-                "spark_cache_native_library_sha256": _SHA,
-                "spark_cache_native_arena_bytes": "12345",
+                "spark_cache_cuda_restore": "1",
+                "spark_cache_cuda_placement_library": _ABS_LIB,
+                "spark_cache_cuda_placement_library_sha256": _SHA,
+                "spark_cache_cuda_placement_arena_bytes": "12345",
             }
         )
         with self.assertRaises(RuntimeError) as ctx:
@@ -527,11 +607,11 @@ class ErrorPathTests(unittest.TestCase):
     def test_native_restore_requires_valid_io_workers(self) -> None:
         vllm, _ = _make_vllm_config(
             {
-                "spark_cache_native_restore": "1",
-                "spark_cache_native_library": _ABS_LIB,
-                "spark_cache_native_library_sha256": _SHA,
-                "spark_cache_native_arena_bytes": "67108864",
-                "spark_cache_native_io_workers": "50",
+                "spark_cache_cuda_restore": "1",
+                "spark_cache_cuda_placement_library": _ABS_LIB,
+                "spark_cache_cuda_placement_library_sha256": _SHA,
+                "spark_cache_cuda_placement_arena_bytes": "67108864",
+                "spark_cache_cuda_restore_io_workers": "50",
             }
         )
         with self.assertRaises(RuntimeError) as ctx:

@@ -1,10 +1,10 @@
-"""Fail-closed orchestration for native SparkCache restore placement.
+"""Verified-or-recompute orchestration for SparkCache CUDA restore.
 
 This is the model-serving path between a validated ``LookupResult`` and the
 attested placement adapter.  It never imports the model-down experiment gate.
 Each content-addressed chunk is read directly into a mapped host arena, its
 manifest length and one whole-file SHA-256 are checked, and only then is the
-native parser allowed to describe bytes to the scatter kernel.
+CUDA parser allowed to describe bytes to the scatter kernel.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ _U32_MAX = (1 << 32) - 1
 
 
 class NativeRestoreError(RuntimeError):
-    """A native restore cannot safely complete and must be recomputed."""
+    """A SparkCache CUDA restore cannot complete and must be recomputed."""
 
 
 @dataclass(frozen=True)
@@ -166,7 +166,7 @@ def plan_native_restore(
         payload_alignment, "payload_alignment", maximum=1 << 20
     )
     if not getattr(lookup, "is_hit", False):
-        raise NativeRestoreError("native restore requires a cache hit")
+        raise NativeRestoreError("SparkCache CUDA restore requires a cache hit")
     manifest = getattr(lookup, "_manifest", None)
     if not isinstance(manifest, Mapping):
         raise NativeRestoreError("cache hit has no validated manifest")
@@ -226,7 +226,7 @@ def plan_native_restore(
             )
         if arena_offset + encoded_bytes > arena_bytes:
             raise NativeRestoreError(
-                f"chunk {index} does not fit the configured native arena"
+                f"chunk {index} does not fit the SparkCache CUDA arena"
             )
         current.append(
             NativeChunkPlan(
@@ -252,7 +252,7 @@ def plan_native_restore(
     if current:
         slabs.append(NativeSlabPlan(tuple(current), cursor))
     if not slabs:
-        raise NativeRestoreError("native restore produced no slabs")
+        raise NativeRestoreError("SparkCache CUDA restore produced no slabs")
     return tuple(slabs)
 
 
@@ -315,7 +315,8 @@ def _check_stats(
     }
     if mismatches:
         raise NativeRestoreError(
-            f"native placement statistics violate restore contract: {mismatches}"
+            "SparkCache CUDA placement statistics violate the restore contract:"
+            f" {mismatches}"
         )
 
 
@@ -334,7 +335,7 @@ def execute_native_restore(
     io_workers: int = 8,
     payload_alignment: int = 256,
 ) -> NativeRestoreResult:
-    """Install one lookup through a single fail-closed native transaction."""
+    """Install one lookup through one verified-or-recompute CUDA transaction."""
 
     dcp_degree = _strict_positive_int(dcp_degree, "dcp_degree", maximum=_U32_MAX)
     dcp_rank = _strict_nonnegative_int(dcp_rank, "dcp_rank", maximum=_U32_MAX)
@@ -380,7 +381,7 @@ def execute_native_restore(
                     or slab.arena_used_bytes > arena.capacity_bytes
                 ):
                     raise NativeRestoreError(
-                        "native mapped arena disagrees with configured capacity"
+                        "SparkCache CUDA mapped arena disagrees with configured capacity"
                     )
                 arena_buffer = native.arena_memoryview(
                     arena, length=slab.arena_used_bytes
@@ -433,7 +434,7 @@ def execute_native_restore(
                         or int(output.row_count) != chunk.row_count
                     ):
                         raise NativeRestoreError(
-                            "native parser disagrees with the authenticated"
+                            "SparkCache CUDA parser disagrees with the authenticated"
                             " manifest/slab plan"
                         )
                     parsed.append(output)
@@ -458,7 +459,7 @@ def execute_native_restore(
                 or not transaction.can_resume
             ):
                 raise NativeRestoreError(
-                    "native finish did not release the parked request"
+                    "SparkCache CUDA finish did not release the parked request"
                 )
     except NativeRestoreError:
         raise
@@ -469,7 +470,9 @@ def execute_native_restore(
         TypeError,
         ValueError,
     ) as error:
-        raise NativeRestoreError(f"native restore failed closed: {error}") from error
+        raise NativeRestoreError(
+            f"SparkCache CUDA restore was rejected; recomputing: {error}"
+        ) from error
 
     return NativeRestoreResult(
         placement_stats=stats,
@@ -482,11 +485,25 @@ def execute_native_restore(
     )
 
 
+CudaRestoreChunkPlan = NativeChunkPlan
+CudaRestoreError = NativeRestoreError
+CudaRestoreResult = NativeRestoreResult
+CudaRestoreSlabPlan = NativeSlabPlan
+execute_cuda_restore = execute_native_restore
+plan_cuda_restore = plan_native_restore
+
+
 __all__ = [
+    "CudaRestoreChunkPlan",
+    "CudaRestoreError",
+    "CudaRestoreResult",
+    "CudaRestoreSlabPlan",
     "NativeChunkPlan",
     "NativeRestoreError",
     "NativeRestoreResult",
     "NativeSlabPlan",
     "execute_native_restore",
+    "execute_cuda_restore",
     "plan_native_restore",
+    "plan_cuda_restore",
 ]

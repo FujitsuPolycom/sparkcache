@@ -140,14 +140,14 @@ class HybridPageCodecTests(unittest.TestCase):
                 base_boundary_tokens=256,
                 result_boundary_tokens=512,
             )
-        with self.assertRaisesRegex(HybridCodecError, "group geometry"):
+        with self.assertRaisesRegex(HybridCodecError, "boundaries are invalid"):
             encode_page_delta(
                 layout,
                 base,
                 result,
                 base_block_counts=(1, 1),
                 result_block_counts=(2, 2),
-                base_boundary_tokens=257,
+                base_boundary_tokens=512,
                 result_boundary_tokens=512,
             )
 

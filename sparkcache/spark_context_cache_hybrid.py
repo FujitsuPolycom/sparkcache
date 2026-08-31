@@ -102,6 +102,34 @@ class PageSnapshotPlan:
     spans: tuple[PagePayloadSpan, ...]
 
 
+def page_snapshot_encoded_size(
+    layout: PageLayout,
+    block_counts: Sequence[int],
+) -> int:
+    """Return the exact encoded size without allocating page payload bytes."""
+
+    if len(block_counts) != len(layout.groups):
+        raise HybridCodecError("block-count vector disagrees with page groups")
+    counts = tuple(int(count) for count in block_counts)
+    if any(count <= 0 for count in counts):
+        raise HybridCodecError("every page group must contribute at least one block")
+    header = json.dumps(
+        {
+            "schema": "sparkcache-hybrid-pages/v1",
+            "layout_sha256": layout.digest,
+            "block_counts": counts,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    payload_bytes = sum(
+        count * layer.bytes_per_page
+        for group, count in zip(layout.groups, counts, strict=True)
+        for layer in group.layers
+    )
+    return len(_MAGIC) + _HEADER_LENGTH.size + len(header) + payload_bytes
+
+
 def plan_page_snapshot(
     layout: PageLayout,
     encoded_prefix: bytes | bytearray | memoryview,
@@ -112,7 +140,7 @@ def plan_page_snapshot(
     """Validate the small SPHP1 header and describe payload byte extents.
 
     ``encoded_prefix`` may be the complete snapshot or only the header bytes.
-    Native restore uses the latter after authenticating the containing .spcc
+    SparkCache CUDA restore uses the latter after authenticating the containing .spcc
     object, avoiding a Python slice for every layer payload.
     """
 
@@ -231,7 +259,6 @@ def decode_page_snapshot(
 
 
 def _validate_delta_boundaries(
-    layout: PageLayout,
     base_boundary_tokens: int,
     result_boundary_tokens: int,
 ) -> None:
@@ -244,11 +271,6 @@ def _validate_delta_boundaries(
         or result_boundary_tokens <= base_boundary_tokens
     ):
         raise HybridCodecError("page delta boundaries are invalid")
-    for group in layout.groups:
-        if base_boundary_tokens % group.block_size:
-            raise HybridCodecError(
-                "page delta base boundary disagrees with group geometry"
-            )
 
 
 def encode_page_delta(
@@ -265,15 +287,13 @@ def encode_page_delta(
 
     Reuse is established page-by-page across every layer in a page group. A
     group reuses a page only when the result carries byte-identical opaque
-    state at the same logical page index. The base snapshot digest and both
-    semantic boundaries are bound into the delta header.
+    state at the same logical page index. When the base boundary lies inside
+    a page, changed bytes make that complete terminal page part of the delta;
+    preceding byte-identical pages remain reusable. The base snapshot digest
+    and both semantic boundaries are bound into the delta header.
     """
 
-    _validate_delta_boundaries(
-        layout,
-        base_boundary_tokens,
-        result_boundary_tokens,
-    )
+    _validate_delta_boundaries(base_boundary_tokens, result_boundary_tokens)
     base_counts = tuple(int(value) for value in base_block_counts)
     result_counts = tuple(int(value) for value in result_block_counts)
     if len(base_counts) != len(layout.groups) or len(result_counts) != len(
@@ -354,11 +374,7 @@ def apply_page_delta(
 ) -> bytes:
     """Verify and apply one page-semantic delta to its exact base snapshot."""
 
-    _validate_delta_boundaries(
-        layout,
-        base_boundary_tokens,
-        result_boundary_tokens,
-    )
+    _validate_delta_boundaries(base_boundary_tokens, result_boundary_tokens)
     prefix_bytes = len(_DELTA_MAGIC) + _HEADER_LENGTH.size
     if (
         len(encoded_delta) < prefix_bytes
