@@ -1346,6 +1346,8 @@ def execute_cuda_hybrid_restore(
     expected_span_tokens: int,
     arena_bytes: int,
     io_workers: int = 8,
+    dcp_degree: int = 1,
+    dcp_rank: int = 0,
     base_reader: Callable[
         [PageBaseReadEvidence, Callable[[], PageBaseReadResult]],
         PageBaseReadResult | bytes,
@@ -1383,6 +1385,12 @@ def execute_cuda_hybrid_restore(
             expected_span_tokens=expected_span_tokens,
             arena_bytes=arena_bytes,
             io_workers=io_workers,
+        )
+
+    if dcp_degree != 1 or dcp_rank != 0:
+        raise CudaHybridRestoreError(
+            "legacy chunk-based page restore supports only DCP1;"
+            " publish a v2 page snapshot before using DCP"
         )
 
     slabs = plan_cuda_restore(

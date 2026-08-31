@@ -236,19 +236,39 @@ def _recurrent_state_identity(
     return {field: next(iter(choices)) for field, choices in values.items()}
 
 
-def kv_group_topology(kv_cache_config: Any) -> tuple[dict[str, Any], ...]:
+def kv_group_topology(
+    kv_cache_config: Any,
+    *,
+    dcp_degree: int = 1,
+) -> tuple[dict[str, Any], ...]:
+    """Describe each manager group, including its DCP page ownership."""
+
+    if dcp_degree <= 0:
+        raise RuntimeError("spark-context-cache: DCP degree must be positive")
     groups = tuple(getattr(kv_cache_config, "kv_cache_groups", ()) or ())
     topology = []
     for group_index, group in enumerate(groups):
         spec = getattr(group, "kv_cache_spec", None)
         layers = tuple(sorted(getattr(group, "layer_names", ()) or ()))
         reuse_policy, reuse_window_tokens = _group_reuse_policy(spec, layers)
+        dcp_replicated = bool(
+            getattr(spec, "dcp_replicated", reuse_policy == "recurrent_align")
+        )
+        dcp_shard_count = 1 if dcp_replicated else dcp_degree
+        block_size = int(getattr(spec, "block_size", 0) or 0)
+        if block_size <= 0:
+            raise RuntimeError(
+                "spark-context-cache: KV-cache group block size must be positive"
+            )
         group_identity = {
             "group": group_index,
             "spec": type(spec).__name__,
-            "block_size": int(getattr(spec, "block_size", 0) or 0),
+            "block_size": block_size,
             "storage_block_size": int(getattr(spec, "storage_block_size", 0) or 0),
             "page_size_bytes": int(getattr(spec, "page_size_bytes", 0) or 0),
+            "dcp_replicated": dcp_replicated,
+            "dcp_shard_count": dcp_shard_count,
+            "logical_tokens_per_block": block_size * dcp_shard_count,
             "reuse_policy": reuse_policy,
             "reuse_window_tokens": reuse_window_tokens,
             "eagle": bool(getattr(group, "is_eagle_group", False)),
@@ -261,9 +281,9 @@ def kv_group_topology(kv_cache_config: Any) -> tuple[dict[str, Any], ...]:
     return tuple(topology)
 
 
-def kv_group_topology_digest(kv_cache_config: Any) -> str:
+def kv_group_topology_digest(kv_cache_config: Any, *, dcp_degree: int = 1) -> str:
     encoded = json.dumps(
-        kv_group_topology(kv_cache_config),
+        kv_group_topology(kv_cache_config, dcp_degree=dcp_degree),
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -285,6 +305,7 @@ class ConnectorConfig:
 
     tp_degree: int
     dcp_degree: int
+    cp_kv_cache_interleave_size: int
     block_size: int
     profile: Any
     storage_mode: str
@@ -369,11 +390,32 @@ def parse_connector_config(
     parallel = vllm_config.parallel_config
     tp_degree = max(1, getattr(parallel, "tensor_parallel_size", 1))
     dcp_degree = max(1, getattr(parallel, "decode_context_parallel_size", 1))
+    cp_kv_cache_interleave_size = getattr(
+        parallel,
+        "cp_kv_cache_interleave_size",
+        getattr(parallel, "dcp_kv_cache_interleave_size", 1),
+    )
+    if (
+        type(cp_kv_cache_interleave_size) is not int
+        or cp_kv_cache_interleave_size <= 0
+    ):
+        raise RuntimeError(
+            "spark-context-cache: cp_kv_cache_interleave_size must be a"
+            " positive integer"
+        )
     if tp_degree % dcp_degree:
         raise RuntimeError(
             "spark-context-cache: decode context parallel size must divide"
             f" tensor parallel size (tp={tp_degree},"
             f" dcp={dcp_degree})"
+        )
+    if (
+        block_size < cp_kv_cache_interleave_size
+        or block_size % cp_kv_cache_interleave_size
+    ):
+        raise RuntimeError(
+            "spark-context-cache: cache block size must be at least and"
+            " divisible by cp_kv_cache_interleave_size"
         )
     pp_degree = max(1, getattr(parallel, "pipeline_parallel_size", 1))
     if pp_degree > 1:
@@ -414,12 +456,17 @@ def parse_connector_config(
         publication_schema = (
             "page-tail-cow-v1" if storage_mode == "block_pages_v1" else "tail-cow-v1"
         )
-    group_topology = kv_group_topology(kv_cache_config)
+    group_topology = kv_group_topology(kv_cache_config, dcp_degree=dcp_degree)
     if storage_mode == "block_pages_v1" and not group_topology:
         raise RuntimeError(
             "spark-context-cache: block-page storage requires KV-cache groups"
         )
     chunk_tokens = profile.chunk_tokens
+    if storage_mode == "per_token_rows" and cp_kv_cache_interleave_size != 1:
+        raise RuntimeError(
+            "spark-context-cache: per-token row storage supports only"
+            " cp_kv_cache_interleave_size=1"
+        )
     load_policy = str(
         getattr(kv_transfer_config, "kv_load_failure_policy", "recompute")
     )
@@ -669,8 +716,9 @@ def parse_connector_config(
     if storage_mode == "block_pages_v1":
         # A cache-manager block ID names one complete physical page, including
         # split kernel rows and opaque bytes beyond the logical tensor shape.
-        quantization_layout += ":manager-pages-v1:" + kv_group_topology_digest(
-            kv_cache_config
+        quantization_layout += ":manager-pages-v2:" + kv_group_topology_digest(
+            kv_cache_config,
+            dcp_degree=dcp_degree,
         )
     record_schema = (
         ("target_ckv", "logical_positions") if storage_mode == "block_pages_v1" else ()
@@ -682,6 +730,7 @@ def parse_connector_config(
         rope_layout=profile.rope_layout,
         tp_degree=tp_degree,
         dcp_degree=dcp_degree,
+        cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
         chunk_tokens=chunk_tokens,
         boundary_hidden_policy=profile.boundary_hidden_policy,
         draft_kv_policy=str(draft_policy),
@@ -749,6 +798,7 @@ def parse_connector_config(
     return ConnectorConfig(
         tp_degree=tp_degree,
         dcp_degree=dcp_degree,
+        cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
         block_size=block_size,
         profile=profile,
         storage_mode=storage_mode,

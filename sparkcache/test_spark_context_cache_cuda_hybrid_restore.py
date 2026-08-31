@@ -1709,6 +1709,28 @@ def test_flat_macro_prefetches_four_objects_before_arena_wait(
     )
 
 
+def test_legacy_chunk_page_restore_rejects_dcp() -> None:
+    layout = PageLayout(
+        (PageGroup(2, (PageLayer("page", "torch.uint8", (4,), 4),)),)
+    )
+    with pytest.raises(
+        cuda_hybrid.CudaHybridRestoreError,
+        match="legacy chunk-based page restore supports only DCP1",
+    ):
+        execute_cuda_hybrid_restore(
+            adapter=object(),
+            request_id="legacy-dcp2",
+            lookup=SimpleNamespace(is_hit=True, _manifest={}),
+            cache_root="unused",
+            layout=layout,
+            group_slots=((1,),),
+            expected_span_tokens=256,
+            arena_bytes=64 * 1024 * 1024,
+            dcp_degree=2,
+            dcp_rank=0,
+        )
+
+
 def test_page_object_spans_exclude_header_and_cover_payload_contiguously() -> None:
     layout = PageLayout((PageGroup(2, (PageLayer("page", "torch.uint8", (4,), 4),)),))
     encoded = encode_page_snapshot(layout, (4,), {"page": bytes(range(16))})
