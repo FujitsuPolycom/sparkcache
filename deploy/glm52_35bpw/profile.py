@@ -293,7 +293,7 @@ def _validate_r7_arguments(arguments: list[str]) -> None:
             )
     if "--disable-prefix-caching" in arguments:
         raise ProfileTransformError(
-            "source GLM-5.2 serving recipe R7 must use its native prefix-cache default or"
+            "source GLM-5.2 serving recipe R7 must use its vLLM prefix-cache default or"
             " --enable-prefix-caching"
         )
     for preserved_flag in (
@@ -395,7 +395,7 @@ def build_kv_transfer_config(
     if streaming_snapshots:
         if streaming_native_library is None or streaming_native_library_sha256 is None:
             raise ProfileTransformError(
-                "streaming snapshots require their native library path and SHA-256"
+                "streaming snapshots require their C++/CUDA library path and SHA-256"
             )
         extra.update(
             {
@@ -420,7 +420,7 @@ def build_kv_transfer_config(
         or streaming_timing
     ):
         raise ProfileTransformError(
-            "streaming native options require streaming_snapshots=True"
+            "streaming C++/CUDA options require streaming_snapshots=True"
         )
 
     if cuda_restore:

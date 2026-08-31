@@ -31,9 +31,17 @@ PARENT = (
 PARENT_CONFIG = (
     "sha256:8cff7a250f16bfb89df23d29f9233dbb1c700a780dcec86a64c535a71aee88be"
 )
-QUICKSTART = (
+QUICKSTART_PATH = "docs/GLM53_JJ_R7_GB10_TP4_QUICKSTART.md"
+QUICKSTART_URL = (
     "https://github.com/FujitsuPolycom/sparkring/blob/main/"
-    "docs/GLM53_JJ_R7_GB10_TP4_QUICKSTART.md"
+    + QUICKSTART_PATH
+)
+QUICKSTART_REVISION = "54d9df70ee7f6fe9195a6b1983341497791be845"
+QUICKSTART_DURABLE_URL = (
+    "https://github.com/FujitsuPolycom/sparkring/blob/"
+    + QUICKSTART_REVISION
+    + "/"
+    + QUICKSTART_PATH
 )
 
 
@@ -60,7 +68,12 @@ def test_public_arm64_receipt_binds_artifact_and_status() -> None:
         "parent_image_config_digest": PARENT_CONFIG,
         "contains_model_weights": False,
     }
-    assert receipt["quickstart"] == QUICKSTART
+    assert receipt["quickstart"] == {
+        "repository": "FujitsuPolycom/sparkring",
+        "path": QUICKSTART_PATH,
+        "publication": "SparkRing PR150",
+        "revision": QUICKSTART_REVISION,
+    }
 
 
 def test_public_arm64_receipt_binds_runtime_and_model_sources() -> None:
@@ -128,11 +141,18 @@ def test_public_arm64_receipt_distinguishes_composition_from_lineage_labels() ->
         "org.sparkcache.default": "disabled-until-explicitly-configured",
         "org.sparkring.parent.image": PARENT_CONFIG,
     }
-    assert labels["inherited_lineage_not_active_composition"] == [
-        "ai.vllm.build.commit",
-        "org.jovian.vllm.commit",
-        "org.jovian.b12x.commit",
-        "org.sparkring.native-parent.vllm",
+    assert labels["compiled_extension_and_lower_layer_provenance"] == {
+        "vllm_build_commit": "3633d61c3c7b04bb4d598cadbdc342f3be40482d",
+        "intermediate_vllm_label": "da4d7be6c97434f6942292ed8abbf4b32dc44355",
+        "lower_layer_b12x_label": "2fcf23a0ce269be27b2e03fece73d46e90e6aeea",
+        "parent_manifest_digest": PARENT,
+        "parent_image_config_digest": PARENT_CONFIG,
+        "interpretation": (
+            "Active Python source is the 331573d composition; retained compiled "
+            "extensions come from the immutable lower image layers."
+        ),
+    }
+    assert labels["inherited_draft_lineage_not_active_model"] == [
         (
             "org.glm53.dflash2.checkpoint-revision="
             "b6d33aa93fc1ac5b23a88251a1c0ce0bfe2ad17c"
@@ -143,6 +163,8 @@ def test_public_arm64_receipt_distinguishes_composition_from_lineage_labels() ->
     image_record = IMAGE_RECORD.read_text(encoding="utf-8")
     assert "not the mounted BF16" in image_record
     assert "incoai/GLM-5.3-Flash-DFlash2@dc77ff1c" in image_record
+    assert "Compiled vLLM extensions retain" in image_record
+    assert "does not claim that every compiled extension was" in image_record
 
 
 def test_public_arm64_receipt_binds_bounded_c4_smoke() -> None:
@@ -186,7 +208,7 @@ def test_public_arm64_docs_route_by_digest_without_overclaiming() -> None:
 
     for text in (image_record, readme):
         assert MANIFEST in text
-        assert QUICKSTART in text
+        assert QUICKSTART_PATH in text
         assert "implemented and tp4 smoke-verified" in text.casefold()
         assert "not generally qualified" in text.casefold()
 
@@ -195,6 +217,7 @@ def test_public_arm64_docs_route_by_digest_without_overclaiming() -> None:
     assert PARENT_CONFIG in image_record
     assert "does not prove shared-base read coalescing" in image_record
     assert "not generally qualified" in readme.casefold()
+    assert QUICKSTART_DURABLE_URL in image_record
 
 
 def test_canonical_docs_route_to_public_arm64_manifest() -> None:
@@ -209,6 +232,8 @@ def test_canonical_docs_route_to_public_arm64_manifest() -> None:
     deployment = DEPLOYMENT_GUIDE.read_text(encoding="utf-8")
     assert "The canonical public image is" in readme
     assert "canonical public image route" in deployment
+    assert QUICKSTART_URL in readme
+    assert QUICKSTART_URL in deployment
     assert "export GLM53_IMAGE='" + (
         "ghcr.io/fujitsupolycom/sparkring-glm53-sparkcache@" + MANIFEST
     ) in readme

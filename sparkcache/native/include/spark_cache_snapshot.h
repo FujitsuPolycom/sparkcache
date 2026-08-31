@@ -19,8 +19,9 @@ extern "C" {
 #endif
 
 /*
- * This is a separate ABI from restore placement. Snapshot publication is
- * opportunistic and fail-open; restore placement remains fail-closed.
+ * This is a separate ABI from SparkCache CUDA restore placement. Snapshot
+ * publication is opportunistic and its ordinary failures do not interrupt
+ * serving; restored state must be verified or recomputed.
  */
 #define SPARK_CACHE_SNAPSHOT_ABI_VERSION 1u
 #define SPARK_CACHE_SNAPSHOT_MIN_SLOTS 2u
@@ -33,8 +34,8 @@ typedef enum SparkCacheSnapshotStatus {
   SPARK_CACHE_SNAPSHOT_INVALID_STATE = 2,
   SPARK_CACHE_SNAPSHOT_CUDA_ERROR = 3,
   /*
-   * Expected fail-open outcomes. The caller must continue inference and may
-   * abandon cache publication without retrying on the critical path.
+   * Expected serving-preserving outcomes. The caller continues inference and
+   * may abandon cache publication without retrying on the critical path.
    */
   SPARK_CACHE_SNAPSHOT_WOULD_BLOCK = 4,
   SPARK_CACHE_SNAPSHOT_NOT_READY = 5,
@@ -71,7 +72,7 @@ enum {
 
 /*
  * The caller owns block leases for all physical slots supplied to submit().
- * It may release those leases after poll() returns READY. The native ring
+ * It may release those leases after poll() returns READY. The C++/CUDA ring
  * never persists current physical-slot coordinates.
  */
 typedef struct SparkCacheSnapshotSource {

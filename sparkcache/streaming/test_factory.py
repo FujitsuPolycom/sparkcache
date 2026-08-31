@@ -75,7 +75,7 @@ def test_worker_settings_require_attested_absolute_snapshot_library(
 
     with pytest.raises(
         RuntimeError,
-        match="absolute native library path.*lowercase SHA-256",
+        match=r"absolute C\+\+/CUDA library path.*lowercase SHA-256",
     ):
         ModelServingStreamingSettings.from_connector(_connector())
 
@@ -861,7 +861,7 @@ class _AbortOnceRuntime:
         return True
 
 
-def test_worker_ignores_later_watermarks_after_fail_open_abort() -> None:
+def test_worker_ignores_later_watermarks_after_publication_abort() -> None:
     adapter = WorkerStreamingSnapshotAdapter(
         types.SimpleNamespace(),
         settings=ModelServingStreamingSettings(

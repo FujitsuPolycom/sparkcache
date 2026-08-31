@@ -31,6 +31,6 @@ filesystem permissions appropriate to the model service and must use separate
 cache roots when tenants are not permitted to share derived state.
 
 SparkCache verifies cache identity and stored data before restore. An identity,
-integrity, or quorum failure must degrade to recomputation. This fail-closed
-behavior does not replace host hardening, storage encryption, access control,
-or isolation of the model-serving runtime.
+integrity, or quorum failure must become a cache miss and recomputation. This
+verified-or-recompute behavior does not replace host hardening, storage
+encryption, access control, or isolation of the model-serving runtime.

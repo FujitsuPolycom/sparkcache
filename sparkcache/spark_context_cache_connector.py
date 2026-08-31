@@ -16,7 +16,7 @@ assembly, H2D copy, and scatter on a background loader. The request is
 reported finished only after its writes have completed; unrelated requests
 remain schedulable while it restores.
 
-Fail-closed contract:
+Verified-or-recompute contract:
 - Storage uses content-addressed chunks with per-record SHA-256 and an
   identity pinning model/quant/TP/DCP/shard-rank/chunk geometry.
 - A failed asynchronous load publishes its invalid blocks and finished
@@ -147,7 +147,7 @@ def configure_streaming_snapshot_runtime(
     """Install or remove the explicitly injected streaming runtime factory.
 
     This is a narrow integration seam for an attested embedding runtime.  It
-    does not create, import, or otherwise enable a native runtime by itself.
+    does not create, import, or otherwise enable a C++/CUDA runtime by itself.
     ``factory`` receives the connector after its basic vLLM configuration is
     available and must return a role-appropriate adapter.
     """
@@ -651,7 +651,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             # Preserve an explicitly injected test/deployment adapter. When
             # none exists, import the builtin factory only on this opt-in
             # path; default-off scheduler and worker processes never import
-            # factory/native-ring modules.
+            # factory and C++/CUDA ring modules.
             if role not in _STREAMING_RUNTIME_FACTORIES:
                 from sparkcache.streaming.factory import (
                     make_model_serving_runtime_factory,
@@ -660,8 +660,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 _STREAMING_RUNTIME_FACTORIES[role] = make_model_serving_runtime_factory(
                     role.name
                 )
-            # Resolve the adapter before native import/allocation so a
-            # partially configured deployment fails closed at startup.
+            # Resolve the adapter before C++/CUDA import/allocation so a
+            # partially configured deployment is rejected at startup.
             self._install_streaming_runtime(role)
         self._native_restore_enabled = (
             config.native_restore_enabled and self._cache_available
@@ -728,8 +728,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._load_threads: list[threading.Thread] = []
         self._load_thread_limit = config.load_thread_limit
         if self._native_restore_enabled and self._storage_mode != "block_pages_v1":
-            # One native adapter owns one transaction and two arenas. Keep
-            # row restores serialized; native page mode creates one adapter
+            # One SparkCache CUDA adapter owns one transaction and two arenas.
+            # Keep row restores serialized; CUDA page mode creates one adapter
             # per bounded load lane instead.
             self._load_thread_limit = 1
         self._inflight_load_reqs: set[str] = set()
@@ -760,7 +760,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         # restore. Followers own no restore blocks: they remain ordinary
         # waiting requests until vLLM publishes the leader's verified blocks
         # into its local prefix cache. Unique flights are bounded by the same
-        # admission limit as native load lanes; excess unrelated work
+        # admission limit as SparkCache CUDA load lanes; excess unrelated work
         # recomputes immediately instead of joining a cache-side queue.
         self._restore_flights: dict[str, _RestoreFlight] = {}
         self._restore_flight_leaders: dict[str, str] = {}
@@ -884,7 +884,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         )
 
     def _install_streaming_runtime(self, role: KVConnectorRole) -> None:
-        """Resolve the opt-in runtime without importing a native backend."""
+        """Resolve the opt-in runtime without importing a C++/CUDA backend."""
 
         factory = _STREAMING_RUNTIME_FACTORIES.get(role)
         if factory is None:
@@ -1592,7 +1592,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 return 0, False
             if is_alias:
                 self.counters["prefix_alias_scheduler_probe_hit"] += 1
-        # probe mode "none": quorum alone gates admission; every worker
+        # Probe mode "none": quorum alone determines admission; every worker
         # validated its own manifest at discovery or commit time, and any
         # rank's load failure still degrades to a clean recompute.
         self.counters["restore_hit"] += 1
@@ -2695,7 +2695,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             return False
 
         # A failed or concurrently skipped pass cannot prove which manifests
-        # survived. Retain fail-closed readback only for that ambiguous path.
+        # survived. Retain verified survivor readback for that ambiguous path.
         return not self._store.lookup(
             identity,
             context_digest,
@@ -2809,7 +2809,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     digest,
                     receipt,
                 )
-            except Exception:  # noqa: BLE001 - cache metadata fails closed
+            except Exception:  # noqa: BLE001 - invalid metadata stays unadvertised
                 invalid_receipts += 1
                 continue
             staged.append((digest, receipt, allocated_bytes))
@@ -2899,7 +2899,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         verify_chunk_metadata=True,
                     ).is_hit
                 }
-            except Exception as error:  # noqa: BLE001 - fail closed/retry
+            except Exception as error:  # noqa: BLE001 - leave unverified and retry
                 self.counters["capacity_failed"] += 1
                 self._capacity_status.update(
                     bytes=self._capacity_estimated_bytes,
@@ -3456,7 +3456,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     self._native_restore_enabled
                     and evidence.base_root_kind != "page_snapshot"
                 ):
-                    # Native object sharing currently publishes one verified
+                    # SparkCache CUDA object sharing publishes one verified
                     # flat-base object set. Nested deltas keep their ordinary
                     # independent direct path instead of waiting on a flight
                     # whose representation they cannot consume.
@@ -3713,7 +3713,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         io_workers=self._native_io_workers,
                     )
                 except Exception as error:  # noqa: BLE001
-                    # The native transaction may already have written some
+                    # The SparkCache CUDA transaction may already have written some
                     # private restore blocks. Never enter Python assembly or
                     # retry those blocks: retire the entry and publish all of
                     # this request's blocks as invalid for clean recompute.
@@ -4195,7 +4195,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._emit_page_base_flight_summaries()
         runtime = self._streaming_runtime
         if runtime is not None:
-            # Drain/cancel snapshot leases before any native cache or staging
+            # Drain/cancel snapshot leases before any C++/CUDA cache or staging
             # resource can be destroyed. A failure remains fatal and prevents
             # unsafe teardown.
             runtime.shutdown()
@@ -4203,7 +4203,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         capacity_thread = self._capacity_thread
         if capacity_thread is not None:
             # Give already handed-off durable commits one final background
-            # capacity pass. A persistent busy/failure remains fail closed:
+            # capacity pass. A persistent busy/failure remains unadvertised:
             # shutdown drops only the in-memory handoff, never advertises it.
             self._capacity_wakeup.set()
             self.wait_for_pending_capacity_commits(timeout=5.0)
@@ -4248,7 +4248,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
         live_threads = sum(thread.is_alive() for thread in self._load_threads)
         if (self._native_adapters or self._native_adapter is not None) and live_threads:
-            # A native loader can still own the handle or mapped arenas.
+            # A SparkCache CUDA loader can still own the handle or mapped arenas.
             # Keep the adapter strongly reachable and let process teardown
             # reclaim it; destroying it here would be a use-after-close race.
             self.counters["native_shutdown_handle_leaked"] = (
@@ -4308,7 +4308,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 # every post-forward callback.
                 runtime.poll()
             # Never invoke the synchronous CPU snapshot/ManifestStore path under
-            # this flag: an incomplete injected runtime must fail closed, not
+            # this flag: an incomplete injected runtime must publish nothing, not
             # silently publish a synchronous end-of-prefill entry.
             return
         if not isinstance(metadata, SparkCacheConnectorMetadata):
@@ -4357,7 +4357,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     plan.digest[:12],
                     1e3 * (time.perf_counter() - snapshot_started),
                 )
-            except Exception as error:  # noqa: BLE001 - enqueue must fail closed
+            except Exception as error:  # noqa: BLE001 - failed enqueue publishes nothing
                 self._finish_store(
                     plan.digest,
                     committed=False,

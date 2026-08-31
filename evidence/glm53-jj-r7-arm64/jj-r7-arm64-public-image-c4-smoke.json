@@ -31,11 +31,15 @@
       "org.sparkcache.default": "disabled-until-explicitly-configured",
       "org.sparkring.parent.image": "sha256:8cff7a250f16bfb89df23d29f9233dbb1c700a780dcec86a64c535a71aee88be"
     },
-    "inherited_lineage_not_active_composition": [
-      "ai.vllm.build.commit",
-      "org.jovian.vllm.commit",
-      "org.jovian.b12x.commit",
-      "org.sparkring.native-parent.vllm",
+    "compiled_extension_and_lower_layer_provenance": {
+      "vllm_build_commit": "3633d61c3c7b04bb4d598cadbdc342f3be40482d",
+      "intermediate_vllm_label": "da4d7be6c97434f6942292ed8abbf4b32dc44355",
+      "lower_layer_b12x_label": "2fcf23a0ce269be27b2e03fece73d46e90e6aeea",
+      "parent_manifest_digest": "sha256:11922064b342de1fc98f0ef85e6648843c8fa7eb3e4f4353c6ad82d6e457dde0",
+      "parent_image_config_digest": "sha256:8cff7a250f16bfb89df23d29f9233dbb1c700a780dcec86a64c535a71aee88be",
+      "interpretation": "Active Python source is the 331573d composition; retained compiled extensions come from the immutable lower image layers."
+    },
+    "inherited_draft_lineage_not_active_model": [
       "org.glm53.dflash2.checkpoint-revision=b6d33aa93fc1ac5b23a88251a1c0ce0bfe2ad17c",
       "org.glm53.dflash2.mxfp8-quant-plumbing=v2"
     ]
@@ -118,5 +122,10 @@
       "corruption recovery"
     ]
   },
-  "quickstart": "https://github.com/FujitsuPolycom/sparkring/blob/main/docs/GLM53_JJ_R7_GB10_TP4_QUICKSTART.md"
+  "quickstart": {
+    "repository": "FujitsuPolycom/sparkring",
+    "path": "docs/GLM53_JJ_R7_GB10_TP4_QUICKSTART.md",
+    "publication": "SparkRing PR150",
+    "revision": "54d9df70ee7f6fe9195a6b1983341497791be845"
+  }
 }

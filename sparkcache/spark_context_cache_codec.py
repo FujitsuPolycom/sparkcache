@@ -30,7 +30,7 @@ _POSITION_STRUCT = struct.Struct("<I")
 
 class CodecError(ValueError):
     """Deterministic packing/unpacking failure. Callers convert this to a
-    fail-closed cache miss; it must never crash a serving process."""
+    cache miss and recomputation; it must never crash a serving process."""
 
 
 def _u32_array(values: Iterable[int], label: str) -> array:

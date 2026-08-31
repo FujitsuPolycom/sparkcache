@@ -1,10 +1,10 @@
-"""Fail-closed feature gate for the model-serving snapshot-ring path.
+"""Verified opt-in requirements for model-serving snapshot rings.
 
 The ordinary SparkCache store remains the default publication path. Keeping
-the gate separate from the CUDA binding makes the default path safe to import
-in CPU-only scheduler processes. Explicit opt-in is assembled by the builtin
-model-serving factory and fails closed unless its native library and pinned vLLM
-lease contract attest exactly.
+the opt-in check separate from the CUDA binding keeps CPU-only scheduler
+imports free of CUDA side effects. Explicit opt-in is assembled by the builtin
+model-serving factory and is rejected unless its C++/CUDA library and pinned
+vLLM lease contract attest exactly.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ _FALSE = frozenset((False, 0, "0", "false", "no", "off", ""))
 
 
 class StreamingSnapshotsUnavailable(RuntimeError):
-    """The feature was explicitly requested before its safety gates exist."""
+    """The feature was requested before its safety requirements were met."""
 
 
 def is_enabled(value: Any) -> bool:
@@ -40,7 +40,7 @@ def is_enabled(value: Any) -> bool:
 
 
 def require_live_integration() -> None:
-    """Fail closed for callers that bypass the connector factory.
+    """Reject callers that bypass the connector factory.
 
     The connector installs the model-serving role factory when streaming is
     explicitly enabled. An embedding that calls this guard directly has not

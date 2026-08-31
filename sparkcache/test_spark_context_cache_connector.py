@@ -1,7 +1,7 @@
 """GPU-free tests for the SparkRing persistent context-cache connector.
 
 Simulates a four-rank DCP4 store -> pool wipe -> restore cycle with real
-byte comparisons on CPU torch tensors, plus the fail-closed sabotage paths.
+byte comparisons on CPU torch tensors, plus verified-or-recompute sabotage paths.
 vLLM is stubbed the same way as the sibling backend suites.
 """
 
@@ -591,14 +591,14 @@ class HybridPageRoundTripTests(unittest.TestCase):
             connector._native_execute_hybrid_restore = native_restore
             connector._native_execute_hybrid_placement = mock.Mock(
                 side_effect=AssertionError(
-                    "page-delta native restore must not receive materialized bytes"
+                    "page-delta SparkCache CUDA restore must not receive materialized bytes"
                 )
             )
             with mock.patch.object(
                 connector._store,
                 "restore_page_snapshot",
                 side_effect=AssertionError(
-                    "page-delta native restore must not materialize a snapshot"
+                    "page-delta SparkCache CUDA restore must not materialize a snapshot"
                 ),
             ):
                 self.assertTrue(
@@ -6640,7 +6640,7 @@ class StreamingSnapshotConnectorSeamTests(unittest.TestCase):
                 settings=types.SimpleNamespace(),
             )
             # Finish reporting itself is GPU-free.  Keep the real adapter and
-            # lease registry, while replacing unrelated native-ring progress.
+            # lease registry, while replacing unrelated C++/CUDA-ring progress.
             worker_adapter._bound = True
             worker_adapter._runtime = object()
             worker_adapter._leases = BlockLeaseRegistry(
@@ -7389,7 +7389,7 @@ class DCP4CompatibilityTests(unittest.TestCase):
         """An identity dictionary without ``tp_shard_rank`` hashes to a
         different storage key than an identity with a concrete physical rank.
 
-        The fail-closed condition depends on the wire key set, not merely on
+        The verified-or-miss condition depends on the wire key set, not merely on
         the value assigned to ``tp_shard_rank``.
         """
         import hashlib
@@ -7434,7 +7434,7 @@ class DCP4CompatibilityTests(unittest.TestCase):
                 incomplete_storage_key,
                 canonical_identity.storage_key,
                 "Identities without tp_shard_rank must have a different "
-                "storage_key and fail closed.",
+                "storage_key and be rejected.",
             )
 
 

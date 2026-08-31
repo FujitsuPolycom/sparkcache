@@ -735,7 +735,7 @@ def test_writer_result_error_aborts_and_releases_claimed_slot() -> None:
     assert later.reason == "unknown_context"
 
 
-def test_writer_submit_exception_is_fail_open_and_leaves_no_ownership() -> None:
+def test_writer_submit_exception_aborts_publication_and_leaves_no_ownership() -> None:
     writer = FakeWriter()
     writer.raise_on_submit = True
     runtime, ring, writer, leases = make_runtime(writer=writer)

@@ -164,7 +164,7 @@ def _secure_fd_load_path(fd: int) -> str:
     if not sys.platform.startswith("linux"):
         raise NativeSnapshotError(
             "secure snapshot-library loading requires Linux /proc/self/fd; "
-            f"platform {sys.platform!r} is fail-closed"
+            f"platform {sys.platform!r} is unsupported"
         )
     path = f"/proc/self/fd/{fd}"
     try:

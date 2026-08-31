@@ -6,7 +6,7 @@ interface. Status labels have these meanings:
 - **research-only** — a design or evidence exists, but deployment support is
   not qualified; accepted design directions without implementation also use
   this status and state their prerequisites;
-- **unsupported** — no safe interface exists; configuration fails closed;
+- **unsupported** — no safe interface exists; configuration is rejected;
   designs incompatible with SparkCache's invariants are explicitly marked
   unsupported by design.
 
@@ -110,7 +110,7 @@ complete encoded representation and preserve byte-exact decoded records.
 
 Opaque page ownership and DSpark rolling-state sharding are undefined for DCP
 degrees above one. `deploy/deepseek_v4/DCP_SUPPORT.md` states the required
-wire-format, ownership, and qualification work. Configuration fails closed.
+wire-format, ownership, and qualification work. Configuration is rejected.
 
 ### Qwen recurrent-state persistence
 

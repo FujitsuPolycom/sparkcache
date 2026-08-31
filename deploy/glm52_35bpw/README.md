@@ -40,7 +40,7 @@ inspection. Stage three additional read-only inputs at rank-local host paths:
 The source files must come from that image's e2666d9a6 vLLM installation.
 The published patch preimages reject any other source. Keeping these changes
 as mounts preserves the image identity used by exact-Q40 while adding the
-connector and fail-closed recompute behavior.
+connector and verified-or-recompute behavior.
 
 Prepare the two files on each rank from the exact inspected image (the output
 directory must not already exist):
@@ -130,7 +130,7 @@ The default rank-local policy is:
 - 200 GiB high and 180 GiB low watermarks;
 - TTL zero;
 - store and restore enabled;
-- fail-closed load policy `recompute`;
+- verified-or-recompute load policy `recompute`;
 - colocated-target MTP state, with no separate draft digest;
 - scheduler probe `none`; and
 - streaming snapshots and SparkCache direct CUDA restore disabled.
@@ -140,7 +140,7 @@ The complete `--kv-transfer-config` is the enable switch. The obsolete
 before the inherited R7 entrypoint starts vLLM.
 
 The accepted inspection has neither `--enable-prefix-caching` nor
-`--disable-prefix-caching`; R7 supplies its native prefix-cache default. The
+`--disable-prefix-caching`; R7 supplies its vLLM prefix-cache default. The
 transformer preserves an absent flag or one explicit enable and rejects an
 explicit disable.
 
@@ -165,7 +165,7 @@ path and SHA-256:
 ```
 
 Keep both switches off for the qualification baseline. Before enabling
-either switch, build the corresponding `sparkcache/native` target for SM121
+either switch, build the corresponding `sparkcache/native` C++/CUDA target for SM121
 in the R7 toolchain. The read-only SparkCache source bind then carries the
 resulting library into the container at the paths above.
 
@@ -182,7 +182,7 @@ unique in the source site/profile. This transformer preserves those upstream
 transport and JIT assignments and does not synthesize replacements. It rejects an API
 port equal to the rendezvous port.
 
-## Four-rank persistence gate
+## Four-rank persistence check
 
 After all four ranks are healthy, create one deterministic reference on a
 cache miss and wait for every rank to publish its manifest:
@@ -222,12 +222,12 @@ exact long answer
 show the same digest offered by all four physical ranks and an external-cache
 restore rather than a fresh store.
 
-The GLM-5.2 semantic gate allows 512 output tokens for each long semantic
-request. The gate combines the OpenAI-compatible `reasoning`,
+The GLM-5.2 semantic check allows 512 output tokens for each long semantic
+request. The check combines the OpenAI-compatible `reasoning`,
 `reasoning_content`, and `content` assistant fields for deterministic evidence
 while checking the exact answer against final `content`. A token-limit finish
 or an empty combined body prints a structured `INCONCLUSIVE` result and exits
-with status 2; neither condition satisfies the persistence gate.
+with status 2; neither condition satisfies the persistence check.
 
 ## Offline validation
 

@@ -747,7 +747,7 @@ def test_prefix_cache_flags_preserve_native_default_or_explicit_enable() -> None
 
     disabled_source = _source_inspection()
     disabled_source["Config"]["Cmd"].append("--disable-prefix-caching")
-    with pytest.raises(ProfileTransformError, match="native prefix-cache default"):
+    with pytest.raises(ProfileTransformError, match="vLLM prefix-cache default"):
         transform_inspection(disabled_source)
 
 

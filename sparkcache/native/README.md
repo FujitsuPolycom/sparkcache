@@ -4,7 +4,7 @@
 registered cache tensors. It is **implemented** and opt-in; qualified
 DeepSeek profiles keep it disabled. CPU/layout tests, CUDA 13 SM121
 compilation, standalone mapped-host placement, ctypes ABI validation, and a
-checksum-bound four-rank integration gate cover this library.
+checksum-bound four-rank integration check cover this library.
 
 `libspark_cache_snapshot.so` implements the store-side gather ring documented
 in [`SNAPSHOT_RING_STATE_MODEL.md`](SNAPSHOT_RING_STATE_MODEL.md). It is
@@ -191,7 +191,7 @@ These rules are not optional:
    both stream events and the device error word.
 
 Earlier slabs may already have written parked KV blocks when a later slab
-fails. This does not weaken the existing fail-closed contract: those blocks
+fails. This does not weaken verified-or-recompute behavior: those blocks
 belong exclusively to the parked request, no forward pass may consume them,
 and the failure path frees/recomputes them. Making the 3.14 GB installation
 physically transactional would require another full-size device copy and
@@ -206,7 +206,7 @@ cd sparkcache
 python -m pytest -q native/tests
 ```
 
-CPU C++ parser/layout/reference gate from WSL:
+CPU C++ parser/layout/reference check from WSL:
 
 ```powershell
 cd sparkcache\native
@@ -222,7 +222,7 @@ The CPU test parses a real canonical v1 byte layout, validates DCP-owned
 positions, scatters two target layers plus one indexer layer into scrambled
 physical slots, and demands byte identity.
 
-## Exact DGX Spark compile gate
+## Exact DGX Spark compile check
 
 Build inside the same CUDA/container environment as vLLM:
 
@@ -254,7 +254,7 @@ CPU/layout behavior only, not GPU execution or performance.
 
 The standalone CUDA probe uses mapped pinned input, one slot upload, one
 destination-table upload and one fused direct scatter. It verifies scrambled
-destination rows byte-for-byte. This is a syntax/correctness gate, not a
+destination rows byte-for-byte. This is a syntax/correctness check, not a
 performance claim.
 
 The build is rejected if:
@@ -265,7 +265,7 @@ The build is rejected if:
   `1/1/1/1`;
 - any CUDA, bounds or byte comparison error occurs.
 
-## Exact 392,960-token model-integrated microbenchmark gate
+## Exact 392,960-token model-integrated microbenchmark check
 
 The initial execution must use throwaway KV destinations rather than tensors
 owned by a serving model.
@@ -302,7 +302,7 @@ owned by a serving model.
    - decode throughput impact on single-request decode (C1) and
      eight-request aggregate decode (C8).
 
-Admission gates:
+Admission requirements:
 
 - zero byte mismatch and byte-identical continued generation;
 - zero duplicate/out-of-range slots and zero device errors;
@@ -326,11 +326,11 @@ environment flag and an attested library hash. The validation order is:
 
 1. apply the published asynchronous-restore scheduler compatibility patch;
 2. build and hash-attest this library;
-3. keep the Python vectorized transposition plus native transposed
+3. keep the Python vectorized transposition plus C++/CUDA transposed
    scatter as fallback;
 4. park the requester until `finish_restore()` succeeds on every rank;
 5. rerun the 392,960-token equivalence, corruption, single-request decode,
-   eight-request aggregate decode, cancellation, and restart gates;
+   eight-request aggregate decode, cancellation, and restart checks;
 6. only then make direct mapped placement the default.
 
 The SparkCache direct CUDA placement path shortens the restored requester's own wait.

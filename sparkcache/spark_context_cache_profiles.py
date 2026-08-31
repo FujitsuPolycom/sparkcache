@@ -42,7 +42,7 @@ NATIVE_RECORD_ORDINALS = {
     "boundary_hidden": 3,
 }
 
-# Ceiling from the native chunk descriptor (record_offset/length arrays).
+# Ceiling from the C++/CUDA chunk descriptor (record_offset/length arrays).
 MAX_NATIVE_RECORD_KINDS = 4
 
 _DRAFT_POLICIES = frozenset({"separate", "colocated_target"})
@@ -223,13 +223,13 @@ class ModelProfile:
             } & persisted
             if unmapped:
                 raise ProfileError(
-                    f"profile {self.name}: families lack native ordinals:"
+                    f"profile {self.name}: families lack C++/CUDA ordinals:"
                     f" {', '.join(sorted(unmapped))}"
                 )
             if len(persisted) > MAX_NATIVE_RECORD_KINDS:
                 raise ProfileError(
                     f"profile {self.name}: {len(persisted)} persisted families"
-                    f" exceed the native ABI ceiling of"
+                    f" exceed the C++/CUDA ABI ceiling of"
                     f" {MAX_NATIVE_RECORD_KINDS}"
                 )
 

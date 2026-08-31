@@ -444,7 +444,7 @@ class IdentityBaseTests(unittest.TestCase):
 
 
 class ErrorPathTests(unittest.TestCase):
-    """Representative fail-closed startup validation paths."""
+    """Representative startup paths that reject unverified configuration."""
 
     def test_dcp_must_divide_tp(self) -> None:
         vllm, _ = _make_vllm_config(tp=4, dcp=3)

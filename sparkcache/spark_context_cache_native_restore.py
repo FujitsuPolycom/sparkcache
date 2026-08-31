@@ -1,7 +1,7 @@
 """Verified-or-recompute orchestration for SparkCache CUDA restore.
 
 This is the model-serving path between a validated ``LookupResult`` and the
-attested placement adapter.  It never imports the model-down experiment gate.
+attested placement adapter. It never imports the model-down experiment check.
 Each content-addressed chunk is read directly into a mapped host arena, its
 manifest length and one whole-file SHA-256 are checked, and only then is the
 CUDA parser allowed to describe bytes to the scatter kernel.
@@ -408,8 +408,8 @@ def execute_native_restore(
                 verified_encoded_bytes += sum(
                     chunk.encoded_bytes for chunk in slab.chunks
                 )
-                # The C parser and placement own the native arena address;
-                # release every exported Python buffer before native records
+                # The C parser and placement own the CUDA arena address;
+                # release every exported Python buffer before C++/CUDA records
                 # or reuses that arena.
                 del chunk_views
                 del arena_buffer

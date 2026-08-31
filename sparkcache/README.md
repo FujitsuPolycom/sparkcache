@@ -155,7 +155,7 @@ Set `spark_cache_clear_once` to an operator-chosen token when a deployment must
 discard the configured rank-local SparkCache contents before reuse:
 
 ```json
-"spark_cache_clear_once": "glm53-native-layout-2026-08-29"
+"spark_cache_clear_once": "glm53-cuda-layout-2026-08-29"
 ```
 
 The token must contain 1--128 letters, digits, periods, underscores, colons,
@@ -237,7 +237,7 @@ when placement completes and intentionally excludes that bookkeeping.
   request block table. Its `SchedulerOutput.recurrent_boundary_blocks` hand-off
   names the pinned physical block by request, group, and token boundary.
   `recurrent_boundary_granularity` advertises SparkCache's 256-token publication
-  boundary to the exact vLLM scheduler without changing vLLM's native hash
+  boundary to the exact vLLM scheduler without changing vLLM's built-in hash
   geometry.
   SparkCache defers a recurrent request until a later cached scheduler step,
   when the preceding forward's hand-off can be observed. It latches one matching
@@ -330,5 +330,5 @@ python -m pytest sparkcache -q
 python -m ruff check sparkcache
 ```
 
-The Python suite is GPU-free. Native CUDA execution requires a CUDA 13 build
+The Python suite is GPU-free. SparkCache CUDA execution requires a CUDA 13 build
 from `native/CMakeLists.txt`.

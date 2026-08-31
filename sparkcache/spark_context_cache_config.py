@@ -4,7 +4,7 @@ Both the scheduler and worker connector roles share one parsing path.
 ``parse_connector_config`` reads all SparkCache settings from a
 ``VllmConfig``-like object — extra-config keys, environment variables,
 parallel degrees, model profile, and KV-cache group topology. It validates
-the fail-closed deployment contract and returns an immutable
+the verified-or-recompute deployment contract and returns an immutable
 :class:`ConnectorConfig` carrying every value the connector needs at
 construction.
 
@@ -276,7 +276,7 @@ class ConnectorConfig:
 
     Every core connector field is determined solely by the vLLM config,
     extra-config keys, environment variables, and model profile supplied at
-    construction. The optional streaming factory owns its native artifact,
+    construction. The optional streaming factory owns its C++/CUDA artifact,
     vLLM-root, lease-contract, and timing settings and validates them while the
     connector is still starting. Both scheduler and worker roles receive the
     same :class:`ConnectorConfig` for the same deployment, so cache-identity

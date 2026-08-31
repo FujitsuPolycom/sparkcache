@@ -1,4 +1,4 @@
-# Streaming snapshot feature gate
+# Streaming snapshot opt-in requirements
 
 **Status: research-only.** The implementation is default-off and restricted to
 the declared GLM-5.2 DCP4 cache inventory. Live profile qualification requires
@@ -25,7 +25,7 @@ fails connector construction unless all of the following attest:
   132 bytes/token, with colocated MTP state.
 
 The scheduler adapter remains CUDA-free. The worker does not hash/load the
-native library, allocate the arena, retain tensor views, or start its writer
+C++/CUDA library, allocate the arena, retain tensor views, or start its writer
 until `register_kv_caches()` has produced the final canonical inventory.
 
 ## Exact model-serving call seams
@@ -40,19 +40,19 @@ until `register_kv_caches()` has produced the final canonical inventory.
    only a promise; `wait_for_save()` converts it to a completed watermark
    after the corresponding target/MTP forward on that stream.
 3. The worker maps each offered logical batch with `BlockTableRangeMapper`,
-   calls `BlockLeaseRegistry.try_reserve(...)`, then calls native
+   calls `BlockLeaseRegistry.try_reserve(...)`, then calls C++/CUDA
    `try_submit(...)` *inside* `LeaseHandle.submit(...)`. The submission
    callback must return a completion fence before it releases the registry
    lock; otherwise preemption can recycle source blocks in the submit/event
    gap.
-4. Once native `poll(...)` returns READY, the worker releases the block lease
+4. Once C++/CUDA `poll(...)` returns READY, the worker releases the block lease
    and claims the generation-checked ring ticket. It lends the immutable view
    to `ManifestSnapshotJournalWriter`; after the returned completion proves
    the writer no longer reads the view, the worker releases the ticket.
 5. Only after all expected chunks are durable may it call
    `commit_manifest()`. Backpressure, cancellation, preemption, writer error,
-   or shutdown must call `abort()`, abandon the native context, and drain or
-   retain leases according to `BlockLeaseRegistry`'s fail-closed rules.
+   or shutdown must call `abort()`, abandon the C++/CUDA context, and drain or
+   retain leases according to `BlockLeaseRegistry`'s ownership rules.
 
 ## Implemented GLM-5.2 profile
 
@@ -76,30 +76,30 @@ until `register_kv_caches()` has produced the final canonical inventory.
 - The model-serving factory retains every exact contiguous row alias for the
   entire ring lifetime and rejects copy-producing/noncontiguous layouts.
 - Scheduler delayed-free, worker lease completion, preemption/resume,
-  fail-open transaction abort, manifest-last publication, and committed
+  serving-preserving transaction abort, manifest-last publication, and committed
   digest advertisement are covered by the connector/runtime/publisher tests.
 
-The standalone native matrix and GPU-free integration tests do not establish
+The standalone C++/CUDA matrix and GPU-free integration tests do not establish
 live GLM performance or zero regression. Qualification requires the cache-off
-versus streaming-cache live-model gate.
+versus streaming-cache live-model comparison.
 
 ## READY-view to `ContextChunk` ownership edge
 
 The translator and writer implement this edge:
 
-- A native macro-batch record is layer-major across every submitted row.
+- A C++/CUDA macro-batch record is layer-major across every submitted row.
   `_SnapshotChunks` requires layer-major bytes for each individual 256-token
   chunk. Translation takes one 64-row DCP4 slice from each layer and joins the
-  slices in the frozen native source-ordinal order.
+  slices in the frozen C++/CUDA source-ordinal order.
 - `ContextChunk` accepts owned `bytes` only. A ring-backed
   `memoryview` cannot satisfy that contract, so the writer makes one bounded
   canonical chunk copy while it borrows the claimed view. Its completion
   becomes observable only after `append_chunk()` has durably returned; the
   runtime then releases the arena.
-- `LOGICAL_POSITIONS` is not present in the native payload. Translation must
+- `LOGICAL_POSITIONS` is not present in the C++/CUDA payload. Translation must
   derive and pack it; the translator generates the exact interleave-1
   DCP-rank positions from logical start and shard rank.
-- Numeric native record kinds and source ordinals are proven identical to
+- Numeric C++/CUDA record kinds and source ordinals are proven identical to
   the connector's `StateRecord`, `LayerPlan`, draft-policy, and boundary-policy
   ordering. The journal writer enforces DCP4, `live_forward`, and
   `colocated_target`; model-serving connector registration constructs and

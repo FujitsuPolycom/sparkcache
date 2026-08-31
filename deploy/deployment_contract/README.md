@@ -18,7 +18,7 @@ model, topology, quantization, cache-identity, and accepted-source policy.
 | `patches.py` | exact-preimage, exact-postimage Git patch application |
 | `receipts.py` | overlay schema, inventory, source identity, and generated-file verification |
 | `container.py` | deterministic Docker command construction and execution |
-| `semantic.py` | deterministic miss, restart/hit, and post-restore semantic gates |
+| `semantic.py` | deterministic miss, restart/hit, and post-restore semantic checks |
 
 `deploy/deepseek_v4/` and `deploy/glm52_35bpw/` are profile adapters at this
 seam. They must reject any source inspection that violates their explicit
@@ -36,7 +36,7 @@ the choice's `finish_reason`. A token-limited response
 body raises `SemanticGateInconclusive`; `SemanticGateInconclusive.as_result()`
 provides a JSON-compatible `INCONCLUSIVE` report. Successful miss and hit
 result dictionaries retain their established fields. The miss reference
-stores the combined body so the hit gate can require deterministic evidence.
+stores the combined body so the hit check can require deterministic evidence.
 Exact expected-answer checks use final `content` and still determine semantic
 success. References written before the optional `assistant_body` field remain
 readable.

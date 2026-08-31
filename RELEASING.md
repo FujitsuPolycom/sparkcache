@@ -12,7 +12,7 @@ the repository does not store a PyPI token.
    GitHub repository. Set the workflow filename to `publish.yml` and the
    environment name to `pypi`.
 3. Create a GitHub Actions environment named `pypi` with a required reviewer.
-   The environment gate must hold the publish job until that reviewer has
+   The protected environment must hold the publish job until that reviewer has
    reviewed the exact workflow artifact and the release's declared evidence
    class. A single-maintainer repository must allow the configured reviewer to
    approve their own deployment.
@@ -70,27 +70,27 @@ workflow.
      changes require the GPU-free suite, archive verification, and isolated
      installation;
    - model-neutral connector control-plane changes require the GPU-free TP/DCP
-     matrix and one representative four-rank live gate before that artifact is
+     matrix and one representative four-rank live check before that artifact is
      described as qualified;
-   - model-profile changes require live gates for the affected profiles;
+   - model-profile changes require live checks for the affected profiles;
    - cache-identity, on-disk format, restore-placement, CUDA-ownership, or vLLM
      runtime-patch changes require the complete qualified profile matrix.
 
    A pre-release may be published with **implemented** status after its
-   offline and package gates pass when live systems are unavailable. Its
+   offline and package checks pass when live systems are unavailable. Its
    README and release notes must state that live qualification is absent, and
    it must not inherit a qualification claim from another artifact.
 
-8. Approve the waiting `pypi` environment deployment only after the gates for
+8. Approve the waiting `pypi` environment deployment only after the checks for
    the declared publication status pass. The approval comment must identify
    the artifact hashes, evidence class, resulting status, and any omitted live
-   gates. The publish job downloads the same two workflow artifacts and
+   checks. The publish job downloads the same two workflow artifacts and
    verifies their SHA-256 values immediately before uploading the distributions
    to PyPI.
 
 The publish workflow rejects a tag that does not match `project.version`. A
 qualification claim must name the exact published artifact hash evaluated by
-its required gates. Never transfer a qualification result between artifacts,
+its required checks. Never transfer a qualification result between artifacts,
 even when their source trees are equivalent.
 
 ## Verification

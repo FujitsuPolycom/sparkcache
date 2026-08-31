@@ -128,7 +128,7 @@ vLLM fork:
   `067c37d974ca2b775d95e51e8fec234929f4e2c4`; #494, independent target
   and draft KV formats, merge `e91c7e68f5863a27c79d2773205678be7d8ff132`;
   #497, multimodal processor revision binding, merge
-  `05d85f603097fe7678d7dda2d522613d9dc61f46`; and #499, native
+  `05d85f603097fe7678d7dda2d522613d9dc61f46`; and #499, compiled
   serialized MXFP8 DFlash2 projections, merge
   `da4d7be6c97434f6942292ed8abbf4b32dc44355`.
 
@@ -203,7 +203,7 @@ ENTRYPOINT=["vllm"]
   rank; rank-local NVMe; SparkCache direct CUDA restore and streaming disabled.
 - Graphs: target `FULL_AND_PIECEWISE`, DFlash FULL, capture sizes
   8, 16, 32, 64, 128, and 256.
-- Scheduler: asynchronous scheduling, chunked prefill, native prefix caching,
+- Scheduler: asynchronous scheduling, chunked prefill, vLLM prefix caching,
   524,288-token model limit, 8,192 batched tokens, and 32 sequences.
 - Prefill: Triton KDA backend. Load format: stock safetensors.
 
@@ -218,6 +218,10 @@ image-ID, and RDMA commands. The request harness is
 [`qualification_request.py`](qualification_request.py).
 
 Core request commands:
+
+The required served alias `glm-5.3-flash-nvfp4-dflash7-bf16-tp4` means
+DFlash2 BF16 with proposal depth seven. It does not identify a separate
+DFlash7 checkpoint.
 
 ```bash
 python deploy/glm53_flash/qualification_request.py \

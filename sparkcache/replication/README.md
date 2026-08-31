@@ -37,13 +37,13 @@ the sender window. Input sequences are scoped by transaction and generation,
 so concurrent publications may each begin at sequence zero. Retransmission
 reuses the exact encoded bytes and consumes no additional credit.
 
-## Fail-open serving rule
+## Serving-continuity rule
 
 Buddy replication is opportunistic. If receiver credit, sender window, remote
 validation, or the publication callback fails, `BuddySender` marks only that
 transaction local-only. It returns `None` instead of waiting for capacity and
 queues one best-effort ABORT control frame to release any remote staging.
-Inference and the local SparkCache commit remain outside this state machine.
+The failure does not interrupt inference or the local SparkCache commit.
 
 The receiver independently bounds:
 

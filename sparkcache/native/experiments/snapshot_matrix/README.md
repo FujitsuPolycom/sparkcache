@@ -1,7 +1,7 @@
 # Snapshot arena/ring qualification matrix
 
 Status: **implemented** as a standalone measurement and grading contract and
-**research-only** for model-serving integration. The native probe opens
+**research-only** for model-serving integration. The C++/CUDA probe opens
 CUDA only against throwaway source buffers; it does not load a model, touch
 model-owned KV state, contact a Spark, or change the serving runtime.
 
@@ -33,7 +33,7 @@ first-touch, warm-read, and gather-plus-consume timing.
 
 A qualifying standalone matrix must use `--profile glm52`, exercise the full
 configured pipeline depth, and pass the saturation, full-payload-byte, memory,
-and CPU-consumer gates below on all four ranks. This remains model-down
+and CPU-consumer checks below on all four ranks. This remains model-down
 throwaway-buffer evidence: it cannot establish model-serving vLLM stream
 ordering, block-lease integration, CUDA-graph behavior, or serving
 interference. Only the selected standalone candidate proceeds to the
@@ -50,7 +50,7 @@ Do not tune against a single thermally lucky run.
 4. Select exactly one standalone candidate for a model reload.
 5. Warm that cell outside the measured interval.
 6. Run the live cell between two cache-off baselines.
-7. Use the weaker baseline value for every throughput gate and the larger
+7. Use the weaker baseline value for every throughput requirement and the larger
    baseline latency for the latency comparison.
 
 Run all four ranks in every standalone cell. Reject the entire cell if any rank
@@ -88,7 +88,7 @@ baseline. No model or transport changes may share this A/B window.
 
 Timeouts are failure signals, not retry hints:
 
-- native create/configure: 10 seconds;
+- C++/CUDA create/configure: 10 seconds;
 - one CUDA gather completion: 2 seconds;
 - writer claim/release drill: 10 seconds;
 - standalone cell: 300 seconds;
@@ -184,9 +184,9 @@ The standalone artifact must contain all four unique cells and use
 retains all four standalone cells, names the one `live_candidate`, and adds
 `memory` and `serving` only to that cell. The named live candidate must equal
 the grader's standalone recommendation; this prevents silently swapping
-configurations between the model-down and model-integrated gates.
+configurations between the model-down and model-integrated checks.
 
-## Qualification gates
+## Qualification checks
 
 Every qualified cell must satisfy:
 
@@ -216,7 +216,7 @@ Every qualified cell must satisfy:
 - gather-plus-CPU-consume p99 at most 100 ms.
 
 Managed memory normally migrates on the first CPU access to GPU-written bytes.
-Therefore a zero-fault counter is not a valid universal gate. Record migration
+Therefore a zero-fault counter is not a valid universal requirement. Record migration
 telemetry when available, but select on measured CPU first-touch and complete
 gather-plus-CPU-consume latency. The CPU read must touch/hash all `used_bytes`;
 reading only metadata or a sample does not qualify.
@@ -227,8 +227,8 @@ Passing does not automatically justify extra memory.
 
 1. Prefer depth 2.
 2. Select depth 3 only when its same-mode depth-2 cell exceeds the 0.5%
-   `WOULD_BLOCK` gate and depth 3 reduces that rate by at least 50%, while
-   preserving all interference gates.
+   `WOULD_BLOCK` requirement and depth 3 reduces that rate by at least 50%, while
+   preserving all interference checks.
 3. Prefer mapped host.
 4. Select managed memory only when its same-depth mapped cell also passes,
    managed gather-plus-CPU-consume p95 is at least 10% lower, and, for profile
@@ -258,7 +258,7 @@ python sparkcache\native\experiments\snapshot_matrix\gate_snapshot_matrix.py `
 `sparkcache.snapshot_matrix.v1` object for every `(arena, depth, rank)` cell:
 mapped/managed, depth 2/3, and ranks 0-3. The aggregator rejects missing or
 duplicate cells/ranks, failed probes, schema/config/geometry disagreement,
-partial readback, incomplete saturation, insufficient overlap, unsafe native
+partial readback, incomplete saturation, insufficient overlap, unsafe C++/CUDA
 statistics, and invalid lifecycle-memory samples.
 
 The aggregator's `aggregation.field_map` object records the complete raw-to-v2

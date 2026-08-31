@@ -1,7 +1,7 @@
-# Snapshot gather byte-comparison gate
+# Snapshot gather byte-comparison check
 
 Status: **implemented** for the GPU-free byte oracle and **unsupported** for
-GPU execution until the model-integrated qualification gate passes.
+GPU execution until the model-integrated qualification requirement passes.
 
 The CUDA probe `native/app/spark_cache_snapshot_probe.cu` exercises one
 target-CKV source and one sparse-indexer source. The portable C++ layout test
@@ -9,7 +9,7 @@ includes MTP metadata but does not compare
 record bytes. `python/snapshot_byte_comparison.py` closes the model-free gap:
 
 - reference bytes come from the canonical `pack_record` codec;
-- candidate bytes use the native kernel's layer-major layout and physical-slot
+- candidate bytes use the CUDA kernel's layer-major layout and physical-slot
   indirection;
 - target CKV, sparse indexer, and MTP draft KV are compared independently;
 - source row stride may exceed useful per-token bytes;
@@ -26,7 +26,7 @@ python -m sparkcache.native.python.snapshot_byte_comparison
 
 ## GPU-execution qualification inputs
 
-The GPU-execution gate begins with a throwaway-buffer probe and never targets
+The GPU-execution check begins with a throwaway-buffer probe and never targets
 model-owned KV. It uses this deliberately small all-record-family fixture:
 
 | source | kind | ordinal | rows | stride | useful bytes/token |
@@ -77,10 +77,10 @@ spark_cache_snapshot_matrix_probe \
 It emits exactly one `sparkcache.snapshot_matrix.v1` JSON object. Run the
 Cartesian product of arena `{mapped,managed}`, slots `{2,3}`, rank
 `{0,1,2,3}`, and rows `{64,1024}`. A successful process reports zero
-mismatches, exact geometry and native counters, and p50/p95/p99 wall latency
+mismatches, exact geometry and C++/CUDA counters, and p50/p95/p99 wall latency
 for the host `try_submit` call, CUDA gather completion after submit returns,
 and their total. `--compare-every N` bounds CPU byte-comparison work during a
-long soak; geometry and native counters are still validated every iteration,
+long soak; geometry and C++/CUDA counters are still validated every iteration,
 and the first and last iterations are always byte-compared. Use `1` for the
 correctness matrix and a larger explicitly recorded cadence for a 10K soak.
 `--pipeline-depth N` defaults to `1` and may be raised through the configured
@@ -101,7 +101,7 @@ configured slot without claiming, and submits once more. The extra submission
 must return `WOULD_BLOCK`. This is repeated
 `--saturation-cycles N` times (default 100), with distinct slot indices proven
 inside every cycle. The probe abandons and drains each drill context, checks
-the drill's native counters, destroys that runtime, and creates a fresh one
+the drill's C++/CUDA counters, destroys that runtime, and creates a fresh one
 for latency measurement. JSON reports `would_block.intentional` separately
 from `would_block.unexpected`; a successful default run has exactly `100`
 intentional and `0` unexpected. This isolation keeps deliberate saturation
@@ -202,7 +202,7 @@ The 368- and 132-byte source strides are the tightly packed registered-tensor
 contract used by SparkCache CUDA placement. The 512/256 strides in the small fixture
 above are intentional padding stress, not claimed model-serving strides. When
 the source-table exporter is wired in, it must derive and attest
-`tensor.stride(1) * tensor.element_size()` and fail closed unless it agrees
+`tensor.stride(1) * tensor.element_size()` and reject the layout unless it agrees
 with the registered row width.
 
 Expected metadata at 64 local rows (one 256-global-token DCP4 chunk) is:
@@ -233,13 +233,13 @@ margin for every admitted inventory. Slot size does not change the declared
 record bytes.
 
 The qualified-layout profile preserves the same scrambled physical-slot and
-byte-comparison gates as the small fixture and allocates all 101 tightly
+byte-comparison checks as the small fixture and allocates all 101 tightly
 packed source arrays. It does not approximate 101 layers by inflating one
-source: per-kind ordinal and source-table traversal are part of the gate.
+source: per-kind ordinal and source-table traversal are part of the check.
 
 ## Model-integrated qualification inputs
 
-The model-integrated gate exports the registered source table from the
+The model-integrated check exports the registered source table from the
 connector and feeds the same probe after the throwaway fixture passes:
 
 - exact sorted layer names;
@@ -253,7 +253,7 @@ connector and feeds the same probe after the throwaway fixture passes:
   context sequence, and logical start;
 - SHA-256 and first mismatch for every declared record slice.
 
-Convert a claimed native ready view without interpreting or repacking its
+Convert a claimed C++/CUDA ready view without interpreting or repacking its
 bytes:
 
 ```python
@@ -288,8 +288,8 @@ Qualification requires all of the following:
 6. One intentionally corrupted byte is reported in the correct record family
    and at the exact within-record offset.
 7. Any missing source, width/ordinal mismatch, short payload, bad mask, or
-   out-of-range slot fails closed before publication.
+   out-of-range slot stops the check before publication.
 
-This gate proves layout and gather bytes only. It does not prove active-model
+This check proves layout and gather bytes only. It does not prove active-model
 stream ordering, block-lease safety, CUDA-graph compatibility, interference,
 or end-to-end manifest correctness.

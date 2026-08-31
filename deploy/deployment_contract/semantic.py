@@ -67,7 +67,7 @@ class SemanticGateInconclusive(RuntimeError):
         self.completion = completion
 
     def as_result(self) -> dict[str, Any]:
-        """Return stable JSON-compatible evidence for a gate report."""
+        """Return stable JSON-compatible evidence for a semantic-check report."""
 
         return {
             "assistant_body_present": bool(self.completion.body),

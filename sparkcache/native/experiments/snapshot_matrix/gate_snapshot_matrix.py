@@ -197,7 +197,7 @@ def _evaluate_cell(
     if _number(ring, "completion_pause_p95_ms") > 500:
         standalone_reasons.append("completion pause p95 exceeds 500 ms")
     # Unified/managed allocations are expected to migrate when the CPU first
-    # consumes GPU-written bytes.  The gate therefore prices the measured
+    # consumes GPU-written bytes. The check therefore prices the measured
     # first-touch and end-to-end path instead of demanding an impossible or
     # tool-dependent zero-fault counter.
     _number(ring, "managed_fault_events")

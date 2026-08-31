@@ -1,6 +1,6 @@
-# Native streaming-snapshot ring state model
+# C++/CUDA streaming-snapshot ring state model
 
-Status: **research-only**. CPU contract and state-machine gates pass. The CUDA
+Status: **research-only**. CPU contract and state-machine checks pass. The CUDA
 source compiled for SM121 with CUDA 13.0.88 and 13.2.86, and both builds passed
 the CPU/layout tests described in [`README.md`](README.md). The CUDA probes
 have not run on a GPU, this document makes no performance claim, and the
@@ -44,7 +44,7 @@ chunk. There is no wait-for-space operation.
 finished reading the current physical KV rows, so vLLM may reuse those rows.
 The arena bytes remain owned by SparkCache until `release(ticket)`.
 
-Generation-tagged tickets make use-after-release fail closed. Abandoning a
+Generation-tagged tickets reject use after release. Abandoning a
 context:
 
 - frees unclaimed `READY` slots immediately;
@@ -64,7 +64,7 @@ error nor a completion-event-record error permits the slot to return directly
 to `FREE`. The completion event may be absent or stale while the gather still
 reads the physical-slot table, source table, and destination arena.
 
-The native failure path therefore:
+The C++/CUDA failure path therefore:
 
 1. marks the context discarded while leaving the affected slot
    `GPU_FILLING`;
@@ -75,8 +75,8 @@ The native failure path therefore:
 5. returns the original CUDA failure without publishing a ticket.
 
 If stream synchronization fails, the slot remains quarantined. Later submit,
-abandon, and shutdown calls retry the drain and fail closed while it remains
-unproven. `shutdown_complete` is never set, `destroy()` does not release native
+abandon, and shutdown calls retry the drain and reject teardown while it remains
+unproven. `shutdown_complete` is never set, `destroy()` does not release C++/CUDA
 memory, and the slot generation cannot be reused. This may deliberately leak
 the handle after an unrecoverable CUDA failure, but it cannot free memory still
 referenced by GPU work.
@@ -97,7 +97,7 @@ The model registers one `SparkCacheSnapshotSource` per target CKV, sparse
 indexer, MTP draft KV, or boundary-hidden tensor. Each record kind uses dense
 layer ordinals and one row width.
 
-For every submitted local chunk, the native code creates a 64-byte-aligned,
+For every submitted local chunk, the C++/CUDA code creates a 64-byte-aligned,
 layer-major raw payload:
 
 ```text
@@ -132,7 +132,7 @@ never enter the persistent artifact.
   the descriptor for the CDLL object's lifetime. Atomic replacement of the
   original pathname therefore cannot substitute different bytes between hash
   and load.
-- Platforms without Linux `/proc/self/fd` fail closed. There is deliberately
+- Platforms without Linux `/proc/self/fd` are unsupported. There is deliberately
   no weaker hash-path-then-`dlopen(path)` fallback.
 - After loading the exact inode, the binding checks every ABI constant,
   structure size, and required capability.
@@ -146,7 +146,7 @@ The snapshot library is intentionally separate (`libspark_cache_snapshot.so`) so
 changing its checksum does not invalidate the proven restore-placement
 library.
 
-## Offline gates
+## Offline checks
 
 From `sparkcache`:
 
@@ -158,7 +158,7 @@ python -m ruff check native/python/spark_cache_snapshot_native.py `
   native/tests/test_snapshot_ring_contract.py
 ```
 
-CPU C++ state/layout gate from WSL:
+CPU C++ state/layout check from WSL:
 
 ```powershell
 cd native
@@ -187,9 +187,9 @@ Useful sequence: submit three contexts, submit a fourth to observe
 5. Decide whether CUDA graph capture requires an event/host-node adapter.
 6. Measure 2-slot versus 3-slot, 16/32/64 MiB, mapped versus managed.
 7. Run cancellation, writer-crash, stale-ticket, single-request decode (C1),
-   eight-request aggregate decode (C8), and four-rank quorum gates.
+   eight-request aggregate decode (C8), and four-rank quorum checks.
 8. Keep the implemented connector/runtime/publisher integration default-off
-   until byte identity, GPU execution, and model-serving soak gates pass.
+   until byte identity, GPU execution, and model-serving soak checks pass.
 
-The first GPU-execution gate must target throwaway buffers, not active model
+The first GPU-execution check must target throwaway buffers, not active model
 KV state.

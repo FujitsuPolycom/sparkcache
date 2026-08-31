@@ -1302,7 +1302,7 @@ Result run_matrix(const Options& options) {
       result.stats.abandoned == 0 &&
       result.stats.stale_tickets == 0;
   if (initialized && !stats_valid) {
-    result.error = "native stats disagree with completed matrix";
+    result.error = "C++/CUDA stats disagree with completed matrix";
     initialized = false;
   }
   result.passed =

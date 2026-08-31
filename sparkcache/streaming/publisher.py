@@ -1,6 +1,6 @@
 """Bounded READY-view translation and manifest-last publication.
 
-This module is intentionally not wired into the connector feature gate. The
+This module is intentionally not wired into the connector opt-in check. The
 runtime exclusively owns ring tickets and lends each claimed, immutable view
 to this writer. Canonical chunk bytes are copied one chunk at a time, durable
 append completes, and the returned completion then permits the runtime to
@@ -58,8 +58,8 @@ class Glm52LayerOrder:
     bytes_per_token: int
 
 
-# Frozen native and canonical order. The 79 target sources include colocated
-# MTP state; there is deliberately no separate native or persisted MTP record.
+# Frozen C++/CUDA and canonical order. The 79 target sources include colocated
+# MTP state; there is deliberately no separate C++/CUDA or persisted MTP record.
 GLM52_LAYER_ORDER = tuple(
     Glm52LayerOrder(
         name=f"model.layers.{ordinal:02d}.mla",

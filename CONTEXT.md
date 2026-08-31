@@ -23,7 +23,7 @@ validity, immutable source identities, overlay receipts, and create-only
 container launch behavior.
 
 The `deploy/deployment_contract/` module owns these mechanics. Its interface
-must preserve deterministic output, fail-closed validation, and the public
+must preserve deterministic output, verified-or-recompute validation, and the public
 imports and command-line behavior used by existing deployments.
 
 ### Profile adapter

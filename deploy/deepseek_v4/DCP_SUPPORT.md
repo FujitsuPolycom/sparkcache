@@ -17,7 +17,8 @@ Two independent contracts make higher DCP unsafe:
    belong to each DCP rank or how recycled sliding-window pages map back into
    group block tables.
 
-This is fail-closed rather than a capacity limitation. The model fits at TP4;
+This is unsupported because ownership cannot be proven, rather than because of
+capacity. The model fits at TP4;
 the missing work is a correctness contract. DCP2/DCP4 require:
 
 - a per-group logical-page ownership map for every HMA block size and reuse

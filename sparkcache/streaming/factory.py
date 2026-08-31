@@ -1,9 +1,9 @@
-"""Fail-closed model-serving assembly for SparkCache streaming snapshots.
+"""Verified model-serving assembly for SparkCache streaming snapshots.
 
 Importing this module does not import the ctypes binding, allocate CUDA
 memory, inspect cache tensors, or start a writer thread.  The worker adapter
 performs those actions exactly once, after vLLM has registered its final KV
-cache inventory.  The scheduler adapter never imports the native binding.
+cache inventory. The scheduler adapter never imports the C++/CUDA binding.
 """
 
 from __future__ import annotations
@@ -69,11 +69,11 @@ def _deployment_path_is_absolute(path: Path) -> bool:
 
 
 def _set_background_cuda_device(device_ordinal: int) -> None:
-    """Establish CUDA's thread-local device before native event polling."""
+    """Establish CUDA's thread-local device before C++/CUDA event polling."""
 
     import torch
 
-    # CPU-only test environments cannot own a native CUDA ring; injected fake
+    # CPU-only test environments cannot own a C++/CUDA ring; injected fake
     # rings still exercise the thread/lifecycle contract. A CUDA-enabled
     # serving environment exposes this binding, and set_device failures remain
     # sticky/fatal below.
@@ -106,7 +106,7 @@ class ModelServingStreamingSettings:
             or _SHA256_RE.fullmatch(self.native_library_sha256) is None
         ):
             raise RuntimeError(
-                "streaming snapshots require an absolute native library path "
+                "streaming snapshots require an absolute C++/CUDA library path "
                 "and a 64-character lowercase SHA-256"
             )
         for name in ("vllm_root", "lease_contract_path"):
@@ -224,7 +224,7 @@ class SchedulerStreamingSnapshotAdapter:
 
 @dataclass(frozen=True, slots=True)
 class Glm52SourceInventory:
-    """Exact native descriptors plus row views retained for ring lifetime."""
+    """Exact C++/CUDA descriptors plus row views retained for ring lifetime."""
 
     sources: tuple[SnapshotSourceSpec, ...]
     retained_row_views: tuple[Any, ...]
@@ -351,7 +351,7 @@ def build_glm52_source_inventory(connector: Any) -> Glm52SourceInventory:
                     source_layer_ordinal=ordinal,
                 )
             )
-            # Retain the actual alias passed to native code. A later Python
+            # Retain the actual alias passed to C++/CUDA code. A later Python
             # collection of a copy-producing reshape must never invalidate
             # the descriptor behind the ring.
             retained.append(rows)
@@ -769,7 +769,7 @@ class WorkerStreamingSnapshotAdapter:
         ):
             # An abort may retain a claimed writer-owned ring view after its
             # one terminal edge. Emit the later observable ownership boundary
-            # so log-based gates do not mistake a stale abort snapshot for a
+            # so log-based checks do not mistake a stale abort snapshot for a
             # leak after the writer really drains.
             self._emit_status("drained", completed_batches=completed)
         return completed
@@ -1024,7 +1024,7 @@ class WorkerStreamingSnapshotAdapter:
             )
             fields.update(
                 visible_after_abort=False,
-                # `leases_after_abort` remains the stable gate field, but its
+                # `leases_after_abort` remains the stable compatibility field, but its
                 # contract is request-scoped. Other concurrently caching
                 # requests may legitimately retain leases.
                 leases_after_abort=request_leases,

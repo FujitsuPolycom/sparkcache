@@ -61,7 +61,7 @@ from sparkcache.streaming.runtime import (
 
 
 class FakeGlmRingBackend:
-    """Immediately-ready, CPU-owned implementation of the native ABI."""
+    """Immediately-ready, CPU-owned implementation of the C++/CUDA ABI."""
 
     def __init__(self) -> None:
         self.config: NativeRingConfig | None = None

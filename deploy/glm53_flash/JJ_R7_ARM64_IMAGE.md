@@ -43,7 +43,7 @@ docker image inspect "$GLM53_IMAGE" --format '{{.Id}}'
 The expected image ID is
 `sha256:6af83baabb239db6b05e379401daf93c8f51694f81483c2781f6014c30e31db4`.
 Model checkpoints are not embedded. Use the
-[GLM-5.3 Jovian Judgement r7 GB10 TP4 quickstart](https://github.com/FujitsuPolycom/sparkring/blob/main/docs/GLM53_JJ_R7_GB10_TP4_QUICKSTART.md)
+[GLM-5.3 Jovian Judgement r7 GB10 TP4 quickstart](https://github.com/FujitsuPolycom/sparkring/blob/54d9df70ee7f6fe9195a6b1983341497791be845/docs/GLM53_JJ_R7_GB10_TP4_QUICKSTART.md)
 for checkpoint mounts, four-rank networking, per-rank launch commands,
 readiness checks, and the OpenAI-compatible endpoint.
 
@@ -62,16 +62,22 @@ readiness checks, and the OpenAI-compatible endpoint.
 | CUDA placement library | SHA-256 `d57509052b73853bcc8e3c3f47bb81748d87b9cbd8d908fc20d4c79a09aa400c` |
 
 The child and parent config digests were resolved from their published registry
-manifests. The active composition labels are
+manifests. The active Python composition labels are
 `org.sparkring.vllm.sparkcache-composition`, `org.sparkring.vllm.tree`,
-`org.sparkring.b12x.composition`, and `org.sparkring.b12x.tree`. Inherited
-`org.jovian.*`, `org.sparkring.native-parent.vllm`, and
-`org.glm53.dflash2.*` labels describe lower image layers. In particular,
+`org.sparkring.b12x.composition`, and `org.sparkring.b12x.tree`.
+
+Inherited labels preserve compiled-extension and lower-layer provenance.
+Compiled vLLM extensions retain `VLLM_BUILD_COMMIT=3633d61c...`; an
+intermediate runtime label names `da4d7be6...`. Active Python source is
+`331573d2...`, but the image does not claim that every compiled extension was
+rebuilt from that Python composition.
+
+Inherited `org.glm53.dflash2.*` labels also describe lower image layers. In particular,
 `org.glm53.dflash2.checkpoint-revision=b6d33...` and
 `org.glm53.dflash2.mxfp8-quant-plumbing=v2` are lineage and plumbing labels,
 not the mounted BF16 `incoai/GLM-5.3-Flash-DFlash2@dc77ff1c` draft used by the
-smoke. These inherited labels are not the active vLLM, B12X, or draft artifact
-identity. The
+smoke. These inherited labels are not the active Python, B12X composition, or
+draft artifact identity. The
 parent and component identifiers are part of the build receipt, not claims
 that another artifact with similar tags is equivalent.
 

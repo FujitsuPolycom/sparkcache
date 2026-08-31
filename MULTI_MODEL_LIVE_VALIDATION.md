@@ -26,10 +26,10 @@ The common serving scheduler budget was
 exact model profile passes its own cold-store, coordinated-restart,
 external-hit, and post-restore canary smoke.
 
-## Common storage and failure gates
+## Common storage and failure checks
 
 Before model serving, every rank passed GPU-free import, physical-capacity,
-invalid-manifest, and corruption gates with the release wheel:
+invalid-manifest, and corruption checks with the release wheel:
 
 - capacity maintenance reduced an 8,417,280-byte fixture to 2,105,344 bytes,
   reclaimed 6,311,936 bytes, evicted two manifests, deleted three chunks, and
@@ -39,7 +39,7 @@ invalid-manifest, and corruption gates with the release wheel:
 - a bit-flipped disposable entry was reported as `corrupt` and invalidated,
   while the source entry remained unchanged.
 
-These gates require a state that cannot be proven correct to become a cache
+These checks require a state that cannot be proven correct to become a cache
 miss. They do not authorize serving unverified bytes.
 
 ## DeepSeek-V4-Flash-0731 TP2/DCP1

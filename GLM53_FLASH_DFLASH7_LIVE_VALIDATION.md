@@ -4,7 +4,9 @@ Status: **qualified** for persistent target-context store, coordinated engine
 restart, all-rank manifest discovery, external restore, continued generation,
 and DFlash2 speculation with seven draft tokens under the exact source
 deployment recorded here. The shorter name `DFlash7` identifies that
-seven-token deployment profile in commands and metrics.
+seven-token deployment profile in commands and metrics. The served alias
+`glm-5.3-flash-nvfp4-dflash7-bf16-tp4` means DFlash2 BF16 with proposal depth
+seven; it does not identify a separate DFlash7 checkpoint.
 
 ## Artifact and serving contract
 

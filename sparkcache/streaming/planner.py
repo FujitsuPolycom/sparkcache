@@ -2,7 +2,7 @@
 
 The opt-in streaming connector feeds this coordinator monotonically completed
 chunked-prefill spans. The coordinator emits bounded macro-batches whose source
-blocks remain leased until a native gather completion event fires.
+blocks remain leased until a C++/CUDA gather completion event fires.
 
 The coordinator never asks inference to wait. If the bounded snapshot ring
 cannot accept every newly completed token, the cache transaction is aborted

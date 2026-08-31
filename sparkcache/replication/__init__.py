@@ -1,4 +1,4 @@
-"""Bounded, fail-open SparkCache buddy replication primitives."""
+"""Bounded buddy replication that never interrupts serving."""
 
 from .protocol import (
     Frame,

@@ -1,9 +1,9 @@
 # StreamingSnapshotRuntime integration boundary
 
 **Status: research-only.** Scheduler/worker adapters and connector seams are
-implemented behind the default-off `spark_cache_streaming_snapshots` feature
-gate. Explicit opt-in lazy-installs the builtin adapter for that connector
-role, then fails closed unless the native library, its pinned SHA-256, the
+implemented behind the default-off `spark_cache_streaming_snapshots` option.
+Explicit opt-in lazy-installs the builtin adapter for that connector role, then
+is rejected unless the C++/CUDA library, its pinned SHA-256, the
 runtime-pinned vLLM block-lease contract, and the declared GLM-5.2 cache
 inventory all attest. Qualification requires a four-Spark cache-off versus
 streaming-cache live-model comparison.
@@ -11,7 +11,7 @@ streaming-cache live-model comparison.
 ## What is implemented
 
 `runtime.py` composes the implemented primitives without importing torch,
-CUDA, vLLM, or the native ABI:
+CUDA, vLLM, or the C++/CUDA ABI:
 
 1. `begin_context()` admits one digest through duplicate/capacity suppression
    and opens an invisible transactional writer journal.
@@ -22,15 +22,15 @@ CUDA, vLLM, or the native ABI:
    bounded macro-batches.
 4. Each batch maps to only its physical block-table slice. The runtime leases
    those block IDs without waiting and expands the DCP-owned global positions
-   into native per-token physical row slots.
-5. `LeaseHandle.submit()` atomically submits the native gather and publishes a
-   completion fence. Native or lease backpressure aborts only caching.
+   into C++/CUDA per-token physical row slots.
+5. `LeaseHandle.submit()` atomically submits the C++/CUDA gather and publishes a
+   completion fence. C++/CUDA or lease backpressure aborts only caching.
 6. `poll()` releases the source-block lease when the gather is GPU-complete,
    claims the READY ring view, and hands it to an injected writer transaction.
 7. The claimed ring slot remains owned until the writer completion says it no
    longer reads the view.
 8. The manifest is committed only after the planner covers the declared span,
-   every batch is durably written, and no native ticket remains.
+   every batch is durably written, and no C++/CUDA ticket remains.
 9. `take_committed()` exposes the digest together with its exact
    `CommitReceipt` only after that manifest visibility point. Unbounded
    connectors can advertise it immediately; bounded connectors enqueue the
@@ -40,13 +40,13 @@ CUDA, vLLM, or the native ABI:
 10. `take_aborted()` exposes asynchronous writer/manifest failures to the
     worker adapter, which suppresses later offers for that request while
     serving continues. Preemption remains resumable: it aborts the preempted
-    native context and releases its source blocks, but a later scheduler offer
+    C++/CUDA context and releases its source blocks, but a later scheduler offer
     may begin a fresh transaction with the current block table.
 
 `factory.py` supplies the model-serving facades around this state machine. The
 scheduler facade tracks emitted offers so `request_finished()` delays physical
 block reuse only while a gather may still read them. The worker facade is
-constructed at connector startup but does not load native code or allocate the
+constructed at connector startup but does not load C++/CUDA code or allocate the
 ring until `register_kv_caches()` supplies the final canonical tensors. It
 binds the exact 79 target-CKV plus 22 sparse-indexer GLM-5.2 inventory, retains
 the contiguous row aliases for the ring lifetime, and assembles the frozen
@@ -69,7 +69,7 @@ WriterCompletion.result()
 
 The runtime is the exclusive owner of block leases and every ring operation:
 submit, poll, claim, release, abandon, and shutdown. The publisher receives a
-borrowed READY view but never a native ticket or ring handle.
+borrowed READY view but never a C++/CUDA ticket or ring handle.
 
 Runtime invokes `submit_ready()` in increasing `batch_index` order. The
 returned completion owns the borrowed view until `query()` becomes true (or
@@ -88,11 +88,11 @@ completion succeeded. `abort()` permanently suppresses visibility but may
 return before already-owned background buffers finish; it never takes ring
 ownership.
 
-Cancellation, preemption, mapping failure, bounded-capacity pressure, native
+Cancellation, preemption, mapping failure, bounded-capacity pressure, C++/CUDA
 `WOULD_BLOCK`, writer failure, and manifest failure abort the invisible
 journal. A cancellation after GPU completion does not wait for disk: source KV
 leases are already releasable, while claimed staging slots drain in later
-`poll()` calls. Unknown CUDA/fence/native ownership is fatal and retains the
+`poll()` calls. Unknown CUDA, fence, or C++/CUDA ownership is fatal and retains the
 lease instead of risking block reuse.
 
 ## Model-serving vLLM callback seam
@@ -116,7 +116,7 @@ request ID, not just IDs retained for asynchronous sends. The worker adapter
 therefore intersects that set with the offers it actually observed before
 asking the lease registry which owned requests are releasable. This ownership
 filter is mandatory: the registry intentionally treats an owned request with
-no lease as ready so fail-open abandonment cannot strand scheduler blocks, but
+no lease as ready so publication abandonment cannot strand scheduler blocks, but
 an entirely unseen request must never be reported as an async-send completion.
 
 This seam is valid only because `wait_for_save()` is invoked:
@@ -134,12 +134,12 @@ The watermark must be monotonic per request. It may advance by an arbitrary
 amount; the runtime rounds down to complete 256-token chunks and suppresses
 already offered ranges. Each emitted batch records its own supplied producer
 stream; PIECEWISE, eager, and full-graph steps may legitimately use different
-streams because the native ABI orders each submission independently.
+streams because the C++/CUDA ABI orders each submission independently.
 
-The scheduler promise must never be handed to native code early. The
+The scheduler promise must never be handed to C++/CUDA code early. The
 model-serving worker adapter accepts it only from `wait_for_save()`, after the
 forward, and submits through `LeaseHandle.submit()` so no preemption path can
-reuse a source block between native submission and completion-fence
+reuse a source block between C++/CUDA submission and completion-fence
 publication.
 
 ## Opt-in assembly contract
@@ -162,11 +162,11 @@ neither.
 ## Deliberate non-goals
 
 - The connector feature remains default-off and is not silently enabled.
-- No native library is loaded, hashed, or allocated while the gate is off, on
+- No C++/CUDA library is loaded, hashed, or allocated while the option is off, on
   the scheduler role, or before worker cache registration.
 - No model, Spark, SSH, or CUDA probe is run.
 - No inference callback waits on capacity maintenance or its retries.
 - No manifest is published from a partial context.
-- Standalone native probes and GPU-free connector/runtime/publisher tests do
+- Standalone C++/CUDA probes and GPU-free connector/runtime/publisher tests do
   not claim live-model performance or zero regression; the four-Spark serving
   comparison is required for qualification.

@@ -36,11 +36,11 @@ qualification requires a receipt produced by the equality validator in
 | Serving topology | GLM-5.3 Flash, TP4/DCP1, one rank on each of `spark-r0` through `spark-r3` |
 | Scheduler capacity | `--max-num-seqs 32` |
 | Restore concurrency | Two host restore workers and two SparkCache CUDA placement lanes per rank |
-| Native staging | Two 256 MiB mapped-host arenas per rank |
+| SparkCache CUDA staging | Two 256 MiB mapped-host arenas per rank |
 | Persistent prefix | 131,072 tokens and 813,068,464 encoded bytes per rank |
 | Runtime receipt | `evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-runtime.json` |
 
-The runtime receipt records one immutable image ID per rank, native library
+The runtime receipt records one immutable image ID per rank, SparkCache CUDA library
 SHA-256 `683cb9e0420da9c68e3263093077fdbcaa400913ff0fb1d18639771213220605`,
 scheduler SHA-256
 `4f8793c4ac4bf356a89c829b6e75b189e6bc4a74c97135208952d0bad1678f15`,
@@ -113,7 +113,7 @@ page-placement kernel. Read work and CUDA submission overlap across slabs.
 
 This path avoids Python `ContextChunk` reconstruction and an 813 MiB
 intermediate join/copy. The adapter accepts at most 4,096 authenticated spans,
-matching the validated native ABI. These changes do not alter `CacheIdentity`,
+matching the validated SparkCache C++/CUDA ABI. These changes do not alter `CacheIdentity`,
 digest values, 256-token logical geometry, or the on-disk exact-manifest and
 chunk formats.
 
@@ -123,7 +123,7 @@ chunk formats.
 
 Each rank restored 813,068,464 bytes through four slabs:
 
-| Rank | Cache service | Read and hash | Native submit | CUDA finish |
+| Rank | Cache service | Read and hash | SparkCache CUDA submit | CUDA finish |
 |---:|---:|---:|---:|---:|
 | 0 | 141.9 ms | 77.9 ms | 25.4 ms | 3.4 ms |
 | 1 | 131.3 ms | 84.6 ms | 13.4 ms | 3.4 ms |
@@ -131,7 +131,7 @@ Each rank restored 813,068,464 bytes through four slabs:
 | 3 | 250.1 ms | 140.7 ms | 20.1 ms | 3.4 ms |
 
 The Python reconstruction pipeline measured 1.29--1.46 seconds per rank for
-the same stored prefix. Native cache service therefore reduced the slowest-rank
+the same stored prefix. SparkCache CUDA restore therefore reduced the slowest-rank
 time to 250.1 ms. End-to-end client latency was 0.907 seconds, including
 scheduler work, live-token execution, and DFlash generation. A separate
 historical canary found the expected marker suffix, and HTTP health remained
