@@ -12,23 +12,10 @@ Sparkcache KV/context Restore reads each rank's local filesystem. SparkCache doe
 payload over a network link. vLLM collectives may still use Ethernet, a
 switched fabric, or a switchless ring.
 
-Deployment labels use TP for tensor-parallel degree and DCP for
-decode-context-parallel degree.
-
-PyPI version `0.1.0a3` is **implemented** and GPU-free tested. Its package
-artifact has no live serving qualification. Qualification belongs to an exact
-artifact, model, topology, and vLLM source contract.
-
-The public GLM-5.3 OCI artifact is qualified for its recorded 8,192-token
-Python-placement restore. The source deployment separately qualifies native
-131,072-token restore and bounded shared-prefix reuse. See
+See
 [the public image record](deploy/glm53_flash/IMAGE_ANNOUNCEMENT.md),
 [the GLM-5.3 validation](GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md), and
 [the native restore record](GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md).
-
-The public image does not contain the model checkpoints. Native restore and
-shared GPU-prefix qualification belong to a later source-bound runtime that has
-no published OCI digest.
 
 ## Implemented capabilities
 
