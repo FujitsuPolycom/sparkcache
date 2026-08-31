@@ -41,6 +41,14 @@ QUICKSTART_DURABLE_URL = (
     + "/"
     + QUICKSTART_PATH
 )
+R8_QUICKSTART_PATH = "docs/GLM53_JJ_R8_GB10_SPARKCACHE_TP4_QUICKSTART.md"
+R8_QUICKSTART_URL = (
+    "https://github.com/FujitsuPolycom/sparkring/blob/main/"
+    + R8_QUICKSTART_PATH
+)
+R8_MANIFEST = (
+    "sha256:380283a506aeb8f9d486a3c64cd738e44268c3cc21590913ea9e4685869f256a"
+)
 
 
 def _receipt() -> dict[str, object]:
@@ -202,42 +210,42 @@ def test_public_arm64_receipt_binds_bounded_c4_smoke() -> None:
 
 def test_public_arm64_docs_route_by_digest_without_overclaiming() -> None:
     image_record = " ".join(IMAGE_RECORD.read_text(encoding="utf-8").split())
-    deployment = " ".join(DEPLOYMENT_GUIDE.read_text(encoding="utf-8").split())
 
-    for text in (image_record, deployment):
-        assert MANIFEST in text
-        assert QUICKSTART_PATH in text
-        assert "implemented and tp4 smoke-verified" in text.casefold()
-        assert "not generally qualified" in text.casefold()
+    assert MANIFEST in image_record
+    assert QUICKSTART_PATH in image_record
+    assert "implemented and tp4 smoke-verified" in image_record.casefold()
+    assert "not generally qualified" in image_record.casefold()
 
     assert IMAGE_CONFIG in image_record
     assert PARENT in image_record
     assert PARENT_CONFIG in image_record
     assert "does not prove shared-base read coalescing" in image_record
     assert QUICKSTART_DURABLE_URL in image_record
-    assert QUICKSTART_URL in deployment
+    deployment = DEPLOYMENT_GUIDE.read_text(encoding="utf-8")
+    assert R8_QUICKSTART_URL in deployment
+    assert R8_MANIFEST in deployment
+    assert MANIFEST not in deployment
 
 
 def test_canonical_docs_route_to_public_arm64_manifest() -> None:
-    documents = (DEPLOYMENT_GUIDE, IMAGE_RECORD)
-
-    for path in documents:
-        text = path.read_text(encoding="utf-8")
-        assert MANIFEST in text, path
-        assert "not generally qualified" in text.casefold(), path
+    image_record = IMAGE_RECORD.read_text(encoding="utf-8")
+    assert MANIFEST in image_record
+    assert "not generally qualified" in image_record.casefold()
 
     deployment = DEPLOYMENT_GUIDE.read_text(encoding="utf-8")
-    assert "canonical public image route" in deployment
-    assert QUICKSTART_URL in deployment
+    assert R8_QUICKSTART_URL in deployment
+    assert R8_MANIFEST in deployment
+    assert "source of truth for the image digest" in deployment
 
 
-def test_historical_image_docs_cannot_be_mistaken_for_current_route() -> None:
+def test_historical_image_docs_cannot_be_mistaken_for_operator_route() -> None:
     announcement = HISTORICAL_IMAGE.read_text(encoding="utf-8")
     publishing = HISTORICAL_PUBLISHING.read_text(encoding="utf-8")
 
     assert announcement.startswith("# Historical GLM-5.3")
-    assert "canonical public image and run procedure" in announcement
+    assert R8_QUICKSTART_URL in announcement
     assert "superseded da4d7be overlay publication path" in publishing
+    assert R8_QUICKSTART_URL in publishing
     assert "JJ_R7_ARM64_IMAGE.md" in announcement
     assert "JJ_R7_ARM64_IMAGE.md" in publishing
 
@@ -269,6 +277,7 @@ def test_front_door_names_an_existing_pypi_artifact() -> None:
     assert "sparkcache[connector]==0.1.0a2" in readme
     assert "sparkcache==0.1.0a3" not in readme
     assert "sparkcache[connector]==0.1.0a3" not in readme
+    assert "This repository declares version `0.1.0a3`" in prose
     assert (
         "A working model deployment also needs a compatible vLLM runtime and a "
         "deployment profile"

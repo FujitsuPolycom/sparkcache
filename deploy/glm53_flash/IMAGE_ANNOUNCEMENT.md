@@ -1,10 +1,12 @@
 # Historical GLM-5.3 Flash SparkCache image record
 
 This document preserves the qualification evidence for the superseded
-`sha256:cd4045b...` image. The canonical public image and run procedure are in
-[`JJ_R7_ARM64_IMAGE.md`](JJ_R7_ARM64_IMAGE.md). Values below describe only the
-historical artifact. Canonical public artifact identities are recorded in the
-linked Jovian Judgement r7 image document.
+`sha256:cd4045b...` image. The later
+[`JJ_R7_ARM64_IMAGE.md`](JJ_R7_ARM64_IMAGE.md) record is also historical.
+Use the
+[SparkRing GLM-5.3 R8 quickstart](https://github.com/FujitsuPolycom/sparkring/blob/main/docs/GLM53_JJ_R8_GB10_SPARKCACHE_TP4_QUICKSTART.md)
+for an operator deployment. Values below describe only the historical
+`sha256:cd4045b...` artifact.
 
 ## Status
 
