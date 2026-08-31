@@ -8,6 +8,13 @@ The package is independent of SparkRing transport. A deployment may use a
 switchless ring, a switched fabric, or ordinary Ethernet for vLLM collectives;
 SparkCache reads and writes only the rank's local filesystem.
 
+The canonical public GLM-5.3 ARM64 image route is
+`ghcr.io/fujitsupolycom/sparkring-glm53-sparkcache@sha256:f012dd915c0fff0be384820c2d72cd015b83b9b33c3f980445dd718a807cd0c5`.
+It is **implemented and TP4 smoke-verified, not generally qualified**. See
+[`deploy/glm53_flash/JJ_R7_ARM64_IMAGE.md`](../deploy/glm53_flash/JJ_R7_ARM64_IMAGE.md)
+for immutable provenance, bounded C4 evidence, and the linked four-host
+procedure.
+
 ## Request lifecycle
 
 1. The scheduler hashes every eligible aligned prompt boundary in one
@@ -256,9 +263,10 @@ when placement completes and intentionally excludes that bookkeeping.
   authenticated source extents, skips fully overridden base objects, and
   streams only final fragments through bounded mapped-arena submissions. The
   final snapshot SHA-256 must match before the parked request completes; no
-  full Python result buffer is constructed. GPU-free regression coverage and
-  exact research-only PR535 TP4 evidence exist; production qualification does
-  not. A graph contains at most two deltas. The following extension publishes
+  full Python result buffer is constructed. The feature is implemented with
+  GPU-free regression coverage and bounded exact PR535 TP4 evidence; general
+  qualification across models, topologies, and workloads does not exist. A
+  graph contains at most two deltas. The following extension publishes
   a fresh flat snapshot, bounding reconstruction work and metadata ancestry.
 - **Concurrent shared GPU prefix — implemented.** One leader restores a
   persistent digest. After every rank succeeds, up to sixteen waiting followers
@@ -310,7 +318,7 @@ See:
 - `../GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md` for GLM-5.3 SparkCache
   CUDA restore, recovery, and C2/C8/C16 shared-prefix evidence. The historical
   filename remains stable for existing links;
-- `../GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md` for exact research-only
+- `../GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md` for bounded exact
   physical-page delta restore and different-root shared-base evidence;
 - `../deploy/deepseek_v4/DCP_SUPPORT.md` for the HMA DCP limitation; and
 - `../ROADMAP.md` for research-only and unsupported work.

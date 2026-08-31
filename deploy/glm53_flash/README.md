@@ -13,33 +13,46 @@ records:
   records SparkCache direct CUDA restore of a 131,072-token prefix, multi-group
   recovery, and bounded shared GPU-prefix reuse through C16.
 - [`GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md`](../../GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md)
-  records research-only physical-page delta restore and different-root
-  shared-base reads for one exact PR535 TP4 image.
+  records bounded exact physical-page delta restore and different-root
+  shared-base reads for one PR535 TP4 image.
 
 Qualification applies only to the checkpoint revisions, source contracts,
 topology, settings, and immutable artifacts named in those records. It does
 not transfer to another vLLM tree, target or draft checkpoint, TP/DCP geometry,
 scheduler configuration, or registry image.
 
-The qualified 8,192-token Python-placement artifact is public at digest
-`sha256:cd4045bba2a0f3dc55361560f8c3a3f171939854db28d48dfdae58eed9c44943`.
-Its immutable parent and build provenance are recorded in
-[`IMAGE_ANNOUNCEMENT.md`](IMAGE_ANNOUNCEMENT.md).
+The canonical public image route is the Jovian Judgement r7 ARM64 image in
+[`JJ_R7_ARM64_IMAGE.md`](JJ_R7_ARM64_IMAGE.md). Its status is **implemented and
+TP4 smoke-verified, not generally qualified**. The record pins the immutable
+digest, public source composition, exact target and draft artifacts, and the
+four-host run procedure.
+
+```bash
+docker pull ghcr.io/fujitsupolycom/sparkring-glm53-sparkcache@sha256:f012dd915c0fff0be384820c2d72cd015b83b9b33c3f980445dd718a807cd0c5
+```
+
+Continue with the
+[GLM-5.3 Jovian Judgement r7 GB10 TP4 quickstart](https://github.com/FujitsuPolycom/sparkring/blob/main/docs/GLM53_JJ_R7_GB10_TP4_QUICKSTART.md).
+
+The superseded Python-placement image at digest `sha256:cd4045b...` retains its
+qualified 8,192-token evidence in
+[`IMAGE_ANNOUNCEMENT.md`](IMAGE_ANNOUNCEMENT.md). That historical record is not
+the run procedure for the Jovian Judgement r7 image.
 
 SparkCache CUDA restore of a 131,072-token prefix and shared GPU-prefix reuse
-are qualified only for the source-bound runtime named in the SparkCache CUDA
-validation record. No public OCI
-digest carries that runtime. [`PUBLISHING.md`](PUBLISHING.md) requires every
-rebuilt digest to complete its own four-rank qualification.
+remain qualified only for the source-bound runtime named in the SparkCache CUDA
+validation record. The public Jovian Judgement r7 image has bounded C4 smoke
+evidence, not that broader qualification.
 
 ## Upstream runtime and artifacts
 
 GLM runtime performance and correctness come primarily from Local Inference
-Lab's Jovian Judgement
-[`vLLM@da4d7be6`](https://github.com/local-inference-lab/vllm/commit/da4d7be6c97434f6942292ed8abbf4b32dc44355).
-[`B12X@2fcf23a0`](https://github.com/local-inference-lab/b12x/commit/2fcf23a0ce269be27b2e03fece73d46e90e6aeea)
-supplies the Blackwell kernels and backend integration. This qualified recipe
-uses
+Lab's [Jovian Judgement vLLM work](https://github.com/local-inference-lab/vllm/tree/dev/jovian-judgement).
+The canonical public image uses public source snapshot
+[`FujitsuPolycom/vllm@331573d2`](https://github.com/FujitsuPolycom/vllm/commit/331573d20bd47e78327ed8d8b4d2e6d350bbb1ab),
+tree `927f52a0085bcecfd2ba679e5abebe1a62623daf`, and
+[`B12X@6255090a`](https://github.com/local-inference-lab/b12x/commit/6255090a03b12c3f7d552102a02fac0b542fb8c9),
+tree `0bb58d0dcc10e29e00ff9850c0d719fca1aba5ad`. It uses
 [`GLM-5.3-Flash-NVFP4@520de24e`](https://huggingface.co/local-inference-lab/GLM-5.3-Flash-NVFP4/tree/520de24eabf507659eaef7c70f14fd584527facc)
 and the BF16
 [`incoai/GLM-5.3-Flash-DFlash2@dc77ff1c`](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2/tree/dc77ff1c99eeb2df044ee3d4f0094eb033fee410).
@@ -64,9 +77,12 @@ Opaque page chunks are authenticated byte partitions of one complete boundary
 snapshot; they are not independent 256-token KV objects. Sparse prefix aliases
 are **implemented** only for `per_token_rows`. Creating an earlier GLM prefix
 by truncating an opaque page manifest is **unsupported**. Opt-in physical-page
-delta publication uses the distinct `page-tail-cow-v1` identity, authenticates
-the complete base-plus-delta graph, and is **research-only** for production
-serving. The PR535 validation record identifies its exact C1 and C8 evidence.
+delta publication uses the distinct `page-tail-cow-v1` identity and
+authenticates the complete base-plus-delta graph. Publication, direct
+SparkCache CUDA restore, shared-base coalescing, and bounded eight-lane restore
+are **implemented with bounded exact TP4 evidence**. General qualification
+remains specific to a model, topology, runtime, and workload. The PR535
+validation record identifies the evidence boundary.
 
 Concurrent requests for the same persistent digest use one restore leader.
 After all workers report successful restoration, patched vLLM retains the
@@ -104,7 +120,7 @@ pull-request lineage includes
 [#497](https://github.com/local-inference-lab/vllm/pull/497), and
 [#499](https://github.com/local-inference-lab/vllm/pull/499).
 
-The image pins `local-inference-lab/b12x` commit
+The historical qualified source runtime pins `local-inference-lab/b12x` commit
 `2fcf23a0ce269be27b2e03fece73d46e90e6aeea`. GitHub reports no pull request
 associated with that commit.
 
@@ -115,9 +131,11 @@ follower attachment. The ten-file contract
 whole-file hashes and required symbols against installed vLLM source. An
 unrecognized hash is unsupported.
 
-## Image construction
+## Historical da4d7be overlay construction
 
-Pull the qualified public Python-placement artifact by immutable digest:
+The following source-bound procedure reproduces the superseded da4d7be
+Python-placement artifact. It does not build the Jovian Judgement r7 image.
+Pull the historical artifact by immutable digest:
 
 ```bash
 docker pull ghcr.io/fujitsupolycom/sparkring-glm53-sparkcache@sha256:cd4045bba2a0f3dc55361560f8c3a3f171939854db28d48dfdae58eed9c44943

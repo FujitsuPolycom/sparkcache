@@ -465,7 +465,7 @@
           <p class="mini-copy">SparkCache encodes one opaque hybrid-memory-allocator (HMA) page snapshot for an exact boundary. Flat v2 roots use <code>sparkcache-page-snapshot-manifest/v2</code> and content-addressed objects of at most 64 MiB.</p>
           <div class="alias-row"><span class="alias-name">snapshot</span><div class="refs"><span class="ref">header</span><span class="ref">all layer pages</span><span class="ref">all groups</span></div></div>
           <div class="alias-row"><span class="alias-name">813 MB flat</span><div class="refs"><span class="ref">64 MiB #1</span><span class="ref">64 MiB #2</span><span class="ref">…</span><span class="ref">tail #13</span></div></div>
-          <p class="alias-caption"><span class="status-tag limited">Qualified · exact C1 artifact</span> Flat macro objects reduce 512 logical-chunk files to 13 payload objects at 813,068,464 bytes. Local image 35b58a7… with SparkCache a1511d2 restored the snapshot on every rank in 1.55–1.70 seconds and returned the exact codeword before and after restart. Sequential object read/hash consumed 1.35–1.50 seconds. SparkCache 229d7d6 is the schema/header-fix implementation origin, not the complete runtime identity. <span class="status-tag limited">Research-only</span> Four-reader prefetch at SparkCache eabe7fd structurally verified all four rank-local 131,072-token snapshots but returned <code>spark</code> instead of the required <code>red</code>; recomputation returned <code>red</code>. Image df4e09a… is not deployable and does not replace the single-reader qualification. Legacy flat manifests remain readable. <strong>Opaque-page prefix aliases are unsupported:</strong> truncating an encoded snapshot cannot create an earlier GLM prefix.</p>
+          <p class="alias-caption"><span class="status-tag limited">Qualified · bounded C1 evidence</span> Flat macro objects reduce 512 logical-chunk files to 13 payload objects at 813,068,464 bytes. The exact historical artifact restored the snapshot on every rank in 1.55–1.70 seconds and returned the required codeword before and after restart. Artifact identifiers and a rejected parallel-reader candidate remain in the linked SparkCache CUDA restore record, not in this current-image guide. Legacy flat manifests remain readable. <strong>Opaque-page prefix aliases are unsupported:</strong> truncating an encoded snapshot cannot create an earlier GLM prefix.</p>
         </article>
       </div>
     </section>
@@ -486,13 +486,13 @@
           <p><code>sparkcache-tail-manifest/v1</code> binds the base boundary and descriptor chains. GPU-free regressions cover extension, corruption rejection, capacity accounting, and reconstruction. No live serving qualification exists for row tails.</p>
         </article>
         <article class="publication-card">
-          <div class="status-pair"><span class="status-tag limited">Research-only · page-delta/v2</span></div>
+          <div class="status-pair"><span class="status-tag">Implemented · page-delta/v2</span></div>
           <h3>Opaque-page delta publication</h3>
           <p><code>sparkcache-hybrid-page-delta/v1</code> binds an exact base snapshot, layout, block counts, and recurrent or sliding boundary. <code>sparkcache-page-delta-manifest/v2</code> groups changed bytes into authenticated objects of at most 64 MiB.</p>
           <div class="publication-flow" aria-label="Verified page snapshot, authenticated page delta, and reconstructed complete snapshot">
             <div class="publication-node base">verified page snapshot</div><div class="publication-arrow" aria-hidden="true">→</div><div class="publication-node delta">authenticated page delta</div><div class="publication-arrow" aria-hidden="true">→</div><div class="publication-node result">verified full snapshot</div>
           </div>
-          <p>Restore authenticates the complete base-plus-delta graph before placement. A graph admits at most two deltas; another extension publishes a flat snapshot. Exact PR535 TP4 evidence covers restart restore at 131,072 tokens and eight distinct 16,384-token results. Production tail-only qualification remains absent.</p>
+          <p>Restore authenticates the complete base-plus-delta graph before placement. A graph admits at most two deltas; another extension publishes a flat snapshot. Bounded exact PR535 TP4 evidence covers restart restore at 131,072 tokens and eight distinct 16,384-token results. General qualification across models, topologies, and workloads remains absent.</p>
         </article>
       </div>
       <p class="context-note">Selecting <code>tail-cow-v1</code> uses distinct row-tail and page-delta cache identities. Existing <code>snapshot-v1</code> entries keep their namespace and full-snapshot publication behavior.</p>
@@ -527,7 +527,7 @@
     <section aria-labelledby="shared-title">
       <div class="section-head">
         <h2 id="shared-title"><span class="num">07</span> Bounded sharing mechanisms</h2>
-        <p><span class="status-tag limited">Qualified through C16</span> One verified exact-prefix restore may attach request-private GPU tails to a bounded cohort. Different-root page-delta base sharing has separate research-only C8 evidence.</p>
+        <p><span class="status-tag limited">Qualified through C16</span> One verified exact-prefix restore may attach request-private GPU tails to a bounded cohort. Implemented different-root page-delta base sharing has separate bounded exact C8 evidence.</p>
       </div>
       <div class="share-layout">
         <aside class="share-controls">
@@ -606,7 +606,7 @@
     <section aria-labelledby="deployment-title">
       <div class="section-head">
         <h2 id="deployment-title"><span class="num">09</span> Recorded restore behavior</h2>
-        <p>The compact measurements below link each result to its evidence boundary. Qualified full-snapshot results come from <a href="../GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md"><code>GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md</code></a>. Page-delta results come from the research-only <a href="../GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md"><code>GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md</code></a>.</p>
+        <p>The compact measurements below link each result to its evidence boundary. Qualified full-snapshot results come from <a href="../GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md"><code>GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md</code></a>. Implemented page-delta results have bounded evidence in <a href="../GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md"><code>GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md</code></a>. The public image route is <a href="../deploy/glm53_flash/JJ_R7_ARM64_IMAGE.md"><code>JJ_R7_ARM64_IMAGE.md</code></a>.</p>
       </div>
       <div class="evidence-table-wrap">
         <table class="evidence-table">
@@ -615,17 +615,15 @@
           <tbody>
             <tr><td><strong>8,192 tokens · C1</strong></td><td>qualified Python page restore</td><td>147.2–194.0 ms cache service per rank</td></tr>
             <tr><td><strong>131,072 tokens · C1</strong></td><td>qualified full snapshot-v1</td><td>131–250 ms cache service per rank in the source runtime</td></tr>
-            <tr><td><strong>131,072 tokens · C1 · flat v2</strong></td><td>qualified image 35b58a7… / SparkCache a1511d2</td><td>13 authenticated objects; sequential read/hash took 1.35–1.50 s; all-rank CUDA restore took 1.55–1.70 s; exact codeword matched before and after restart</td></tr>
-            <tr><td><strong>Flat v2 · SparkCache eabe7fd</strong></td><td>research-only</td><td>four-reader restore passed structural checks but failed the exact codeword oracle; image df4e09a… is not deployable</td></tr>
-            <tr><td><strong>16,384 tokens · C8 page deltas</strong></td><td>research-only PR535 image becf556…</td><td>eight exact persistent restores; one base read per rank; 1.392–2.338 s client latency</td></tr>
+            <tr><td><strong>131,072 tokens · C1 · flat v2</strong></td><td>qualified historical artifact</td><td>13 authenticated objects; all-rank CUDA restore took 1.55–1.70 s; exact codeword matched before and after restart</td></tr>
+            <tr><td><strong>16,384 tokens · C8 page deltas</strong></td><td>implemented · bounded PR535 evidence</td><td>eight exact persistent restores; one base read per rank; 1.392–2.338 s client latency</td></tr>
+            <tr><td><strong>Public r7 image · C4</strong></td><td>implemented · TP4 smoke</td><td>four exact restart restores; 100% external restore; 0.562–1.583 s client latency</td></tr>
             <tr><td><strong>131,072 tokens · C16</strong></td><td>qualified shared exact-prefix restore</td><td>16 × 813 MB became 1 × 813 MB per rank; pretokenized client p50 was 2.698 s</td></tr>
           </tbody>
         </table>
       </div>
-      <p class="context-note"><span class="status-tag limited">Research-only · capacity</span> The PR535 C8 result used eight 16,384-token roots over one 8,192-token base and eight bounded 256 MiB mapped arenas per rank. It does not establish C8×64K or C16×32K.</p>
-      <p class="context-note"><span class="status-tag limited">Qualified</span> The exact flat-v2 local image is <code>sha256:35b58a7bf414059c65b8f74e4e4b17ee6a81b7008e1bffbc9bd298b5e08c739e</code>, with SparkCache source <code>a1511d2</code> and tree <code>4d5b8e…</code>. SparkCache <code>229d7d6</code> identifies the schema/header-fix origin. The image qualifies C1 full-snapshot restore only and does not qualify a published OCI digest.</p>
-      <p class="context-note"><span class="status-tag limited">Research-only</span> Four-reader flat-v2 prefetch at SparkCache <code>eabe7fd0c878db7384ef87fe80a1e96b9bedcf67</code> structurally verified every rank but failed the exact semantic oracle. Image <code>df4e09a…</code> is not deployable. The retained timing and semantic qualification belongs to the sequential <code>35b58a7…</code> artifact.</p>
-      <p class="context-note"><span class="status-tag limited">Research-only</span> Physical-page delta publication and different-root base-read coalescing have exact evidence only for image <code>sha256:becf556650dff79a9959aef371ea861187db248bd0f46c3ebfbd26759e458818</code>. A small model inference, not HTTP health alone, establishes scheduler manifest readiness after startup. See the <a href="../GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md">PR535 page-delta record</a> for source identities and limitations.</p>
+      <p class="context-note"><span class="status-tag">Implemented · bounded capacity</span> The PR535 C8 result used eight 16,384-token roots over one 8,192-token base and eight bounded 256 MiB mapped arenas per rank. It does not establish C8×64K or C16×32K.</p>
+      <p class="context-note"><span class="status-tag">Implemented · bounded evidence</span> A small model inference, not HTTP health alone, establishes scheduler manifest readiness after startup. The public r7 C4 smoke does not prove shared-base coalescing. See the <a href="../GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md">PR535 page-delta record</a> and <a href="../deploy/glm53_flash/JJ_R7_ARM64_IMAGE.md">public image record</a> for distinct evidence boundaries.</p>
     </section>
 
     <footer>

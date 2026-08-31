@@ -104,18 +104,15 @@ def test_prefix_explorer_describes_present_storage_and_restore_behavior() -> Non
         "one small inference established scheduler manifest readiness",
         "eight bounded 256 MiB mapped arenas per rank",
         "does not establish C8×64K or C16×32K",
-        "Sequential object read/hash consumed 1.35–1.50 seconds",
-        "Four-reader prefetch at SparkCache eabe7fd structurally verified",
-        "returned spark instead of the required red",
-        "Image df4e09a… is not deployable",
+        "Artifact identifiers and a rejected parallel-reader candidate remain in the linked SparkCache CUDA restore record",
         "request-private GPU tail",
         "persistent copy-on-write tail objects",
         "When enabled, SparkCache CUDA restore owns verified reconstruction and device transfer",
         "SparkCache CUDA placement component",
         "GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md",
         "GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md",
-        "sha256:35b58a7bf414059c65b8f74e4e4b17ee6a81b7008e1bffbc9bd298b5e08c739e",
-        "sha256:becf556650dff79a9959aef371ea861187db248bd0f46c3ebfbd26759e458818",
+        "JJ_R7_ARM64_IMAGE.md",
+        "four exact restart restores",
     )
     for fragment in required:
         assert fragment.casefold() in visible.casefold()
@@ -138,14 +135,14 @@ def test_readme_links_explorer_and_states_capabilities() -> None:
     prose = " ".join(readme.split())
 
     required = (
-        "[interactive prefix-reuse explorer](docs/sparkcache-prefix-explainer.html)",
-        "Physical-page delta publication and direct restore | **research-only**",
-        "Persistent base-segment read sharing for `block_pages_v1` page-delta roots is **research-only with exact live TP4 evidence**",
-        "sparkcache-page-base-restore-flight/v1",
-        "eight exact results",
-        "all eight persistent restores shared one 100,868,258-byte base read per rank",
-        "Source `eabe7fd0c878db7384ef87fe80a1e96b9bedcf67`",
-        "semantically rejected",
+        "[Jovian Judgement vLLM work]",
+        "Physical-page delta publication | **implemented**",
+        "Different-root shared-base reads | **implemented**",
+        "Shared GPU exact-prefix blocks | **qualified**",
+        "[GLM-5.3 Jovian Judgement r7 GB10 TP4 quickstart]",
+        "[image record](deploy/glm53_flash/JJ_R7_ARM64_IMAGE.md)",
+        "Interactive prefix and publication explorer",
+        "not generally qualified",
     )
     for fragment in required:
         assert fragment in prose

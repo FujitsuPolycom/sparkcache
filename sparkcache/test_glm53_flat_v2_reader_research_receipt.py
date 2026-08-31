@@ -72,10 +72,14 @@ def test_four_reader_receipt_binds_structure_and_semantic_controls() -> None:
     assert control["elapsed_seconds"] == 55.14106
 
 
-def test_readme_labels_four_reader_candidate_research_only() -> None:
-    readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
-    prose = " ".join(readme.split())
+def test_dedicated_record_labels_four_reader_candidate_research_only() -> None:
+    record = (
+        REPOSITORY_ROOT
+        / "GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md"
+    ).read_text(encoding="utf-8")
+    prose = " ".join(record.split())
 
-    assert "Bounded flat-object prefetch is **research-only**" in prose
-    assert "does not replace the single-reader qualification" in prose
-    assert RECEIPT.name in readme
+    assert "Rejected four-reader flat-v2 artifact" in prose
+    assert "rejected for deployment" in prose
+    assert "does not replace the qualified single-reader artifact" in prose
+    assert RECEIPT.name in record
