@@ -90,6 +90,7 @@ class ProfileRegistryTests(unittest.TestCase):
                 "rope_layout": "glm52-rope-v1",
                 "tp_degree": 4,
                 "dcp_degree": 4,
+                "cp_kv_cache_interleave_size": 1,
                 "chunk_tokens": 256,
                 "boundary_hidden_policy": "live_forward",
                 "draft_kv_policy": "separate",

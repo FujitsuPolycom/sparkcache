@@ -31,6 +31,7 @@ def _make_vllm_config(
     dcp: int = 4,
     pp: int = 1,
     block_size: int = 64,
+    cp_kv_cache_interleave_size: int = 1,
     max_model_len: int = 0,
     kv_cache_config: object | None = None,
 ) -> tuple[types.SimpleNamespace, types.SimpleNamespace]:
@@ -53,6 +54,7 @@ def _make_vllm_config(
         parallel_config=types.SimpleNamespace(
             tensor_parallel_size=tp,
             decode_context_parallel_size=dcp,
+            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
             pipeline_parallel_size=pp,
         ),
         model_config=types.SimpleNamespace(max_model_len=max_model_len),
@@ -84,6 +86,14 @@ class ParseConnectorConfigTests(unittest.TestCase):
         self.assertTrue(config.store_enabled)
         self.assertTrue(config.restore_enabled)
         self.assertEqual(config.clear_once_token, "")
+
+    def test_per_token_rows_reject_nontrivial_dcp_interleave(self) -> None:
+        vllm, _ = _make_vllm_config(cp_kv_cache_interleave_size=4)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "per-token row storage supports only cp_kv_cache_interleave_size=1",
+        ):
+            cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
 
     def test_clear_once_accepts_operator_token_and_absolute_rank_root(self) -> None:
         root = (Path.cwd() / "cache" / "rank-0").resolve()
@@ -152,10 +162,15 @@ class ParseConnectorConfigTests(unittest.TestCase):
         self.assertEqual(config.capacity_policy.low_watermark_bytes, 900000)
         self.assertEqual(config.capacity_policy.ttl_seconds, 3600)
 
-    def test_load_thread_limit_clamped_to_2(self) -> None:
+    def test_load_thread_limit_accepts_8_for_page_restores(self) -> None:
         vllm, _ = _make_vllm_config({"spark_cache_load_threads": "8"})
         config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
-        self.assertEqual(config.load_thread_limit, 2)
+        self.assertEqual(config.load_thread_limit, 8)
+
+    def test_load_thread_limit_clamped_to_8(self) -> None:
+        vllm, _ = _make_vllm_config({"spark_cache_load_threads": "16"})
+        config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+        self.assertEqual(config.load_thread_limit, 8)
 
     def test_load_thread_limit_native_restore_forces_one(self) -> None:
         vllm, _ = _make_vllm_config(
@@ -386,6 +401,7 @@ class IdentityBaseTests(unittest.TestCase):
             "rope_layout": config.identity_base["rope_layout"],
             "tp_degree": 4,
             "dcp_degree": 4,
+            "cp_kv_cache_interleave_size": 1,
             "chunk_tokens": config.identity_base["chunk_tokens"],
             "dcp_shard_rank": 0,
             "tp_shard_rank": 0,
@@ -678,6 +694,7 @@ class KvGroupTopologyTests(unittest.TestCase):
 
     def test_sliding_window_policy(self) -> None:
         class SlidingWindowSpec:
+            block_size = 64
             sliding_window = 512
 
         kv_cache_config = types.SimpleNamespace(
@@ -696,8 +713,8 @@ class KvGroupTopologyTests(unittest.TestCase):
 
     def test_mamba_align_policy_records_recurrent_identity(self) -> None:
         class MambaSpec:
-            block_size = 256
-            storage_block_size = 256
+            block_size = 512
+            storage_block_size = 512
             page_size_bytes = 4096
             mamba_cache_mode = "align"
             tokens_per_state = 256
@@ -713,9 +730,12 @@ class KvGroupTopologyTests(unittest.TestCase):
                 ),
             )
         )
-        topology = cfg.kv_group_topology(kv_cache_config)
+        topology = cfg.kv_group_topology(kv_cache_config, dcp_degree=2)
         self.assertEqual(topology[0]["reuse_policy"], "recurrent_align")
         self.assertIsNone(topology[0]["reuse_window_tokens"])
+        self.assertTrue(topology[0]["dcp_replicated"])
+        self.assertEqual(topology[0]["dcp_shard_count"], 1)
+        self.assertEqual(topology[0]["logical_tokens_per_block"], 512)
         self.assertEqual(
             topology[0]["recurrent_state"],
             {
@@ -767,14 +787,73 @@ class KvGroupTopologyTests(unittest.TestCase):
         )
         identity = connector_config.build_identity(0, 0)
 
-        self.assertIn(":manager-pages-v1:", identity.quantization_layout)
+        self.assertIn(":manager-pages-v2:", identity.quantization_layout)
         row_indexed_identity = replace(
             identity,
             quantization_layout=identity.quantization_layout.replace(
-                ":manager-pages-v1:", ":", 1
+                ":manager-pages-v2:", ":", 1
             ),
         )
         self.assertNotEqual(identity.storage_key, row_indexed_identity.storage_key)
+
+    def test_glm53_manager_pages_accept_tp4_dcp2_and_dcp4(self) -> None:
+        """Opaque manager pages retain the configured DCP degree in identity."""
+
+        class FullAttentionSpec:
+            block_size = 2304
+            storage_block_size = 2304
+            page_size_bytes = 4096
+
+        kv_cache_config = types.SimpleNamespace(
+            num_blocks=8,
+            kv_cache_groups=(
+                types.SimpleNamespace(
+                    kv_cache_spec=FullAttentionSpec(),
+                    is_eagle_group=False,
+                    layer_names=("attention",),
+                ),
+            ),
+        )
+        for dcp_degree in (2, 4):
+            with self.subTest(dcp_degree=dcp_degree):
+                vllm, _ = _make_vllm_config(
+                    {"spark_cache_model_profile": "glm53-flash-hybrid"},
+                    dcp=dcp_degree,
+                    tp=4,
+                    block_size=2304,
+                    cp_kv_cache_interleave_size=4,
+                )
+                connector_config = cfg.parse_connector_config(
+                    vllm,
+                    vllm.kv_transfer_config,
+                    kv_cache_config,
+                )
+                self.assertEqual(connector_config.dcp_degree, dcp_degree)
+                self.assertEqual(connector_config.cp_kv_cache_interleave_size, 4)
+                self.assertFalse(
+                    connector_config.group_topology[0]["dcp_replicated"]
+                )
+                self.assertEqual(
+                    connector_config.group_topology[0]["dcp_shard_count"],
+                    dcp_degree,
+                )
+                self.assertEqual(
+                    connector_config.group_topology[0][
+                        "logical_tokens_per_block"
+                    ],
+                    2304 * dcp_degree,
+                )
+                self.assertEqual(
+                    connector_config.build_identity(0, 0).dcp_degree,
+                    dcp_degree,
+                )
+                self.assertEqual(
+                    connector_config.build_identity(
+                        0,
+                        0,
+                    ).cp_kv_cache_interleave_size,
+                    4,
+                )
 
     def test_mamba_non_align_policy_fails_closed(self) -> None:
         class MambaSpec:

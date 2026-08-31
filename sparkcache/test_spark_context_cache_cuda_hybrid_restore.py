@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import threading
@@ -10,6 +11,10 @@ import pytest
 
 import sparkcache.persistent_context_cache.cache_manifest as cache_manifest
 import sparkcache.spark_context_cache_cuda_hybrid_restore as cuda_hybrid
+from sparkcache.page_base_read_flights import (
+    PageBaseReadFlightKey,
+    PageBaseReadFlights,
+)
 from sparkcache.persistent_context_cache.cache_manifest import (
     CacheIdentity,
     ManifestStore,
@@ -122,6 +127,112 @@ def _page_delta_fixture(tmp_path, monkeypatch):
     )
 
 
+def _shared_base_delta_fixture(tmp_path, monkeypatch):
+    layout = PageLayout(
+        (PageGroup(256, (PageLayer("page", "torch.uint8", (128,), 128),)),)
+    )
+    base_blocks = 8
+    result_blocks = 16
+    base_payload = b"".join(
+        bytes((index,)) * 128 for index in range(base_blocks)
+    )
+    red_payload = base_payload + b"".join(
+        bytes((64 + index,)) * 128
+        for index in range(base_blocks, result_blocks)
+    )
+    blue_payload = base_payload + b"".join(
+        bytes((128 + index,)) * 128
+        for index in range(base_blocks, result_blocks)
+    )
+    base = encode_page_snapshot(layout, (base_blocks,), {"page": base_payload})
+    red = encode_page_snapshot(layout, (result_blocks,), {"page": red_payload})
+    blue = encode_page_snapshot(layout, (result_blocks,), {"page": blue_payload})
+    base_plan = plan_page_snapshot(layout, base, (base_blocks,))
+    red_delta = encode_page_delta(
+        layout,
+        base,
+        red,
+        base_block_counts=(base_blocks,),
+        result_block_counts=(result_blocks,),
+        base_boundary_tokens=base_blocks * 256,
+        result_boundary_tokens=result_blocks * 256,
+    )
+    red_delta_plan = plan_page_delta(
+        layout,
+        red_delta,
+        base_block_counts=(base_blocks,),
+        result_block_counts=(result_blocks,),
+        base_boundary_tokens=base_blocks * 256,
+        result_boundary_tokens=result_blocks * 256,
+    )
+    object_bytes = max(base_plan.header_bytes, red_delta_plan.header_bytes) + 1
+    monkeypatch.setattr(cache_manifest, "_PAGE_SNAPSHOT_OBJECT_BYTES", object_bytes)
+    monkeypatch.setattr(cache_manifest, "_PAGE_DELTA_OBJECT_BYTES", object_bytes)
+    identity = CacheIdentity(
+        target_checkpoint="1" * 64,
+        draft_checkpoint="2" * 64,
+        quantization_layout="test-block-pages-v1",
+        rope_layout="test-rope-v1",
+        tp_degree=1,
+        dcp_degree=1,
+        record_schema=("target_ckv", "logical_positions"),
+        publication_schema="page-tail-cow-v1",
+    )
+    base_tokens = tuple(range(base_blocks * 256))
+    red_tokens = (*base_tokens, *range(base_blocks * 256, result_blocks * 256))
+    blue_tokens = (
+        *base_tokens,
+        *range(100_000, 100_000 + (result_blocks - base_blocks) * 256),
+    )
+    salt = "native-shared-base-page-delta"
+    base_digest = context_prefix_digest(
+        base_tokens, salt, token_count=len(base_tokens)
+    )
+    red_digest = context_prefix_digest(
+        red_tokens, salt, token_count=len(red_tokens)
+    )
+    blue_digest = context_prefix_digest(
+        blue_tokens, salt, token_count=len(blue_tokens)
+    )
+    store = ManifestStore(tmp_path)
+    store.commit_page_snapshot(
+        identity=identity,
+        context_digest=base_digest,
+        span_tokens=base_blocks * 256,
+        snapshot=base,
+    )
+    for token_ids, result in ((red_tokens, red), (blue_tokens, blue)):
+        store.commit_page_extension(
+            identity=identity,
+            base_context_digest=base_digest,
+            token_ids=token_ids,
+            identity_salt=salt,
+            layout=layout,
+            base_block_counts=(base_blocks,),
+            result_block_counts=(result_blocks,),
+            base_boundary_tokens=base_blocks * 256,
+            result_boundary_tokens=result_blocks * 256,
+            result_snapshot=result,
+        )
+    red_lookup = store.lookup(identity, red_digest, verify_chunks=False)
+    blue_lookup = store.lookup(identity, blue_digest, verify_chunks=False)
+    assert red_lookup.is_hit and blue_lookup.is_hit
+    return SimpleNamespace(
+        store=store,
+        identity=identity,
+        layout=layout,
+        base=base,
+        red=red,
+        blue=blue,
+        red_lookup=red_lookup,
+        blue_lookup=blue_lookup,
+        object_bytes=object_bytes,
+        base_blocks=base_blocks,
+        result_blocks=result_blocks,
+        result_tokens=result_blocks * 256,
+    )
+
+
 class _PageCaptureArena:
     arena_mode = cuda_hybrid.cuda.ARENA_MAPPED_HOST
 
@@ -191,6 +302,348 @@ class _PageCaptureAdapter:
 
     def begin_parked_page_restore(self, *_args, **_kwargs):
         return self.transaction
+
+
+def test_concurrent_distinct_deltas_share_each_authenticated_base_object_once(
+    tmp_path, monkeypatch
+) -> None:
+    fixture = _shared_base_delta_fixture(tmp_path, monkeypatch)
+    evidence = fixture.store.page_delta_base_read_evidence(
+        fixture.red_lookup,
+        layout=fixture.layout,
+        result_block_counts=(fixture.result_blocks,),
+        result_boundary_tokens=fixture.result_tokens,
+    )
+    assert evidence == fixture.store.page_delta_base_read_evidence(
+        fixture.blue_lookup,
+        layout=fixture.layout,
+        result_block_counts=(fixture.result_blocks,),
+        result_boundary_tokens=fixture.result_tokens,
+    )
+    key = PageBaseReadFlightKey("worker-0", "block_pages_v1", evidence)
+    flights = PageBaseReadFlights()
+    assert flights.register_cohort(key, ("red", "blue")).member_ids == (
+        "red",
+        "blue",
+    )
+    base_paths = {
+        (tmp_path / "chunks" / f"{item['sha256']}.spcc").resolve()
+        for item in fixture.red_lookup._manifest["base_root"]["snapshot_objects"]
+    }
+    physical_reads = []
+    authentications = []
+    original_read = cuda_hybrid._pread_exact_into
+    original_authenticate = cuda_hybrid._read_authenticated_page_object
+
+    def counted_read(path, encoded_bytes, target):
+        if path.resolve() in base_paths:
+            physical_reads.append(path.resolve())
+        return original_read(path, encoded_bytes, target)
+
+    def counted_authenticate(source):
+        if source.path.resolve() in base_paths:
+            authentications.append(source.path.resolve())
+        return original_authenticate(source)
+
+    monkeypatch.setattr(cuda_hybrid, "_pread_exact_into", counted_read)
+    monkeypatch.setattr(
+        cuda_hybrid,
+        "_read_authenticated_page_object",
+        counted_authenticate,
+    )
+    monkeypatch.setattr(
+        cuda_hybrid.cuda,
+        "arena_memoryview",
+        lambda arena, *, length: memoryview(arena.payload)[:length],
+    )
+
+    def restore(request_id, lookup):
+        adapter = _PageCaptureAdapter(fixture.object_bytes)
+        result = execute_cuda_hybrid_restore(
+            adapter=adapter,
+            request_id=request_id,
+            lookup=lookup,
+            cache_root=tmp_path,
+            layout=fixture.layout,
+            group_slots=(tuple(range(fixture.result_blocks)),),
+            expected_span_tokens=fixture.result_tokens,
+            arena_bytes=fixture.object_bytes,
+            io_workers=4,
+            base_reader=lambda actual_evidence, reader: flights.resolve(
+                request_id,
+                PageBaseReadFlightKey(
+                    "worker-0", "block_pages_v1", actual_evidence
+                ),
+                reader,
+            ),
+        )
+        return result, b"".join(
+            item[3] for item in sorted(adapter.transaction.submissions)
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        red_future = executor.submit(restore, "red", fixture.red_lookup)
+        blue_future = executor.submit(restore, "blue", fixture.blue_lookup)
+        red_result, restored_red = red_future.result(timeout=5)
+        blue_result, restored_blue = blue_future.result(timeout=5)
+
+    red_plan = plan_page_snapshot(
+        fixture.layout, fixture.red, (fixture.result_blocks,)
+    )
+    blue_plan = plan_page_snapshot(
+        fixture.layout, fixture.blue, (fixture.result_blocks,)
+    )
+    assert restored_red == fixture.red[red_plan.header_bytes :]
+    assert restored_blue == fixture.blue[blue_plan.header_bytes :]
+    assert set(physical_reads) == base_paths
+    assert len(physical_reads) == len(base_paths)
+    assert set(authentications) == base_paths
+    assert len(authentications) == len(base_paths)
+    assert red_result.source_bytes == len(fixture.red)
+    assert blue_result.source_bytes == len(fixture.blue)
+    summary = flights.take_summaries()
+    assert len(summary) == 1
+    assert summary[0]["physical_base_reads"] == 1
+    assert summary[0]["avoided_base_reads"] == 1
+
+
+def test_native_shared_base_follower_cancellation_does_not_abort_leader(
+    tmp_path, monkeypatch
+) -> None:
+    fixture = _shared_base_delta_fixture(tmp_path, monkeypatch)
+    evidence = fixture.store.page_delta_base_read_evidence(
+        fixture.red_lookup,
+        layout=fixture.layout,
+        result_block_counts=(fixture.result_blocks,),
+        result_boundary_tokens=fixture.result_tokens,
+    )
+    key = PageBaseReadFlightKey("worker-0", "block_pages_v1", evidence)
+    flights = PageBaseReadFlights()
+    flights.register_cohort(key, ("red", "blue"))
+    base_paths = {
+        (tmp_path / "chunks" / f"{item['sha256']}.spcc").resolve()
+        for item in fixture.red_lookup._manifest["base_root"]["snapshot_objects"]
+    }
+    base_started = threading.Event()
+    release_base = threading.Event()
+    original_read = cuda_hybrid._pread_exact_into
+
+    def blocked_base_read(path, encoded_bytes, target):
+        if path.resolve() in base_paths:
+            base_started.set()
+            assert release_base.wait(timeout=5)
+        return original_read(path, encoded_bytes, target)
+
+    monkeypatch.setattr(cuda_hybrid, "_pread_exact_into", blocked_base_read)
+    monkeypatch.setattr(
+        cuda_hybrid.cuda,
+        "arena_memoryview",
+        lambda arena, *, length: memoryview(arena.payload)[:length],
+    )
+
+    def restore(request_id, lookup):
+        adapter = _PageCaptureAdapter(fixture.object_bytes)
+        result = execute_cuda_hybrid_restore(
+            adapter=adapter,
+            request_id=request_id,
+            lookup=lookup,
+            cache_root=tmp_path,
+            layout=fixture.layout,
+            group_slots=(tuple(range(fixture.result_blocks)),),
+            expected_span_tokens=fixture.result_tokens,
+            arena_bytes=fixture.object_bytes,
+            base_reader=lambda actual_evidence, reader: flights.resolve(
+                request_id,
+                PageBaseReadFlightKey(
+                    "worker-0", "block_pages_v1", actual_evidence
+                ),
+                reader,
+            ),
+        )
+        return result, b"".join(
+            item[3] for item in sorted(adapter.transaction.submissions)
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        red_future = executor.submit(restore, "red", fixture.red_lookup)
+        assert base_started.wait(timeout=5)
+        blue_future = executor.submit(restore, "blue", fixture.blue_lookup)
+        assert flights.cancel("blue")
+        with pytest.raises(
+            cuda_hybrid.CudaHybridRestoreError,
+            match="request left the registered cohort",
+        ):
+            blue_future.result(timeout=5)
+        release_base.set()
+        _result, restored_red = red_future.result(timeout=5)
+
+    red_plan = plan_page_snapshot(
+        fixture.layout, fixture.red, (fixture.result_blocks,)
+    )
+    assert restored_red == fixture.red[red_plan.header_bytes :]
+    summary = flights.take_summaries()
+    assert len(summary) == 1
+    assert summary[0]["outcome"] == "verified"
+    assert summary[0]["cancelled_members"] == 1
+    assert summary[0]["physical_base_reads"] == 1
+
+
+def test_corrupt_native_shared_base_rejects_only_its_matching_cohort(
+    tmp_path, monkeypatch
+) -> None:
+    fixture = _shared_base_delta_fixture(tmp_path, monkeypatch)
+    evidence = fixture.store.page_delta_base_read_evidence(
+        fixture.red_lookup,
+        layout=fixture.layout,
+        result_block_counts=(fixture.result_blocks,),
+        result_boundary_tokens=fixture.result_tokens,
+    )
+    key = PageBaseReadFlightKey("worker-0", "block_pages_v1", evidence)
+    flights = PageBaseReadFlights()
+    flights.register_cohort(key, ("red", "blue"))
+    descriptor = fixture.red_lookup._manifest["base_root"]["snapshot_objects"][0]
+    corrupt_path = tmp_path / "chunks" / f"{descriptor['sha256']}.spcc"
+    damaged = bytearray(corrupt_path.read_bytes())
+    damaged[-1] ^= 1
+    corrupt_path.write_bytes(damaged)
+    physical_reads = []
+    original_read = cuda_hybrid._pread_exact_into
+
+    def counted_read(path, encoded_bytes, target):
+        physical_reads.append(path.resolve())
+        return original_read(path, encoded_bytes, target)
+
+    monkeypatch.setattr(cuda_hybrid, "_pread_exact_into", counted_read)
+
+    def restore(request_id, lookup):
+        return execute_cuda_hybrid_restore(
+            adapter=_PageCaptureAdapter(fixture.object_bytes),
+            request_id=request_id,
+            lookup=lookup,
+            cache_root=tmp_path,
+            layout=fixture.layout,
+            group_slots=(tuple(range(fixture.result_blocks)),),
+            expected_span_tokens=fixture.result_tokens,
+            arena_bytes=fixture.object_bytes,
+            base_reader=lambda actual_evidence, reader: flights.resolve(
+                request_id,
+                PageBaseReadFlightKey(
+                    "worker-0", "block_pages_v1", actual_evidence
+                ),
+                reader,
+            ),
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futures = (
+            executor.submit(restore, "red", fixture.red_lookup),
+            executor.submit(restore, "blue", fixture.blue_lookup),
+        )
+        for future in futures:
+            with pytest.raises(
+                cuda_hybrid.CudaHybridRestoreError,
+                match="page object SHA-256 mismatch",
+            ):
+                future.result(timeout=5)
+
+    assert physical_reads.count(corrupt_path.resolve()) == 1
+    summary = flights.take_summaries()
+    assert len(summary) == 1
+    assert summary[0]["outcome"] == "recompute"
+    assert summary[0]["physical_base_reads"] == 1
+
+
+def test_corrupt_private_delta_does_not_poison_shared_base_or_peer(
+    tmp_path, monkeypatch
+) -> None:
+    fixture = _shared_base_delta_fixture(tmp_path, monkeypatch)
+    evidence = fixture.store.page_delta_base_read_evidence(
+        fixture.red_lookup,
+        layout=fixture.layout,
+        result_block_counts=(fixture.result_blocks,),
+        result_boundary_tokens=fixture.result_tokens,
+    )
+    key = PageBaseReadFlightKey("worker-0", "block_pages_v1", evidence)
+    flights = PageBaseReadFlights()
+    flights.register_cohort(key, ("red", "blue"))
+    red_descriptors = fixture.red_lookup._manifest["delta_objects"]
+    blue_digests = {
+        item["sha256"] for item in fixture.blue_lookup._manifest["delta_objects"]
+    }
+    corrupt_descriptor = next(
+        item
+        for item in reversed(red_descriptors[1:])
+        if item["sha256"] not in blue_digests
+    )
+    corrupt_path = (
+        tmp_path / "chunks" / f"{corrupt_descriptor['sha256']}.spcc"
+    )
+    damaged = bytearray(corrupt_path.read_bytes())
+    damaged[-1] ^= 1
+    corrupt_path.write_bytes(damaged)
+    base_paths = {
+        (tmp_path / "chunks" / f"{item['sha256']}.spcc").resolve()
+        for item in fixture.red_lookup._manifest["base_root"]["snapshot_objects"]
+    }
+    base_reads = []
+    original_read = cuda_hybrid._pread_exact_into
+
+    def counted_read(path, encoded_bytes, target):
+        if path.resolve() in base_paths:
+            base_reads.append(path.resolve())
+        return original_read(path, encoded_bytes, target)
+
+    monkeypatch.setattr(cuda_hybrid, "_pread_exact_into", counted_read)
+    monkeypatch.setattr(
+        cuda_hybrid.cuda,
+        "arena_memoryview",
+        lambda arena, *, length: memoryview(arena.payload)[:length],
+    )
+
+    def restore(request_id, lookup):
+        adapter = _PageCaptureAdapter(fixture.object_bytes)
+        result = execute_cuda_hybrid_restore(
+            adapter=adapter,
+            request_id=request_id,
+            lookup=lookup,
+            cache_root=tmp_path,
+            layout=fixture.layout,
+            group_slots=(tuple(range(fixture.result_blocks)),),
+            expected_span_tokens=fixture.result_tokens,
+            arena_bytes=fixture.object_bytes,
+            base_reader=lambda actual_evidence, reader: flights.resolve(
+                request_id,
+                PageBaseReadFlightKey(
+                    "worker-0", "block_pages_v1", actual_evidence
+                ),
+                reader,
+            ),
+        )
+        return result, b"".join(
+            item[3] for item in sorted(adapter.transaction.submissions)
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        red_future = executor.submit(restore, "red", fixture.red_lookup)
+        blue_future = executor.submit(restore, "blue", fixture.blue_lookup)
+        with pytest.raises(
+            cuda_hybrid.CudaHybridRestoreError,
+            match="page object SHA-256 mismatch",
+        ):
+            red_future.result(timeout=5)
+        _result, restored_blue = blue_future.result(timeout=5)
+
+    blue_plan = plan_page_snapshot(
+        fixture.layout, fixture.blue, (fixture.result_blocks,)
+    )
+    assert restored_blue == fixture.blue[blue_plan.header_bytes :]
+    assert set(base_reads) == base_paths
+    assert len(base_reads) == len(base_paths)
+    summary = flights.take_summaries()
+    assert len(summary) == 1
+    assert summary[0]["outcome"] == "verified"
+    assert summary[0]["physical_base_reads"] == 1
+    assert summary[0]["avoided_base_reads"] == 1
 
 
 def test_page_delta_planner_authenticates_graph_and_applies_delta_precedence(
@@ -1254,6 +1707,28 @@ def test_flat_macro_prefetches_four_objects_before_arena_wait(
     assert len(fallback.transaction.submissions) == len(
         manifest["snapshot_objects"]
     )
+
+
+def test_legacy_chunk_page_restore_rejects_dcp() -> None:
+    layout = PageLayout(
+        (PageGroup(2, (PageLayer("page", "torch.uint8", (4,), 4),)),)
+    )
+    with pytest.raises(
+        cuda_hybrid.CudaHybridRestoreError,
+        match="legacy chunk-based page restore supports only DCP1",
+    ):
+        execute_cuda_hybrid_restore(
+            adapter=object(),
+            request_id="legacy-dcp2",
+            lookup=SimpleNamespace(is_hit=True, _manifest={}),
+            cache_root="unused",
+            layout=layout,
+            group_slots=((1,),),
+            expected_span_tokens=256,
+            arena_bytes=64 * 1024 * 1024,
+            dcp_degree=2,
+            dcp_rank=0,
+        )
 
 
 def test_page_object_spans_exclude_header_and_cover_payload_contiguously() -> None:

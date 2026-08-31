@@ -65,6 +65,19 @@ class PageBaseCohortRegistration:
     flight_state: str = "none"
 
 
+@dataclass(frozen=True)
+class PageBaseReadResult:
+    """One immutable authenticated base representation and its byte charge.
+
+    Native page restore retains independently authenticated macro objects
+    instead of materializing one contiguous snapshot.  The coordinator needs
+    only their aggregate authenticated size to enforce the same flight bounds.
+    """
+
+    value: object
+    encoded_bytes: int
+
+
 @dataclass
 class _Flight:
     key: PageBaseReadFlightKey
@@ -72,7 +85,7 @@ class _Flight:
     state: str = "registered"
     leader_request_id: str | None = None
     designated_leader_request_id: str | None = None
-    result: bytes | None = None
+    result: bytes | PageBaseReadResult | None = None
     error: str | None = None
     cancelled: set[str] = field(default_factory=set)
     participant_count: int = 0
@@ -201,8 +214,8 @@ class PageBaseReadFlights:
         self,
         request_id: str,
         key: PageBaseReadFlightKey,
-        reader: Callable[[], bytes | bytearray],
-    ) -> bytes | bytearray:
+        reader: Callable[[], bytes | bytearray | PageBaseReadResult],
+    ) -> bytes | PageBaseReadResult:
         """Return cohort-shared bytes or execute the ordinary independent read."""
 
         with self._condition:
@@ -238,13 +251,27 @@ class PageBaseReadFlights:
         if leader:
             try:
                 readable = reader()
-                if not isinstance(readable, (bytes, bytearray)):
-                    raise TypeError("page-base reader must return bytes")
-                if len(readable) != key.evidence.base_encoded_bytes:
+                if isinstance(readable, PageBaseReadResult):
+                    if (
+                        type(readable.encoded_bytes) is not int
+                        or readable.encoded_bytes <= 0
+                    ):
+                        raise TypeError(
+                            "page-base reader result has an invalid byte charge"
+                        )
+                    readable_bytes = readable.encoded_bytes
+                    result = readable
+                elif isinstance(readable, (bytes, bytearray)):
+                    readable_bytes = len(readable)
+                    result = bytes(readable)
+                else:
+                    raise TypeError(
+                        "page-base reader must return bytes or an authenticated result"
+                    )
+                if readable_bytes != key.evidence.base_encoded_bytes:
                     raise PageBaseReadError(
                         "page-base reader length differs from authenticated geometry"
                     )
-                result = bytes(readable)
             except Exception as error:
                 with self._condition:
                     if self._flights.get(key) is flight:
@@ -351,7 +378,11 @@ class PageBaseReadFlights:
                 active_flights=len(self._flights),
                 registered_members=len(self._request_keys),
                 retained_bytes=sum(
-                    len(flight.result)
+                    (
+                        flight.result.encoded_bytes
+                        if isinstance(flight.result, PageBaseReadResult)
+                        else len(flight.result)
+                    )
                     for flight in self._flights.values()
                     if flight.result is not None
                 ),
@@ -394,7 +425,11 @@ class PageBaseReadFlights:
                 "participants": flight.participant_count,
                 "physical_base_reads": physical_reads,
                 "base_bytes": (
-                    len(flight.result)
+                    (
+                        flight.result.encoded_bytes
+                        if isinstance(flight.result, PageBaseReadResult)
+                        else len(flight.result)
+                    )
                     if flight.result is not None
                     else (evidence.base_encoded_bytes if physical_reads else 0)
                 ),

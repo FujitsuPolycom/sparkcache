@@ -172,10 +172,6 @@ class ModelProfile:
         """
         if dcp_degree <= 0:
             raise ProfileError("dcp_degree must be positive")
-        if self.storage_mode == "block_pages_v1" and dcp_degree != 1:
-            raise ProfileError(
-                f"profile {self.name}: block-page storage requires dcp_degree 1"
-            )
         if self.chunk_tokens % dcp_degree:
             raise ProfileError(
                 f"profile {self.name}: chunk_tokens {self.chunk_tokens} is not"
