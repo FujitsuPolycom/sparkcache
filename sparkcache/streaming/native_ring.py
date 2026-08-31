@@ -1,4 +1,4 @@
-"""High-level, explicitly constructed owner for the native snapshot ring.
+"""High-level, explicitly constructed owner for the C++/CUDA snapshot ring.
 
 Importing this module is CPU-only. The ctypes binding is imported and its
 attested shared library is loaded only by :meth:`NativeSnapshotRing.from_attested`.
@@ -39,7 +39,7 @@ class NativeSnapshotRingStateError(NativeSnapshotRingError):
 
 
 class NativeSnapshotRingStatusError(NativeSnapshotRingError):
-    """The native ABI returned an unexpected status."""
+    """The C++/CUDA ABI returned an unexpected status."""
 
     def __init__(self, operation: str, status: int, detail: str) -> None:
         super().__init__(
@@ -199,7 +199,7 @@ class CtypesSnapshotRingBackend:
         import ctypes
 
         if self._handle is not None:
-            raise NativeSnapshotRingStateError("native backend is already created")
+            raise NativeSnapshotRingStateError("C++/CUDA backend is already created")
         raw_config = self._abi.SnapshotConfig(
             abi_version=self._abi.ABI_VERSION,
             arena_mode=config.arena_mode,
@@ -220,7 +220,7 @@ class CtypesSnapshotRingBackend:
         if result == NativeStatus.OK:
             if not handle.value:
                 raise NativeSnapshotRingStateError(
-                    "native create returned OK without a handle"
+                    "C++/CUDA create returned OK without a handle"
                 )
             self._handle = handle
         return result
@@ -365,7 +365,7 @@ class CtypesSnapshotRingBackend:
 
     def _require_handle(self):
         if self._handle is None:
-            raise NativeSnapshotRingStateError("native backend has no live handle")
+            raise NativeSnapshotRingStateError("C++/CUDA backend has no live handle")
         return self._handle
 
 
@@ -450,7 +450,7 @@ class _OwnedTicket:
 
 
 class NativeSnapshotRing:
-    """Generation-checked owner of one configured native snapshot handle."""
+    """Generation-checked owner of one configured C++/CUDA snapshot handle."""
 
     def __init__(
         self,
@@ -479,7 +479,7 @@ class NativeSnapshotRing:
         library_path: str | PathLike[str],
         expected_sha256: str,
     ) -> "NativeSnapshotRing":
-        """Explicit native load/allocation edge for model-serving callers."""
+        """Explicit C++/CUDA load/allocation edge for model-serving callers."""
 
         backend = CtypesSnapshotRingBackend(
             library_path,
@@ -552,7 +552,7 @@ class NativeSnapshotRing:
                 if raw is not None:
                     self._poison(
                         NativeSnapshotRingStateError(
-                            "native submit returned a ticket for a dropped submission"
+                            "C++/CUDA submit returned a ticket for a dropped submission"
                         )
                     )
                 return None
@@ -561,21 +561,21 @@ class NativeSnapshotRing:
             if raw is None:
                 self._poison(
                     NativeSnapshotRingStateError(
-                        "native submit returned OK without a ticket"
+                        "C++/CUDA submit returned OK without a ticket"
                     )
                 )
             assert raw is not None
             if raw.generation <= 0 or not 0 <= raw.slot_index < self.config.slot_count:
                 self._poison(
                     NativeSnapshotRingStateError(
-                        "native submit returned an invalid generation ticket"
+                        "C++/CUDA submit returned an invalid generation ticket"
                     )
                 )
             key = (raw.slot_index, raw.generation)
             if key in self._tickets:
                 self._poison(
                     NativeSnapshotRingStateError(
-                        "native submit reused an active generation ticket"
+                        "C++/CUDA submit reused an active generation ticket"
                     )
                 )
             public = SnapshotTicket(
@@ -609,7 +609,7 @@ class NativeSnapshotRing:
                     return None
                 self._poison(
                     NativeSnapshotRingStateError(
-                        "native dropped a locally active generation ticket"
+                        "C++/CUDA ring dropped a locally active generation ticket"
                     )
                 )
             if status != NativeStatus.OK:
@@ -617,7 +617,7 @@ class NativeSnapshotRing:
             if owned.phase is _TicketPhase.ABANDONED_SUBMITTED:
                 self._poison(
                     NativeSnapshotRingStateError(
-                        "abandoned native ticket unexpectedly became READY"
+                        "abandoned C++/CUDA ticket unexpectedly became READY"
                     )
                 )
             view = self._validated_view(
@@ -649,7 +649,7 @@ class NativeSnapshotRing:
             if status == NativeStatus.DROPPED:
                 self._poison(
                     NativeSnapshotRingStateError(
-                        "native dropped a locally active generation ticket"
+                        "C++/CUDA ring dropped a locally active generation ticket"
                     )
                 )
             if status != NativeStatus.OK:
@@ -701,7 +701,7 @@ class NativeSnapshotRing:
                 if owned.phase is _TicketPhase.SUBMITTED:
                     owned.phase = _TicketPhase.ABANDONED_SUBMITTED
                 elif owned.phase is _TicketPhase.READY:
-                    # Native abandon frees unclaimed READY slots immediately.
+                    # C++/CUDA abandon frees unclaimed READY slots immediately.
                     self._retire(owned)
                 elif owned.phase is _TicketPhase.CLAIMED:
                     owned.phase = _TicketPhase.ABANDONED_CLAIMED
@@ -792,7 +792,7 @@ class NativeSnapshotRing:
     ) -> SnapshotView:
         if raw is None:
             self._poison(
-                NativeSnapshotRingStateError("native READY status omitted its view")
+                NativeSnapshotRingStateError("C++/CUDA READY status omitted its view")
             )
         assert raw is not None
         public = owned.public
@@ -805,13 +805,13 @@ class NativeSnapshotRing:
         ):
             self._poison(
                 NativeSnapshotRingStateError(
-                    "native READY view disagrees with its generation ticket"
+                    "C++/CUDA READY view disagrees with its generation ticket"
                 )
             )
         if raw.state != expected_state:
             self._poison(
                 NativeSnapshotRingStateError(
-                    "native READY view has an unexpected ownership state"
+                    "C++/CUDA READY view has an unexpected ownership state"
                 )
             )
         if (
@@ -824,7 +824,7 @@ class NativeSnapshotRing:
         ):
             self._poison(
                 NativeSnapshotRingStateError(
-                    "native READY view has invalid capacity or record metadata"
+                    "C++/CUDA READY view has invalid capacity or record metadata"
                 )
             )
         expected_offsets, expected_lengths, expected_used = self._layout_for_rows(
@@ -837,7 +837,7 @@ class NativeSnapshotRing:
         ):
             self._poison(
                 NativeSnapshotRingStateError(
-                    "native READY view disagrees with the configured source layout"
+                    "C++/CUDA READY view disagrees with the configured source layout"
                 )
             )
         try:
@@ -845,7 +845,7 @@ class NativeSnapshotRing:
         except (TypeError, ValueError) as error:
             self._poison(
                 NativeSnapshotRingStateError(
-                    f"native READY payload is not a usable buffer: {error}"
+                    f"C++/CUDA READY payload is not a usable buffer: {error}"
                 )
             )
         if (
@@ -858,7 +858,7 @@ class NativeSnapshotRing:
             payload.release()
             self._poison(
                 NativeSnapshotRingStateError(
-                    "native READY payload is not a contiguous used_bytes byte view"
+                    "C++/CUDA READY payload is not a contiguous used_bytes byte view"
                 )
             )
         return SnapshotView(ticket=public, raw=raw, payload=payload)

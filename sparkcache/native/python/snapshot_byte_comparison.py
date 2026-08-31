@@ -1,7 +1,7 @@
 """GPU-free byte oracle for the SparkCache snapshot gather layout.
 
 The reference side uses the same ``pack_record`` function as the synchronous
-end-of-prefill Python snapshot path. The candidate side emulates the native
+end-of-prefill Python snapshot path. The candidate side emulates the C++/CUDA
 gather kernel's
 layer-major layout, including physical-slot indirection, padded source strides,
 record-kind offsets, and 64-byte alignment.
@@ -36,7 +36,7 @@ class SnapshotComparisonError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class SourceFamilyGeometry:
-    """Storage geometry for one native snapshot record family."""
+    """Storage geometry for one C++/CUDA snapshot record family."""
 
     record_kind: str
     source_count: int
@@ -145,7 +145,7 @@ def calculate_payload_geometry(
     row_count: int,
     slot_bytes: int,
 ) -> SnapshotPayloadGeometry:
-    """Mirror the native layout calculation without allocating source bytes."""
+    """Mirror the C++/CUDA layout calculation without allocating source bytes."""
 
     if not families:
         raise SnapshotComparisonError("source family table must not be empty")
@@ -288,7 +288,7 @@ def emulate_native_gather(
         record_mask |= 1 << kind
         cursor += record_bytes
 
-    # Alignment padding is deliberately nonzero. The native kernel does not
+    # Alignment padding is deliberately nonzero. The CUDA kernel does not
     # define those bytes, and comparisons must only inspect declared records.
     output = bytearray([0xA5]) * cursor
     for source in sources:

@@ -69,7 +69,7 @@ class PageBaseCohortRegistration:
 class PageBaseReadResult:
     """One immutable authenticated base representation and its byte charge.
 
-    Native page restore retains independently authenticated macro objects
+    SparkCache CUDA page restore retains independently authenticated macro objects
     instead of materializing one contiguous snapshot.  The coordinator needs
     only their aggregate authenticated size to enforce the same flight bounds.
     """

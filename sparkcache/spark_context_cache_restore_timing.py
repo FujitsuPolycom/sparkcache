@@ -56,7 +56,7 @@ class RestoreTiming:
         self._observed_phases.add(phase)
 
     def observe(self, phase: str, elapsed_ns: int) -> None:
-        """Best-effort production observer; timing cannot affect restore."""
+        """Record optional timing without allowing telemetry to affect restore."""
 
         try:
             self.add(phase, elapsed_ns)

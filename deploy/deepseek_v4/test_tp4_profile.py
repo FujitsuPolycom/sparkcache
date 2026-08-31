@@ -145,7 +145,7 @@ def test_transfer_config_is_bounded_python_hma_restore() -> None:
     assert extra["spark_cache_model_profile"] == "deepseek-v4-fp8-hma"
     assert extra["spark_cache_draft_policy"] == "colocated_target"
     assert extra["spark_cache_streaming_snapshots"] is False
-    assert extra["spark_cache_native_restore"] is False
+    assert extra["spark_cache_cuda_restore"] is False
     assert extra["spark_cache_max_bytes"] == MAX_BYTES == 200 * 1024**3
     assert extra["spark_cache_low_watermark_bytes"] == LOW_WATERMARK_BYTES
     assert LOW_WATERMARK_BYTES == 180 * 1024**3
@@ -174,14 +174,13 @@ def test_transform_accepts_all_four_physical_ranks() -> None:
         environment = _environment(transformed)
         assert environment["MASTER_PORT"] == "29600"
         assert "SPARK_CONTEXT_CACHE_ENABLE" not in environment
-        assert "SPARK_CONTEXT_CACHE_ENABLE" in environment[
-            "SPARKRING_EXPLICITLY_UNSET"
-        ]
+        assert "SPARK_CONTEXT_CACHE_ENABLE" in environment["SPARKRING_EXPLICITLY_UNSET"]
         assert environment["PYTHONPATH"].startswith("/opt/sparkcache-src:")
         assert "/opt/sparkcache-src/sparkcache" not in environment["PYTHONPATH"]
-        assert transformed["Config"]["Labels"][
-            "org.sparkcache.deployment-profile"
-        ] == "deepseek-v4-flash-0731-tp4-dcp1"
+        assert (
+            transformed["Config"]["Labels"]["org.sparkcache.deployment-profile"]
+            == "deepseek-v4-flash-0731-tp4-dcp1"
+        )
 
 
 def test_cluster_preflight_accepts_one_homogeneous_four_rank_ring() -> None:
@@ -243,9 +242,7 @@ def test_cluster_preflight_rejects_collective_port_drift() -> None:
 @pytest.mark.parametrize("degree", (2, 4))
 def test_transform_rejects_hma_dcp_greater_than_one(degree: int) -> None:
     inspection = _source()
-    inspection["Config"]["Cmd"].extend(
-        ("--decode-context-parallel-size", str(degree))
-    )
+    inspection["Config"]["Cmd"].extend(("--decode-context-parallel-size", str(degree)))
     with pytest.raises(ProfileTransformError, match="DCP1"):
         transform_inspection(inspection, checkpoint_sha256=CHECKPOINT)
 

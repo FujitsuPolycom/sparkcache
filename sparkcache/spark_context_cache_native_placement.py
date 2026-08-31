@@ -4,7 +4,7 @@ This module does not install itself into the vLLM connector.  It layers
 artifact attestation, registered-tensor validation, and parked-request
 semantics on the canonical ctypes ABI binding in ``spark_cache_native``.
 The caller still owns manifest quorum, scheduler parking, block reclamation,
-and fail-closed recomputation.
+and verified-or-recompute handling.
 """
 
 from __future__ import annotations

@@ -9,24 +9,55 @@ records:
 - [`GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md`](../../GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md)
   records an 8,192-token persistent restore through the Python page-placement
   path at 147.2--194.0 ms per rank.
-- [`GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md`](../../GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md)
-  records native direct restore of a 131,072-token prefix, multi-group
+- [`GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md`](../../GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md)
+  records SparkCache direct CUDA restore of a 131,072-token prefix, multi-group
   recovery, and bounded shared GPU-prefix reuse through C16.
+- [`GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md`](../../GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md)
+  records bounded exact physical-page delta restore and different-root
+  shared-base reads for one PR535 TP4 image.
 
 Qualification applies only to the checkpoint revisions, source contracts,
 topology, settings, and immutable artifacts named in those records. It does
 not transfer to another vLLM tree, target or draft checkpoint, TP/DCP geometry,
 scheduler configuration, or registry image.
 
-The qualified 8,192-token Python-placement artifact is public at digest
-`sha256:cd4045bba2a0f3dc55361560f8c3a3f171939854db28d48dfdae58eed9c44943`.
-Its immutable parent and build provenance are recorded in
-[`IMAGE_ANNOUNCEMENT.md`](IMAGE_ANNOUNCEMENT.md).
+The canonical public image route is the Jovian Judgement r7 ARM64 image in
+[`JJ_R7_ARM64_IMAGE.md`](JJ_R7_ARM64_IMAGE.md). Its status is **implemented and
+TP4 smoke-verified, not generally qualified**. The record pins the immutable
+digest, public source composition, exact target and draft artifacts, and the
+four-host run procedure.
 
-Native 131,072-token restore and shared GPU-prefix reuse are qualified only for
-the source-bound runtime named in the native validation record. No public OCI
-digest carries that runtime. [`PUBLISHING.md`](PUBLISHING.md) requires every
-rebuilt digest to complete its own four-rank qualification.
+```bash
+docker pull ghcr.io/fujitsupolycom/sparkring-glm53-sparkcache@sha256:f012dd915c0fff0be384820c2d72cd015b83b9b33c3f980445dd718a807cd0c5
+```
+
+Continue with the
+[GLM-5.3 Jovian Judgement r7 GB10 TP4 quickstart](https://github.com/FujitsuPolycom/sparkring/blob/main/docs/GLM53_JJ_R7_GB10_TP4_QUICKSTART.md).
+
+The superseded Python-placement image at digest `sha256:cd4045b...` retains its
+qualified 8,192-token evidence in
+[`IMAGE_ANNOUNCEMENT.md`](IMAGE_ANNOUNCEMENT.md). That historical record is not
+the run procedure for the Jovian Judgement r7 image.
+
+SparkCache CUDA restore of a 131,072-token prefix and shared GPU-prefix reuse
+remain qualified only for the source-bound runtime named in the SparkCache CUDA
+validation record. The public Jovian Judgement r7 image has bounded C4 smoke
+evidence, not that broader qualification.
+
+## Upstream runtime and artifacts
+
+GLM runtime performance and correctness come primarily from Local Inference
+Lab's [Jovian Judgement vLLM work](https://github.com/local-inference-lab/vllm/tree/dev/jovian-judgement).
+The canonical public image uses public source snapshot
+[`FujitsuPolycom/vllm@331573d2`](https://github.com/FujitsuPolycom/vllm/commit/331573d20bd47e78327ed8d8b4d2e6d350bbb1ab),
+tree `927f52a0085bcecfd2ba679e5abebe1a62623daf`, and
+[`B12X@6255090a`](https://github.com/local-inference-lab/b12x/commit/6255090a03b12c3f7d552102a02fac0b542fb8c9),
+tree `0bb58d0dcc10e29e00ff9850c0d719fca1aba5ad`. It uses
+[`GLM-5.3-Flash-NVFP4@520de24e`](https://huggingface.co/local-inference-lab/GLM-5.3-Flash-NVFP4/tree/520de24eabf507659eaef7c70f14fd584527facc)
+and the BF16
+[`incoai/GLM-5.3-Flash-DFlash2@dc77ff1c`](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2/tree/dc77ff1c99eeb2df044ee3d4f0094eb033fee410).
+The external draft is not Local Inference Lab's separate
+[MXFP8 DFlash2 checkpoint](https://huggingface.co/local-inference-lab/GLM-5.3-Flash-DFlash2-MXFP8).
 
 ## Stored state and prefix behavior
 
@@ -45,8 +76,13 @@ every rank.
 Opaque page chunks are authenticated byte partitions of one complete boundary
 snapshot; they are not independent 256-token KV objects. Sparse prefix aliases
 are **implemented** only for `per_token_rows`. Creating an earlier GLM prefix
-by truncating an opaque page manifest is **unsupported**. Tail-only GLM
-publication requires a page-semantic format and a distinct cache namespace.
+by truncating an opaque page manifest is **unsupported**. Opt-in physical-page
+delta publication uses the distinct `page-tail-cow-v1` identity and
+authenticates the complete base-plus-delta graph. Publication, direct
+SparkCache CUDA restore, shared-base coalescing, and bounded eight-lane restore
+are **implemented with bounded exact TP4 evidence**. General qualification
+remains specific to a model, topology, runtime, and workload. The PR535
+validation record identifies the evidence boundary.
 
 Concurrent requests for the same persistent digest use one restore leader.
 After all workers report successful restoration, patched vLLM retains the
@@ -84,7 +120,7 @@ pull-request lineage includes
 [#497](https://github.com/local-inference-lab/vllm/pull/497), and
 [#499](https://github.com/local-inference-lab/vllm/pull/499).
 
-The image pins `local-inference-lab/b12x` commit
+The historical qualified source runtime pins `local-inference-lab/b12x` commit
 `2fcf23a0ce269be27b2e03fece73d46e90e6aeea`. GitHub reports no pull request
 associated with that commit.
 
@@ -95,9 +131,11 @@ follower attachment. The ten-file contract
 whole-file hashes and required symbols against installed vLLM source. An
 unrecognized hash is unsupported.
 
-## Image construction
+## Historical da4d7be overlay construction
 
-Pull the qualified public Python-placement artifact by immutable digest:
+The following source-bound procedure reproduces the superseded da4d7be
+Python-placement artifact. It does not build the Jovian Judgement r7 image.
+Pull the historical artifact by immutable digest:
 
 ```bash
 docker pull ghcr.io/fujitsupolycom/sparkring-glm53-sparkcache@sha256:cd4045bba2a0f3dc55361560f8c3a3f171939854db28d48dfdae58eed9c44943
@@ -106,7 +144,8 @@ docker pull ghcr.io/fujitsupolycom/sparkring-glm53-sparkcache@sha256:cd4045bba2a
 Its parent is
 `ghcr.io/fujitsupolycom/sparkring-glm53-runtime@sha256:864adfe68f458223e186a19844ac80c7adc7365e5db1f25e109b85fc19850dcd`.
 The public artifact remains bound to SparkCache revision `3860a2250193a6679ac6bac857af53e0757841f8`;
-it does not contain the later native/shared-prefix source described above.
+it does not contain the later SparkCache CUDA/shared-prefix source described
+above.
 
 Build from the repository root after recording the exact local parent image
 ID and SparkCache source-tree digest:
@@ -195,14 +234,15 @@ token incomplete for retry; it does not delay model serving indefinitely. See
 [`sparkcache/README.md`](../../sparkcache/README.md#one-shot-cache-clear) for
 token, root-path, and deletion-scope rules.
 
-Native page restore is disabled unless the launch supplies all of:
+SparkCache CUDA restore is disabled unless the launch supplies all of:
 
-- `SPARK_CONTEXT_CACHE_NATIVE_RESTORE=1`;
-- an attested `SPARK_CONTEXT_CACHE_NATIVE_LIBRARY` path;
-- its `SPARK_CONTEXT_CACHE_NATIVE_LIBRARY_SHA256`;
-- a 64, 128, or 256 MiB `SPARK_CONTEXT_CACHE_NATIVE_ARENA_BYTES` value.
+- `SPARK_CONTEXT_CACHE_CUDA_RESTORE=1`;
+- an attested `SPARK_CONTEXT_CACHE_CUDA_PLACEMENT_LIBRARY` path;
+- its `SPARK_CONTEXT_CACHE_CUDA_PLACEMENT_LIBRARY_SHA256`;
+- a 64, 128, or 256 MiB
+  `SPARK_CONTEXT_CACHE_CUDA_PLACEMENT_ARENA_BYTES` value.
 
-The qualified 128K runtime used two host restore workers, two native placement
+The qualified 128K runtime used two host restore workers, two SparkCache CUDA placement
 lanes, and two 256 MiB mapped-host arenas per rank. Streaming snapshots remain
 unsupported for opaque page storage.
 
@@ -233,12 +273,12 @@ python -m deploy.glm53_flash.concurrency_benchmark \
 ```
 
 The default fixture reproduces the recorded 131,072-token persistent prefix.
-See the native restore validation record for exact runtime identities, results,
+See the SparkCache CUDA restore validation record for exact runtime identities, results,
 and committed receipts.
 
 ## Compatibility
 
-The native placement path, longest exact-boundary search, and shared GPU lease
+The SparkCache CUDA placement path, longest exact-boundary search, and shared GPU lease
 do not change `CacheIdentity`, digest values, 256-token logical geometry, exact
 manifest format, or existing chunk bytes. Missing or incompatible state remains
 a cache miss followed by ordinary computation.

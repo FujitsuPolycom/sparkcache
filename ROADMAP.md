@@ -1,133 +1,93 @@
-# Research-only and unsupported work
+# SparkCache research map
 
-This document records work that is not part of SparkCache's implemented
-interface. Status labels have these meanings:
+This page collects ideas and unsupported designs. Implemented behavior belongs
+in the package documentation. Model-specific test gaps belong with the matching
+profile under [`deploy/`](deploy/).
 
-- **research-only** — a design or evidence exists, but deployment support is
-  not qualified; accepted design directions without implementation also use
-  this status and state their prerequisites;
-- **unsupported** — no safe interface exists; configuration fails closed;
-  designs incompatible with SparkCache's invariants are explicitly marked
-  unsupported by design.
+- **research-only** means code or a bounded experiment exists, but no supported
+  deployment profile uses it.
+- **unsupported** means SparkCache has no safe interface for the behavior.
 
-Open correctness and scaling defects are listed in `DEFECTS.md` and take
-priority over feature work.
+Open correctness defects are listed in [`DEFECTS.md`](DEFECTS.md).
 
-## Research-only design work
+## Implemented features that need wider live testing
 
-### Tail-publication performance qualification
+| Feature | Implemented behavior | Useful live tests |
+|---|---|---|
+| Copy-on-write publication | Row tails and physical-page deltas use immutable authenticated graphs and separate namespaces. | Repeated conversation growth, published-byte accounting, corruption recovery, and more page geometries. |
+| SparkCache CUDA restore | An attested library places authenticated objects into request-owned GPU blocks. | More model layouts, cancellation, allocation pressure, and bounded-memory checks. |
+| Shared bases and GPU prefixes | Bounded requests can share authenticated stored bases and verified GPU blocks. | Mixed prompt lengths, leader cancellation, allocation pressure, and sustained concurrency. |
 
-**Status: research-only qualification work.** Longest exact-boundary search,
-authenticated row-prefix aliases, immutable row tails, and authenticated
-block-page deltas are implemented. Tail publication is opt-in through
-`spark_cache_publication_schema=tail-cow-v1`, which selects distinct row and
-page cache identities while leaving the default snapshot identity unchanged.
+These features remain **implemented**. The open work expands the deployments
+and workloads for which live evidence exists.
 
-GPU-free coverage proves copy-on-write extension, bounded page-delta
-compaction, recurrent/sliding boundary geometry, corruption removal,
-reference-aware maintenance, and verified reconstruction. Live GLM-5.3
-qualification must still measure publication bytes, cold restore latency,
-native-placement latency after page reconstruction, SSD writes, and continued
-generation across repeated conversation extensions.
+## Research-only ideas
 
-### Per-entry retention controls
+### Per-entry retention
 
-**Status: research-only.** The implemented TTL and LRU policy applies to an entire
-cache root. Per-entry metadata would allow a caller to set a TTL and pin a
-known session against pressure eviction. Pins must have an expiry or explicit
-release operation so abandoned sessions cannot permanently defeat capacity
-bounds.
+Per-entry expiry or temporary session pins could complement root-wide TTL and
+LRU. Every pin would need an expiry or explicit release.
 
 ### Trunk-aware eviction
 
-**Status: research-only.** Prefix aliases and cross-root row-trunk sharing are
-implemented. Manifest-recency LRU still treats every root independently.
-Frequency and reference-value metadata could allow eviction to prefer
-unshared suffixes and preserve chunks referenced by many conversation trunks.
-Such metadata must remain outside authenticated restore state and cannot make
-an entry eligible for restoration.
+Frequency and shared-byte metadata could preserve heavily reused prompt trunks
+while evicting private suffixes. This metadata must never decide restore
+eligibility.
 
 ### Restore prefetch
 
-**Status: research-only.** A named-digest warm-up operation would start read and
-verification before vLLM schedules the request. It must reuse the bounded
-asynchronous-load machinery without claiming an external hit until all ranks
-confirm completion.
+A digest-based warm-up could begin bounded reading and verification before
+scheduling. A request would still count as a hit only after every rank confirms
+the verified result.
 
-### Native restore expansion
+### Streaming publication
 
-**Status: research-only qualification work.** Native multi-group page restore
-is implemented and source-runtime-qualified for the recorded GLM-5.3 TP4/DCP1
-profile. Tail page deltas reconstruct a fully verified snapshot before Python
-or native placement, but that path has no live performance qualification.
+The planner, lease registry, gather ring, journal, and progress runtime are
+implemented and GPU-free tested. Each storage layout still needs a tensor
+inventory, byte-exact translator, ownership proof, and live interference test.
 
-DeepSeek-V4 opaque HMA pages retain their verified Python restore path. Native
-support for that profile must describe all five page groups, preserve each
-group's semantic reuse window, and prove byte identity before changing its
-qualified deployment contract.
-
-## Research-only
-
-### Streaming snapshot generalization
-
-The streaming planner, lease registry, gather ring, journal, and progress
-runtime are implemented and GPU-free tested. The registered tensor inventory
-and translator are specific to GLM-5.2 DCP4. Qualification for another model
-requires an explicit registered-layer inventory, byte-exact translation, CUDA
-ownership tests, and interference measurements.
-
-The model-serving qualification gate requires cache-active time-to-first-token and decode
-throughput within 2% of the cache-off profile under the same workload.
+Streaming remains off unless a deployment profile explicitly enables a
+matching runtime, library, and layout.
 
 ### Buddy-replication carrier
 
-The replication package implements transaction framing, credit limits,
-idempotency, stale-generation rejection, expiry, and reconnect state. It has no
-network adapter. Possible carriers are:
+The replication package implements framing, credits, retries, expiry, and
+reconnect state. It does not include a network adapter.
 
-- an asyncio TCP adapter for minimal dependencies and transparent failures;
-- NIXL for UCX/RDMA, POSIX, and storage backends where its dependency cost is
-  acceptable.
+Possible carriers include TCP and RDMA-capable transports. Replication is for
+repair; ordinary restore remains rank-local.
 
-The supported use case is repair of a missing or corrupt rank-local shard from
-a replica. Normal restores remain rank-local.
+### Heat-aware storage controls
 
-### Lossless chunk compression
+Possible signals include hit count, recomputation avoided, shared bytes,
+exclusive bytes, publication budgets, logical write volume, and device
+endurance data.
 
-Measure zstd ratio and CPU cost on real target-KV, sparse-indexer, and draft
-records before defining a format. Any accepted format must authenticate the
-complete encoded representation and preserve byte-exact decoded records.
+These signals may guide publication and eviction. They must not make an
+unverified entry eligible for restore.
 
-## Unsupported
+### Lossless compression
 
-### DeepSeek-V4 HMA pages at DCP2/DCP4
+A compressed object must authenticate its encoded form and decode to the exact
+original bytes. Adoption needs useful space savings without unacceptable CPU
+or restore cost.
 
-Opaque page ownership and DSpark rolling-state sharding are undefined for DCP
-degrees above one. `deploy/deepseek_v4/DCP_SUPPORT.md` states the required
-wire-format, ownership, and qualification work. Configuration fails closed.
+## Unsupported without a profile
 
-### Qwen recurrent-state persistence
+- Recurrent state for an unregistered storage layout.
+- Opaque pages whose parallel ownership is undefined.
+- CUDA placement for an unregistered destination layout.
+- Streaming publication for an unregistered tensor inventory.
 
-No model profile, record schema, state ownership contract, or live evidence
-exists. Supporting Qwen requires identifying every recurrent state tensor and
-proving its lifecycle under prefix reuse and restart.
+Supporting one of these requires an explicit profile, a distinct cache
+namespace when storage meaning changes, GPU-free tests, and a matching live
+test record.
 
 ## Unsupported by design
 
-- **Lossy KV compression or quantized archival tiers.** Approximate state
-  violates byte-exact restore and continued-generation equivalence.
-- **Cross-position blended reuse.** Repairing approximate KV from another
-  position is a different cache contract and cannot be represented as a
-  verified SparkCache hit.
-- **A distributed filesystem as the normal cache store.** Rank-local DCP
-  placement already supplies parallel local reads; a distributed filesystem
-  adds inference-fabric traffic and cluster operational weight. Replication is
-  scoped to repair.
-- **Process-level GPU checkpointing.** Driver/runtime-specific process images
-  are not portable logical context records and cannot be shared by prompt
-  identity.
-- **Erasure coding at small ring sizes.** Parity and reconstruction complexity
-  does not provide a measured benefit over one bounded buddy replica.
-- **Prefill/decode disaggregation.** The switchless deployment does not have
-  spare interconnect bandwidth for continuous KV movement between serving
-  pools.
+- Lossy compression or quantized archival state.
+- Approximate or blended cross-position reuse.
+- Network storage as the ordinary rank-local cache path.
+- Driver-specific process checkpoints as portable context records.
+- Reusing one cache identity across different physical shard layouts.
+- Making inference wait for publication, replication, eviction, or telemetry.

@@ -1,0 +1,92 @@
+{
+  "schema": "sparkcache-glm53-dcp-validation/v1",
+  "evidence_status": "research-only",
+  "qualification": false,
+  "platform": "four NVIDIA GB10 systems, Linux/ARM64, TP4",
+  "runtime": {
+    "vllm_composition": "331573d20bd47e78327ed8d8b4d2e6d350bbb1ab",
+    "vllm_tree": "927f52a0085bcecfd2ba679e5abebe1a62623daf",
+    "b12x_composition": "6255090a03b12c3f7d552102a02fac0b542fb8c9",
+    "b12x_tree": "0bb58d0dcc10e29e00ff9850c0d719fca1aba5ad",
+    "nccl_library_sha256": "5f1c3f10d5ace66d4ba584415bbfe42b6ac1a0a9116a3b81dcbe50516ad924b3",
+    "sparkcache_behavioral_base_commit": "9561923405bbb52ac7ff1810d3119a41b7b58b45",
+    "sparkcache_deployable_source_sha256": "40de372dda64dd25f493584b2ba3dae81c4350d424d3cf00cfea92452dac170c",
+    "sparkcache_behavior_has_uncommitted_changes": true,
+    "cuda_placement_library_sha256": "d57509052b73853bcc8e3c3f47bb81748d87b9cbd8d908fc20d4c79a09aa400c"
+  },
+  "models": {
+    "target": {
+      "repository": "local-inference-lab/GLM-5.3-Flash-NVFP4",
+      "revision": "520de24eabf507659eaef7c70f14fd584527facc",
+      "config_sha256": "676382abd1e90a6c85f0c8f33d45441ecd45fd514fd7b63ce5610e732d8e4996",
+      "index_sha256": "0d1d9e6b226e76520e182de10d4e7194cc885c5cb1bf885bb90de1916ce312cb"
+    },
+    "draft": {
+      "repository": "incoai/GLM-5.3-Flash-DFlash2",
+      "revision": "dc77ff1c99eeb2df044ee3d4f0094eb033fee410",
+      "dtype": "BF16",
+      "config_sha256": "c4aeac0101196a6e26705b34c45230bcd0c7c68ee2d2d1efdb242087f3712573",
+      "weights_sha256": "b33c03475ba7322cf398828f2d8d1be376df30dc05c6b40c28c8ea8da23e410b"
+    }
+  },
+  "serving": {
+    "max_model_len": 524288,
+    "max_num_batched_tokens": 8192,
+    "speculative_method": "dflash",
+    "speculative_tokens": 7,
+    "cp_kv_cache_interleave_size": 4,
+    "dcp_ckv_gather": true,
+    "publication_schema": "snapshot-v1",
+    "manager_page_namespace": "manager-pages-v2"
+  },
+  "accepted_runs": {
+    "dcp2": {
+      "decode_context_parallel_size": 2,
+      "publication": {
+        "span_tokens": 9216,
+        "snapshot_ms_by_physical_rank": [130.5, 132.9, 118.7, 129.2],
+        "commit_ms_by_physical_rank": [157.3, 167.2, 165.7, 189.3]
+      },
+      "python_restore": {
+        "semantic_oracle": "exact red",
+        "service_ms": {"minimum": 234.8, "maximum": 264.5},
+        "page_bytes_per_physical_rank": 78751393
+      },
+      "cuda_restore": {
+        "semantic_oracle": "exact red",
+        "service_ms": {"minimum": 151.1, "maximum": 174.1}
+      }
+    },
+    "dcp4": {
+      "decode_context_parallel_size": 4,
+      "publication": {
+        "span_tokens": 8192,
+        "snapshot_ms": {"minimum": 62.4, "maximum": 94.2},
+        "commit_ms": {"minimum": 147.2, "maximum": 180.7}
+      },
+      "cuda_restore": {
+        "semantic_oracle": "exact red",
+        "service_ms": {"minimum": 118.8, "maximum": 133.7},
+        "page_bytes_per_physical_rank": 62953633
+      }
+    }
+  },
+  "rejected_diagnostics": [
+    {
+      "topology": "TP4/DCP2",
+      "structural_result": "manifest and payload authentication completed",
+      "semantic_result": "rejected because restored reasoning degenerated",
+      "root_cause": "Mamba recurrent pages were misclassified as DCP-sharded because MambaSpec has no dcp_replicated attribute; recurrent_align pages are DCP-replicated",
+      "conclusion": "structural verification without an exact semantic oracle is not accepted as restore evidence"
+    }
+  ],
+  "not_established": [
+    "general deployment qualification",
+    "large-context restore",
+    "concurrent restore",
+    "page-delta or tail-only publication under DCP",
+    "fault injection",
+    "long-duration soak",
+    "throughput or latency outside the recorded spans"
+  ]
+}

@@ -1,1 +1,1 @@
-"""Fail-closed runtime contract checks for SparkCache."""
+"""Exact-source runtime contract checks for SparkCache."""

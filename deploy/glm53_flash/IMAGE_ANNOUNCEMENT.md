@@ -1,4 +1,10 @@
-# GLM-5.3 Flash SparkCache community image
+# Historical GLM-5.3 Flash SparkCache image record
+
+This document preserves the qualification evidence for the superseded
+`sha256:cd4045b...` image. The canonical public image and run procedure are in
+[`JJ_R7_ARM64_IMAGE.md`](JJ_R7_ARM64_IMAGE.md). Values below describe only the
+historical artifact. Canonical public artifact identities are recorded in the
+linked Jovian Judgement r7 image document.
 
 ## Status
 
@@ -9,6 +15,18 @@ SparkCache release.
 
 Support owner: `FujitsuPolycom`. The image remains an ephemeral test build
 until the support owner explicitly adopts a longer maintenance commitment.
+
+GLM runtime performance and correctness come primarily from Local Inference
+Lab's Jovian Judgement
+[`vLLM@da4d7be6`](https://github.com/local-inference-lab/vllm/commit/da4d7be6c97434f6942292ed8abbf4b32dc44355),
+with Blackwell kernels from
+[`B12X@2fcf23a0`](https://github.com/local-inference-lab/b12x/commit/2fcf23a0ce269be27b2e03fece73d46e90e6aeea).
+The qualified service pairs the image with
+[`GLM-5.3-Flash-NVFP4@520de24e`](https://huggingface.co/local-inference-lab/GLM-5.3-Flash-NVFP4/tree/520de24eabf507659eaef7c70f14fd584527facc)
+with the BF16
+[`incoai/GLM-5.3-Flash-DFlash2@dc77ff1c`](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2/tree/dc77ff1c99eeb2df044ee3d4f0094eb033fee410).
+The draft is not Local Inference Lab's separate
+[MXFP8 DFlash2 checkpoint](https://huggingface.co/local-inference-lab/GLM-5.3-Flash-DFlash2-MXFP8).
 
 ## Image and digest
 
@@ -110,7 +128,7 @@ vLLM fork:
   `067c37d974ca2b775d95e51e8fec234929f4e2c4`; #494, independent target
   and draft KV formats, merge `e91c7e68f5863a27c79d2773205678be7d8ff132`;
   #497, multimodal processor revision binding, merge
-  `05d85f603097fe7678d7dda2d522613d9dc61f46`; and #499, native
+  `05d85f603097fe7678d7dda2d522613d9dc61f46`; and #499, compiled
   serialized MXFP8 DFlash2 projections, merge
   `da4d7be6c97434f6942292ed8abbf4b32dc44355`.
 
@@ -182,10 +200,10 @@ ENTRYPOINT=["vllm"]
   BF16, seven speculative tokens, draft TP4, CC BY-NC-ND 4.0.
 - KV mode: 12 GiB FP8 GPU KV per rank; measured capacity 549,950 tokens.
 - External cache: SparkCache maximum 48 GiB and low watermark 40 GiB per
-  rank; rank-local NVMe; native direct restore and streaming disabled.
+  rank; rank-local NVMe; SparkCache direct CUDA restore and streaming disabled.
 - Graphs: target `FULL_AND_PIECEWISE`, DFlash FULL, capture sizes
   8, 16, 32, 64, 128, and 256.
-- Scheduler: asynchronous scheduling, chunked prefill, native prefix caching,
+- Scheduler: asynchronous scheduling, chunked prefill, vLLM prefix caching,
   524,288-token model limit, 8,192 batched tokens, and 32 sequences.
 - Prefill: Triton KDA backend. Load format: stock safetensors.
 
@@ -200,6 +218,10 @@ image-ID, and RDMA commands. The request harness is
 [`qualification_request.py`](qualification_request.py).
 
 Core request commands:
+
+The required served alias `glm-5.3-flash-nvfp4-dflash7-bf16-tp4` means
+DFlash2 BF16 with proposal depth seven. It does not identify a separate
+DFlash7 checkpoint.
 
 ```bash
 python deploy/glm53_flash/qualification_request.py \
@@ -238,7 +260,7 @@ performance baseline is implied.
 ## Known limitations
 
 - MTP drafting, other checkpoints, other topologies, spans over 8,192 tokens,
-  native direct restore, streaming snapshots, throughput, and soak behavior:
+  SparkCache direct CUDA restore, streaming snapshots, throughput, and soak behavior:
   `Not tested`.
 - Exact semantic output was not established by the historical suffix-only
   receipt. Requalification must use the exact-content qualifier.

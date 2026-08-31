@@ -471,7 +471,7 @@ def test_native_shared_base_follower_cancellation_does_not_abort_leader(
         assert flights.cancel("blue")
         with pytest.raises(
             cuda_hybrid.CudaHybridRestoreError,
-            match="request left the registered cohort",
+            match="left the registered cohort",
         ):
             blue_future.result(timeout=5)
         release_base.set()

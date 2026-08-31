@@ -1,15 +1,21 @@
-# Issue triage labels
+# Issue labels
 
-SparkCache issue records use these status labels:
+SparkCache uses the labels configured in the public GitHub repository.
 
-| Label | Meaning |
-| --- | --- |
-| `status:untriaged` | The report has not been checked for scope, evidence, or duplication. |
-| `status:needs-information` | A named fact, reproduction condition, or decision is required before implementation can proceed. |
-| `status:ready` | Scope, acceptance conditions, and dependencies are explicit enough for implementation. |
-| `status:in-progress` | Implementation or qualification work is active. |
-| `status:done` | Acceptance conditions are satisfied and validation evidence is recorded. |
+| Label | Use |
+|---|---|
+| `bug` | Reproducible incorrect behavior. |
+| `documentation` | Missing, stale, or unclear repository prose. |
+| `enhancement` | A feature or usability request. |
+| `question` | A request for explanation or missing information. |
+| `duplicate` | An existing issue already tracks the same behavior. |
+| `invalid` | The report does not describe an actionable repository issue. |
+| `wontfix` | The repository will not implement the requested change. |
+| `good first issue` | A focused change suitable for a first contribution. |
+| `help wanted` | A scoped issue where outside help would be useful. |
 
-Use exactly one status label per issue record. Additional labels may describe
-the affected subsystem, model family, topology, or severity, but they do not
-replace the status label.
+Dependency automation may also apply `dependencies`, `github_actions`, or
+`python` to pull requests.
+
+Do not invent workflow-state labels in issue prose. GitHub issue state and the
+public labels above are authoritative.

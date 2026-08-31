@@ -1,15 +1,15 @@
 """Worker-side orchestration for opportunistic streaming snapshots.
 
 This module is CPU-importable and disabled by default.  It owns no connector
-hook and loads no native library. Model-serving integration must explicitly
+hook and loads no C++/CUDA library. Model-serving integration must explicitly
 construct it with an already configured ring, bounded lease registry, planner, and
 transactional writer.
 
 The runtime deliberately separates two ownership intervals:
 
 * a :class:`BlockLeaseRegistry` lease protects source KV blocks until the
-  native gather reports GPU completion;
-* a claimed native-ring view remains owned until the injected writer has
+  C++/CUDA gather reports GPU completion;
+* a claimed C++/CUDA-ring view remains owned until the injected writer has
   finished consuming the staged bytes.
 
 Thus cancellation can release model KV as soon as the gather completes
@@ -54,7 +54,7 @@ class StreamingSnapshotRuntimeError(RuntimeError):
 
 
 class StreamingSnapshotFatalError(StreamingSnapshotRuntimeError):
-    """Ownership status is unknown; the worker must fail closed."""
+    """Ownership status is unknown; the worker must stop cache publication."""
 
 
 @runtime_checkable
@@ -208,7 +208,7 @@ class _RingFence:
 
 @dataclass(frozen=True, slots=True)
 class _ImmediateFence:
-    """Known-no-submission fence used for native WOULD_BLOCK/DROPPED."""
+    """Known-no-submission fence used for C++/CUDA WOULD_BLOCK/DROPPED."""
 
     def query(self) -> bool:
         return True
@@ -238,10 +238,10 @@ class _Context:
 
 
 class StreamingSnapshotRuntime:
-    """Fail-open cache state machine for one vLLM worker rank.
+    """Optional cache state machine whose ordinary failures preserve serving.
 
-    Ordinary capacity, mapping, native-ring backpressure, cancellation, and
-    writer-result errors abort only cache publication.  Fence/native ownership
+    Ordinary capacity, mapping, C++/CUDA-ring backpressure, cancellation, and
+    writer-result errors abort only cache publication. Fence or C++/CUDA ownership
     errors poison the runtime and raise :class:`StreamingSnapshotFatalError`;
     continuing could allow vLLM to recycle a block still read by CUDA.
     """
@@ -673,7 +673,7 @@ class StreamingSnapshotRuntime:
             self._poison(error)
         ticket = box["ticket"]
         if ticket is None:
-            # Native WOULD_BLOCK/DROPPED is known not to have launched work.
+            # C++/CUDA WOULD_BLOCK/DROPPED is known not to have launched work.
             # The immediate fence lets abort release the source lease safely.
             self.counters["native_backpressure"] += 1
             self._abort_context(
@@ -811,7 +811,7 @@ class StreamingSnapshotRuntime:
         if context.inflight:
             self._poison(
                 StreamingSnapshotRuntimeError(
-                    "planner reached commit while native batches remain"
+                    "planner reached commit while C++/CUDA batches remain"
                 )
             )
         try:
@@ -827,7 +827,7 @@ class StreamingSnapshotRuntime:
             self._planner.commit(context.request_id)
         except Exception as error:
             # The manifest may now be visible, so internal state disagreement
-            # is not a fail-open cache miss.
+            # cannot be treated as an ordinary cache-publication abandonment.
             self._poison(error)
         self._committed_manifests[context.context_digest] = receipt
         self._contexts.pop(context.request_id, None)

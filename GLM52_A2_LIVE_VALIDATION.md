@@ -85,7 +85,7 @@ hashes and lengths while returning identical final content:
 - `a6878822f4e9a9639d17e63bfec6b98093cba0b17edbcfb7227befa11a1d222a`, 277 characters;
 - `a83ea242c380bf61038a081eb11b470629d1ed288c0dcd1536f6e27897310ac9`, 366 characters.
 
-Conclusion: non-empty-body and truncation checks are valid safety gates, but
+Conclusion: non-empty-body and truncation checks are valid safety requirements, but
 full GLM reasoning-trace equality is not a deterministic cache-correctness
 oracle under this runtime. Cache qualification therefore rests on all-rank
 external restore, exact final content, non-truncated completion, and fresh
@@ -97,4 +97,4 @@ diagnostic.
 This record qualifies only the exact `0.1.0a2` wheel and GLM TP4/DCP4 lane.
 It does not qualify the `0.1.0a2` DeepSeek TP2/DCP1 or TP4/DCP1 profiles, a
 different runtime image, a different checkpoint, another scheduler budget,
-streaming snapshots, or native restore.
+streaming snapshots, or SparkCache CUDA restore.

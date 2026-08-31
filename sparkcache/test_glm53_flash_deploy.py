@@ -20,10 +20,13 @@ DRAFT_ID = "b33c03475ba7322cf398828f2d8d1be376df30dc05c6b40c28c8ea8da23e410b"
 
 
 def test_target_revision_identity_is_deterministic() -> None:
-    assert immutable_revision_identity(
-        "local-inference-lab/GLM-5.3-Flash-NVFP4",
-        "520de24eabf507659eaef7c70f14fd584527facc",
-    ) == TARGET_ID
+    assert (
+        immutable_revision_identity(
+            "local-inference-lab/GLM-5.3-Flash-NVFP4",
+            "520de24eabf507659eaef7c70f14fd584527facc",
+        )
+        == TARGET_ID
+    )
 
 
 def test_embedded_mtp_policy_changes_the_cache_namespace() -> None:
@@ -57,7 +60,9 @@ def test_embedded_mtp_identity_rejects_incomplete_or_invalid_policy(
         )
 
 
-def test_connector_config_binds_target_and_draft_without_optional_native_paths() -> None:
+def test_connector_config_binds_target_and_draft_without_optional_native_paths() -> (
+    None
+):
     config = build_kv_transfer_config(
         target_checkpoint_sha256=TARGET_ID,
         draft_checkpoint_sha256=DRAFT_ID,
@@ -70,7 +75,7 @@ def test_connector_config_binds_target_and_draft_without_optional_native_paths()
     assert extra["spark_cache_draft_checkpoint_sha256"] == DRAFT_ID
     assert extra["spark_cache_draft_policy"] == "separate"
     assert extra["spark_cache_streaming_snapshots"] is False
-    assert extra["spark_cache_native_restore"] is False
+    assert extra["spark_cache_cuda_restore"] is False
     assert json.loads(compact_json(config)) == config
 
 

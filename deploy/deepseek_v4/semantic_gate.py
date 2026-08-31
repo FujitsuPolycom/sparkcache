@@ -1,4 +1,4 @@
-"""Deterministic semantic gate for DeepSeek-V4 cache store and restore."""
+"""Deterministic semantic check for DeepSeek-V4 cache store and restore."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def run_miss(
     long_max_tokens: int = 32,
     records: int = 384,
 ) -> dict[str, Any]:
-    """Run the shared miss gate through this module's injectable HTTP seam."""
+    """Run the shared miss check through this module's injectable HTTP seam."""
 
     return run_semantic_miss(
         endpoint,
@@ -49,7 +49,7 @@ def run_hit(
     short_max_tokens: int = 32,
     records: int | None = None,
 ) -> dict[str, Any]:
-    """Run the shared hit gate through this module's injectable HTTP seam."""
+    """Run the shared hit check through this module's injectable HTTP seam."""
 
     return run_semantic_hit(
         endpoint,

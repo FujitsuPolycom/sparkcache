@@ -28,7 +28,7 @@ overlay receipts were byte-identical (`dfc1ece2...`), and all serving binds
 were inspected before start: model, source, scheduler, and config read-only;
 cache and JIT roots read-write and disjoint.
 
-## Cache-off baseline and 6,912-token persistence gate
+## Cache-off baseline and 6,912-token persistence check
 
 The qualified image served first with SparkCache disabled. Health,
 model metadata, and exact `BASELINE_OK` output passed. The cache-enabled stack
@@ -54,7 +54,7 @@ Three more deterministic entries were stored, followed by one full four-rank
 restart. Every rank rediscovered all four manifests
 (`checked=4 offered=4 rejected=0`).
 
-| Prompt tokens | Aligned restored tokens | Snapshot/rank | NVMe commit/rank | Restore/rank | End-to-end hit gate |
+| Prompt tokens | Aligned restored tokens | Snapshot/rank | NVMe commit/rank | Restore/rank | End-to-end hit check |
 |---:|---:|---:|---:|---:|---:|
 | 36,910 | 36,864 | 189–240 ms | 1.34–1.57 s | 207–298 ms | 1.56 s |
 | 73,774 | 73,728 | 369–460 ms | 2.63–3.03 s | 335–412 ms | 1.64 s |
@@ -65,14 +65,14 @@ hit tokens for those restored prefixes, four-rank quorum for every digest,
 byte-identical semantic answers, and an immediate exact sentinel after each
 restore. The four entries occupied about 1.086 GiB per rank.
 
-## Capacity and corruption gates
+## Capacity and corruption checks
 
-The physical-NVMe capacity gate passed identically on all four hosts. It
+The physical-NVMe capacity check passed identically on all four hosts. It
 reduced 8,417,280 allocated bytes to 2,105,344, reclaimed 6,311,936 bytes,
 evicted the two oldest manifests, deleted three chunks including one orphan,
 retained the newest entry, and satisfied the low-watermark target.
 
-The corruption gate copied the smallest live entry into a disposable root:
+The corruption check copied the smallest live entry into a disposable root:
 27 chunks, 42,294,661 bytes. The copy verified healthy; flipping one byte made
 lookup return `corrupt`; invalidation removed the copied manifest and damaged
 chunk; the serving source root was unchanged.
@@ -94,9 +94,9 @@ chunk; the serving source root was unchanged.
    `SPARKRING_EXPLICITLY_UNSET`; the direct vLLM entrypoint ignores GLM image
    attestation state.
 5. Post-restart discovery reports reach the scheduler on the first worker
-   round trip. The hit gate must first send a short request that publishes
+   round trip. The hit check must first send a short request that publishes
    every rank's cache inventory to the scheduler (a quorum prime), or the
-   long request correctly fails closed to recompute.
+   long request correctly becomes a cache miss and recomputes.
 6. The DSpark build can answer the same trivial arithmetic prompt differently
    under async and synchronous scheduling (`42` versus `34`). Arithmetic is
    therefore not a valid cache-corruption oracle. Exact echo sentinels are

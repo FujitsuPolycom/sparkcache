@@ -84,7 +84,7 @@ class MockLibrary:
 
     @staticmethod
     def _copy_error(_placement, output, capacity):
-        message = b"mock native failure\0"
+        message = b"mock C++/CUDA failure\0"
         ctypes.memmove(output, message, min(len(message), capacity))
         return 0
 
@@ -122,7 +122,7 @@ class FakeTensor:
 
 def _attested_mock(tmp_path: Path, mock: MockLibrary | None = None):
     artifact = tmp_path / "libspark_cache_placement.so"
-    artifact.write_bytes(b"native-test-artifact")
+    artifact.write_bytes(b"cuda-test-artifact")
     digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
     loaded = mock or MockLibrary()
     library = NativePlacementLibrary.load(
@@ -175,7 +175,7 @@ def test_hash_mismatch_refuses_to_load_before_cdll(tmp_path):
 
 def test_canonical_binding_rejection_fails_closed(tmp_path):
     artifact = tmp_path / "placement.so"
-    artifact.write_bytes(b"native-test-artifact")
+    artifact.write_bytes(b"cuda-test-artifact")
     digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
 
     def reject(_path):

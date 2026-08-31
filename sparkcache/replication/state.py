@@ -66,7 +66,7 @@ StreamCommitCallback = Callable[[CommittedReplica, bytes], None]
 
 
 class BuddyReceiver:
-    """Fail-closed remote receiver with bounded volatile staging.
+    """Bounded remote receiver that publishes only verified replicas.
 
     A successful COMMIT callback is the remote publication boundary. Protocol
     failures discard only the replica transaction; they cannot affect the
@@ -405,7 +405,7 @@ class BuddyReceiver:
 
 
 class BuddySender:
-    """Credit-limited sender window that fails open to local-only caching."""
+    """Credit-limited sender whose ordinary failures retain local-only caching."""
 
     def __init__(
         self,
