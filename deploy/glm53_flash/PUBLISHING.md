@@ -1,9 +1,11 @@
-# Publish the GLM-5.3 SparkCache image
+# Historical GLM-5.3 SparkCache publication procedure
 
 This procedure documents the superseded da4d7be overlay publication path. The
-canonical public Jovian Judgement r7 ARM64 image route is
-[`JJ_R7_ARM64_IMAGE.md`](JJ_R7_ARM64_IMAGE.md). Do not substitute the historical
-digests below into that quickstart.
+later [`JJ_R7_ARM64_IMAGE.md`](JJ_R7_ARM64_IMAGE.md) record is also historical.
+Use the
+[SparkRing GLM-5.3 R8 quickstart](https://github.com/FujitsuPolycom/sparkring/blob/main/docs/GLM53_JJ_R8_GB10_SPARKCACHE_TP4_QUICKSTART.md)
+for an operator deployment. Do not substitute the historical digests below
+into that quickstart.
 
 Status: **implemented** for image construction and private GHCR publication.
 An exact registry digest remains unqualified until all four TP4/DCP1 ranks pull

@@ -31,7 +31,7 @@ def test_glm_documentation_credits_exact_upstream_sources_and_artifacts() -> Non
     assert MXFP8_DRAFT_URL in historical
 
     deployment = documents[0].read_text(encoding="utf-8")
-    assert "The external draft is not Local Inference Lab's separate" in deployment
+    assert "The BF16 draft is distinct from Local Inference Lab's" in deployment
 
     public_image = documents[2].read_text(encoding="utf-8")
     assert "FujitsuPolycom/vllm/commit/331573d20bd47e78327ed8d8b4d2e6d350bbb1ab" in public_image

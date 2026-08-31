@@ -1,4 +1,9 @@
-# GLM-5.3 Jovian Judgement r7 ARM64 SparkCache image
+# Historical GLM-5.3 Jovian Judgement r7 ARM64 SparkCache image
+
+> [!IMPORTANT]
+> This page preserves one superseded image and its bounded evidence. Use the
+> [SparkRing GLM-5.3 R8 quickstart](https://github.com/FujitsuPolycom/sparkring/blob/main/docs/GLM53_JJ_R8_GB10_SPARKCACHE_TP4_QUICKSTART.md)
+> for an operator deployment.
 
 ## Status
 
@@ -30,7 +35,7 @@ The draft configuration SHA-256 is
 its weights SHA-256 is
 `b33c03475ba7322cf398828f2d8d1be376df30dc05c6b40c28c8ea8da23e410b`.
 
-## Pull and run
+## Reproduce the recorded artifact
 
 Pull the immutable image rather than a mutable tag:
 
