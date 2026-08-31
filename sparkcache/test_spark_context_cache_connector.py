@@ -327,6 +327,88 @@ class HybridAllocatorContractTests(unittest.TestCase):
 
 
 class HybridPageRoundTripTests(unittest.TestCase):
+    def test_dcp_recurrent_align_uses_replicated_position_width(
+        self,
+    ) -> None:
+        """A replicated recurrent table uses its unsharded position width."""
+
+        connector = object.__new__(SparkContextCacheConnector)
+        connector._dcp_degree = 2
+        connector._group_topology = (
+            {
+                "logical_tokens_per_block": 512,
+                "reuse_policy": "recurrent_align",
+                "reuse_window_tokens": None,
+            },
+        )
+        group = tuple([0] * 17 + [34, 13, 12, 11, 10, 9, 8, 7])
+
+        self.assertEqual(len(group), 25)
+        self.assertEqual(group[17], 34)
+        self.assertEqual(
+            connector._select_group_blocks_for_span((group,), 9216),
+            ((34,),),
+        )
+        self.assertEqual(
+            connector._select_group_blocks_for_span(
+                (group,),
+                9216,
+                recurrent_boundary_blocks=((0, 42),),
+            ),
+            ((42,),),
+        )
+
+    def test_dcp_manager_page_boundary_uses_complete_local_pages(self) -> None:
+        """Opaque snapshots stop at a complete DCP-local manager page."""
+
+        connector = object.__new__(SparkContextCacheConnector)
+        connector._block_size = 2304
+        connector._chunk_tokens = 256
+        connector._dcp_degree = 2
+        connector._storage_mode = "block_pages_v1"
+        connector._group_topology = (
+            {"dcp_shard_count": 2, "logical_tokens_per_block": 4608},
+            {"dcp_shard_count": 1, "logical_tokens_per_block": 2304},
+        )
+
+        self.assertEqual(connector._aligned_span(8193), 4608)
+
+    def test_dcp_manager_page_selection_uses_global_tokens_per_local_block(
+        self,
+    ) -> None:
+        """A local DCP page covers ``block_size * dcp_degree`` global tokens."""
+
+        connector = object.__new__(SparkContextCacheConnector)
+        connector._dcp_degree = 2
+        connector._group_topology = (
+            {
+                "block_size": 256,
+                "dcp_replicated": False,
+                "dcp_shard_count": 2,
+                "logical_tokens_per_block": 512,
+                "reuse_policy": "full",
+                "reuse_window_tokens": None,
+            },
+            {
+                "block_size": 256,
+                "dcp_replicated": True,
+                "dcp_shard_count": 1,
+                "logical_tokens_per_block": 256,
+                "reuse_policy": "recurrent_align",
+                "reuse_window_tokens": None,
+            },
+        )
+        groups = ((3, 5), (7,))
+
+        self.assertEqual(
+            connector._select_group_blocks_for_span(groups, 1024),
+            ((3, 5), (7,)),
+        )
+        self.assertEqual(
+            connector._group_block_counts_for_span(1024),
+            (2, 1),
+        )
+
     def test_page_tail_uses_geometry_when_historical_recurrent_slot_is_null(
         self,
     ) -> None:

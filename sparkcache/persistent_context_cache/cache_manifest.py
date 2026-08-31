@@ -186,6 +186,10 @@ class CacheIdentity:
     rope_layout: str
     tp_degree: int
     dcp_degree: int
+    # Number of consecutive global token positions assigned to one DCP rank
+    # before ownership advances to the next rank. Values above one change the
+    # physical DCP ownership mapping and therefore belong to cache identity.
+    cp_kv_cache_interleave_size: int = 1
     chunk_tokens: int = 256
     # DCP shard ownership: entries written by one rank must never restore
     # into another. -1 means "not sharded" (DCP1 whole-context entries).
@@ -229,7 +233,12 @@ class CacheIdentity:
         for field in ("quantization_layout", "rope_layout"):
             if not getattr(self, field):
                 raise ValueError(f"{field} must be non-empty")
-        for field in ("tp_degree", "dcp_degree", "chunk_tokens"):
+        for field in (
+            "tp_degree",
+            "dcp_degree",
+            "cp_kv_cache_interleave_size",
+            "chunk_tokens",
+        ):
             if getattr(self, field) <= 0:
                 raise ValueError(f"{field} must be positive")
         if self.boundary_hidden_policy not in ("persisted", "live_forward"):
@@ -277,6 +286,7 @@ class CacheIdentity:
             "rope_layout": self.rope_layout,
             "tp_degree": self.tp_degree,
             "dcp_degree": self.dcp_degree,
+            "cp_kv_cache_interleave_size": self.cp_kv_cache_interleave_size,
             "chunk_tokens": self.chunk_tokens,
             "dcp_shard_rank": self.dcp_shard_rank,
             "tp_shard_rank": self.tp_shard_rank,

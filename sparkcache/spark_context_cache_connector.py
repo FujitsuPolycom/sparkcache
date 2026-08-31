@@ -603,6 +603,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._block_size = config.block_size
         self._tp_degree = config.tp_degree
         self._dcp_degree = config.dcp_degree
+        self._cp_kv_cache_interleave_size = config.cp_kv_cache_interleave_size
         self._profile = config.profile
         self._storage_mode = config.storage_mode
         self._publication_schema = config.publication_schema
@@ -1052,7 +1053,23 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             return False
 
     def _aligned_span(self, prompt_len: int) -> int:
-        span = (prompt_len - 1) // self._block_size * self._block_size
+        alignment = self._block_size
+        if self._storage_mode == "block_pages_v1" and self._dcp_degree > 1:
+            try:
+                sharded_page_quanta = tuple(
+                    int(topology["logical_tokens_per_block"])
+                    for topology in self._group_topology
+                    if int(topology["dcp_shard_count"]) > 1
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise RuntimeError(
+                    "spark-context-cache: block-page DCP topology is incomplete"
+                ) from error
+            alignment = math.lcm(
+                self._chunk_tokens,
+                *(sharded_page_quanta or (self._block_size,)),
+            )
+        span = (prompt_len - 1) // alignment * alignment
         return span // self._chunk_tokens * self._chunk_tokens
 
     @staticmethod
@@ -1099,42 +1116,49 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         for group_index, (group, topology) in enumerate(
             zip(groups, self._group_topology)
         ):
-            block_size = int(topology["block_size"])
-            required = (span_tokens + block_size - 1) // block_size
-            if len(group) < required:
-                raise HybridCodecError(
-                    "request block table is shorter than the aligned cache span"
-                )
+            logical_tokens_per_block = int(topology["logical_tokens_per_block"])
+            boundary_required = (
+                span_tokens + logical_tokens_per_block - 1
+            ) // logical_tokens_per_block
             policy = topology["reuse_policy"]
             window = topology["reuse_window_tokens"]
-            selected = required
+            selected = boundary_required
+            minimum_table_blocks = boundary_required
             if policy == "sliding":
                 if window is None:
                     raise HybridCodecError("sliding page group has no reuse window")
                 # The window includes the token about to be computed. Only its
                 # preceding window-1 KV positions must be resident.
                 selected = min(
-                    required,
-                    (int(window) - 1 + block_size - 1) // block_size,
+                    boundary_required,
+                    (int(window) - 1 + logical_tokens_per_block - 1)
+                    // logical_tokens_per_block,
                 )
             elif policy == "recurrent_align":
                 # Align mode retains a single recurrent checkpoint at the
                 # persistent boundary. Earlier position-indexed table entries
                 # are null after vLLM removes skipped state blocks.
                 selected = 1
+                minimum_table_blocks = 1
             elif policy != "full":
                 raise HybridCodecError(f"unsupported page reuse policy {policy!r}")
-            # The table can include a live tail beyond the persistent span.
-            # Sliding/recurrent groups can also contain recycled or null IDs
-            # before their semantic window. Select relative to the persistent
-            # boundary so neither class of unrelated page is copied. A
-            # SparkCache manifest names one exact full span; its constituent
-            # chunks are never matched as independent prefixes, so only the
-            # reuse window at that span's final boundary is required.
+            if len(group) < minimum_table_blocks:
+                raise HybridCodecError(
+                    "request block table is shorter than the aligned cache span"
+                )
+            # Full and sliding tables are position-indexed. Recurrent-align
+            # tables instead retain one live checkpoint in their final slot;
+            # earlier entries may be null padding or historical state. An
+            # explicit boundary hand-off names a pinned publication checkpoint
+            # and therefore takes precedence over the live tail.
             if policy == "recurrent_align" and group_index in overrides:
                 chosen = (overrides[group_index],)
+            elif policy == "recurrent_align" and len(group) < boundary_required:
+                chosen = (group[-1],)
             else:
-                chosen = group[required - selected : required]
+                chosen = group[
+                    boundary_required - selected : boundary_required
+                ]
             if any(block <= 0 for block in chosen):
                 raise HybridCodecError(
                     "selected page window contains vLLM's null block"
@@ -1151,8 +1175,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
 
         counts = []
         for topology in self._group_topology:
-            block_size = int(topology["block_size"])
-            required = (span_tokens + block_size - 1) // block_size
+            logical_tokens_per_block = int(topology["logical_tokens_per_block"])
+            required = (
+                span_tokens + logical_tokens_per_block - 1
+            ) // logical_tokens_per_block
             policy = topology["reuse_policy"]
             if policy == "sliding":
                 window = topology["reuse_window_tokens"]
@@ -1160,7 +1186,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     raise HybridCodecError("sliding page group has no reuse window")
                 required = min(
                     required,
-                    (int(window) - 1 + block_size - 1) // block_size,
+                    (int(window) - 1 + logical_tokens_per_block - 1)
+                    // logical_tokens_per_block,
                 )
             elif policy == "recurrent_align":
                 required = 1
@@ -3875,6 +3902,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     expected_span_tokens=plan.span_tokens,
                     arena_bytes=self._native_arena_bytes,
                     io_workers=self._native_io_workers,
+                    dcp_degree=self._dcp_degree,
+                    dcp_rank=self._worker_rank(),
                     base_reader=lambda evidence, reader: (
                         self._restore_page_base_for_request(
                             plan.request_id,
