@@ -21,6 +21,23 @@ state which combinations are implemented, qualified, research-only, or
 unsupported. Deployment labels use TP for tensor-parallel degree and DCP for
 decode-context-parallel degree.
 
+## GLM-5.3 upstream credit
+
+The GLM-5.3 integrations depend primarily on Local Inference Lab's
+[Jovian Judgement vLLM branch](https://github.com/local-inference-lab/vllm/tree/dev/jovian-judgement)
+for model-runtime performance and correctness, and on
+[B12X](https://github.com/local-inference-lab/b12x) for Blackwell kernels and
+backend integration. Local Inference Lab publishes the
+[GLM-5.3 Flash NVFP4 target](https://huggingface.co/local-inference-lab/GLM-5.3-Flash-NVFP4)
+and a separate
+[MXFP8 DFlash2 checkpoint](https://huggingface.co/local-inference-lab/GLM-5.3-Flash-DFlash2-MXFP8).
+
+The qualified GLM-5.3 recipes in this repository use the exact NVFP4 target
+revision named in their deployment record and
+[`incoai/GLM-5.3-Flash-DFlash2@dc77ff1c`](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2/tree/dc77ff1c99eeb2df044ee3d4f0094eb033fee410),
+whose external draft weights are BF16, not MXFP8. Model and draft formats are
+not interchangeable.
+
 ## Implemented capabilities
 
 | Capability | Status | Scope |
