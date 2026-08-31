@@ -8,13 +8,16 @@ This record establishes **research-only live evidence** for physical-page
 delta publication and SparkCache CUDA restore on one exact GLM-5.3 TP4/DCP1
 runtime. A fresh 98,304-token base was extended to 131,072 tokens, all four
 ranks published the same bounded delta geometry, and an engine restart restored
-the result with exact `blue` output. A later two-request run restored distinct
-`red` and `blue` results exactly.
+the result with exact `blue` output. A later eight-request run returned eight
+exact, distinct results while all eight persistent restores shared one
+authenticated base read per rank.
 
 This is not a general deployment qualification and does not authorize
 `tail-cow-v1` for production. It does not establish another model, checkpoint,
 topology, physical-page geometry, vLLM source, or concurrent-reader bound.
-Native base-read coalescing is not implemented or claimed.
+Persistent-restore readiness required one model inference after startup because
+worker manifest inventories do not reach the scheduler through the HTTP health
+endpoint.
 
 ## Runtime identity
 
@@ -26,14 +29,14 @@ container tags or conversation history.
 | vLLM PR535 source | `local-inference-lab/vllm@ead9d8a4e21b3818b21ec6f4d4d94564dd60c3f8` |
 | SparkRing runtime composition | `FujitsuPolycom/sparkring@6da4865d440608a46eada50f27b2fff0e698c574` |
 | B12X | `local-inference-lab/b12x@b1d541f9e71a35f030d45fae437630fff7507c2a` |
-| SparkCache content installed in the runtime | `78fadb37aad5c4b5e1e05a04fa7414c32de8f009` |
-| Consolidated public SparkCache head containing that work | `3e08200105055cb912daecaa11a4f9a392321dbb` |
+| SparkCache content installed in the runtime | `59ac0b04db6035a9a9d2a52e92405ceaf84daa40` |
+| SparkCache source-tree SHA-256 | `21035ceeeab514b573dffc9a8b415b246fad8cd11ad83c633717b37f2bf6dd1b` |
 | CUDA placement library SHA-256 | `d57509052b73853bcc8e3c3f47bb81748d87b9cbd8d908fc20d4c79a09aa400c` |
-| Local research image tag | `sparkring-glm53-sparkcache:pr535-6da4865-sc78-tp4-research-exact-v2-arm64` |
+| Local research image SHA-256 | `sha256:becf556650dff79a9959aef371ea861187db248bd0f46c3ebfbd26759e458818` |
 
 The image was not published. The running containers were
-`glm53-pr535-sc78-tp4-01-r0` through
-`glm53-pr535-sc78-tp4-01-r3` on `spark-r0` through `spark-r3`. Rank 0 served
+`glm53-pr535-sc59ac-c8-01-r0` through
+`glm53-pr535-sc59ac-c8-01-r3` on `spark-r0` through `spark-r3`. Rank 0 served
 HTTP on port 8015.
 
 ## Checkpoint identity
@@ -60,8 +63,8 @@ tokens. It was the external DFlash2 checkpoint above, not an MXFP8 draft.
 - logical SparkCache digest boundary: 256 tokens;
 - publication setting: operator value `tail-cow-v1`, authenticated identity
   value `page-tail-cow-v1`, and `block_pages_v1` storage;
-- SparkCache CUDA restore: two load lanes, eight I/O workers, and one 256 MiB
-  mapped arena per lane;
+- SparkCache CUDA restore: eight load lanes, eight I/O workers, and one
+  256 MiB mapped arena per lane, for a 2 GiB per-rank mapped-arena ceiling;
 - rank-local cache limit: 40 GiB with a 32 GiB low watermark;
 - fresh host root:
   `/var/tmp/glm53-pr535-sc78-tp4-01/sparkcache-context/pr535-sc78-tp4-01`,
@@ -121,19 +124,32 @@ four workers reported `outcome: verified` for the same 131,072-token digest.
 work, so it must not be compared directly with one worker's cache-service
 time.
 
-## Two-request observation and limitation
+## Concurrent different-root restore
 
-A subsequent post-restart C2 request restored distinct 131,072-token entries.
-Both responses matched equality predicates: one exact `red`, one exact `blue`.
-The two-client wall time was 2.63 seconds. Across both requests and all four
-ranks, cache-service time was 1.657--1.910 seconds.
+Eight concurrent 16,384-token requests used distinct result roots derived from
+one 8,192-token physical-page base. All eight responses matched their exact
+expected codewords, and all eight requests entered persistent restore. Client
+latency was 1.392026--2.337652 seconds.
 
-This C2 result is semantic and timing evidence for two independent native
-page-delta restores. It is not evidence of native segment or base coalescing.
-Each request independently read and authenticated the embedded 98,304-token
-base on every rank. Consequently, shared-base I/O remained duplicated. The
-materializing Python/Torch path's base-read flights do not apply because the
-native path intentionally avoids constructing a shared Python base buffer.
+Each rank emitted one `sparkcache-page-base-restore-flight/v1` record for the
+eight admitted restores: `participants=8`, `physical_base_reads=1`,
+`avoided_base_reads=7`, and `base_bytes=100868258`. Every rank reported the
+same sharing counts. Private deltas, reconstructed-result authentication, and
+CUDA placement remained request-specific. No semantic, checksum, or placement
+error was observed. Base-read time was 161.461--188.138 ms across ranks, and
+worker cache-service observations were 516.0--990.5 ms.
+
+The workers discovered their persistent manifests during startup, but the
+scheduler's manifest quorum remained empty until worker statistics returned
+from a real model execution. An HTTP health request does not execute the model.
+A five-token prompt with a one-token completion established scheduler readiness
+before the recorded cohort. A separate health-only startup run returned all
+eight exact results but restored seven and safely recomputed one; which request
+recomputed depended on arrival order.
+
+The recorded result establishes bounded direct-CUDA base-read coalescing across
+eight different result roots. It also establishes that deployment readiness
+must include a small inference before persistent-hit expectations are measured.
 
 ## Interpretation and limits
 
@@ -143,9 +159,10 @@ place only verified result bytes, and preserve exact model semantics. It also
 shows that publication scales with the changed physical pages for this
 98K-to-128K extension rather than writing another complete result snapshot.
 
-The result does not establish native segment coalescing, retained host-base
-caching, production tail-only safety, C8/C16 behavior, corruption recovery for
-this specific graph, or another split-page geometry. Failures to prove graph
+The result does not establish retained host-base caching, production tail-only
+safety, C16 behavior, corruption recovery for this specific graph, or another
+split-page geometry. It does not establish persistent-hit readiness from HTTP
+health alone. Failures to prove graph
 identity, integrity, or compatibility remain cache misses and recomputation;
 optional cache work must not delay serving.
 

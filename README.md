@@ -5,32 +5,21 @@
 > formats, deployment patches, and supported profiles may change.
 
 SparkCache is a persistent, rank-local NVMe context cache for vLLM's
-KV-Connector-V1 interface. Each tensor-parallel worker stores and restores only
-the model state owned by its physical rank.
+KV-Connector-V1 interface. It makes verified prefills reusable across requests
+and process restarts. Growing conversations can reuse the longest compatible
+stored prefix instead of requiring an exact full-prompt match.
 
-Sparkcache KV/context Restore reads each rank's local filesystem. SparkCache does not send KV
-payload over a network link. vLLM collectives may still use Ethernet, a
-switched fabric, or a switchless ring.
+Each tensor-parallel worker stores and restores only the model state owned by
+its physical rank. Cache payloads stay on rank-local filesystems; SparkCache
+does not send them over a network link. vLLM collectives may still use
+Ethernet, a switched fabric, or a switchless ring.
 
-Deployment labels use TP for tensor-parallel degree and DCP for
+SparkCache supports content-addressed snapshots, authenticated prefix aliases,
+physical-page deltas, SparkCache CUDA placement, and bounded sharing of a
+stored base across different request tails. The tables and evidence links below
+state which combinations are implemented, qualified, research-only, or
+unsupported. Deployment labels use TP for tensor-parallel degree and DCP for
 decode-context-parallel degree.
-
-PyPI version `0.1.0a3` is **implemented** and GPU-free tested. Its package
-artifact has no live serving qualification. Qualification belongs to an exact
-artifact, model, topology, and vLLM source contract.
-
-The public GLM-5.3 OCI artifact is qualified for its recorded 8,192-token
-Python-placement restore. The source deployment separately qualifies native
-131,072-token restore and bounded shared-prefix reuse. See
-[the public image record](deploy/glm53_flash/IMAGE_ANNOUNCEMENT.md),
-[the GLM-5.3 validation](GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md), and
-[the SparkCache CUDA restore record](GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md).
-Physical-page delta publication and restart restore have separate
-[research-only PR535 evidence](GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md).
-
-The public image does not contain the model checkpoints. SparkCache CUDA restore and
-shared GPU-prefix qualification belong to a later source-bound runtime that has
-no published OCI digest.
 
 ## Implemented capabilities
 
@@ -40,8 +29,8 @@ no published OCI digest.
 | Longest stored exact-boundary discovery | **implemented** | One incremental token-digest pass; longest all-rank candidate wins |
 | Sparse row-prefix aliases | **implemented** | Authenticated metadata over `per_token_rows`; GPU-free regression coverage |
 | Opaque hybrid-memory-allocator page snapshots | **qualified** | Listed DeepSeek-V4 and GLM deployments only |
-| Native direct page restore | **qualified** | Exact GLM-5.3 TP4/DCP1 source deployment recorded below |
-| Physical-page delta publication and direct restore | **research-only** | Exact GLM-5.3 PR535 TP4/DCP1 run; production tail-only use remains unqualified |
+| SparkCache CUDA page restore | **qualified** | Exact GLM-5.3 TP4/DCP1 source deployment recorded below |
+| Physical-page delta publication and direct restore | **research-only** | Exact GLM-5.3 PR535 TP4/DCP1 run, including eight different-root restores sharing one base read per rank; production tail-only use remains unqualified |
 | Concurrent shared GPU-prefix reuse | **qualified** | Up to 16 waiting followers, two retained prefixes, 15-second retention; GLM-5.3 through 16 concurrent requests |
 | Streaming snapshots | **research-only** | GLM-5.2 DCP4 inventory; disabled for opaque page profiles |
 | Buddy replication | **research-only** | Protocol and receiver state exist; no network carrier is included |
@@ -140,7 +129,7 @@ the package qualification.
 | Public GLM-5.3 OCI image, TP4/DCP1 | 8,192 | 156.8–171.8 ms | [public image record](deploy/glm53_flash/IMAGE_ANNOUNCEMENT.md) |
 | GLM-5.3 source deployment, TP4/DCP1 | 8,192 | 147.2–194.0 ms | [GLM-5.3 validation](GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md) |
 
-The native GLM-5.3 work changes practical restore cost across prefix sizes and
+SparkCache CUDA placement changes practical restore cost across prefix sizes and
 concurrency. C1, C8, and C16 mean one, eight, and sixteen concurrent requests.
 
 Client timing includes scheduler and model work. Cache-service timing isolates
@@ -338,26 +327,32 @@ An exact GLM-5.3 PR535 TP4/DCP1 run published a 252,534,308-byte four-object
 delta from a 98,304-token base to a 131,072-token result. After a full engine
 restart, all four ranks verified and restored 859,160,739 result bytes in
 1,574.575--1,662.062 ms cache-service time, and the client returned exact
-`blue` in 1.983 seconds. A C2 `red` plus `blue` check also passed, but both
-native requests read the shared base independently. See the
+`blue` in 1.983 seconds. A separate eight-request 16,384-token run returned
+eight exact results. After one small inference established scheduler manifest
+readiness, all eight persistent restores shared one 100,868,258-byte base read
+per rank (`participants=8`, `physical_base_reads=1`,
+`avoided_base_reads=7`). Client latency was 1.392026--2.337652 seconds. See the
 [physical-page delta research record](GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md)
 for exact identities, conditions, phase timings, and limitations.
 
+After process startup, run one small model inference before expecting
+persistent hits. Worker manifest inventories reach the scheduler through model
+execution; the HTTP health endpoint alone does not establish that readiness.
+
 Persistent base-segment read sharing for `block_pages_v1` page-delta roots is
-**implemented and GPU-free tested; serving qualification is not established**.
-This coordination applies to the materializing Python/Torch path. Requests whose
-authenticated result roots name the same base root may share one verified,
-immutable base-snapshot buffer per rank. Every request independently reads and
-authenticates its private delta, reconstructs its result snapshot, and performs
-request-private placement. Native direct restores bypass these byte-buffer
-flights because they do not materialize or publish a base buffer. Mutable
+**research-only with exact live TP4 evidence**. Requests whose authenticated
+result roots name the same base root may share one verified, immutable base
+read per rank in both materializing and direct CUDA restore paths. Every
+request independently reads and authenticates its private delta, verifies its
+reconstructed result, and performs request-private placement. Mutable
 recurrent pages are never shared.
 
 One process admits at most two base-read cohorts and 16 cumulative participants
 per cohort. A base must declare at most 1 GiB, and peak byte reservations across
-cohorts must fit within 2 GiB. Followers remain outside the load lanes until the
-base read completes. With more than one load lane, unrelated restore work can
-continue while one base read is pending.
+cohorts must fit within 2 GiB. Page restore may use up to eight load lanes, with
+one 256 MiB mapped arena per lane and a 2 GiB per-rank ceiling. Non-page CUDA
+restore remains limited to one lane. Followers remain outside the load lanes
+until the base read completes, so unrelated restore work can continue.
 The buffer is released when every admitted participant acquires or abandons the
 result; there is no retained host-memory cache or time-based reuse. Requests
 that exceed a sharing bound use an independent restore. One
@@ -399,8 +394,8 @@ retains every structured rank record and the available response and artifact
 hashes.
 
 This flat evidence does not cover tail-only page deltas. The separate PR535
-record above supplies research-only exact-output C1 and C2 page-delta evidence;
-native segment sharing and general deployment qualification remain unproven.
+record above supplies research-only exact-output page-delta and native
+shared-base evidence; general deployment qualification remains unproven.
 This two-request flat result does not replace the single-reader qualification.
 Source `eabe7fd0c878db7384ef87fe80a1e96b9bedcf67`, which lacks
 the prior-CUDA-work ordering, remains semantically rejected by its
