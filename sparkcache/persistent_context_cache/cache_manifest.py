@@ -2942,7 +2942,7 @@ class ManifestStore:
         identity: CacheIdentity,
         context_digest: str,
         span_tokens: int,
-        snapshot: bytes,
+        snapshot: Any,
     ) -> CommitReceipt:
         """Publish one flat opaque page snapshot as authenticated extents.
 
@@ -2970,16 +2970,35 @@ class ManifestStore:
             or span_tokens % identity.chunk_tokens
         ):
             raise ValueError("page snapshot span must cover complete logical chunks")
-        if not isinstance(snapshot, bytes) or not snapshot:
-            raise ValueError("page snapshot payload must be nonempty bytes")
+        if isinstance(snapshot, (bytes, bytearray)):
+            snapshot_bytes = len(snapshot)
+            snapshot_view = memoryview(snapshot)
+
+            def read_range(start: int, end: int) -> bytes:
+                return snapshot_view[start:end].tobytes()
+
+        else:
+            snapshot_bytes = getattr(snapshot, "total_bytes", None)
+            read_range = getattr(snapshot, "read_range", None)
+            if (
+                type(snapshot_bytes) is not int
+                or snapshot_bytes <= 0
+                or not callable(read_range)
+            ):
+                raise ValueError(
+                    "page snapshot payload must be bytes or a bounded scatter view"
+                )
 
         with _RootGuard(self.root, shared=True, blocking=True):
             descriptors: list[dict[str, Any]] = []
             objects: list[tuple[Path, bytes]] = []
-            snapshot_view = memoryview(snapshot)
-            for start in range(0, len(snapshot), _PAGE_SNAPSHOT_OBJECT_BYTES):
-                end = min(len(snapshot), start + _PAGE_SNAPSHOT_OBJECT_BYTES)
-                encoded = snapshot_view[start:end].tobytes()
+            snapshot_digest = hashlib.sha256()
+            for start in range(0, snapshot_bytes, _PAGE_SNAPSHOT_OBJECT_BYTES):
+                end = min(snapshot_bytes, start + _PAGE_SNAPSHOT_OBJECT_BYTES)
+                encoded = read_range(start, end)
+                if not isinstance(encoded, bytes) or len(encoded) != end - start:
+                    raise ValueError("page snapshot scatter range differs")
+                snapshot_digest.update(encoded)
                 object_digest = _sha256(encoded)
                 descriptors.append(
                     {
@@ -3008,10 +3027,10 @@ class ManifestStore:
                 "identity": identity.to_wire(),
                 "context_digest": context_digest,
                 "committed_tokens": span_tokens,
-                "snapshot_encoded_bytes": len(snapshot),
+                "snapshot_encoded_bytes": snapshot_bytes,
                 "snapshot_object_bytes": _PAGE_SNAPSHOT_OBJECT_BYTES,
                 "snapshot_objects": descriptors,
-                "snapshot_sha256": _sha256(snapshot),
+                "snapshot_sha256": snapshot_digest.hexdigest(),
                 "logical_chunk_tokens": identity.chunk_tokens,
                 "logical_chunk_count": span_tokens // identity.chunk_tokens,
             }
@@ -3047,7 +3066,7 @@ class ManifestStore:
         result_block_counts: Sequence[int],
         base_boundary_tokens: int,
         result_boundary_tokens: int,
-        result_snapshot: bytes,
+        result_snapshot: bytes | bytearray,
     ) -> CommitReceipt:
         """Publish a page-semantic delta over one verified opaque snapshot."""
 

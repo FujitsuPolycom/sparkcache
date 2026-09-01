@@ -55,6 +55,8 @@ _ACCESS_MODES = {
 }
 _LEGACY_CUDA_RESTORE_WARNING_LOCK = threading.Lock()
 _LEGACY_CUDA_RESTORE_WARNING_EMITTED = False
+_ASYNC_PAGE_CAPTURE_CONFIG = "spark_cache_async_page_capture"
+_ASYNC_PAGE_CAPTURE_ENV = "SPARK_CONTEXT_CACHE_ASYNC_PAGE_CAPTURE"
 
 
 def _warn_legacy_cuda_restore_config() -> None:
@@ -373,6 +375,7 @@ class ConnectorConfig:
     store_enabled: bool
     restore_enabled: bool
     streaming_snapshots_enabled: bool
+    async_page_capture_enabled: bool
     cuda_restore_enabled: bool
     cuda_placement_library_path: str
     cuda_placement_library_sha256: str
@@ -613,6 +616,38 @@ def parse_connector_config(
     except ValueError as error:
         raise RuntimeError(f"spark-context-cache: {error}") from error
     streaming_snapshots_enabled = streaming_snapshots_requested and store_enabled
+    try:
+        async_page_capture_enabled = _streaming_snapshots_enabled(
+            extra(
+                _ASYNC_PAGE_CAPTURE_CONFIG,
+                os.environ.get(_ASYNC_PAGE_CAPTURE_ENV, "0"),
+            )
+        )
+    except ValueError as error:
+        raise RuntimeError(
+            "spark-context-cache: spark_cache_async_page_capture must be"
+            " 0/1 or false/true"
+        ) from error
+    if async_page_capture_enabled and storage_mode != "block_pages_v1":
+        raise RuntimeError(
+            "spark-context-cache: asynchronous manager-page capture requires"
+            " block-page storage"
+        )
+    if async_page_capture_enabled and not store_enabled:
+        raise RuntimeError(
+            "spark-context-cache: asynchronous manager-page capture requires"
+            " cache publication"
+        )
+    if async_page_capture_enabled and streaming_snapshots_enabled:
+        raise RuntimeError(
+            "spark-context-cache: asynchronous manager-page capture and"
+            " row streaming snapshots are mutually exclusive"
+        )
+    if async_page_capture_enabled and publication_schema:
+        raise RuntimeError(
+            "spark-context-cache: asynchronous manager-page capture supports"
+            " complete snapshot publication only"
+        )
     if storage_mode == "block_pages_v1" and streaming_snapshots_enabled:
         raise RuntimeError(
             "spark-context-cache: block-page storage does not support"
@@ -866,6 +901,7 @@ def parse_connector_config(
         store_enabled=store_enabled,
         restore_enabled=restore_enabled,
         streaming_snapshots_enabled=streaming_snapshots_enabled,
+        async_page_capture_enabled=async_page_capture_enabled,
         cuda_restore_enabled=cuda_restore_enabled,
         cuda_placement_library_path=cuda_placement_library_path,
         cuda_placement_library_sha256=cuda_placement_library_sha256,
