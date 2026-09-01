@@ -2569,6 +2569,48 @@ class ConnectorRoundTripTests(unittest.TestCase):
 
 
 class SchedulerChunkedPrefillTests(unittest.TestCase):
+    def test_restore_only_miss_recomputes_without_creating_a_store_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                block_size=64,
+                extra_config={"spark_cache_access_mode": "restore-only"},
+                role=KVConnectorRole.SCHEDULER,
+            )
+            token_ids = list(range(1100))
+            request = types.SimpleNamespace(
+                request_id="uncached-request",
+                prompt_token_ids=token_ids,
+            )
+
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(request, 0),
+                (0, False),
+            )
+            output = types.SimpleNamespace(
+                scheduled_new_reqs=[
+                    types.SimpleNamespace(
+                        req_id=request.request_id,
+                        prompt_token_ids=token_ids,
+                        num_computed_tokens=0,
+                        block_ids=([10, 11, 12, 13],),
+                    )
+                ],
+                num_scheduled_tokens={request.request_id: 1024},
+                scheduled_cached_reqs=types.SimpleNamespace(
+                    req_ids=[],
+                    resumed_req_ids=set(),
+                    num_computed_tokens=[],
+                    new_block_ids=[],
+                ),
+            )
+
+            metadata = connector.build_connector_meta(output)
+
+            self.assertEqual(metadata.plans, [])
+            self.assertEqual(connector._store_progress, {})
+
     def test_tail_store_plan_selects_longest_all_rank_base(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(
@@ -3295,10 +3337,14 @@ class CapacityPolicyConnectorTests(unittest.TestCase):
         self.assertEqual(connector._held, {survivor})
         self.assertEqual(connector.counters["capacity_manifests_evicted"], 1)
         stats = connector.get_kv_connector_stats()
+        capacity = stats.data["reports"][0]["capacity"]
         reduced = stats.reduce()
-        self.assertEqual(reduced["spark_cache_capacity_bytes"], 800)
-        self.assertEqual(reduced["spark_cache_capacity_max_bytes"], 1000)
-        self.assertEqual(reduced["spark_cache_capacity_satisfied"], 1)
+        self.assertEqual(capacity["bytes"], 800)
+        self.assertEqual(capacity["max_bytes"], 1000)
+        self.assertEqual(reduced["sparkcache_used_gib"], 0.0)
+        self.assertEqual(reduced["sparkcache_limit_gib"], 0.0)
+        self.assertEqual(reduced["sparkcache_healthy"], 1)
+        self.assertEqual(reduced["sparkcache_evicted"], 1)
 
     def test_maintenance_failure_is_nonfatal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3803,12 +3849,9 @@ class StreamingCapacityHandoffTests(unittest.TestCase):
             self.assertEqual(capacity["pending_streaming_commits"], 0)
             self.assertEqual(capacity["streaming_store_committed"], 1)
             self.assertEqual(capacity["streaming_store_evicted"], 0)
-            self.assertEqual(
-                reduced["spark_cache_capacity_pending_streaming_commits"],
-                0,
-            )
-            self.assertEqual(reduced["spark_cache_streaming_store_evicted"], 0)
-            self.assertEqual(reduced["spark_cache_capacity_satisfied"], 1)
+            self.assertNotIn("sparkcache_pending", reduced)
+            self.assertNotIn("sparkcache_stream_evicted", reduced)
+            self.assertEqual(reduced["sparkcache_healthy"], 1)
             connector.shutdown()
 
 
@@ -3839,6 +3882,98 @@ class SweepTests(unittest.TestCase):
 
 
 class AsyncStoreTests(unittest.TestCase):
+    def test_restore_only_worker_rejects_store_metadata_before_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                64,
+                extra_config={"spark_cache_access_mode": "restore-only"},
+            )
+            connector.register_kv_caches(_make_pools(8, 64))
+            plan = _ReqPlan(
+                "must-not-publish",
+                "6" * 64,
+                1024,
+                (3, 0, 5, 1),
+                True,
+            )
+            connector.bind_connector_metadata(
+                SparkCacheConnectorMetadata(plans=[plan])
+            )
+
+            with mock.patch.object(
+                connector,
+                "_snapshot_store",
+                wraps=connector._snapshot_store,
+            ) as snapshot:
+                connector.wait_for_save()
+
+            snapshot.assert_not_called()
+            self.assertIsNone(connector._store_thread)
+            self.assertFalse(
+                connector._store.lookup(connector._identity(0), plan.digest).is_hit
+            )
+
+    def test_restore_only_worker_restores_a_preexisting_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            writer = _make_connector(root, 0, 64)
+            source = _make_pools(8, 64)
+            expected = {name: tensor.clone() for name, tensor in source.items()}
+            writer.register_kv_caches(source)
+            plan = _ReqPlan(
+                "published-before-restore-only-start",
+                "5" * 64,
+                1024,
+                (3, 0, 5, 1),
+                True,
+            )
+            writer.bind_connector_metadata(
+                SparkCacheConnectorMetadata(plans=[plan])
+            )
+            writer.wait_for_save()
+            self.assertTrue(writer.wait_for_pending_stores(timeout=5))
+
+            reader = _make_connector(
+                root,
+                0,
+                64,
+                extra_config={"spark_cache_access_mode": "restore-only"},
+            )
+            destination = _make_pools(8, 64)
+            for tensor in destination.values():
+                tensor.zero_()
+            reader.register_kv_caches(destination)
+            reader.bind_connector_metadata(
+                SparkCacheConnectorMetadata(
+                    plans=[dataclasses.replace(plan, is_store=False)]
+                )
+            )
+
+            reader.start_load_kv(None)
+
+            self.assertEqual(
+                _drain(reader),
+                {"published-before-restore-only-start"},
+            )
+            slots = codec.local_slots_for_positions(
+                codec.owned_positions(1024, 4, 0),
+                plan.block_ids,
+                64,
+                4,
+            )
+            slot_tensor = torch.tensor(slots, dtype=torch.long)
+            for name in _LAYERS:
+                actual_rows = destination[name].reshape(-1, _LAYERS[name])
+                expected_rows = expected[name].reshape(-1, _LAYERS[name])
+                torch.testing.assert_close(
+                    actual_rows[slot_tensor],
+                    expected_rows[slot_tensor],
+                    rtol=0,
+                    atol=0,
+                )
+
     def test_tail_publication_snapshots_only_rows_after_verified_base(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -5967,13 +6102,16 @@ class AsyncRestoreTests(unittest.TestCase):
                 )
             )
 
-            with mock.patch.object(connector_module.logger, "info") as log_info:
+            with (
+                mock.patch.object(connector_module, "_debug_log") as log_debug,
+                mock.patch.object(connector_module.logger, "info") as log_info,
+            ):
                 connector.start_load_kv(None)
                 self.assertEqual(_drain(connector), {"timed-restore"})
 
             rendered = next(
                 call.args[1]
-                for call in log_info.call_args_list
+                for call in log_debug.call_args_list
                 if len(call.args) == 2
                 and isinstance(call.args[1], str)
                 and call.args[1].startswith(RESTORE_TIMING_PREFIX)
@@ -5987,6 +6125,14 @@ class AsyncRestoreTests(unittest.TestCase):
             self.assertGreater(record["phase_ms"]["restore_read"], 0)
             self.assertGreater(record["phase_ms"]["reassembly_decode"], 0)
             self.assertGreater(record["phase_ms"]["h2d_submit"], 0)
+            operator_lines = [
+                call.args[1]
+                for call in log_info.call_args_list
+                if len(call.args) == 2 and call.args[0] == "%s"
+            ]
+            self.assertTrue(operator_lines[0].startswith("sparkcache: restore tokens="))
+            self.assertIn(" tok/s", operator_lines[0])
+            self.assertTrue(operator_lines[1].startswith("sparkcache: phases read="))
 
     def test_timing_failure_does_not_prevent_restore_completion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -6229,7 +6375,9 @@ class QuorumStatsAggregationTests(unittest.TestCase):
         ranks = {r["rank"] for r in acc.data["reports"]}
         self.assertEqual(ranks, {0, 1, 2, 3})
         self.assertFalse(acc.is_empty())
-        self.assertEqual(acc.reduce()["spark_cache_ranks_reporting"], 4)
+        reduced = acc.reduce()
+        self.assertEqual(reduced["sparkcache_ranks"], 4)
+        self.assertEqual(reduced["sparkcache_entries"], 4)
 
     def test_later_report_replaces_same_rank(self) -> None:
         cls = connector_module.SparkCacheStats

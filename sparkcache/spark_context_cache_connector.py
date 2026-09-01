@@ -114,6 +114,14 @@ if TYPE_CHECKING:
 
 logger = init_logger("vllm.spark_context_cache")
 
+
+def _debug_log(message: str, *args: Any) -> None:
+    """Emit optional detail without requiring debug support from embedders."""
+
+    debug = getattr(logger, "debug", None)
+    if callable(debug):
+        debug(message, *args)
+
 _CAPACITY_RETRY_SECONDS = 5.0
 _CLEAR_ONCE_LOCK_TIMEOUT_SECONDS = 30.0
 _QUORUM_REPORT_BATCH_SIZE = 64
@@ -477,8 +485,8 @@ class SparkCacheStats(KVConnectorStats):
     def reduce(self) -> dict[str, int | float]:
         reports = self.data.get("reports", [])
         reduced: dict[str, int | float] = {
-            "spark_cache_ranks_reporting": len(reports),
-            "spark_cache_digests_held": sum(
+            "sparkcache_ranks": len(reports),
+            "sparkcache_entries": sum(
                 int(r.get("held_count", len(r.get("held", [])))) for r in reports
             ),
         }
@@ -488,60 +496,71 @@ class SparkCacheStats(KVConnectorStats):
             if isinstance(report.get("streaming"), dict)
         ]
         if streaming:
-            reduced.update(
-                spark_cache_streaming_ranks_reporting=len(streaming),
-                spark_cache_streaming_active_contexts=sum(
-                    int(status.get("active_contexts", 0)) for status in streaming
-                ),
-                spark_cache_streaming_active_leases=sum(
-                    int(status.get("active_leases", 0)) for status in streaming
-                ),
-                spark_cache_streaming_active_tickets=sum(
-                    int(status.get("active_tickets", 0)) for status in streaming
-                ),
+            active_contexts = sum(
+                int(status.get("active_contexts", 0)) for status in streaming
             )
+            active_leases = sum(
+                int(status.get("active_leases", 0)) for status in streaming
+            )
+            active_tickets = sum(
+                int(status.get("active_tickets", 0)) for status in streaming
+            )
+            if active_contexts:
+                reduced["sparkcache_streams"] = active_contexts
+            if active_leases:
+                reduced["sparkcache_leases"] = active_leases
+            if active_tickets:
+                reduced["sparkcache_tickets"] = active_tickets
         capacity = [
             report.get("capacity")
             for report in reports
             if isinstance(report.get("capacity"), dict)
         ]
         if capacity:
+            used_bytes = sum(int(status.get("bytes", 0)) for status in capacity)
+            maximum_bytes = sum(
+                int(status.get("max_bytes", 0)) for status in capacity
+            )
             reduced.update(
-                spark_cache_capacity_ranks_reporting=len(capacity),
-                spark_cache_capacity_bytes=sum(
-                    int(status.get("bytes", 0)) for status in capacity
-                ),
-                spark_cache_capacity_max_bytes=sum(
-                    int(status.get("max_bytes", 0)) for status in capacity
-                ),
-                spark_cache_capacity_manifests_evicted=sum(
-                    int(status.get("manifests_evicted", 0)) for status in capacity
-                ),
-                spark_cache_capacity_bytes_reclaimed=sum(
-                    int(status.get("bytes_reclaimed", 0)) for status in capacity
-                ),
-                spark_cache_capacity_pending_streaming_commits=sum(
-                    int(status.get("pending_streaming_commits", 0))
-                    for status in capacity
-                ),
-                spark_cache_streaming_store_evicted=sum(
-                    int(status.get("streaming_store_evicted", 0)) for status in capacity
-                ),
-                spark_cache_capacity_invalid_streaming_receipts=sum(
-                    int(status.get("invalid_streaming_receipts", 0))
-                    for status in capacity
-                ),
-                spark_cache_capacity_shutdown_dropped_streaming_commits=sum(
-                    int(status.get("shutdown_dropped_streaming_commits", 0))
-                    for status in capacity
-                ),
-                spark_cache_capacity_satisfied=int(
+                sparkcache_used_gib=round(used_bytes / 1024**3, 1),
+                sparkcache_limit_gib=round(maximum_bytes / 1024**3, 1),
+                sparkcache_healthy=int(
                     all(
                         bool(status.get("capacity_satisfied", False))
                         for status in capacity
                     )
                 ),
             )
+            alerts = {
+                "sparkcache_evicted": sum(
+                    int(status.get("manifests_evicted", 0)) for status in capacity
+                ),
+                "sparkcache_reclaimed_gib": round(
+                    sum(
+                        int(status.get("bytes_reclaimed", 0))
+                        for status in capacity
+                    )
+                    / 1024**3,
+                    1,
+                ),
+                "sparkcache_pending": sum(
+                    int(status.get("pending_streaming_commits", 0))
+                    for status in capacity
+                ),
+                "sparkcache_stream_evicted": sum(
+                    int(status.get("streaming_store_evicted", 0))
+                    for status in capacity
+                ),
+                "sparkcache_invalid_receipts": sum(
+                    int(status.get("invalid_streaming_receipts", 0))
+                    for status in capacity
+                ),
+                "sparkcache_dropped_commits": sum(
+                    int(status.get("shutdown_dropped_streaming_commits", 0))
+                    for status in capacity
+                ),
+            }
+            reduced.update({key: value for key, value in alerts.items() if value})
         return reduced
 
     def is_empty(self) -> bool:
@@ -641,6 +660,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._capacity_policy = config.capacity_policy
         self._min_span = config.min_span
         self._max_span = config.max_span
+        self._access_mode = config.access_mode
         self._store_enabled = config.store_enabled and self._cache_available
         self._restore_enabled = config.restore_enabled and self._cache_available
         self._streaming_snapshots_enabled = (
@@ -868,12 +888,14 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             "streaming_capacity_shutdown_dropped": 0,
         }
         logger.info(
-            "spark-context-cache: role=%s root=%s dcp=%d store=%s restore=%s"
+            "spark-context-cache: role=%s root=%s dcp=%d access_mode=%s"
+            " store=%s restore=%s"
             " cuda_restore=%s max_span=%d load_threads=%d max_bytes=%d"
             " low_bytes=%d ttl_seconds=%d",
             role.name,
             self._root,
             self._dcp_degree,
+            self._access_mode,
             self._store_enabled,
             self._restore_enabled,
             self._native_restore_enabled,
@@ -1624,9 +1646,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         # rank's load failure still degrades to a clean recompute.
         self.counters["restore_hit"] += 1
         logger.info(
-            "spark-context-cache: scheduler hit digest=%s span=%d (async)",
-            digest[:12],
+            "sparkcache: hit tokens=%d digest=%s",
             span,
+            digest[:12],
         )
         self._restore_flights[digest] = _RestoreFlight(
             digest=digest,
@@ -3275,7 +3297,6 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 return
             plan = queued.plan
             timing = queued.timing
-            started = time.perf_counter()
             with contextlib.suppress(Exception):
                 timing.start_service()
             try:
@@ -3319,7 +3340,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self._load_cv.notify_all()
             try:
                 with contextlib.suppress(Exception):
-                    logger.info("%s", timing.render())
+                    _debug_log("%s", timing.render())
                 if verified:
                     with contextlib.suppress(Exception):
                         ttl_seconds = self._capacity_policy.ttl_seconds
@@ -3330,11 +3351,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                                 min(60, ttl_seconds // 2) if ttl_seconds else 60
                             ),
                         )
-                    logger.info(
-                        "spark-context-cache: restored %d tokens async in %.1f ms",
-                        plan.span_tokens,
-                        1e3 * (time.perf_counter() - started),
-                    )
+                    with contextlib.suppress(Exception):
+                        for message in timing.operator_lines():
+                            logger.info("%s", message)
             finally:
                 # Request completion may be published immediately after the
                 # verified placement edge, but connector quiescence includes
@@ -3773,7 +3792,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self.counters["native_chunks_verified"] = self.counters.get(
                     "native_chunks_verified", 0
                 ) + int(result.verified_chunks)
-                logger.info(
+                _debug_log(
                     "spark-context-cache: SparkCache CUDA restore verified %d chunks"
                     " (%d encoded bytes, %d slabs) read_hash=%.1f ms"
                     " parse_submit=%.1f ms finish=%.1f ms",
@@ -3948,7 +3967,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     )
                     + int(getattr(result, "skipped_base_object_bytes", 0))
                 )
-            logger.info(
+            _debug_log(
                 "spark-context-cache: SparkCache CUDA restore verified %d bytes"
                 " read_source_bytes=%d skipped_base_bytes=%d"
                 " slabs=%d read_hash=%.1f ms placement=%.1f ms"
@@ -4311,6 +4330,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         return
 
     def wait_for_save(self) -> None:
+        # Enforce the publication policy independently on every worker. The
+        # scheduler normally omits store plans when publication is disabled,
+        # but a stale or mismatched metadata object must not make a
+        # restore-only worker capture or publish model state.
+        if not self._store_enabled:
+            return
         metadata = self._get_connector_metadata()
         if self._streaming_snapshots_enabled:
             # Scheduler offers are promises for the step vLLM has just

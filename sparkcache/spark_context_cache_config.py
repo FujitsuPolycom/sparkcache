@@ -47,6 +47,12 @@ _CUDA_PLACEMENT_ARENA_BYTES = frozenset(
     {64 * 1024 * 1024, 128 * 1024 * 1024, 256 * 1024 * 1024}
 )
 _MISSING = object()
+_ACCESS_MODES = {
+    "read-write": (True, True),
+    "restore-only": (False, True),
+    "store-only": (True, False),
+    "disabled": (False, False),
+}
 _LEGACY_CUDA_RESTORE_WARNING_LOCK = threading.Lock()
 _LEGACY_CUDA_RESTORE_WARNING_EMITTED = False
 
@@ -117,6 +123,52 @@ def _config_bool(value: Any) -> bool:
     if value in (1, "1", True, "true"):
         return True
     return False
+
+
+def _access_controls(
+    extra: Callable[[str, Any], Any],
+) -> tuple[str, bool, bool]:
+    """Resolve persistent-cache read and publication controls.
+
+    ``spark_cache_access_mode`` provides an operator-readable baseline. The
+    independent ``spark_cache_store`` and ``spark_cache_restore`` settings
+    remain supported and override their respective baseline values. This
+    preserves existing configurations while allowing a deployment to request
+    restore-only operation explicitly.
+    """
+
+    mode_raw = extra(
+        "spark_cache_access_mode",
+        os.environ.get("SPARK_CONTEXT_CACHE_ACCESS_MODE", "read-write"),
+    )
+    mode = str(mode_raw).strip().lower()
+    try:
+        default_store, default_restore = _ACCESS_MODES[mode]
+    except KeyError as error:
+        choices = ", ".join(sorted(_ACCESS_MODES))
+        raise RuntimeError(
+            "spark-context-cache: spark_cache_access_mode must be one of "
+            f"{choices}"
+        ) from error
+
+    store_raw = extra("spark_cache_store", _MISSING)
+    if store_raw is _MISSING:
+        store_raw = os.environ.get("SPARK_CONTEXT_CACHE_STORE", _MISSING)
+    restore_raw = extra("spark_cache_restore", _MISSING)
+    if restore_raw is _MISSING:
+        restore_raw = os.environ.get("SPARK_CONTEXT_CACHE_RESTORE", _MISSING)
+    store_enabled = (
+        default_store if store_raw is _MISSING else _config_bool(store_raw)
+    )
+    restore_enabled = (
+        default_restore if restore_raw is _MISSING else _config_bool(restore_raw)
+    )
+    effective_mode = next(
+        name
+        for name, controls in _ACCESS_MODES.items()
+        if controls == (store_enabled, restore_enabled)
+    )
+    return effective_mode, store_enabled, restore_enabled
 
 
 def _nonnegative_config_int(value: Any, label: str) -> int:
@@ -317,6 +369,7 @@ class ConnectorConfig:
     capacity_policy: CapacityPolicy
     min_span: int
     max_span: int
+    access_mode: str
     store_enabled: bool
     restore_enabled: bool
     streaming_snapshots_enabled: bool
@@ -549,16 +602,9 @@ def parse_connector_config(
             os.environ.get("SPARK_CONTEXT_CACHE_MAX_SPAN", default_max_span),
         )
     )
-    store_enabled = extra(
-        "spark_cache_store",
-        os.environ.get("SPARK_CONTEXT_CACHE_STORE", "1"),
-    ) in (1, "1", True, "true")
-    restore_enabled = extra(
-        "spark_cache_restore",
-        os.environ.get("SPARK_CONTEXT_CACHE_RESTORE", "1"),
-    ) in (1, "1", True, "true")
+    access_mode, store_enabled, restore_enabled = _access_controls(extra)
     try:
-        streaming_snapshots_enabled = _streaming_snapshots_enabled(
+        streaming_snapshots_requested = _streaming_snapshots_enabled(
             extra(
                 _STREAMING_SNAPSHOTS_CONFIG,
                 os.environ.get(_STREAMING_SNAPSHOTS_ENV, "0"),
@@ -566,6 +612,7 @@ def parse_connector_config(
         )
     except ValueError as error:
         raise RuntimeError(f"spark-context-cache: {error}") from error
+    streaming_snapshots_enabled = streaming_snapshots_requested and store_enabled
     if storage_mode == "block_pages_v1" and streaming_snapshots_enabled:
         raise RuntimeError(
             "spark-context-cache: block-page storage does not support"
@@ -576,7 +623,7 @@ def parse_connector_config(
             "spark-context-cache: tail-cow-v1 publication does not support"
             " streaming snapshots"
         )
-    cuda_restore_enabled = _config_bool(
+    cuda_restore_requested = _config_bool(
         _compat_config_value(
             extra,
             canonical_key="spark_cache_cuda_restore",
@@ -587,6 +634,7 @@ def parse_connector_config(
             normalize=_config_bool,
         )
     )
+    cuda_restore_enabled = cuda_restore_requested and restore_enabled
     cuda_placement_library_path = str(
         _compat_config_value(
             extra,
@@ -814,6 +862,7 @@ def parse_connector_config(
         capacity_policy=capacity_policy,
         min_span=min_span,
         max_span=max_span,
+        access_mode=access_mode,
         store_enabled=store_enabled,
         restore_enabled=restore_enabled,
         streaming_snapshots_enabled=streaming_snapshots_enabled,
