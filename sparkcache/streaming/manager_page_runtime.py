@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -10,6 +12,44 @@ from sparkcache.spark_context_cache_hybrid import (
     PageLayout,
     encode_page_snapshot_header,
 )
+
+logger = logging.getLogger("vllm.spark_context_cache")
+
+
+def _format_token_rate(token_rate: float) -> str:
+    if token_rate >= 1_000_000:
+        return f"{token_rate / 1_000_000:.2f}M"
+    if token_rate >= 1_000:
+        return f"{token_rate / 1_000:.0f}K"
+    return f"{token_rate:.0f}"
+
+
+def _log_capture_observed(
+    *,
+    rank: int,
+    digest: str,
+    span_tokens: int,
+    elapsed_ns: int,
+    payload_bytes: int,
+) -> None:
+    """Report optional capture telemetry without affecting publication."""
+
+    token_rate = (
+        span_tokens * 1_000_000_000 / elapsed_ns if elapsed_ns else 0.0
+    )
+    try:
+        logger.info(
+            "sparkcache: capture rank=%d digest=%s tokens=%d observed=%.1fms"
+            " rate=%s tok/s bytes=%.1fMiB",
+            rank,
+            digest[:12],
+            span_tokens,
+            elapsed_ns / 1_000_000,
+            _format_token_rate(token_rate),
+            payload_bytes / 1024**2,
+        )
+    except Exception:  # noqa: BLE001 - diagnostics never alter cache behavior
+        return
 
 
 @dataclass(slots=True)
@@ -19,6 +59,7 @@ class _PendingCapture:
     plan: Any
     ticket: Any
     block_counts: tuple[int, ...]
+    submitted_ns: int
 
 
 class PageSnapshotScatter:
@@ -83,6 +124,7 @@ class ManagerPageCaptureRuntime:
                 "asynchronous manager-page capture requires a registered page layout"
             )
         self._connector = connector
+        self._rank = int(connector._worker_rank())
         self._layout = layout
         self._ring = ring
         self._poll_seconds = float(progress_poll_seconds)
@@ -116,6 +158,7 @@ class ManagerPageCaptureRuntime:
             self._completed.discard(request_id)
             context_sequence = self._next_sequence
             self._next_sequence += 1
+            submitted_ns = time.perf_counter_ns()
             try:
                 ticket = self._ring.submit(
                     context_sequence=context_sequence,
@@ -140,6 +183,7 @@ class ManagerPageCaptureRuntime:
                 plan=plan,
                 ticket=ticket,
                 block_counts=tuple(len(group) for group in groups),
+                submitted_ns=submitted_ns,
             )
             self._ensure_thread_locked()
             self._wake.set()
@@ -232,7 +276,7 @@ class ManagerPageCaptureRuntime:
                 self._cv.notify_all()
 
     def _progress_once(self) -> None:
-        ready: list[tuple[_PendingCapture, Any]] = []
+        ready: list[tuple[_PendingCapture, Any, int]] = []
         with self._cv:
             for capture in tuple(self._pending.values()):
                 view = self._ring.poll(capture.ticket)
@@ -241,13 +285,21 @@ class ManagerPageCaptureRuntime:
                 claimed = self._ring.claim(capture.ticket)
                 if self._pending.pop(capture.request_id, None) is not None:
                     self._completed.add(capture.request_id)
-                    ready.append((capture, claimed))
+                    ready.append((capture, claimed, time.perf_counter_ns()))
                 if not self._pending:
                     self._wake.clear()
                 self._cv.notify_all()
-        for capture, claimed in ready:
+        for capture, claimed, completed_ns in ready:
             scatter = None
             try:
+                elapsed_ns = max(0, completed_ns - capture.submitted_ns)
+                _log_capture_observed(
+                    rank=self._rank,
+                    digest=capture.plan.digest,
+                    span_tokens=capture.plan.span_tokens,
+                    elapsed_ns=elapsed_ns,
+                    payload_bytes=claimed.payload.nbytes,
+                )
                 header = encode_page_snapshot_header(
                     self._layout, capture.block_counts
                 )
