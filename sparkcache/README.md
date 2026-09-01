@@ -187,6 +187,13 @@ latency, effective token rate, bytes, and phase timings. A
 `sparkcache-restore-timing/v1` JSON record with the complete phase breakdown is
 available at DEBUG.
 
+Asynchronous publication emits a `sparkcache: capture` INFO line when the
+progress thread observes GPU-to-host copy completion. It reports rank, digest,
+tokens, observed elapsed time, effective token rate, and copied bytes.
+
+The separate commit log reports durable-storage time. The two records separate
+capture interference from background storage work.
+
 Timing is diagnostic only. Missing timing data does not change whether a
 stored entry may be used.
 

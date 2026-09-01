@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from sparkcache.streaming import manager_page_runtime
 from sparkcache.spark_context_cache_hybrid import (
     PageGroup,
     PageLayer,
@@ -82,6 +83,10 @@ class FakeConnector:
         self.completed_event = threading.Event()
 
     @staticmethod
+    def _worker_rank() -> int:
+        return 3
+
+    @staticmethod
     def _select_group_blocks_for_span(
         groups,
         span_tokens,
@@ -121,7 +126,9 @@ def _plan(request_id: str = "request"):
     )
 
 
-def test_runtime_completes_native_capture_then_hands_off_encoded_snapshot() -> None:
+def test_runtime_completes_native_capture_then_hands_off_encoded_snapshot(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     connector = FakeConnector()
     raw_body = b"a2a5" + b"r07"
     ring = FakeRing(raw_body)
@@ -132,10 +139,11 @@ def test_runtime_completes_native_capture_then_hands_off_encoded_snapshot() -> N
         progress_thread_initializer=lambda: None,
     )
     plan = _plan()
-    assert runtime.submit(plan, producer_stream=91)
-    assert connector.completed == []
-    ring.ready.set()
-    assert connector.completed_event.wait(timeout=1)
+    with caplog.at_level("INFO", logger="vllm.spark_context_cache"):
+        assert runtime.submit(plan, producer_stream=91)
+        assert connector.completed == []
+        ring.ready.set()
+        assert connector.completed_event.wait(timeout=1)
 
     assert len(connector.completed) == 1
     completed_plan, encoded, block_counts = connector.completed[0]
@@ -146,8 +154,50 @@ def test_runtime_completes_native_capture_then_hands_off_encoded_snapshot() -> N
     ) == {"attention": b"a2a5", "recurrent": b"r07"}
     assert runtime.take_finished(set()) == set()
     assert runtime.take_finished({"request"}) == {"request"}
+    capture_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("sparkcache: capture ")
+    ]
+    assert len(capture_lines) == 1
+    assert "rank=3" in capture_lines[0]
+    assert "digest=aaaaaaaaaaaa" in capture_lines[0]
+    assert "tokens=512" in capture_lines[0]
+    assert "observed=" in capture_lines[0]
+    assert "rate=" in capture_lines[0]
+    assert " tok/s" in capture_lines[0]
+    assert "bytes=0.0MiB" in capture_lines[0]
     runtime.shutdown()
     assert ring.closed
+
+
+def test_capture_telemetry_failure_does_not_abort_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connector = FakeConnector()
+    ring = FakeRing(b"a2a5r07")
+    runtime = ManagerPageCaptureRuntime(
+        connector,
+        ring=ring,
+        progress_poll_seconds=0.001,
+        progress_thread_initializer=lambda: None,
+    )
+
+    def fail_log(*args, **kwargs) -> None:
+        del args, kwargs
+        raise RuntimeError("broken diagnostic handler")
+
+    monkeypatch.setattr(manager_page_runtime.logger, "info", fail_log)
+    assert runtime.submit(_plan("diagnostic-failure"), producer_stream=91)
+    ring.ready.set()
+    assert connector.completed_event.wait(timeout=1)
+
+    assert len(connector.completed) == 1
+    assert connector.aborted == []
+    assert runtime.take_finished({"diagnostic-failure"}) == {
+        "diagnostic-failure"
+    }
+    runtime.shutdown()
 
 
 def test_runtime_drains_preempted_capture_before_returning() -> None:
