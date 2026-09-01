@@ -49,6 +49,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
+    KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
     KVConnectorRole,
     SupportsHMA,
@@ -126,6 +127,7 @@ _CAPACITY_RETRY_SECONDS = 5.0
 _CLEAR_ONCE_LOCK_TIMEOUT_SECONDS = 30.0
 _QUORUM_REPORT_BATCH_SIZE = 64
 _QUORUM_DELTA_HISTORY_SIZE = 64
+_STARTUP_HANDSHAKE_MAX_DIGESTS = 8 * _QUORUM_REPORT_BATCH_SIZE
 _QUORUM_PENDING_DELTA_LIMIT = 64
 _QUORUM_RETIRED_GENERATION_LIMIT = 64
 _QUORUM_DELTA_PROTOCOL = "sparkcache-quorum-delta-v1"
@@ -466,6 +468,18 @@ class SparkCacheConnectorMetadata(KVConnectorMetadata):
     @property
     def offers(self) -> list[_StreamingSnapshotOffer]:
         return self.streaming_snapshot_offers
+
+
+@dataclass
+class SparkCacheHandshakeMetadata(KVConnectorHandshakeMetadata):
+    """One worker's complete startup manifest inventory.
+
+    Each report contains at most ``_QUORUM_REPORT_BATCH_SIZE`` manifest
+    digests. The engine transports this metadata once after every worker has
+    registered its KV caches and before it accepts requests.
+    """
+
+    reports: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass
@@ -5522,6 +5536,84 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             )
             report["capacity"] = capacity
         return SparkCacheStats(data={"reports": [report]})
+
+    def get_handshake_metadata(self) -> SparkCacheHandshakeMetadata | None:
+        """Return a bounded manifest inventory at engine startup.
+
+        vLLM collects connector handshake metadata after worker KV-cache
+        registration and before the engine becomes ready. SparkCache uses that
+        existing exchange to establish the same physical-rank quorum otherwise
+        learned from post-request worker statistics. The handshake carries at
+        most ``_STARTUP_HANDSHAKE_MAX_DIGESTS`` entries so cache size cannot
+        make API readiness unbounded. Later bounded statistics report entries
+        outside that startup subset.
+        """
+
+        if self._role is not KVConnectorRole.WORKER or not self._restore_enabled:
+            return None
+        with self._load_lock:
+            held = tuple(sorted(self._held))[:_STARTUP_HANDSHAKE_MAX_DIGESTS]
+            state_sequence = self._stats_sequence + int(
+                self._held != self._stats_observed_held
+            )
+            checkpoint_count = max(
+                1,
+                math.ceil(len(held) / _QUORUM_REPORT_BATCH_SIZE),
+            )
+            reports = []
+            for index in range(checkpoint_count):
+                start = index * _QUORUM_REPORT_BATCH_SIZE
+                checkpoint_held = list(
+                    held[start : start + _QUORUM_REPORT_BATCH_SIZE]
+                )
+                reports.append(
+                    {
+                        "rank": self._physical_rank(),
+                        "protocol": _QUORUM_DELTA_PROTOCOL,
+                        "generation": self._stats_generation,
+                        "generation_epoch": self._stats_generation_epoch,
+                        "held_count": len(held),
+                        "held": [],
+                        "checkpoint": {
+                            "state_sequence": state_sequence,
+                            "cycle": self._stats_checkpoint_cycle,
+                            "index": index,
+                            "count": checkpoint_count,
+                            "held_count": len(held),
+                            "held": checkpoint_held,
+                        },
+                    }
+                )
+        return SparkCacheHandshakeMetadata(reports=tuple(reports))
+
+    def set_xfer_handshake_metadata(
+        self, metadata: dict[int, KVConnectorHandshakeMetadata]
+    ) -> None:
+        """Establish scheduler quorum from worker startup inventories.
+
+        The transport rank must agree with each report's physical rank. A
+        missing, malformed, or mismatched worker report contributes no quorum;
+        requests continue with ordinary prompt computation until later bounded
+        worker statistics establish unanimity.
+        """
+
+        if self._role is not KVConnectorRole.SCHEDULER:
+            return
+        for transport_rank, handshake in sorted(metadata.items()):
+            if type(transport_rank) is not int or not isinstance(
+                handshake, SparkCacheHandshakeMetadata
+            ):
+                continue
+            for report in handshake.reports:
+                if not isinstance(report, dict) or report.get("rank") != transport_rank:
+                    continue
+                self._absorb_quorum(
+                    SimpleNamespace(
+                        kv_connector_stats=SparkCacheStats(
+                            data={"reports": [dict(report)]}
+                        )
+                    )
+                )
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         with self._load_lock:
