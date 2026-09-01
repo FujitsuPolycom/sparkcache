@@ -86,7 +86,88 @@ class ParseConnectorConfigTests(unittest.TestCase):
         config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
         self.assertTrue(config.store_enabled)
         self.assertTrue(config.restore_enabled)
+        self.assertEqual(config.access_mode, "read-write")
         self.assertEqual(config.clear_once_token, "")
+
+    def test_restore_only_mode_reads_without_publishing(self) -> None:
+        vllm, _ = _make_vllm_config(
+            {"spark_cache_access_mode": "restore-only"}
+        )
+
+        config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+
+        self.assertFalse(config.store_enabled)
+        self.assertTrue(config.restore_enabled)
+        self.assertEqual(config.access_mode, "restore-only")
+
+    def test_access_mode_does_not_change_cache_identity(self) -> None:
+        read_write_vllm, _ = _make_vllm_config()
+        restore_only_vllm, _ = _make_vllm_config(
+            {"spark_cache_access_mode": "restore-only"}
+        )
+
+        read_write = cfg.parse_connector_config(
+            read_write_vllm,
+            read_write_vllm.kv_transfer_config,
+            None,
+        )
+        restore_only = cfg.parse_connector_config(
+            restore_only_vllm,
+            restore_only_vllm.kv_transfer_config,
+            None,
+        )
+
+        self.assertEqual(
+            read_write.build_identity(0, 0).storage_key,
+            restore_only.build_identity(0, 0).storage_key,
+        )
+
+    def test_independent_controls_override_access_mode(self) -> None:
+        vllm, _ = _make_vllm_config(
+            {
+                "spark_cache_access_mode": "restore-only",
+                "spark_cache_store": "1",
+                "spark_cache_restore": "0",
+            }
+        )
+
+        config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+
+        self.assertTrue(config.store_enabled)
+        self.assertFalse(config.restore_enabled)
+        self.assertEqual(config.access_mode, "store-only")
+
+    def test_unknown_access_mode_is_rejected(self) -> None:
+        vllm, _ = _make_vllm_config(
+            {"spark_cache_access_mode": "sometimes"}
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "spark_cache_access_mode"):
+            cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+
+    def test_restore_only_mode_disables_publication_accelerators(self) -> None:
+        vllm, _ = _make_vllm_config(
+            {
+                "spark_cache_access_mode": "restore-only",
+                "spark_cache_streaming_snapshots": "1",
+            }
+        )
+
+        config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+
+        self.assertFalse(config.streaming_snapshots_enabled)
+
+    def test_store_only_mode_disables_restore_accelerators(self) -> None:
+        vllm, _ = _make_vllm_config(
+            {
+                "spark_cache_access_mode": "store-only",
+                "spark_cache_cuda_restore": "1",
+            }
+        )
+
+        config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+
+        self.assertFalse(config.cuda_restore_enabled)
 
     def test_per_token_rows_reject_nontrivial_dcp_interleave(self) -> None:
         vllm, _ = _make_vllm_config(cp_kv_cache_interleave_size=4)

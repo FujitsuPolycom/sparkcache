@@ -1967,7 +1967,7 @@ class DefectD18LatePublicationBaseQuorumTests(unittest.TestCase):
             stats = workers[0].get_kv_connector_stats()
             for worker in workers[1:]:
                 stats = stats.aggregate(worker.get_kv_connector_stats())
-            self.assertEqual(stats.reduce()["spark_cache_digests_held"], 4)
+            self.assertEqual(stats.reduce()["sparkcache_entries"], 4)
             scheduler.update_connector_output(
                 types.SimpleNamespace(
                     kv_connector_stats=stats,

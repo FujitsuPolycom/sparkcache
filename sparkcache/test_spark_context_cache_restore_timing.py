@@ -52,6 +52,15 @@ class RestoreTimingTests(unittest.TestCase):
                 "cuda_sync",
             },
         )
+        self.assertEqual(
+            timing.operator_lines(),
+            (
+                "sparkcache: restore tokens=16384 total=29.0ms"
+                " rate=565K tok/s bytes=0.1MiB",
+                "sparkcache: phases read=4.0ms place=6.0ms"
+                " sync=7.0ms queue=1.0ms",
+            ),
+        )
 
     def test_unknown_or_duplicate_phase_is_rejected(self) -> None:
         timing = RestoreTiming(

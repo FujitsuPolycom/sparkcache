@@ -121,3 +121,39 @@ class RestoreTiming:
             sort_keys=True,
             separators=(",", ":"),
         )
+
+    def operator_lines(self) -> tuple[str, str]:
+        """Render two compact INFO lines for an operator-facing restore event."""
+
+        if self.outcome == "pending":
+            raise RuntimeError("cannot summarize unfinished restore timing")
+
+        total_ms = self.end_to_end_ns / 1_000_000
+        token_rate = (
+            self.span_tokens * 1_000_000_000 / self.end_to_end_ns
+            if self.end_to_end_ns
+            else 0.0
+        )
+        if token_rate >= 1_000_000:
+            rate = f"{token_rate / 1_000_000:.2f}M"
+        elif token_rate >= 1_000:
+            rate = f"{token_rate / 1_000:.0f}K"
+        else:
+            rate = f"{token_rate:.0f}"
+        payload = (
+            f" bytes={self.page_bytes / 1024**2:.1f}MiB"
+            if self.page_bytes
+            else ""
+        )
+        result = (
+            f"sparkcache: restore tokens={self.span_tokens} total={total_ms:.1f}ms"
+            f" rate={rate} tok/s{payload}"
+        )
+        phases = (
+            "sparkcache: phases"
+            f" read={self.phase_ns['restore_read'] / 1_000_000:.1f}ms"
+            f" place={self.phase_ns['h2d_submit'] / 1_000_000:.1f}ms"
+            f" sync={self.phase_ns['cuda_sync'] / 1_000_000:.1f}ms"
+            f" queue={self.queue_wait_ns / 1_000_000:.1f}ms"
+        )
+        return result, phases

@@ -33,8 +33,7 @@ configuration leaves SparkCache unloaded.
     "spark_cache_model_profile": "profile-name",
     "spark_cache_target_checkpoint_sha256": "<64 lowercase hex characters>",
     "spark_cache_draft_policy": "colocated_target",
-    "spark_cache_store": true,
-    "spark_cache_restore": true,
+    "spark_cache_access_mode": "read-write",
     "spark_cache_max_bytes": 214748364800,
     "spark_cache_low_watermark_bytes": 193273528320,
     "spark_cache_ttl_seconds": 0,
@@ -49,6 +48,36 @@ its own checkpoint digest.
 
 The profile is part of cache identity. An unknown profile or unsupported
 parallel geometry stops connector startup before any stored entry is used.
+
+### Restore and publication controls
+
+`spark_cache_access_mode` selects how the connector uses persistent storage:
+
+| Mode | Restore stored prefixes | Publish completed prefixes |
+|---|---:|---:|
+| `read-write` | Yes | Yes |
+| `restore-only` | Yes | No |
+| `store-only` | No | Yes |
+| `disabled` | No | No |
+
+`read-write` is the default and preserves the behavior of deployments that do
+not set a mode.
+
+`restore-only` is useful when serving prompts with uncertain reuse. Existing
+entries remain available, but completed requests do not capture or publish
+model state. An unavailable or rejected entry is computed normally.
+
+The independent `spark_cache_store` and `spark_cache_restore` booleans remain
+supported. Each explicitly supplied boolean overrides its side of the selected
+mode.
+
+The equivalent environment variables are
+`SPARK_CONTEXT_CACHE_ACCESS_MODE`, `SPARK_CONTEXT_CACHE_STORE`, and
+`SPARK_CONTEXT_CACHE_RESTORE`.
+
+Access controls do not participate in cache identity. Switching between
+`read-write` and `restore-only` can reuse compatible stored entries without a
+namespace change.
 
 ## Publication options
 

@@ -27,6 +27,7 @@ If those checks do not pass, vLLM computes the prompt normally.
 | Capability | In plain language | Status |
 |---|---|---|
 | Persistent snapshots | Save reusable context as immutable, verified objects. | **implemented** |
+| Independent restore and publication controls | Restore existing entries without capturing new snapshots, or enable either direction separately. | **implemented** |
 | Longest exact-prefix selection | Reuse the longest stored part of a prompt, not only a complete prompt match. | **implemented** |
 | Sparse row-prefix aliases | Point to reusable earlier row boundaries without copying their payloads. | **implemented** |
 | Complete manager-page snapshots | Preserve model-managed pages whose state is not exposed as ordinary rows. | **implemented** |
