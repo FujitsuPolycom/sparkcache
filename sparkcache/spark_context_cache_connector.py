@@ -472,7 +472,7 @@ class SparkCacheConnectorMetadata(KVConnectorMetadata):
 
 @dataclass
 class SparkCacheHandshakeMetadata(KVConnectorHandshakeMetadata):
-    """One worker's complete startup manifest inventory.
+    """One worker's bounded startup manifest inventory.
 
     Each report contains at most ``_QUORUM_REPORT_BATCH_SIZE`` manifest
     digests. The engine transports this metadata once after every worker has

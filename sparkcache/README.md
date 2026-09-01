@@ -17,6 +17,16 @@ each worker reads and writes only its physical rank's state.
 Row-oriented storage may also publish authenticated aliases that point to an
 earlier exact manifest. A broken alias does not affect the exact manifest.
 
+### Startup inventory
+
+Each worker sends at most 512 discovered manifest digests through vLLM's
+one-time connector handshake before API readiness. The scheduler exposes an
+entry only when every physical rank reports the same digest.
+
+Larger inventories continue through bounded delta and checkpoint reports
+after the engine starts. Entries outside the startup subset recompute until
+their all-rank reports arrive.
+
 ## Configure the connector
 
 Pass SparkCache through vLLM's `--kv-transfer-config`. Omitting the connector
@@ -130,6 +140,24 @@ Any error discards those private blocks and recomputes the prompt.
 See [`native/README.md`](native/README.md) for the ABI and memory-ordering
 rules. Deployment profiles record the model layouts tested with this path.
 
+## SparkCache CUDA publication
+
+Asynchronous manager-page capture is **implemented** and disabled by default.
+
+It records producer readiness on the model-runner stream, gathers complete
+request-owned pages on a low-priority CUDA stream, and hands a claimed mapped
+ring view to the durable writer.
+
+Ring saturation skips optional publication without waiting. Preemption
+synchronizes only the affected capture before its source pages can be reused.
+
+Enablement requires an attested `libspark_cache_snapshot` library, bounded
+slot sizes, and the exact vLLM ownership contract described in
+[`native/MANAGER_PAGE_CAPTURE_CONTRACT.md`](native/MANAGER_PAGE_CAPTURE_CONTRACT.md).
+
+This path supports complete page snapshots. Page-tail publication remains a
+separate implementation path.
+
 ## Capacity and cleanup
 
 `spark_cache_max_bytes` is the high watermark for one cache root. Crossing it
@@ -154,9 +182,10 @@ filesystem failure disables caching for that connector while serving continues.
 
 ## Diagnostics
 
-Each asynchronous restore emits a `sparkcache-restore-timing/v1` JSON record.
-It separates queueing, lookup, reading, verification, reconstruction, device
-submission, synchronization, and total service time.
+Each asynchronous restore emits compact INFO lines with restored tokens,
+latency, effective token rate, bytes, and phase timings. A
+`sparkcache-restore-timing/v1` JSON record with the complete phase breakdown is
+available at DEBUG.
 
 Timing is diagnostic only. Missing timing data does not change whether a
 stored entry may be used.
