@@ -99,6 +99,9 @@ def _install_vllm_stubs() -> None:
     class KVConnectorMetadata:
         pass
 
+    class KVConnectorHandshakeMetadata:
+        pass
+
     class SupportsHMA:
         pass
 
@@ -119,6 +122,7 @@ def _install_vllm_stubs() -> None:
             return self._metadata
 
     base.KVConnectorBase_V1 = KVConnectorBase_V1
+    base.KVConnectorHandshakeMetadata = KVConnectorHandshakeMetadata
     base.KVConnectorMetadata = KVConnectorMetadata
     base.KVConnectorRole = KVConnectorRole
     base.SupportsHMA = SupportsHMA
@@ -6359,6 +6363,96 @@ class AsyncRestoreTests(unittest.TestCase):
                 ),
             )
             self.assertEqual(connector.build_connector_meta(step).plans, [])
+
+
+class StartupInventoryHandshakeTests(unittest.TestCase):
+    def test_worker_handshake_carries_every_bounded_checkpoint_chunk(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            worker = _make_connector(Path(directory), 2, 64)
+            worker._held = {f"{value:064x}" for value in range(130)}
+
+            metadata = worker.get_handshake_metadata()
+
+            self.assertIsNotNone(metadata)
+            assert metadata is not None
+            self.assertEqual(len(metadata.reports), 3)
+            self.assertEqual(
+                [report["checkpoint"]["index"] for report in metadata.reports],
+                [0, 1, 2],
+            )
+            self.assertTrue(
+                all(
+                    len(report["checkpoint"]["held"])
+                    <= connector_module._QUORUM_REPORT_BATCH_SIZE
+                    for report in metadata.reports
+                )
+            )
+            self.assertTrue(all(report["rank"] == 2 for report in metadata.reports))
+
+    def test_worker_handshake_limits_inventory_before_api_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            worker = _make_connector(Path(directory), 2, 64)
+            worker._held = {f"{value:064x}" for value in range(700)}
+
+            metadata = worker.get_handshake_metadata()
+
+            self.assertIsNotNone(metadata)
+            assert metadata is not None
+            self.assertEqual(len(metadata.reports), 8)
+            checkpoint = [report["checkpoint"] for report in metadata.reports]
+            self.assertEqual([item["index"] for item in checkpoint], list(range(8)))
+            self.assertTrue(all(item["count"] == 8 for item in checkpoint))
+            self.assertTrue(all(item["held_count"] == 512 for item in checkpoint))
+            self.assertEqual(sum(len(item["held"]) for item in checkpoint), 512)
+
+    def test_scheduler_handshake_establishes_full_physical_rank_quorum(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            digest = "a" * 64
+            metadata = {}
+            for rank in range(4):
+                worker = _make_connector(root / f"worker-{rank}", rank, 64)
+                worker._held = {digest}
+                metadata[rank] = worker.get_handshake_metadata()
+            scheduler = _make_connector(
+                root / "scheduler",
+                0,
+                64,
+                role=KVConnectorRole.SCHEDULER,
+            )
+
+            scheduler.set_xfer_handshake_metadata(metadata)
+
+            self.assertTrue(scheduler._has_full_quorum(digest))
+
+    def test_transport_rank_mismatch_cannot_contribute_to_quorum(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            digest = "b" * 64
+            worker = _make_connector(root / "worker", 0, 64)
+            worker._held = {digest}
+            report = worker.get_handshake_metadata()
+            scheduler = _make_connector(
+                root / "scheduler",
+                0,
+                64,
+                role=KVConnectorRole.SCHEDULER,
+            )
+
+            scheduler.set_xfer_handshake_metadata({0: report, 1: report})
+
+            self.assertEqual(scheduler._quorum[digest], {0})
+            self.assertFalse(scheduler._has_full_quorum(digest))
+
+    def test_scheduler_does_not_emit_worker_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            scheduler = _make_connector(
+                Path(directory),
+                0,
+                64,
+                role=KVConnectorRole.SCHEDULER,
+            )
+            self.assertIsNone(scheduler.get_handshake_metadata())
 
 
 class QuorumStatsAggregationTests(unittest.TestCase):
