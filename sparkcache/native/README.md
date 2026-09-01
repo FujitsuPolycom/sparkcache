@@ -5,7 +5,7 @@ SparkCache includes two optional C++/CUDA libraries:
 | Library | What it does | Status |
 |---|---|---|
 | `libspark_cache_placement.so` | Places authenticated cache records into request-owned GPU blocks. | **implemented** |
-| `libspark_cache_snapshot.so` | Gathers completed cache rows into a bounded write-behind ring. | **research-only** |
+| `libspark_cache_snapshot.so` | Gathers completed cache rows or manager pages into a bounded write-behind ring. | **research-only** |
 
 A deployment profile pins the library SHA-256, describes the memory layout,
 and records the live tests performed with that exact artifact.
@@ -120,6 +120,15 @@ for optional write-behind publication. See
 
 Backpressure or failure may cancel publication. It must not delay serving or
 expose a partial manifest.
+
+Opaque hybrid-memory-allocator pages require group-qualified page tables and
+all-group block leases.
+
+The GPU-free descriptor and payload-layout foundation is documented in
+[`MANAGER_PAGE_CAPTURE_CONTRACT.md`](MANAGER_PAGE_CAPTURE_CONTRACT.md).
+
+Its C++/CUDA and connector path is research-only and requires explicit opt-in.
+No serving profile enables it by default.
 
 ## Build and test
 

@@ -146,6 +146,9 @@ _MAX_PAGE_BASE_BYTES_TOTAL = 2 * 1024**3
 _STREAMING_RUNTIME_FACTORIES: dict[
     KVConnectorRole, Callable[["SparkContextCacheConnector"], Any]
 ] = {}
+_ASYNC_PAGE_RUNTIME_FACTORY: Callable[
+    ["SparkContextCacheConnector"], Any
+] | None = None
 
 
 def configure_streaming_snapshot_runtime(
@@ -168,6 +171,17 @@ def configure_streaming_snapshot_runtime(
     if not callable(factory):
         raise TypeError("streaming runtime factory must be callable")
     _STREAMING_RUNTIME_FACTORIES[role] = factory
+
+
+def configure_async_page_capture_runtime(
+    factory: Callable[["SparkContextCacheConnector"], Any] | None,
+) -> None:
+    """Install a GPU-free test or attested manager-page runtime builder."""
+
+    global _ASYNC_PAGE_RUNTIME_FACTORY
+    if factory is not None and not callable(factory):
+        raise TypeError("manager-page capture runtime factory must be callable")
+    _ASYNC_PAGE_RUNTIME_FACTORY = factory
 
 
 def _load_cuda_components() -> SimpleNamespace:
@@ -336,7 +350,7 @@ class _HybridStoreSnapshot:
     rank: int
     identity: CacheIdentity
     positions: tuple[int, ...]
-    encoded_pages: bytes
+    encoded_pages: Any
     block_counts: tuple[int, ...]
 
 
@@ -571,8 +585,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     """Store/restore each rank's DCP shard on rank-local NVMe."""
 
     # Exact-vLLM runtimes use this opt-in before pinning and exporting aligned
-    # recurrent replay-boundary blocks. wait_for_save synchronously detaches
-    # every referenced page before request/preemption cleanup may release it.
+    # recurrent replay-boundary blocks. Synchronous capture detaches them in
+    # wait_for_save. Explicit asynchronous page capture retains all groups until
+    # its completion event or preemption drain proves CUDA stopped reading.
     supports_recurrent_boundary_blocks = True
 
     @property
@@ -601,6 +616,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
 
     configure_streaming_snapshot_runtime = staticmethod(
         configure_streaming_snapshot_runtime
+    )
+    configure_async_page_capture_runtime = staticmethod(
+        configure_async_page_capture_runtime
     )
 
     def __init__(
@@ -666,6 +684,15 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._streaming_snapshots_enabled = (
             config.streaming_snapshots_enabled and self._cache_available
         )
+        if config.async_page_capture_enabled and not self._cache_available:
+            raise RuntimeError(
+                "spark-context-cache: asynchronous manager-page capture cannot"
+                " start while persistent cache initialization is unavailable"
+            )
+        self._async_page_capture_enabled = config.async_page_capture_enabled
+        self._async_page_capture_runtime: Any = None
+        self._async_page_capture_settings: Any = None
+        self._async_page_capture_eligible: set[str] = set()
         self._streaming_runtime: Any = None
         if self._streaming_snapshots_enabled:
             # An explicit opt-in never falls back to end-of-prefill snapshots.
@@ -684,6 +711,15 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             # Resolve the adapter before C++/CUDA import/allocation so a
             # partially configured deployment is rejected at startup.
             self._install_streaming_runtime(role)
+        if self._async_page_capture_enabled:
+            from sparkcache.streaming.manager_page_factory import (
+                ManagerPageCaptureSettings,
+                verify_manager_page_lease_contract,
+            )
+
+            settings = ManagerPageCaptureSettings.from_connector(self)
+            verify_manager_page_lease_contract(settings)
+            self._async_page_capture_settings = settings
         self._native_restore_enabled = (
             config.native_restore_enabled and self._cache_available
         )
@@ -2069,6 +2105,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             # the exact offers sent to workers so it delays block reuse only
             # for requests whose final gather may still be in flight.
             runtime.observe_metadata(meta)
+        if (
+            self._async_page_capture_enabled
+            and self._role is KVConnectorRole.SCHEDULER
+        ):
+            self._async_page_capture_eligible.update(
+                plan.request_id for plan in meta.plans if plan.is_store
+            )
         return meta
 
     # ------------------------------------------------------------------
@@ -2082,6 +2125,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             # This must remain synchronous: the runtime drains armed CUDA
             # fences or raises without releasing blocks of unknown status.
             runtime.handle_preemptions(kv_connector_metadata)
+        runtime = self._async_page_capture_runtime
+        if runtime is not None:
+            for request_id in getattr(
+                kv_connector_metadata, "preempted_request_ids", ()
+            ):
+                runtime.preempt(request_id)
 
     def _manager_page_view(
         self,
@@ -2333,6 +2382,37 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             # The adapter closes over this connector. Bind only after the
             # complete tensor inventory and canonical layer plans exist.
             runtime.bind_kv_caches()
+        if self._async_page_capture_enabled and self._role is KVConnectorRole.WORKER:
+            factory = _ASYNC_PAGE_RUNTIME_FACTORY
+            if factory is None:
+                from sparkcache.streaming.manager_page_factory import (
+                    build_manager_page_runtime,
+                )
+
+                settings = self._async_page_capture_settings
+                if settings is None:
+                    raise RuntimeError(
+                        "spark-context-cache: manager-page capture settings vanished"
+                    )
+                runtime = build_manager_page_runtime(self, settings)
+            else:
+                runtime = factory(self)
+            required = (
+                "submit",
+                "preempt",
+                "take_finished",
+                "quiesce",
+                "shutdown",
+            )
+            missing = [
+                name for name in required if not callable(getattr(runtime, name, None))
+            ]
+            if missing:
+                raise RuntimeError(
+                    "spark-context-cache: manager-page capture runtime is incomplete: "
+                    + ", ".join(missing)
+                )
+            self._async_page_capture_runtime = runtime
         if (
             self._cache_available
             and self._capacity_policy.enabled
@@ -4209,11 +4289,24 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> tuple[bool, dict[str, Any] | None]:
         """Release scheduler bookkeeping for a hybrid-memory-allocator request.
 
-        End-of-prefill stores do not retain request blocks after the CPU
-        snapshot, so the multi-group path has no delayed-free work. Streaming
-        snapshots require group-qualified leases and are refused until that
-        contract is implemented.
+        Synchronous stores do not retain request blocks after the CPU snapshot.
+        Explicit asynchronous manager-page capture delays all-group cleanup
+        until every worker reports its native read complete. Row-oriented
+        streaming snapshots do not support multiple KV-cache groups.
         """
+        if self._async_page_capture_enabled:
+            request_id = request.request_id
+            cleanup_delay, _ = self.request_finished(request, [])
+            if cleanup_delay:
+                raise RuntimeError(
+                    "spark-context-cache: manager-page cleanup encountered"
+                    " an incompatible row-streaming lease"
+                )
+            eligible = request_id in self._async_page_capture_eligible
+            if eligible:
+                self._async_page_capture_eligible.discard(request_id)
+                return True, None
+            return False, None
         if self._streaming_runtime is not None:
             raise RuntimeError(
                 "spark-context-cache: streaming snapshots do not support"
@@ -4226,6 +4319,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> tuple[set[str] | None, set[str] | None]:
         finished_sending: set[str] = set()
         runtime = self._streaming_runtime
+        if runtime is not None:
+            finished_sending.update(runtime.take_finished(finished_req_ids))
+        runtime = self._async_page_capture_runtime
         if runtime is not None:
             finished_sending.update(runtime.take_finished(finished_req_ids))
         with self._load_cv:
@@ -4248,6 +4344,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             # unsafe teardown.
             runtime.shutdown()
             self._streaming_runtime = None
+        runtime = self._async_page_capture_runtime
+        if runtime is not None:
+            runtime.quiesce()
         capacity_thread = self._capacity_thread
         if capacity_thread is not None:
             # Give already handed-off durable commits one final background
@@ -4288,6 +4387,21 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 )
             else:
                 self._store_thread = None
+        runtime = self._async_page_capture_runtime
+        if runtime is not None:
+            if runtime.shutdown():
+                self._async_page_capture_runtime = None
+            else:
+                self.counters["async_page_capture_shutdown_ring_retained"] = (
+                    self.counters.get(
+                        "async_page_capture_shutdown_ring_retained", 0
+                    )
+                    + 1
+                )
+                logger.warning(
+                    "spark-context-cache: shutdown retained manager-page"
+                    " capture ring for a live durable writer"
+                )
         self.wait_for_pending_loads(timeout=5.0)
         for _ in self._load_threads:
             self._load_queue.put(None)
@@ -4390,6 +4504,28 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     )
                     continue
                 self._store_inflight = 1
+            if self._async_page_capture_enabled:
+                runtime = self._async_page_capture_runtime
+                if runtime is None:
+                    self._finish_store(
+                        plan.digest,
+                        committed=False,
+                        error=RuntimeError(
+                            "manager-page capture runtime is unavailable"
+                        ),
+                    )
+                    continue
+                producer_stream = int(torch.cuda.current_stream().cuda_stream)
+                try:
+                    runtime.submit(plan, producer_stream=producer_stream)
+                except Exception as error:  # noqa: BLE001 - serving continues
+                    runtime.preempt(plan.request_id)
+                    self._finish_store(
+                        plan.digest,
+                        committed=False,
+                        error=error,
+                    )
+                continue
             snapshot_started = time.perf_counter()
             try:
                 snapshot = self._snapshot_store(plan)
@@ -4489,6 +4625,65 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             positions=tuple(range(plan.span_tokens)),
             encoded_pages=encoded,
             block_counts=tuple(len(group) for group in groups),
+        )
+
+    def _complete_async_page_capture(
+        self,
+        plan: _ReqPlan,
+        encoded_pages: Any,
+        block_counts: tuple[int, ...],
+    ) -> None:
+        """Validate completed native bytes and queue the existing commit path."""
+
+        layout = self._page_layout
+        if layout is None:
+            self._abort_async_page_capture(
+                plan.digest, "block-page layout is not registered"
+            )
+            return
+        try:
+            expected_groups = self._select_group_blocks_for_span(
+                plan.group_block_ids,
+                plan.span_tokens,
+                recurrent_boundary_blocks=plan.recurrent_boundary_blocks,
+            )
+            expected_counts = tuple(len(group) for group in expected_groups)
+            if block_counts != expected_counts:
+                raise HybridCodecError(
+                    "native capture block counts disagree with the store plan"
+                )
+            header = getattr(encoded_pages, "header_bytes", encoded_pages)
+            total_bytes = getattr(encoded_pages, "total_bytes", None)
+            plan_page_snapshot(
+                layout,
+                header,
+                block_counts,
+                total_bytes=total_bytes,
+            )
+            snapshot = _HybridStoreSnapshot(
+                plan=plan,
+                rank=self._worker_rank(),
+                identity=self._identity(self._worker_rank()),
+                positions=(),
+                encoded_pages=encoded_pages,
+                block_counts=block_counts,
+            )
+            self._ensure_store_thread()
+            self._store_queue.put(snapshot)
+        except Exception as error:  # noqa: BLE001 - serving continues
+            release = getattr(encoded_pages, "release", None)
+            if callable(release):
+                release()
+            self._finish_store(plan.digest, committed=False, error=error)
+
+    def _abort_async_page_capture(self, digest: str, reason: str) -> None:
+        self.counters["async_page_capture_aborted"] = (
+            self.counters.get("async_page_capture_aborted", 0) + 1
+        )
+        self._finish_store(
+            digest,
+            committed=False,
+            error=RuntimeError(reason),
         )
 
     def _ensure_store_thread(self) -> None:
@@ -4622,6 +4817,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     error=error,
                 )
                 continue
+            finally:
+                encoded_pages = getattr(snapshot, "encoded_pages", None)
+                release = getattr(encoded_pages, "release", None)
+                if callable(release):
+                    release()
 
     def _publish_row_prefix_aliases(
         self,

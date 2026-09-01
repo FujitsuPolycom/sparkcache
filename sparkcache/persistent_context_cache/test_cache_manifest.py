@@ -107,6 +107,58 @@ def _clear_once_in_subprocess(
 
 
 class ManifestStoreTests(unittest.TestCase):
+    def test_page_snapshot_scatter_is_consumed_in_bounded_ranges(self) -> None:
+        from sparkcache.spark_context_cache_hybrid import (
+            PageGroup,
+            PageLayer,
+            PageLayout,
+            encode_page_snapshot,
+            encode_page_snapshot_header,
+        )
+
+        identity = dataclasses.replace(_page_identity(), publication_schema="")
+        layout = PageLayout((PageGroup(256, (PageLayer("page", "u8", (32,), 32),)),))
+        snapshot = encode_page_snapshot(
+            layout,
+            (16,),
+            {"page": hashlib.shake_256(b"scatter-page-bytes").digest(512)},
+        )
+        header = encode_page_snapshot_header(layout, (16,))
+
+        class Scatter:
+            total_bytes = len(snapshot)
+            calls: list[tuple[int, int]] = []
+
+            @staticmethod
+            def read_range(start: int, end: int) -> bytes:
+                Scatter.calls.append((start, end))
+                if end <= len(header):
+                    return header[start:end]
+                if start >= len(header):
+                    return snapshot[start:end]
+                return header[start:] + snapshot[len(header) : end]
+
+        digest = hashlib.sha256(b"scatter-page-snapshot").hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            store = ManifestStore(directory)
+            with mock.patch.object(cache_manifest, "_PAGE_SNAPSHOT_OBJECT_BYTES", 64):
+                store.commit_page_snapshot(
+                    identity=identity,
+                    context_digest=digest,
+                    span_tokens=128 * identity.chunk_tokens,
+                    snapshot=Scatter(),
+                )
+            lookup = store.lookup(identity, digest, verify_chunks=True)
+            restored = store.restore_page_snapshot(
+                lookup,
+                layout=layout,
+                result_block_counts=(16,),
+                result_boundary_tokens=128 * identity.chunk_tokens,
+            )
+        self.assertEqual(restored, snapshot)
+        self.assertGreater(len(Scatter.calls), 1)
+        self.assertTrue(all(end - start <= 64 for start, end in Scatter.calls))
+
     def test_flat_page_snapshot_uses_bounded_macro_objects_and_restores_exactly(
         self,
     ) -> None:

@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "spark_cache_page_capture.h"
+
 #if defined(_WIN32)
 #if defined(SPARK_CACHE_SNAPSHOT_BUILD)
 #define SPARK_CACHE_SNAPSHOT_API __declspec(dllexport)
@@ -67,7 +69,9 @@ enum {
   SPARK_CACHE_SNAPSHOT_CAP_EXTERNAL_STREAM = 1u << 2,
   SPARK_CACHE_SNAPSHOT_CAP_NONBLOCKING_ACQUIRE = 1u << 3,
   SPARK_CACHE_SNAPSHOT_CAP_CONTEXT_ABANDON = 1u << 4,
-  SPARK_CACHE_SNAPSHOT_CAP_ORDERLY_SHUTDOWN = 1u << 5
+  SPARK_CACHE_SNAPSHOT_CAP_ORDERLY_SHUTDOWN = 1u << 5,
+  SPARK_CACHE_SNAPSHOT_CAP_MANAGER_PAGE_CAPTURE = 1u << 6,
+  SPARK_CACHE_SNAPSHOT_CAP_LOW_PRIORITY_CAPTURE_STREAM = 1u << 7
 };
 
 /*
@@ -166,6 +170,10 @@ SPARK_CACHE_SNAPSHOT_API SparkCacheSnapshotStatus
 spark_cache_snapshot_query_abi(SparkCacheSnapshotAbiInfo* output);
 
 SPARK_CACHE_SNAPSHOT_API SparkCacheSnapshotStatus
+spark_cache_snapshot_query_page_capture_abi(
+    SparkCachePageCaptureAbiInfo* output);
+
+SPARK_CACHE_SNAPSHOT_API SparkCacheSnapshotStatus
 spark_cache_snapshot_create(
     const SparkCacheSnapshotConfig* config,
     SparkCacheSnapshot** output);
@@ -192,6 +200,13 @@ spark_cache_snapshot_configure_sources(
     const SparkCacheSnapshotSource* sources,
     uint32_t source_count);
 
+SPARK_CACHE_SNAPSHOT_API SparkCacheSnapshotStatus
+spark_cache_snapshot_configure_page_sources(
+    SparkCacheSnapshot* snapshot,
+    const SparkCachePageCaptureSource* sources,
+    uint32_t source_count,
+    uint32_t group_count);
+
 /*
  * Nonblocking producer edge. `producer_stream` is the integer CUDA stream
  * handle on which the source tensors became valid. The gather and completion
@@ -204,6 +219,15 @@ spark_cache_snapshot_try_submit(
     SparkCacheSnapshot* snapshot,
     const SparkCacheSnapshotSubmission* submission,
     const uint32_t* physical_slots,
+    uint64_t producer_stream,
+    SparkCacheSnapshotTicket* output);
+
+SPARK_CACHE_SNAPSHOT_API SparkCacheSnapshotStatus
+spark_cache_snapshot_try_submit_pages(
+    SparkCacheSnapshot* snapshot,
+    const SparkCachePageCaptureSubmission* submission,
+    const SparkCachePageCaptureGroup* groups,
+    const uint32_t* physical_pages,
     uint64_t producer_stream,
     SparkCacheSnapshotTicket* output);
 
@@ -239,6 +263,16 @@ spark_cache_snapshot_release(
  */
 SPARK_CACHE_SNAPSHOT_API SparkCacheSnapshotStatus
 spark_cache_snapshot_abandon_context(
+    SparkCacheSnapshot* snapshot,
+    uint64_t context_sequence);
+
+/*
+ * Preemption edge. It waits only for captures belonging to one context, then
+ * releases their source-page ownership. It never waits for a ring slot or a
+ * background writer.
+ */
+SPARK_CACHE_SNAPSHOT_API SparkCacheSnapshotStatus
+spark_cache_snapshot_drain_context(
     SparkCacheSnapshot* snapshot,
     uint64_t context_sequence);
 

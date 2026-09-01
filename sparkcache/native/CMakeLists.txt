@@ -17,7 +17,8 @@ set_target_properties(spark_cache_placement_layout PROPERTIES
     POSITION_INDEPENDENT_CODE ON)
 
 add_library(spark_cache_snapshot_layout STATIC
-    src/spark_cache_snapshot_layout.cpp)
+    src/spark_cache_snapshot_layout.cpp
+    src/spark_cache_page_capture_layout.cpp)
 target_compile_definitions(spark_cache_snapshot_layout
     PRIVATE SPARK_CACHE_SNAPSHOT_BUILD=1)
 target_include_directories(spark_cache_snapshot_layout PUBLIC include)
@@ -46,6 +47,16 @@ if(BUILD_TESTING)
     add_test(
         NAME spark_cache_snapshot_ring_test
         COMMAND spark_cache_snapshot_ring_test)
+
+    add_executable(spark_cache_page_capture_layout_test
+        tests/page_capture_layout_test.cpp)
+    target_link_libraries(spark_cache_page_capture_layout_test
+        PRIVATE spark_cache_snapshot_layout)
+    target_compile_options(spark_cache_page_capture_layout_test PRIVATE
+        -Wall -Wextra -Wpedantic -Werror -UNDEBUG)
+    add_test(
+        NAME spark_cache_page_capture_layout_test
+        COMMAND spark_cache_page_capture_layout_test)
 endif()
 
 option(

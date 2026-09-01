@@ -375,6 +375,7 @@ class ParseConnectorConfigTests(unittest.TestCase):
         vllm, _ = _make_vllm_config()
         config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
         self.assertFalse(config.streaming_snapshots_enabled)
+        self.assertFalse(config.async_page_capture_enabled)
 
     def test_tail_publication_is_opt_in_and_namespace_bound(self) -> None:
         default_vllm, _ = _make_vllm_config()
@@ -757,6 +758,69 @@ class ErrorPathTests(unittest.TestCase):
             "block-page storage does not support streaming snapshots",
             str(ctx.exception),
         )
+
+    def test_async_page_capture_is_explicit_and_block_page_only(self) -> None:
+        class FullAttentionSpec:
+            block_size = 512
+            storage_block_size = 512
+            page_size_bytes = 528
+
+        kv_cache_config = types.SimpleNamespace(
+            num_blocks=8,
+            kv_cache_groups=(
+                types.SimpleNamespace(
+                    kv_cache_spec=FullAttentionSpec(),
+                    is_eagle_group=False,
+                    layer_names=("full",),
+                ),
+            ),
+        )
+        block_pages, _ = _make_vllm_config(
+            {
+                "spark_cache_model_profile": "deepseek-v4-fp8-hma",
+                "spark_cache_async_page_capture": "1",
+            }
+        )
+        parsed = cfg.parse_connector_config(
+            block_pages,
+            block_pages.kv_transfer_config,
+            kv_cache_config,
+        )
+        self.assertTrue(parsed.async_page_capture_enabled)
+
+        rows, _ = _make_vllm_config(
+            {"spark_cache_async_page_capture": "1"}
+        )
+        with self.assertRaisesRegex(RuntimeError, "requires block-page storage"):
+            cfg.parse_connector_config(rows, rows.kv_transfer_config, None)
+
+        no_store, _ = _make_vllm_config(
+            {
+                "spark_cache_model_profile": "deepseek-v4-fp8-hma",
+                "spark_cache_async_page_capture": "1",
+                "spark_cache_store": "0",
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "requires cache publication"):
+            cfg.parse_connector_config(
+                no_store,
+                no_store.kv_transfer_config,
+                kv_cache_config,
+            )
+
+        tail_store, _ = _make_vllm_config(
+            {
+                "spark_cache_model_profile": "deepseek-v4-fp8-hma",
+                "spark_cache_async_page_capture": "1",
+                "spark_cache_publication_schema": "tail-cow-v1",
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "complete snapshot publication only"):
+            cfg.parse_connector_config(
+                tail_store,
+                tail_store.kv_transfer_config,
+                kv_cache_config,
+            )
 
 
 class KvGroupTopologyTests(unittest.TestCase):
