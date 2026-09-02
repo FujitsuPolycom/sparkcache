@@ -40,7 +40,13 @@ from sparkcache.spark_context_cache_cuda_hybrid_restore import (
 from sparkcache.spark_context_cache_cuda_placement import RestoreState
 
 
-def _page_delta_fixture(tmp_path, monkeypatch):
+def _page_delta_fixture(
+    tmp_path,
+    monkeypatch,
+    *,
+    publication_schema: str = "page-tail-cow-v1",
+    minimum_object_bytes: int = 0,
+):
     layout = PageLayout(
         (PageGroup(256, (PageLayer("page", "torch.uint8", (128,), 128),)),)
     )
@@ -70,7 +76,10 @@ def _page_delta_fixture(tmp_path, monkeypatch):
         base_boundary_tokens=base_blocks * 256,
         result_boundary_tokens=result_blocks * 256,
     )
-    object_bytes = max(base_plan.header_bytes, delta_plan.header_bytes) + 1
+    object_bytes = max(
+        minimum_object_bytes,
+        max(base_plan.header_bytes, delta_plan.header_bytes) + 1,
+    )
     monkeypatch.setattr(cache_manifest, "_PAGE_SNAPSHOT_OBJECT_BYTES", object_bytes)
     monkeypatch.setattr(cache_manifest, "_PAGE_DELTA_OBJECT_BYTES", object_bytes)
     identity = CacheIdentity(
@@ -81,7 +90,7 @@ def _page_delta_fixture(tmp_path, monkeypatch):
         tp_degree=1,
         dcp_degree=1,
         record_schema=("target_ckv", "logical_positions"),
-        publication_schema="page-tail-cow-v1",
+        publication_schema=publication_schema,
     )
     tokens = tuple(range(result_blocks * 256))
     salt = "native-page-delta"
@@ -681,6 +690,90 @@ def test_page_delta_planner_authenticates_graph_and_applies_delta_precedence(
     )
 
 
+def test_flat_page_delta_planner_reads_descriptor_stages(
+    tmp_path, monkeypatch
+) -> None:
+    fixture = _page_delta_fixture(
+        tmp_path,
+        monkeypatch,
+        publication_schema="page-tail-cow-v2",
+        minimum_object_bytes=4096,
+    )
+
+    plan = plan_cuda_page_delta_restore(
+        fixture.lookup,
+        cache_root=tmp_path,
+        layout=fixture.layout,
+        group_slots=(tuple(range(fixture.result_blocks)),),
+        expected_span_tokens=fixture.result_tokens,
+        arena_bytes=fixture.object_bytes,
+    )
+
+    assert plan.result_snapshot_sha256 == hashlib.sha256(fixture.result).hexdigest()
+    assert sum(span.byte_count for span in plan.source_spans) == (
+        len(fixture.result) - plan.page_plan.header_bytes
+    )
+
+    final_blocks = 24
+    middle_plan = plan_page_snapshot(
+        fixture.layout,
+        fixture.result,
+        (fixture.result_blocks,),
+    )
+    final_payload = fixture.result[middle_plan.header_bytes :] + b"".join(
+        bytes((128 + index,)) * 128
+        for index in range(fixture.result_blocks, final_blocks)
+    )
+    final_snapshot = encode_page_snapshot(
+        fixture.layout,
+        (final_blocks,),
+        {"page": final_payload},
+    )
+    tokens = tuple(range(final_blocks * 256))
+    final_digest = context_prefix_digest(
+        tokens,
+        fixture.salt,
+        token_count=final_blocks * 256,
+    )
+    fixture.store.commit_page_extension(
+        identity=fixture.identity,
+        base_context_digest=fixture.result_digest,
+        token_ids=tokens,
+        identity_salt=fixture.salt,
+        layout=fixture.layout,
+        base_block_counts=(fixture.result_blocks,),
+        result_block_counts=(final_blocks,),
+        base_boundary_tokens=fixture.result_tokens,
+        result_boundary_tokens=final_blocks * 256,
+        result_snapshot=final_snapshot,
+    )
+    final_lookup = fixture.store.lookup(
+        fixture.identity,
+        final_digest,
+        verify_chunks=False,
+    )
+    final_plan = plan_cuda_page_delta_restore(
+        final_lookup,
+        cache_root=tmp_path,
+        layout=fixture.layout,
+        group_slots=(tuple(range(final_blocks)),),
+        expected_span_tokens=final_blocks * 256,
+        arena_bytes=fixture.object_bytes,
+    )
+    reconstructed = b"".join(
+        span.source.path.read_bytes()[
+            span.source_offset_bytes : span.source_offset_bytes + span.byte_count
+        ]
+        for span in final_plan.source_spans
+    )
+    snapshot_plan = plan_page_snapshot(
+        fixture.layout,
+        final_snapshot,
+        (final_blocks,),
+    )
+    assert reconstructed == final_snapshot[snapshot_plan.header_bytes :]
+
+
 def test_nested_page_deltas_resolve_newest_over_middle_over_flat_base(
     tmp_path, monkeypatch
 ) -> None:
@@ -838,6 +931,60 @@ def test_page_delta_direct_restore_skips_overridden_base_objects_and_full_buffer
     assert result.skipped_base_object_bytes > 0
     assert adapter.transaction.state is RestoreState.FINISHED
     assert adapter.transaction.can_resume
+
+
+def test_page_delta_restore_reuses_one_bounded_read_pool(
+    tmp_path, monkeypatch
+) -> None:
+    fixture = _page_delta_fixture(tmp_path, monkeypatch)
+    adapter = _PageCaptureAdapter(fixture.object_bytes)
+    monkeypatch.setattr(
+        cuda_hybrid.cuda,
+        "arena_memoryview",
+        lambda arena, *, length: memoryview(arena.payload)[:length],
+    )
+    original_pool = concurrent.futures.ThreadPoolExecutor
+    original_read = cuda_hybrid._read_authenticated_page_object
+    pool_sizes = []
+    reads_after_submit = []
+
+    def counted_pool(*args, **kwargs):
+        workers = kwargs.get("max_workers", args[0] if args else None)
+        pool_sizes.append(workers)
+        return original_pool(*args, **kwargs)
+
+    monkeypatch.setattr(
+        cuda_hybrid.concurrent.futures,
+        "ThreadPoolExecutor",
+        counted_pool,
+    )
+
+    def observed_read(source):
+        if adapter.transaction.submit_count:
+            reads_after_submit.append(source.path)
+            assert adapter.transaction.state is RestoreState.PARKED
+        return original_read(source)
+
+    monkeypatch.setattr(
+        cuda_hybrid,
+        "_read_authenticated_page_object",
+        observed_read,
+    )
+
+    execute_cuda_hybrid_restore(
+        adapter=adapter,
+        request_id="page-delta-bounded-read-pool",
+        lookup=fixture.lookup,
+        cache_root=tmp_path,
+        layout=fixture.layout,
+        group_slots=(tuple(range(fixture.result_blocks)),),
+        expected_span_tokens=fixture.result_tokens,
+        arena_bytes=fixture.object_bytes,
+        io_workers=8,
+    )
+
+    assert pool_sizes == [4]
+    assert reads_after_submit
 
 
 def test_page_delta_direct_restore_maps_multiple_groups_and_layers(

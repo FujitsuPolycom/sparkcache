@@ -1,0 +1,68 @@
+{
+  "schema": "sparkcache-page-tail-v2-qualification/v1",
+  "status": "qualified",
+  "scope": {
+    "model": "GLM-5.3-Flash-NVFP4",
+    "target_checkpoint_sha256": "a35e6bf2875c1875609b8deaec404c07c6cc80259e4222fc0b51e649498bd6b9",
+    "draft_checkpoint_sha256": "b33c03475ba7322cf398828f2d8d1be376df30dc05c6b40c28c8ea8da23e410b",
+    "topology": "TP4/DCP4",
+    "storage_mode": "block_pages_v1",
+    "publication_schema": "page-tail-cow-v2",
+    "sparkcache_commit": "fb03fd4f007f492608ebef01954365627ab2a2d6",
+    "vllm_commit": "3633d61c3c7b04bb4d598cadbdc342f3be40482d",
+    "runtime_image_id": "sha256:7df364ed1bb0036d2514e36d5e40cfa1721c7fb9d841b0d9c4b519b53f5680c8",
+    "cuda_placement_sha256": "d57509052b73853bcc8e3c3f47bb81748d87b9cbd8d908fc20d4c79a09aa400c",
+    "cuda_snapshot_sha256": "4398f18b8913e743e7bf1ed8fe29560d4580e61b6a1e2ab8b16684b19b6573b5"
+  },
+  "configuration": {
+    "max_model_tokens": 1048576,
+    "kv_cache_dtype": "fp8",
+    "kv_cache_bytes_per_rank": 25769803776,
+    "cuda_placement_arena_bytes": 268435456,
+    "cuda_restore_io_workers": 8,
+    "async_capture_slot_bytes": 3221225472,
+    "async_capture_slot_count": 2
+  },
+  "chained_growth": {
+    "token_boundaries": [131072, 262144, 524288, 921600],
+    "byte_exact_semantics": true,
+    "payload_bytes_per_rank": [252526754, 252534307, 454745637, 663276069],
+    "publication_kinds": ["page_snapshot", "page_delta", "page_delta", "page_delta"],
+    "final_manifest_bytes": 7459,
+    "final_manifest_delta_stages": 3,
+    "final_manifest_delta_objects_per_stage": [4, 7, 10]
+  },
+  "restart_restore": {
+    "tokens": 921600,
+    "byte_exact_semantics": true,
+    "rank_elapsed_ms": 4747.3,
+    "effective_tokens_per_second_approximate": 194000,
+    "client_elapsed_seconds": 10.475
+  },
+  "foreground_interference": {
+    "publication_context_tokens": 327680,
+    "concurrency": 8,
+    "baseline_median_seconds": 4.8386,
+    "overlap_median_seconds": 5.2199,
+    "median_increase_percent": 7.9,
+    "overlap_max_seconds": 5.9449
+  },
+  "integrity": {
+    "flat_stage_corruption_rejected": true,
+    "unverifiable_state_recomputed": true,
+    "restart_restore_verified_before_placement": true
+  },
+  "validation": {
+    "sparkcache_tests_passed": 974,
+    "sparkcache_tests_skipped": 7,
+    "deployment_tests_passed": 111,
+    "deployment_tests_skipped": 1,
+    "interference_harness_tests_passed": 1,
+    "sparkring_runtime_tests_passed": 51,
+    "sparkring_runtime_tests_skipped": 1
+  },
+  "distribution": {
+    "published": false,
+    "note": "The content-addressed image was loaded directly on the four qualification hosts. This record does not identify a pullable image."
+  }
+}

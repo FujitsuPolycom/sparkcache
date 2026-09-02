@@ -558,6 +558,131 @@ def encode_page_delta(
     )
 
 
+def encode_page_delta_from_capture(
+    layout: PageLayout,
+    base_snapshot: bytes | bytearray | memoryview,
+    captured_tail: object,
+    *,
+    base_block_counts: Sequence[int],
+    result_block_counts: Sequence[int],
+    reused_pages_by_group: Sequence[int],
+    base_boundary_tokens: int,
+    result_boundary_tokens: int,
+) -> bytes:
+    """Encode an authenticated delta directly from selected captured pages.
+
+    The caller supplies reuse counts established before native capture. The
+    captured payload must contain each layer's non-reused result pages in
+    layout order. The result snapshot checksum is computed incrementally from
+    the verified base prefixes and captured page bytes, so no complete result
+    snapshot or page-by-page comparison is required.
+    """
+
+    _validate_delta_boundaries(base_boundary_tokens, result_boundary_tokens)
+    try:
+        base_counts = tuple(int(value) for value in base_block_counts)
+        result_counts = tuple(int(value) for value in result_block_counts)
+        reused = tuple(int(value) for value in reused_pages_by_group)
+    except (TypeError, ValueError) as error:
+        raise HybridCodecError("captured page extension counts are invalid") from error
+    if not (
+        len(base_counts)
+        == len(result_counts)
+        == len(reused)
+        == len(layout.groups)
+    ):
+        raise HybridCodecError("captured page extension geometry differs")
+    if any(
+        base <= 0
+        or result < base
+        or not 0 <= shared <= base
+        for base, result, shared in zip(
+            base_counts, result_counts, reused, strict=True
+        )
+    ):
+        raise HybridCodecError("captured page extension counts are invalid")
+
+    base_view = memoryview(base_snapshot).cast("B")
+    base_plan = plan_page_snapshot(
+        layout,
+        base_view,
+        base_counts,
+        total_bytes=len(base_view),
+    )
+    total_bytes = getattr(captured_tail, "total_bytes", None)
+    read_range = getattr(captured_tail, "read_range", None)
+    if isinstance(captured_tail, (bytes, bytearray, memoryview)):
+        captured_view = memoryview(captured_tail).cast("B")
+        total_bytes = len(captured_view)
+
+        def read_range(start: int, end: int) -> bytes:
+            return captured_view[start:end].tobytes()
+
+    if (
+        type(total_bytes) is not int
+        or total_bytes <= 0
+        or not callable(read_range)
+    ):
+        raise HybridCodecError("captured page extension payload is invalid")
+
+    result_digest = hashlib.sha256(encode_page_snapshot_header(layout, result_counts))
+    payload_parts: list[bytes] = []
+    layer_tails: list[dict[str, object]] = []
+    cursor = 0
+    span_index = 0
+    for group_index, group in enumerate(layout.groups):
+        shared = reused[group_index]
+        tail_pages = result_counts[group_index] - shared
+        for layer in group.layers:
+            span = base_plan.spans[span_index]
+            span_index += 1
+            prefix_end = span.source_start + shared * layer.bytes_per_page
+            prefix = base_view[span.source_start : prefix_end]
+            tail_bytes = tail_pages * layer.bytes_per_page
+            end = cursor + tail_bytes
+            if end > total_bytes:
+                raise HybridCodecError("captured page extension payload is truncated")
+            tail = read_range(cursor, end)
+            if not isinstance(tail, bytes) or len(tail) != tail_bytes:
+                raise HybridCodecError("captured page extension range differs")
+            result_digest.update(prefix)
+            result_digest.update(tail)
+            payload_parts.append(tail)
+            layer_tails.append(
+                {
+                    "name": layer.name,
+                    "bytes": tail_bytes,
+                    "sha256": hashlib.sha256(tail).hexdigest(),
+                }
+            )
+            cursor = end
+    if cursor != total_bytes:
+        raise HybridCodecError("captured page extension has trailing bytes")
+
+    header = json.dumps(
+        {
+            "schema": "sparkcache-hybrid-page-delta/v1",
+            "layout_sha256": layout.digest,
+            "base_snapshot_sha256": hashlib.sha256(base_view).hexdigest(),
+            "result_snapshot_sha256": result_digest.hexdigest(),
+            "base_block_counts": base_counts,
+            "result_block_counts": result_counts,
+            "base_boundary_tokens": base_boundary_tokens,
+            "result_boundary_tokens": result_boundary_tokens,
+            "reused_pages_by_group": reused,
+            "layer_tails": layer_tails,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return (
+        _DELTA_MAGIC
+        + _HEADER_LENGTH.pack(len(header))
+        + header
+        + b"".join(payload_parts)
+    )
+
+
 def apply_page_delta(
     layout: PageLayout,
     base_snapshot: bytes,
@@ -603,6 +728,75 @@ def apply_page_delta(
     if hashlib.sha256(result).hexdigest() != plan.result_snapshot_sha256:
         raise HybridCodecError("hybrid page delta result checksum mismatch")
     return result
+
+
+def materialize_page_extension_capture(
+    layout: PageLayout,
+    base_snapshot: bytes,
+    captured_tail: object,
+    *,
+    base_block_counts: Sequence[int],
+    result_block_counts: Sequence[int],
+    reused_pages_by_group: Sequence[int],
+) -> bytes:
+    """Build a complete snapshot from verified base bytes and captured pages."""
+
+    base_counts = tuple(int(value) for value in base_block_counts)
+    result_counts = tuple(int(value) for value in result_block_counts)
+    reused = tuple(int(value) for value in reused_pages_by_group)
+    if not (
+        len(base_counts)
+        == len(result_counts)
+        == len(reused)
+        == len(layout.groups)
+    ):
+        raise HybridCodecError("captured page extension geometry differs")
+    if any(
+        base <= 0
+        or result < base
+        or not 0 <= shared <= base
+        for base, result, shared in zip(
+            base_counts, result_counts, reused, strict=True
+        )
+    ):
+        raise HybridCodecError("captured page extension counts are invalid")
+    total_bytes = getattr(captured_tail, "total_bytes", None)
+    read_range = getattr(captured_tail, "read_range", None)
+    if isinstance(captured_tail, (bytes, bytearray, memoryview)):
+        view = memoryview(captured_tail)
+        total_bytes = len(view)
+
+        def read_range(start: int, end: int) -> bytes:
+            return view[start:end].tobytes()
+
+    if (
+        type(total_bytes) is not int
+        or total_bytes <= 0
+        or not callable(read_range)
+    ):
+        raise HybridCodecError("captured page extension payload is invalid")
+    base_payloads = decode_page_snapshot(layout, base_snapshot, base_counts)
+    result_payloads: dict[str, bytes] = {}
+    cursor = 0
+    for group_index, group in enumerate(layout.groups):
+        shared = reused[group_index]
+        tail_pages = result_counts[group_index] - shared
+        for layer in group.layers:
+            tail_bytes = tail_pages * layer.bytes_per_page
+            end = cursor + tail_bytes
+            if end > total_bytes:
+                raise HybridCodecError("captured page extension payload is truncated")
+            tail = read_range(cursor, end)
+            if not isinstance(tail, bytes) or len(tail) != tail_bytes:
+                raise HybridCodecError("captured page extension range differs")
+            prefix = base_payloads[layer.name][
+                : shared * layer.bytes_per_page
+            ]
+            result_payloads[layer.name] = prefix + tail
+            cursor = end
+    if cursor != total_bytes:
+        raise HybridCodecError("captured page extension has trailing bytes")
+    return encode_page_snapshot(layout, result_counts, result_payloads)
 
 
 def split_snapshot(encoded: bytes, part_count: int) -> tuple[bytes, ...]:

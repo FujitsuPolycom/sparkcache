@@ -539,16 +539,26 @@ def parse_connector_config(
             ),
         )
     )
-    if publication_schema_raw not in ("snapshot-v1", "tail-cow-v1"):
+    if publication_schema_raw not in (
+        "snapshot-v1",
+        "tail-cow-v1",
+        "tail-cow-v2",
+    ):
         raise RuntimeError(
             "spark-context-cache: spark_cache_publication_schema must be"
-            " 'snapshot-v1' or 'tail-cow-v1'"
+            " 'snapshot-v1', 'tail-cow-v1', or 'tail-cow-v2'"
         )
     publication_schema = ""
     if publication_schema_raw == "tail-cow-v1":
         publication_schema = (
             "page-tail-cow-v1" if storage_mode == "block_pages_v1" else "tail-cow-v1"
         )
+    elif publication_schema_raw == "tail-cow-v2":
+        if storage_mode != "block_pages_v1":
+            raise RuntimeError(
+                "spark-context-cache: tail-cow-v2 requires block-page storage"
+            )
+        publication_schema = "page-tail-cow-v2"
     group_topology = kv_group_topology(kv_cache_config, dcp_degree=dcp_degree)
     if storage_mode == "block_pages_v1" and not group_topology:
         raise RuntimeError(
@@ -675,11 +685,6 @@ def parse_connector_config(
         raise RuntimeError(
             "spark-context-cache: asynchronous manager-page capture and"
             " row streaming snapshots are mutually exclusive"
-        )
-    if async_page_capture_enabled and publication_schema:
-        raise RuntimeError(
-            "spark-context-cache: asynchronous manager-page capture supports"
-            " complete snapshot publication only"
         )
     if storage_mode == "block_pages_v1" and streaming_snapshots_enabled:
         raise RuntimeError(

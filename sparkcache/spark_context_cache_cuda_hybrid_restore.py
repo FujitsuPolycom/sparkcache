@@ -52,6 +52,7 @@ _CHUNK_MAGIC = b"SPCKV001"
 _TARGET_KIND = cuda.RECORD_TARGET_CKV
 _PAGE_SNAPSHOT_MANIFEST_SCHEMA = "sparkcache-page-snapshot-manifest/v2"
 _PAGE_DELTA_MANIFEST_SCHEMA = "sparkcache-page-delta-manifest/v2"
+_PAGE_DELTA_MANIFEST_SCHEMA_V3 = "sparkcache-page-delta-manifest/v3"
 _MAX_PAGE_OBJECT_READ_WORKERS = 4
 _MAX_PAGE_OBJECT_PREFETCH_BYTES = 256 * 1024 * 1024
 _MAX_PAGE_DELTA_DEPTH = 2
@@ -322,7 +323,8 @@ def plan_cuda_page_delta_restore(
         not getattr(lookup, "is_hit", False)
         or getattr(lookup, "root_kind", None) != "page_delta"
         or not isinstance(manifest, dict)
-        or manifest.get("schema") != _PAGE_DELTA_MANIFEST_SCHEMA
+        or manifest.get("schema")
+        not in (_PAGE_DELTA_MANIFEST_SCHEMA, _PAGE_DELTA_MANIFEST_SCHEMA_V3)
         or manifest.get("committed_tokens") != expected_span_tokens
     ):
         raise CudaHybridRestoreError(
@@ -358,7 +360,8 @@ def plan_cuda_page_delta_restore(
             f"page-delta root identity was rejected: {error}"
         ) from error
     if (
-        identity.publication_schema != "page-tail-cow-v1"
+        identity.publication_schema
+        not in ("page-tail-cow-v1", "page-tail-cow-v2")
         or identity.required_records
         != frozenset((StateRecord.TARGET_CKV, StateRecord.LOGICAL_POSITIONS))
         or persisted != manifest
@@ -372,43 +375,98 @@ def plan_cuda_page_delta_restore(
     root = manifest
     root_digest = context_digest
     try:
-        for depth in range(_MAX_PAGE_DELTA_DEPTH):
-            if not _is_page_delta_root(root):
-                break
-            if root.get("schema") != _PAGE_DELTA_MANIFEST_SCHEMA:
-                raise CudaHybridRestoreError(
-                    "page-delta direct restore requires v2 macro objects"
-                )
-            if root.get("layout_sha256") != layout.digest:
-                raise CudaHybridRestoreError("page-delta root layout differs")
-            base_root, descriptors = _validate_page_delta_root(
+        if root.get("schema") == _PAGE_DELTA_MANIFEST_SCHEMA_V3:
+            base_root, _descriptors = _validate_page_delta_root(
                 root,
                 identity=identity,
                 context_digest=root_digest,
             )
-            objects = _page_objects(
-                descriptors,
-                cache_root=cache_root,
-                total_bytes=root["delta_encoded_bytes"],
-                arena_bytes=arena_bytes,
-                label="page delta",
-            )
-            authenticated = _read_authenticated_page_object(objects[0])
-            prefetched[objects[0].path] = authenticated
-            delta_plan = plan_page_delta(
-                layout,
-                authenticated.payload,
-                base_block_counts=root["base_block_counts"],
-                result_block_counts=root["result_block_counts"],
-                base_boundary_tokens=root["base_committed_tokens"],
-                result_boundary_tokens=root["committed_tokens"],
-                total_bytes=root["delta_encoded_bytes"],
-            )
-            stages_newest_first.append(_CudaPageDeltaStage(delta_plan, objects))
-            if base_root.get("committed_tokens") != root["base_committed_tokens"]:
-                raise CudaHybridRestoreError("page-delta base boundary differs")
+            flat_stages: list[
+                tuple[dict[str, Any], tuple[CudaPageObject, ...]]
+            ] = []
+            for stage in reversed(root["delta_stages"]):
+                objects = _page_objects(
+                    stage["delta_objects"],
+                    cache_root=cache_root,
+                    total_bytes=stage["delta_encoded_bytes"],
+                    arena_bytes=arena_bytes,
+                    label="flat page delta",
+                )
+                flat_stages.append((stage, objects))
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(
+                    _MAX_PAGE_OBJECT_READ_WORKERS,
+                    len(flat_stages),
+                )
+            ) as executor:
+                first_objects = tuple(
+                    executor.map(
+                        _read_authenticated_page_object,
+                        (objects[0] for _stage, objects in flat_stages),
+                    )
+                )
+            for (stage, objects), authenticated in zip(
+                flat_stages,
+                first_objects,
+                strict=True,
+            ):
+                prefetched[objects[0].path] = authenticated
+                delta_plan = plan_page_delta(
+                    layout,
+                    authenticated.payload,
+                    base_block_counts=stage["base_block_counts"],
+                    result_block_counts=stage["result_block_counts"],
+                    base_boundary_tokens=stage["base_committed_tokens"],
+                    result_boundary_tokens=stage["committed_tokens"],
+                    total_bytes=stage["delta_encoded_bytes"],
+                )
+                stages_newest_first.append(
+                    _CudaPageDeltaStage(delta_plan, objects)
+                )
             root_digest = root["base_context_digest"]
             root = base_root
+        else:
+            for depth in range(_MAX_PAGE_DELTA_DEPTH):
+                if not _is_page_delta_root(root):
+                    break
+                if root.get("schema") != _PAGE_DELTA_MANIFEST_SCHEMA:
+                    raise CudaHybridRestoreError(
+                        "page-delta direct restore requires v2 macro objects"
+                    )
+                if root.get("layout_sha256") != layout.digest:
+                    raise CudaHybridRestoreError("page-delta root layout differs")
+                base_root, descriptors = _validate_page_delta_root(
+                    root,
+                    identity=identity,
+                    context_digest=root_digest,
+                )
+                objects = _page_objects(
+                    descriptors,
+                    cache_root=cache_root,
+                    total_bytes=root["delta_encoded_bytes"],
+                    arena_bytes=arena_bytes,
+                    label="page delta",
+                )
+                authenticated = _read_authenticated_page_object(objects[0])
+                prefetched[objects[0].path] = authenticated
+                delta_plan = plan_page_delta(
+                    layout,
+                    authenticated.payload,
+                    base_block_counts=root["base_block_counts"],
+                    result_block_counts=root["result_block_counts"],
+                    base_boundary_tokens=root["base_committed_tokens"],
+                    result_boundary_tokens=root["committed_tokens"],
+                    total_bytes=root["delta_encoded_bytes"],
+                )
+                stages_newest_first.append(
+                    _CudaPageDeltaStage(delta_plan, objects)
+                )
+                if base_root.get("committed_tokens") != root["base_committed_tokens"]:
+                    raise CudaHybridRestoreError(
+                        "page-delta base boundary differs"
+                    )
+                root_digest = root["base_context_digest"]
+                root = base_root
         if _is_page_delta_root(root):
             raise CudaHybridRestoreError("page-delta graph exceeds the depth limit")
         if not _is_page_snapshot_root(root):
@@ -430,7 +488,10 @@ def plan_cuda_page_delta_restore(
         stages = tuple(reversed(stages_newest_first))
         if not stages:
             raise CudaHybridRestoreError("page-delta graph contains no delta")
-        shared_base_used = base_reader is not None and len(stages) == 1
+        shared_base_used = base_reader is not None and (
+            len(stages) == 1
+            or manifest.get("schema") == _PAGE_DELTA_MANIFEST_SCHEMA_V3
+        )
         if shared_base_used:
             evidence = PageBaseReadEvidence(
                 identity_storage_key=identity.storage_key,
@@ -844,7 +905,8 @@ def _plan_page_objects(
             f"flat page root identity was rejected: {error}"
         ) from error
     if (
-        identity.publication_schema not in ("", "page-tail-cow-v1")
+        identity.publication_schema
+        not in ("", "page-tail-cow-v1", "page-tail-cow-v2")
         or identity.required_records
         != frozenset((StateRecord.TARGET_CKV, StateRecord.LOGICAL_POSITIONS))
         or persisted != manifest
@@ -1218,78 +1280,81 @@ def _execute_page_delta_restore(
         encode_page_snapshot_header(layout, plan.page_plan.block_counts)
     )
 
+    # Each submission launches CUDA work asynchronously. Reading and
+    # authenticating the following batch at the top of the next iteration
+    # therefore overlaps the preceding placement. Keep one executor for the
+    # transaction so the bounded read lane does not repeatedly create threads.
+    read_workers = min(max(1, io_workers), _MAX_PAGE_OBJECT_READ_WORKERS)
     with transaction:
-        for batch_index, batch in enumerate(batches):
-            sources: dict[Path, CudaPageObject] = {}
-            for span in batch:
-                sources.setdefault(span.source.path, span.source)
-            loaded: dict[Path, CudaAuthenticatedPageObject] = {
-                path: prefetched[path]
-                for path in sources
-                if path in prefetched
-            }
-            pending = tuple(
-                source for path, source in sources.items() if path not in loaded
-            )
-            if pending:
-                started = time.perf_counter()
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=min(
-                        max(1, io_workers),
-                        _MAX_PAGE_OBJECT_READ_WORKERS,
-                        len(pending),
-                    )
-                ) as read_pool:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=read_workers
+        ) as read_pool:
+            for batch_index, batch in enumerate(batches):
+                sources: dict[Path, CudaPageObject] = {}
+                for span in batch:
+                    sources.setdefault(span.source.path, span.source)
+                loaded: dict[Path, CudaAuthenticatedPageObject] = {
+                    path: prefetched[path]
+                    for path in sources
+                    if path in prefetched
+                }
+                pending = tuple(
+                    source
+                    for path, source in sources.items()
+                    if path not in loaded
+                )
+                if pending:
+                    started = time.perf_counter()
                     authenticated = tuple(
                         read_pool.map(_read_authenticated_page_object, pending)
                     )
-                read_ms += 1e3 * (time.perf_counter() - started)
-                for item in authenticated:
-                    loaded[item.source.path] = item
-                    read_source_bytes += item.source.encoded_bytes
+                    read_ms += 1e3 * (time.perf_counter() - started)
+                    for item in authenticated:
+                        loaded[item.source.path] = item
+                        read_source_bytes += item.source.encoded_bytes
 
-            arena_index = batch_index % cuda.ARENA_COUNT
-            started = time.perf_counter()
-            arena = transaction.acquire_arena(arena_index)
-            arena_wait_ms += 1e3 * (time.perf_counter() - started)
-            used_bytes = sum(span.byte_count for span in batch)
-            arena_buffer = cuda.arena_memoryview(arena, length=used_bytes)
-            native_spans = []
-            arena_offset = 0
-            try:
+                arena_index = batch_index % cuda.ARENA_COUNT
                 started = time.perf_counter()
-                for span in batch:
-                    payload = loaded[span.source.path].payload
-                    payload_view = memoryview(payload)
-                    try:
-                        source_end = span.source_offset_bytes + span.byte_count
-                        arena_buffer[
-                            arena_offset : arena_offset + span.byte_count
-                        ] = payload_view[span.source_offset_bytes:source_end]
-                    finally:
-                        payload_view.release()
-                    native_spans.append(
-                        cuda.PageCopySpan(
-                            arena_offset,
-                            span.snapshot_offset_bytes,
-                            span.destination_byte_offset,
-                            span.byte_count,
-                            span.destination_index,
-                            0,
+                arena = transaction.acquire_arena(arena_index)
+                arena_wait_ms += 1e3 * (time.perf_counter() - started)
+                used_bytes = sum(span.byte_count for span in batch)
+                arena_buffer = cuda.arena_memoryview(arena, length=used_bytes)
+                native_spans = []
+                arena_offset = 0
+                try:
+                    started = time.perf_counter()
+                    for span in batch:
+                        payload = loaded[span.source.path].payload
+                        payload_view = memoryview(payload)
+                        try:
+                            source_end = span.source_offset_bytes + span.byte_count
+                            arena_buffer[
+                                arena_offset : arena_offset + span.byte_count
+                            ] = payload_view[span.source_offset_bytes:source_end]
+                        finally:
+                            payload_view.release()
+                        native_spans.append(
+                            cuda.PageCopySpan(
+                                arena_offset,
+                                span.snapshot_offset_bytes,
+                                span.destination_byte_offset,
+                                span.byte_count,
+                                span.destination_index,
+                                0,
+                            )
                         )
-                    )
-                    arena_offset += span.byte_count
-                host_copy_ms += 1e3 * (time.perf_counter() - started)
-                final_sha256.update(arena_buffer)
-            finally:
-                arena_buffer.release()
-            started = time.perf_counter()
-            transaction.submit_page_slab(
-                arena_index=arena_index,
-                arena_used_bytes=used_bytes,
-                spans=native_spans,
-            )
-            submit_call_ms += 1e3 * (time.perf_counter() - started)
+                        arena_offset += span.byte_count
+                    host_copy_ms += 1e3 * (time.perf_counter() - started)
+                    final_sha256.update(arena_buffer)
+                finally:
+                    arena_buffer.release()
+                started = time.perf_counter()
+                transaction.submit_page_slab(
+                    arena_index=arena_index,
+                    arena_used_bytes=used_bytes,
+                    spans=native_spans,
+                )
+                submit_call_ms += 1e3 * (time.perf_counter() - started)
         if final_sha256.hexdigest() != plan.result_snapshot_sha256:
             raise CudaHybridRestoreError(
                 "page-delta reconstructed snapshot checksum mismatch"
@@ -1358,7 +1423,8 @@ def execute_cuda_hybrid_restore(
 
     manifest = getattr(lookup, "_manifest", None)
     if isinstance(manifest, dict) and (
-        manifest.get("schema") == _PAGE_DELTA_MANIFEST_SCHEMA
+        manifest.get("schema")
+        in (_PAGE_DELTA_MANIFEST_SCHEMA, _PAGE_DELTA_MANIFEST_SCHEMA_V3)
     ):
         return _execute_page_delta_restore(
             adapter=adapter,

@@ -59,6 +59,11 @@ The BF16 draft is distinct from Local Inference Lab's
   records byte-exact 98,304-to-131,072-token page-tail publication, restart
   restore, corruption rejection, valid-base fallback, and repaired restore on
   the GLM-5.3 Flash TP4/DCP4 deployment identified inside the receipt.
+- [`page-tail-cow-v2/qualification.json`](../../evidence/glm53-flash-dcp4-page-tail-v2/qualification.json)
+  records direct sparse page capture, flat authenticated delta stages,
+  byte-exact chained growth and restart restore, corruption rejection, and a
+  concurrent-serving interference measurement for its source-bound TP4/DCP4
+  artifact.
 - [`GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md`](../../GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md)
   records source-bound SparkCache CUDA placement and shared-prefix evidence.
 - [`GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md`](../../GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md)

@@ -87,6 +87,7 @@ from sparkcache.spark_context_cache_hybrid import (
     PageLayout,
     decode_page_snapshot,
     encode_page_snapshot,
+    materialize_page_extension_capture,
     plan_page_snapshot,
     split_snapshot,
 )
@@ -636,6 +637,38 @@ class SparkCacheStats(KVConnectorStats):
             }
             reduced.update({key: value for key, value in failures.items() if value})
         return reduced
+
+    def format_log_lines(self) -> tuple[str, ...]:
+        """Return short human-readable summaries without dropping raw metrics."""
+
+        reduced = self.reduce()
+
+        def byte_count(name: str) -> str:
+            value = int(reduced.get(name, 0))
+            for suffix, unit in (("GiB", 1024**3), ("MiB", 1024**2)):
+                if value >= unit:
+                    return f"{value / unit:.1f}{suffix}"
+            return f"{value}B"
+
+        lines = [
+            "sparkcache: capacity"
+            f" ranks={int(reduced.get('sparkcache_ranks', 0))}"
+            f" entries={int(reduced.get('sparkcache_entries', 0))}"
+            f" used={float(reduced.get('sparkcache_used_gib', 0.0)):.1f}/"
+            f"{float(reduced.get('sparkcache_limit_gib', 0.0)):.1f}GiB"
+            " healthy="
+            + ("yes" if int(reduced.get("sparkcache_healthy", 0)) else "no"),
+            "sparkcache: publications"
+            f" count={int(reduced.get('sparkcache_publications', 0))}"
+            f" payload={byte_count('sparkcache_payload_bytes')}"
+            f" unique={byte_count('sparkcache_unique_bytes')}",
+            "sparkcache: writes"
+            f" staged={byte_count('sparkcache_staged_bytes')}"
+            f" dedup={byte_count('sparkcache_dedup_bytes')}"
+            f" aborted={byte_count('sparkcache_aborted_bytes')}"
+            f" failed={byte_count('sparkcache_failed_bytes')}",
+        ]
+        return tuple(lines)
 
     def is_empty(self) -> bool:
         return not self.data.get("reports")
@@ -4883,14 +4916,69 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 raise HybridCodecError(
                     "native capture block counts disagree with the store plan"
                 )
-            header = getattr(encoded_pages, "header_bytes", encoded_pages)
-            total_bytes = getattr(encoded_pages, "total_bytes", None)
-            plan_page_snapshot(
-                layout,
-                header,
-                block_counts,
-                total_bytes=total_bytes,
+            reused_pages = getattr(
+                encoded_pages, "reused_pages_by_group", None
             )
+            if reused_pages is None:
+                header = getattr(encoded_pages, "header_bytes", encoded_pages)
+                total_bytes = getattr(encoded_pages, "total_bytes", None)
+                plan_page_snapshot(
+                    layout,
+                    header,
+                    block_counts,
+                    total_bytes=total_bytes,
+                )
+            else:
+                from sparkcache.streaming.manager_page_capture import (
+                    select_manager_page_extension_pages,
+                )
+
+                if not plan.base_context_digest or plan.base_span_tokens <= 0:
+                    raise HybridCodecError(
+                        "native page extension has no authenticated base"
+                    )
+                _, _, selected_counts, expected_reused = (
+                    select_manager_page_extension_pages(
+                        expected_groups,
+                        base_page_counts=self._group_block_counts_for_span(
+                            plan.base_span_tokens
+                        ),
+                        logical_tokens_per_page=tuple(
+                            int(group["logical_tokens_per_block"])
+                            for group in self._group_topology
+                        ),
+                        reuse_policies=tuple(
+                            str(group["reuse_policy"])
+                            for group in self._group_topology
+                        ),
+                        base_boundary_tokens=plan.base_span_tokens,
+                    )
+                )
+                if (
+                    tuple(reused_pages) != expected_reused
+                    or selected_counts != expected_counts
+                    or tuple(
+                        getattr(encoded_pages, "result_block_counts", ())
+                    )
+                    != expected_counts
+                ):
+                    raise HybridCodecError(
+                        "native page extension geometry disagrees with the store plan"
+                    )
+                expected_bytes = sum(
+                    (count - reused) * layer.bytes_per_page
+                    for group, count, reused in zip(
+                        layout.groups,
+                        expected_counts,
+                        expected_reused,
+                        strict=True,
+                    )
+                    for layer in group.layers
+                )
+                if getattr(encoded_pages, "total_bytes", None) != expected_bytes:
+                    raise HybridCodecError(
+                        "native page extension payload length differs"
+                    )
             snapshot = _HybridStoreSnapshot(
                 plan=plan,
                 rank=self._worker_rank(),
@@ -4962,6 +5050,40 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     layout = self._page_layout
                     if layout is None:
                         raise RuntimeError("block-page layout was not registered")
+                    result_snapshot = snapshot.encoded_pages
+                    verified_base_snapshot = None
+                    reused_pages = getattr(
+                        result_snapshot, "reused_pages_by_group", None
+                    )
+                    if reused_pages is not None:
+                        base = self._store.lookup(
+                            snapshot.identity,
+                            snapshot.plan.base_context_digest,
+                            verify_chunks=True,
+                        )
+                        if not base.is_hit:
+                            raise RuntimeError(
+                                f"page extension base is unavailable: {base.reason}"
+                            )
+                        base_counts = self._group_block_counts_for_span(
+                            snapshot.plan.base_span_tokens
+                        )
+                        base_snapshot = self._store.restore_page_snapshot(
+                            base,
+                            layout=layout,
+                            result_block_counts=base_counts,
+                            result_boundary_tokens=snapshot.plan.base_span_tokens,
+                        )
+                        if self._publication_schema != "page-tail-cow-v2":
+                            result_snapshot = materialize_page_extension_capture(
+                                layout,
+                                base_snapshot,
+                                result_snapshot,
+                                base_block_counts=base_counts,
+                                result_block_counts=snapshot.block_counts,
+                                reused_pages_by_group=reused_pages,
+                            )
+                        verified_base_snapshot = base_snapshot
                     try:
                         receipt = self._store.commit_page_extension(
                             identity=snapshot.identity,
@@ -4975,7 +5097,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                             result_block_counts=snapshot.block_counts,
                             base_boundary_tokens=snapshot.plan.base_span_tokens,
                             result_boundary_tokens=snapshot.plan.span_tokens,
-                            result_snapshot=snapshot.encoded_pages,
+                            result_snapshot=result_snapshot,
+                            verified_base_snapshot=verified_base_snapshot,
                         )
                     except PageDeltaDepthExceeded:
                         receipt = self._store.commit_page_snapshot(

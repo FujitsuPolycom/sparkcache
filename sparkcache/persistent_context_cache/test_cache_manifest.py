@@ -23,7 +23,6 @@ from sparkcache.persistent_context_cache.cache_manifest import (
     ContextChunk,
     IncompleteEntry,
     ManifestStore,
-    PageDeltaDepthExceeded,
     StateRecord,
 )
 
@@ -507,7 +506,7 @@ class ManifestStoreTests(unittest.TestCase):
         identity = dataclasses.replace(
             _identity(),
             record_schema=("target_ckv", "logical_positions"),
-            publication_schema="page-tail-cow-v1",
+            publication_schema="page-tail-cow-v2",
         )
         layout = PageLayout(
             (PageGroup(256, (PageLayer("page", "u8", (1024,), 1024),)),)
@@ -517,6 +516,7 @@ class ManifestStoreTests(unittest.TestCase):
         base_digest = context_prefix_digest(tokens, salt, token_count=256)
         result_digest = context_prefix_digest(tokens, salt, token_count=512)
         third_digest = context_prefix_digest(tokens, salt, token_count=768)
+        fourth_digest = context_prefix_digest(tokens, salt, token_count=1024)
         base_snapshot = encode_page_snapshot(layout, (1,), {"page": b"A" * 1024})
         result_snapshot = encode_page_snapshot(
             layout,
@@ -576,7 +576,7 @@ class ManifestStoreTests(unittest.TestCase):
                 page_root_path,
                 *(
                     root / "chunks" / f"{item['sha256']}.spcc"
-                    for item in page_root["delta_objects"]
+                    for item in page_root["delta_stages"][-1]["delta_objects"]
                 ),
             ]
             self.assertGreaterEqual(
@@ -606,7 +606,7 @@ class ManifestStoreTests(unittest.TestCase):
                 chained_root_path,
                 *(
                     root / "chunks" / f"{item['sha256']}.spcc"
-                    for item in chained_root["delta_objects"]
+                    for item in chained_root["delta_stages"][-1]["delta_objects"]
                 ),
             ]
             self.assertGreaterEqual(
@@ -616,7 +616,18 @@ class ManifestStoreTests(unittest.TestCase):
                     for path in chained_objects
                 ),
             )
-            with self.assertRaises(PageDeltaDepthExceeded):
+            third_lookup = store.lookup(identity, third_digest)
+            prepared_base = store.restore_page_snapshot(
+                third_lookup,
+                layout=layout,
+                result_block_counts=(3,),
+                result_boundary_tokens=768,
+            )
+            with mock.patch.object(
+                store,
+                "restore_page_snapshot",
+                side_effect=AssertionError("prepared base was read again"),
+            ):
                 store.commit_page_extension(
                     identity=identity,
                     base_context_digest=third_digest,
@@ -628,7 +639,45 @@ class ManifestStoreTests(unittest.TestCase):
                     base_boundary_tokens=768,
                     result_boundary_tokens=1024,
                     result_snapshot=fourth_snapshot,
+                    verified_base_snapshot=prepared_base,
                 )
+            flattened = store.lookup(identity, fourth_digest)
+            self.assertTrue(flattened.is_hit, flattened.reason)
+            self.assertEqual(flattened.root_kind, "page_delta")
+            self.assertEqual(
+                flattened._manifest["schema"],  # type: ignore[index]
+                "sparkcache-page-delta-manifest/v3",
+            )
+            self.assertEqual(
+                len(flattened._manifest["delta_stages"]),  # type: ignore[index]
+                3,
+            )
+            self.assertEqual(
+                flattened._manifest["base_context_digest"],  # type: ignore[index]
+                base_digest,
+            )
+            self.assertEqual(
+                store.restore_page_snapshot(
+                    flattened,
+                    layout=layout,
+                    result_block_counts=(4,),
+                    result_boundary_tokens=1024,
+                ),
+                fourth_snapshot,
+            )
+            corrupted_descriptor = flattened._manifest["delta_stages"][1][  # type: ignore[index]
+                "delta_objects"
+            ][0]
+            corrupted_path = (
+                root / "chunks" / f"{corrupted_descriptor['sha256']}.spcc"
+            )
+            original = corrupted_path.read_bytes()
+            corrupted_path.write_bytes(bytes((original[0] ^ 0xFF,)) + original[1:])
+            rejected = store.lookup(identity, fourth_digest)
+            self.assertFalse(rejected.is_hit)
+            self.assertEqual(rejected.reason, "corrupt")
+            corrupted_path.write_bytes(original)
+            self.assertTrue(store.lookup(identity, fourth_digest).is_hit)
             (root / "manifests" / identity.storage_key / f"{base_digest}.json").unlink()
             (
                 root / "manifests" / identity.storage_key / f"{result_digest}.json"

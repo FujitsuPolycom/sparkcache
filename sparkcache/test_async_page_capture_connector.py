@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import threading
+import tempfile
 import types
 from collections import Counter
+from pathlib import Path
+
+import torch
 
 import sparkcache.test_spark_context_cache_connector  # noqa: F401
 
@@ -11,6 +15,8 @@ from sparkcache.spark_context_cache_connector import (
     SparkContextCacheConnector,
     _ReqPlan,
 )
+from sparkcache.test_spark_context_cache_connector import _make_connector
+from sparkcache.streaming.manager_page_runtime import ManagerPageCaptureRuntime
 
 
 class FakeRuntime:
@@ -31,6 +37,37 @@ class FakeRuntime:
 
     def take_finished(self, finished_req_ids: set[str]) -> set[str]:
         return self.finished & finished_req_ids
+
+
+class FakeSparseRing:
+    def __init__(self, payload: bytes) -> None:
+        self.payload = memoryview(payload)
+        self.ready = threading.Event()
+        self.active: set[int] = set()
+
+    @property
+    def active_ticket_count(self) -> int:
+        return len(self.active)
+
+    def submit(self, **kwargs):
+        sequence = kwargs["context_sequence"]
+        self.active.add(sequence)
+        return types.SimpleNamespace(context_sequence=sequence)
+
+    def poll(self, ticket):
+        return types.SimpleNamespace(payload=self.payload) if self.ready.is_set() else None
+
+    def claim(self, ticket):
+        return types.SimpleNamespace(payload=self.payload)
+
+    def release(self, ticket) -> None:
+        self.active.discard(ticket.context_sequence)
+
+    def drain_context(self, context_sequence: int) -> None:
+        self.active.discard(context_sequence)
+
+    def shutdown(self) -> None:
+        return None
 
 
 def _connector(plan: _ReqPlan, runtime: FakeRuntime) -> SparkContextCacheConnector:
@@ -153,3 +190,225 @@ def test_submission_error_releases_delayed_free_ownership(monkeypatch) -> None:
 
     assert runtime.preempted == ["request"]
     assert connector._store_inflight == 0
+
+
+def test_async_full_page_capture_publishes_authenticated_page_delta() -> None:
+    class FullAttentionSpec:
+        block_size = 256
+        storage_block_size = 256
+        page_size_bytes = 8
+
+    class MambaSpec:
+        block_size = 256
+        storage_block_size = 256
+        page_size_bytes = 8
+        mamba_cache_mode = "align"
+        tokens_per_state = 256
+        num_speculative_blocks = 0
+        num_prefill_checkpoint_blocks = 1
+
+    cache_config = types.SimpleNamespace(
+        num_blocks=10,
+        kv_cache_groups=(
+            types.SimpleNamespace(
+                kv_cache_spec=FullAttentionSpec(),
+                is_eagle_group=False,
+                layer_names=("full",),
+            ),
+            types.SimpleNamespace(
+                kv_cache_spec=MambaSpec(),
+                is_eagle_group=False,
+                layer_names=("state",),
+            ),
+        ),
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        connector = _make_connector(
+            Path(directory),
+            0,
+            extra_config={
+                "spark_cache_model_profile": "deepseek-v4-fp8-hma",
+                "spark_cache_publication_schema": "tail-cow-v1",
+            },
+            tp=1,
+            dcp=1,
+            kv_cache_config=cache_config,
+        )
+        connector.register_kv_caches(
+            {
+                "full": torch.arange(80, dtype=torch.uint8).reshape(10, 1, 8),
+                "state": torch.arange(80, dtype=torch.uint8).reshape(10, 1, 8),
+            }
+        )
+        tokens = tuple(range(512))
+        base_digest = connector._digest(list(tokens), 256)
+        connector._store_one(
+            _ReqPlan(
+                "base",
+                base_digest,
+                256,
+                (3,),
+                True,
+                block_ids_by_group=((3,), (4,)),
+                token_ids=tokens[:256],
+            )
+        )
+        extension = _ReqPlan(
+            "extension",
+            connector._digest(list(tokens), 512),
+            512,
+            (3, 5),
+            True,
+            block_ids_by_group=((3, 5), (0, 7)),
+            token_ids=tokens,
+            base_context_digest=base_digest,
+            base_span_tokens=256,
+            recurrent_boundary_blocks=((1, 7),),
+        )
+        captured = connector._snapshot_hybrid_store(extension)
+
+        connector._store_inflight = 1
+        connector._complete_async_page_capture(
+            extension,
+            captured.encoded_pages,
+            captured.block_counts,
+        )
+        assert connector.wait_for_pending_stores(timeout=5)
+
+        lookup = connector._store.lookup(
+            connector._identity(0), extension.digest
+        )
+        assert lookup.is_hit, lookup.reason
+        assert lookup.root_kind == "page_delta"
+        restored = connector._store.restore_page_snapshot(
+            lookup,
+            layout=connector._page_layout,
+            result_block_counts=captured.block_counts,
+            result_boundary_tokens=extension.span_tokens,
+        )
+        assert restored == captured.encoded_pages
+        connector.shutdown()
+
+
+def test_sparse_async_capture_publishes_restorable_page_delta(monkeypatch) -> None:
+    class FullAttentionSpec:
+        block_size = 256
+        storage_block_size = 256
+        page_size_bytes = 8
+
+    class MambaSpec:
+        block_size = 256
+        storage_block_size = 256
+        page_size_bytes = 8
+        mamba_cache_mode = "align"
+        tokens_per_state = 256
+        num_speculative_blocks = 0
+        num_prefill_checkpoint_blocks = 1
+
+    cache_config = types.SimpleNamespace(
+        num_blocks=10,
+        kv_cache_groups=(
+            types.SimpleNamespace(
+                kv_cache_spec=FullAttentionSpec(),
+                is_eagle_group=False,
+                layer_names=("full",),
+            ),
+            types.SimpleNamespace(
+                kv_cache_spec=MambaSpec(),
+                is_eagle_group=False,
+                layer_names=("state",),
+            ),
+        ),
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        connector = _make_connector(
+            Path(directory),
+            0,
+            extra_config={
+                "spark_cache_model_profile": "deepseek-v4-fp8-hma",
+                "spark_cache_publication_schema": "tail-cow-v2",
+            },
+            tp=1,
+            dcp=1,
+            kv_cache_config=cache_config,
+        )
+        connector.register_kv_caches(
+            {
+                "full": torch.arange(80, dtype=torch.uint8).reshape(10, 1, 8),
+                "state": torch.arange(80, dtype=torch.uint8).reshape(10, 1, 8),
+            }
+        )
+        tokens = tuple(range(512))
+        base_digest = connector._digest(list(tokens), 256)
+        connector._store_one(
+            _ReqPlan(
+                "base",
+                base_digest,
+                256,
+                (3,),
+                True,
+                block_ids_by_group=((3,), (4,)),
+                token_ids=tokens[:256],
+            )
+        )
+        extension = _ReqPlan(
+            "sparse-extension",
+            connector._digest(list(tokens), 512),
+            512,
+            (3, 5),
+            True,
+            block_ids_by_group=((3, 5), (0, 7)),
+            token_ids=tokens,
+            base_context_digest=base_digest,
+            base_span_tokens=256,
+            recurrent_boundary_blocks=((1, 7),),
+        )
+        expected = connector._snapshot_hybrid_store(extension)
+        ring = FakeSparseRing(bytes(range(40, 48)) + bytes(range(56, 64)))
+        runtime = ManagerPageCaptureRuntime(
+            connector,
+            ring=ring,
+            progress_poll_seconds=0.001,
+            progress_thread_initializer=lambda: None,
+        )
+        connector._store_inflight = 1
+        restore_calls = 0
+        restore_page_snapshot = connector._store.restore_page_snapshot
+
+        def counted_restore(*args, **kwargs):
+            nonlocal restore_calls
+            restore_calls += 1
+            return restore_page_snapshot(*args, **kwargs)
+
+        connector._store.restore_page_snapshot = counted_restore
+        monkeypatch.setattr(
+            "sparkcache.spark_context_cache_connector."
+            "materialize_page_extension_capture",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("sparse capture was materialized")
+            ),
+        )
+
+        assert runtime.submit(extension, producer_stream=91)
+        ring.ready.set()
+        assert runtime.wait_idle(timeout=1)
+        assert connector.wait_for_pending_stores(timeout=5)
+
+        lookup = connector._store.lookup(
+            connector._identity(0), extension.digest
+        )
+        assert lookup.is_hit, lookup.reason
+        assert lookup.root_kind == "page_delta"
+        restored = connector._store.restore_page_snapshot(
+            lookup,
+            layout=connector._page_layout,
+            result_block_counts=expected.block_counts,
+            result_boundary_tokens=extension.span_tokens,
+        )
+        assert restored == expected.encoded_pages
+        # One reconstruction read during publication, followed by the test's
+        # result-delta and embedded-base restore calls. The commit path must
+        # not read the already verified base a second time.
+        assert restore_calls == 3
+        runtime.shutdown()
+        connector.shutdown()

@@ -6776,6 +6776,46 @@ class QuorumStatsAggregationTests(unittest.TestCase):
         self.assertEqual(reduced["sparkcache_publication_aborted"], 1)
         self.assertNotIn("sparkcache_publication_failed", reduced)
 
+    def test_aggregate_log_summary_is_split_by_operator_concern(self) -> None:
+        cls = connector_module.SparkCacheStats
+        stats = cls(
+            data={
+                "reports": [
+                    {
+                        "rank": rank,
+                        "held_count": 3,
+                        "capacity": {
+                            "bytes": 300 * 1024**2,
+                            "max_bytes": 40 * 1024**3,
+                            "capacity_satisfied": True,
+                        },
+                        "publication": {
+                            "committed_publications": 3,
+                            "logical_payload_bytes": 300 * 1024**2,
+                            "committed_unique_object_bytes": 300 * 1024**2,
+                            "staged_write_bytes": 300 * 1024**2,
+                            "deduplicated_bytes": 0,
+                            "aborted_staged_write_bytes": 0,
+                            "failed_staged_write_bytes": 0,
+                        },
+                    }
+                    for rank in range(4)
+                ]
+            }
+        )
+
+        self.assertEqual(
+            stats.format_log_lines(),
+            (
+                "sparkcache: capacity ranks=4 entries=12 "
+                "used=1.2/160.0GiB healthy=yes",
+                "sparkcache: publications count=12 payload=1.2GiB "
+                "unique=1.2GiB",
+                "sparkcache: writes staged=1.2GiB dedup=0B "
+                "aborted=0B failed=0B",
+            ),
+        )
+
     def test_later_report_replaces_same_rank(self) -> None:
         cls = connector_module.SparkCacheStats
         acc = cls(
