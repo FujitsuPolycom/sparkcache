@@ -62,6 +62,7 @@ from vllm.logger import init_logger
 from sparkcache.spark_context_cache_codec import (
     CHUNK_TOKENS,
     CodecError,
+    MultimodalFeatureIdentity,
     build_layer_plans,
     chunk_prefix_digests,
     chunk_count,
@@ -73,6 +74,7 @@ from sparkcache.spark_context_cache_codec import (
     pack_record,
     unpack_positions,
     unpack_record,
+    validate_multimodal_features,
 )
 from sparkcache.spark_context_cache_config import (
     SHA256_RE,
@@ -138,6 +140,7 @@ _MAX_PAGE_BASE_READ_FLIGHTS = 2
 _MAX_PAGE_BASE_READ_MEMBERS = 16
 _MAX_PAGE_BASE_BYTES_PER_FLIGHT = 1024**3
 _MAX_PAGE_BASE_BYTES_TOTAL = 2 * 1024**3
+_CONTEXT_DIGEST_NAMESPACE = "sparkcache-context-v2-multimodal"
 
 # The runtime is deliberately supplied by the embedding process instead of
 # importing or constructing the optional streaming-snapshot runtime here.
@@ -237,6 +240,10 @@ class _ReqPlan:
     # descriptors of this plan.  Workers validate these roots before the
     # leader's blocks may back a shorter shared-prefix lease.
     shared_segments: tuple[tuple[str, int], ...] = ()
+    # True when digest includes a media content identity. Token-only prefix
+    # alias and tail derivation cannot reproduce that identity and must not
+    # publish alternative keys for this plan.
+    has_multimodal_identity: bool = False
 
     @property
     def group_block_ids(self) -> tuple[tuple[int, ...], ...]:
@@ -634,6 +641,43 @@ class SparkCacheStats(KVConnectorStats):
         return not self.data.get("reports")
 
 
+def _multimodal_feature_identities(
+    request: object,
+    token_count: int,
+) -> tuple[MultimodalFeatureIdentity, ...] | None:
+    """Extract complete vLLM media identity, or None when it is unprovable.
+
+    Current vLLM request and scheduler-transfer objects retain each feature's
+    content identifier and placeholder range even when its tensor data is
+    stripped after a local prefix-cache hit. Older ``mm_hashes``-only objects
+    do not expose enough placeholder geometry for prefix-stable digests.
+    """
+
+    raw_features = getattr(request, "mm_features", None)
+    if raw_features is not None:
+        try:
+            raw_features = tuple(raw_features)
+        except TypeError:
+            return None
+    if raw_features:
+        try:
+            features = tuple(
+                MultimodalFeatureIdentity(
+                    modality=feature.modality,
+                    identifier=feature.identifier,
+                    offset=feature.mm_position.offset,
+                    length=feature.mm_position.length,
+                )
+                for feature in raw_features
+            )
+            return validate_multimodal_features(features, token_count)
+        except (AttributeError, CodecError, TypeError):
+            return None
+    if getattr(request, "mm_hashes", None):
+        return None
+    return ()
+
+
 class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     """Store/restore each rank's DCP shard on rank-local NVMe."""
 
@@ -781,7 +825,14 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._native_arena_bytes = config.native_arena_bytes
         self._native_io_workers = config.native_io_workers
         self._identity_base = config.identity_base
-        self._context_digest_salt = config.build_identity(0, 0).storage_key
+        # The namespace change cleanly misses legacy token-only digests, which
+        # cannot reveal whether their KV bytes came from multimodal embeddings.
+        # Without this one-time rollover, a text request could still select an
+        # unsafe multimodal entry published before media identity was bound.
+        self._context_digest_salt = (
+            f"{_CONTEXT_DIGEST_NAMESPACE}:"
+            f"{config.build_identity(0, 0).storage_key}"
+        )
         self._scheduler_probe = config.scheduler_probe
         self._shard_rank = 0
         self._capacity_estimated_bytes = 0
@@ -915,6 +966,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         # Kept separate from the long-standing progress tuple so scheduler
         # checkpoint/test adapters that seed that tuple remain compatible.
         self._store_token_ids: dict[str, tuple[int, ...]] = {}
+        self._store_multimodal: set[str] = set()
         self._store_bases: dict[str, tuple[str, int]] = {}
         self._store_recurrent_boundaries: dict[str, tuple[tuple[int, int], ...]] = {}
         self.counters: dict[str, int] = {
@@ -924,6 +976,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             "store_skipped_busy": 0,
             "store_skipped_present": 0,
             "store_skipped_quorum": 0,
+            "multimodal_bypass": 0,
             "page_delta_compactions": 0,
             "recurrent_boundary_metadata_rejected": 0,
             "prefix_alias_publication_attempted": 0,
@@ -1068,7 +1121,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             )
         return self._config.build_identity(shard_rank, tp_shard_rank)
 
-    def _digest(self, token_ids: list[int], span: int) -> str:
+    def _digest(
+        self,
+        token_ids: list[int],
+        span: int,
+        multimodal_features: Sequence[MultimodalFeatureIdentity] = (),
+    ) -> str:
         # The salt must be identical on every role and rank: it names the
         # shared context, not this process's shard. Pin both shard fields to
         # zero at construction rather than letting the worker role substitute
@@ -1077,16 +1135,22 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             token_ids,
             self._context_digest_salt,
             token_count=span,
+            multimodal_features=multimodal_features,
         )
 
     def _publication_base(
         self,
         token_ids: Sequence[int],
         span_tokens: int,
+        multimodal_features: Sequence[MultimodalFeatureIdentity] = (),
     ) -> tuple[str, int]:
         """Select the longest all-rank prefix eligible for tail publication."""
 
         if not self._publication_schema:
+            return "", 0
+        if any(feature.offset < span_tokens for feature in multimodal_features):
+            # ManifestStore's extension proof derives token-only digests. An
+            # exact multimodal snapshot is safe; a derived key is not.
             return "", 0
         first = (
             (self._min_span + self._chunk_tokens - 1) // self._chunk_tokens
@@ -1097,6 +1161,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             token_ids,
             self._context_digest_salt,
             boundaries=range(first, span_tokens, self._chunk_tokens),
+            multimodal_features=multimodal_features,
         )
         selected = next(
             (
@@ -1518,6 +1583,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             return None
 
         token_ids = list(request.prompt_token_ids or [])
+        multimodal_features = _multimodal_feature_identities(
+            request,
+            len(token_ids),
+        )
+        if multimodal_features is None:
+            self.counters["multimodal_bypass"] += 1
+            return None
         aligned_span = self._aligned_span(len(token_ids))
         span_ceiling = min(
             aligned_span,
@@ -1537,6 +1609,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 span_ceiling + 1,
                 self._chunk_tokens,
             ),
+            multimodal_features=multimodal_features,
         )
         selected = next(
             (
@@ -1607,6 +1680,16 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> tuple[int | None, bool]:
         if not self._restore_enabled:
             return 0, False
+        token_ids = list(request.prompt_token_ids or [])
+        multimodal_features = _multimodal_feature_identities(
+            request,
+            len(token_ids),
+        )
+        if multimodal_features is None:
+            # Missing content identity or placeholder geometry cannot prove
+            # which media produced the KV state. Recompute without caching.
+            self.counters["multimodal_bypass"] += 1
+            return 0, False
         request_id = request.request_id
         follower_digest = self._restore_flight_followers.get(request_id)
         if follower_digest is not None:
@@ -1643,7 +1726,6 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     return flight.span_tokens - num_computed_tokens, True
                 self._need_load.pop(request_id, None)
                 self._retire_restore_flight(leader_digest, outcome="cancelled")
-        token_ids = list(request.prompt_token_ids or [])
         aligned_span = self._aligned_span(len(token_ids))
         span_ceiling = min(
             aligned_span,
@@ -1671,6 +1753,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 span_ceiling + 1,
                 self._chunk_tokens,
             ),
+            multimodal_features=multimodal_features,
         )
         selected = next(
             (
@@ -1942,14 +2025,30 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             token_ids = list(new_req.prompt_token_ids or [])
             req_id = new_req.req_id
             self._need_load.pop(req_id, None)
+            multimodal_features = _multimodal_feature_identities(
+                new_req,
+                len(token_ids),
+            )
+            if multimodal_features is None:
+                # Publication without a complete media content/range identity
+                # would recreate the token-placeholder alias.
+                self.counters["multimodal_bypass"] += 1
+                continue
             scheduled = scheduler_output.num_scheduled_tokens.get(req_id, 0)
             group_blocks = self._normalize_group_blocks(new_req.block_ids)
             block_ids = group_blocks[0]
             span = self._aligned_span(len(token_ids))
             if self._store_enabled and self._min_span <= span <= self._max_span:
-                digest = self._digest(token_ids, span)
+                has_multimodal_identity = any(
+                    feature.offset < span for feature in multimodal_features
+                )
+                digest = self._digest(token_ids, span, multimodal_features)
                 exact_token_ids = tuple(token_ids[:span])
-                base_digest, base_span = self._publication_base(token_ids, span)
+                base_digest, base_span = self._publication_base(
+                    token_ids,
+                    span,
+                    multimodal_features,
+                )
                 admitted = self._admitted.get(req_id)
                 if admitted is not None and admitted[0] == digest:
                     # The restored entry already exists on every rank. A
@@ -1981,6 +2080,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                             [list(group) for group in group_blocks],
                         )
                         self._store_token_ids[req_id] = exact_token_ids
+                        if has_multimodal_identity:
+                            self._store_multimodal.add(req_id)
                 elif self._recurrent_group_indexes:
                     recurrent_boundary_blocks = (
                         self._validated_recurrent_boundary_blocks(
@@ -2003,6 +2104,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         [list(group) for group in group_blocks],
                     )
                     self._store_token_ids[req_id] = exact_token_ids
+                    if has_multimodal_identity:
+                        self._store_multimodal.add(req_id)
                     if recurrent_boundary_blocks:
                         self._store_recurrent_boundaries[req_id] = (
                             recurrent_boundary_blocks
@@ -2021,6 +2124,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                             token_ids=exact_token_ids,
                             base_context_digest=base_digest,
                             base_span_tokens=base_span,
+                            has_multimodal_identity=has_multimodal_identity,
                         )
                     )
                 else:
@@ -2034,6 +2138,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         [list(group) for group in group_blocks],
                     )
                     self._store_token_ids[req_id] = exact_token_ids
+                    if has_multimodal_identity:
+                        self._store_multimodal.add(req_id)
                     if base_digest:
                         self._store_bases[req_id] = (base_digest, base_span)
         cached = scheduler_output.scheduled_cached_reqs
@@ -2042,10 +2148,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 continue
             digest, span, done, blocks_by_group = self._store_progress[req_id]
             exact_token_ids = self._store_token_ids.get(req_id, ())
+            has_multimodal_identity = req_id in self._store_multimodal
             base_digest, base_span = self._store_bases.get(req_id, ("", 0))
             if self._has_full_quorum(digest):
                 del self._store_progress[req_id]
                 self._store_token_ids.pop(req_id, None)
+                self._store_multimodal.discard(req_id)
                 self._store_bases.pop(req_id, None)
                 self._store_recurrent_boundaries.pop(req_id, None)
                 self.counters["store_skipped_quorum"] += 1
@@ -2059,6 +2167,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             if recurrent_boundary_blocks is None:
                 del self._store_progress[req_id]
                 self._store_token_ids.pop(req_id, None)
+                self._store_multimodal.discard(req_id)
                 self._store_bases.pop(req_id, None)
                 self._store_recurrent_boundaries.pop(req_id, None)
                 continue
@@ -2097,6 +2206,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 if done >= span:
                     del self._store_progress[req_id]
                     self._store_token_ids.pop(req_id, None)
+                    self._store_multimodal.discard(req_id)
                     self._store_bases.pop(req_id, None)
                     self._store_recurrent_boundaries.pop(req_id, None)
                     if self._has_full_quorum(digest):
@@ -2126,7 +2236,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         blocks_by_group,
                     )
                     continue
-                if exact_token_ids:
+                if exact_token_ids and not has_multimodal_identity:
                     # A durable worker commit can finish while the scheduler is
                     # idle. Its first quorum report then returns only after the
                     # next request has begun prefill, which is too late for the
@@ -2138,6 +2248,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     )
                 del self._store_progress[req_id]
                 self._store_token_ids.pop(req_id, None)
+                self._store_multimodal.discard(req_id)
                 self._store_bases.pop(req_id, None)
                 self._store_recurrent_boundaries.pop(req_id, None)
                 normalized = tuple(tuple(group) for group in blocks_by_group)
@@ -2153,6 +2264,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         base_context_digest=base_digest,
                         base_span_tokens=base_span,
                         recurrent_boundary_blocks=recurrent_boundary_blocks,
+                        has_multimodal_identity=has_multimodal_identity,
                     )
                 )
             else:
@@ -4390,6 +4502,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._admitted.pop(request_id, None)
         self._store_progress.pop(request_id, None)
         self._store_token_ids.pop(request_id, None)
+        store_multimodal = getattr(self, "_store_multimodal", None)
+        if store_multimodal is not None:
+            store_multimodal.discard(request_id)
         self._store_bases.pop(request_id, None)
         self._store_recurrent_boundaries.pop(request_id, None)
         runtime = self._streaming_runtime
@@ -4957,6 +5072,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self._storage_mode != "per_token_rows"
             or self._streaming_snapshots_enabled
             or not plan.token_ids
+            or plan.has_multimodal_identity
         ):
             return set()
         self.counters["prefix_alias_publication_attempted"] += 1
