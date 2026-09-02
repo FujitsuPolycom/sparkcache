@@ -2165,16 +2165,28 @@ if __name__ == "__main__":
 
 
 class DefectD19MultimodalPromptAliasingTests(unittest.TestCase):
-    """Multimodal prompts bypass token-identity publication and restore.
+    """Multimodal prompts bind persistent identity to their media content.
 
     vLLM replaces each image or video with a run of identical placeholder token
     ids, so two prompts carrying different media in the same layout have equal
-    ``prompt_token_ids``. The exact-context digest hashes token ids only, so a
-    published multimodal entry would be restored for any other prompt with the
-    same layout and serve the wrong media's KV state. Requests that carry
-    ``mm_features`` must therefore neither publish nor restore by digest; a
-    text-only request with an empty ``mm_features`` list keeps both paths.
+    ``prompt_token_ids``. SparkCache digests must also bind each overlapping
+    feature's content identifier, modality, and placeholder range. Identical
+    media may reuse a persistent entry; different or unprovable media must miss.
     """
+
+    @staticmethod
+    def _feature(
+        identifier: object = "image-red",
+        *,
+        modality: object = "image",
+        offset: object = 128,
+        length: object = 512,
+    ) -> types.SimpleNamespace:
+        return types.SimpleNamespace(
+            identifier=identifier,
+            modality=modality,
+            mm_position=types.SimpleNamespace(offset=offset, length=length),
+        )
 
     @staticmethod
     def _scheduler_output(*requests) -> types.SimpleNamespace:
@@ -2198,7 +2210,228 @@ class DefectD19MultimodalPromptAliasingTests(unittest.TestCase):
             ),
         )
 
-    def test_restore_lookup_ignores_requests_with_multimodal_features(self) -> None:
+    def test_restore_lookup_distinguishes_media_with_identical_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                block_size=64,
+                extra_config={"spark_cache_scheduler_probe": "none"},
+                role=KVConnectorRole.SCHEDULER,
+            )
+            token_ids = list(range(1100))
+            red = types.SimpleNamespace(
+                request_id="red-image-prompt",
+                prompt_token_ids=token_ids,
+                mm_features=[self._feature("image-red")],
+            )
+            blue = types.SimpleNamespace(
+                request_id="blue-image-prompt",
+                prompt_token_ids=token_ids,
+                mm_features=[self._feature("image-blue")],
+            )
+            red_plan = connector.build_connector_meta(self._scheduler_output(red)).plans[0]
+            connector._quorum[red_plan.digest] = {0, 1, 2, 3}
+
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(red, 0),
+                (red_plan.span_tokens, True),
+            )
+            self.assertIn(red.request_id, connector._need_load)
+
+            self.assertEqual(connector.get_num_new_matched_tokens(blue, 0), (0, False))
+            self.assertNotIn(blue.request_id, connector._need_load)
+            self.assertNotIn(blue.request_id, connector._restore_flight_leaders)
+            self.assertEqual(connector.counters["restore_hit"], 1)
+            self.assertEqual(connector.counters["multimodal_bypass"], 0)
+
+    def test_store_planning_uses_media_identity_and_keeps_text_compatible(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                block_size=64,
+                role=KVConnectorRole.SCHEDULER,
+            )
+            token_ids = list(range(1100))
+            red = types.SimpleNamespace(
+                request_id="red-image-prompt",
+                prompt_token_ids=token_ids,
+                mm_features=[self._feature("image-red")],
+            )
+            second_red = types.SimpleNamespace(
+                request_id="same-red-image-prompt",
+                prompt_token_ids=token_ids,
+                mm_features=[self._feature("image-red")],
+            )
+            blue = types.SimpleNamespace(
+                request_id="blue-image-prompt",
+                prompt_token_ids=token_ids,
+                mm_features=[self._feature("image-blue")],
+            )
+            moved_red = types.SimpleNamespace(
+                request_id="moved-red-image-prompt",
+                prompt_token_ids=token_ids,
+                mm_features=[self._feature("image-red", offset=64)],
+            )
+            text = types.SimpleNamespace(
+                request_id="text-prompt",
+                prompt_token_ids=token_ids,
+                mm_features=[],
+            )
+
+            metadata = connector.build_connector_meta(
+                self._scheduler_output(red, second_red, blue, moved_red, text)
+            )
+            plans = {plan.request_id: plan for plan in metadata.plans}
+
+            self.assertEqual(
+                set(plans),
+                {
+                    red.request_id,
+                    second_red.request_id,
+                    blue.request_id,
+                    moved_red.request_id,
+                    text.request_id,
+                },
+            )
+            self.assertEqual(
+                plans[red.request_id].digest,
+                plans[second_red.request_id].digest,
+            )
+            self.assertNotEqual(
+                plans[red.request_id].digest,
+                plans[blue.request_id].digest,
+            )
+            self.assertNotEqual(
+                plans[red.request_id].digest,
+                plans[moved_red.request_id].digest,
+            )
+            self.assertNotEqual(
+                plans[red.request_id].digest,
+                plans[text.request_id].digest,
+            )
+            self.assertTrue(plans[red.request_id].has_multimodal_identity)
+            self.assertFalse(plans[text.request_id].has_multimodal_identity)
+            self.assertEqual(connector.counters["multimodal_bypass"], 0)
+
+    def test_multimodal_digest_is_stable_when_text_extends_after_media(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                block_size=64,
+                extra_config={"spark_cache_scheduler_probe": "none"},
+                role=KVConnectorRole.SCHEDULER,
+            )
+            short_tokens = list(range(1100))
+            feature = self._feature("image-red")
+            short = types.SimpleNamespace(
+                request_id="short-image-prompt",
+                prompt_token_ids=short_tokens,
+                mm_features=[feature],
+            )
+            short_plan = connector.build_connector_meta(
+                self._scheduler_output(short)
+            ).plans[0]
+            connector._quorum[short_plan.digest] = {0, 1, 2, 3}
+            extended = types.SimpleNamespace(
+                request_id="extended-image-prompt",
+                prompt_token_ids=short_tokens + list(range(1100, 1400)),
+                mm_features=[feature],
+            )
+
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(extended, 0),
+                (short_plan.span_tokens, True),
+            )
+
+    def test_shared_prefix_lease_does_not_cross_media_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                block_size=64,
+                extra_config={"spark_cache_scheduler_probe": "none"},
+                role=KVConnectorRole.SCHEDULER,
+            )
+            token_ids = list(range(1100))
+            text = types.SimpleNamespace(
+                request_id="text-prompt",
+                prompt_token_ids=token_ids,
+                mm_features=[],
+            )
+            image = types.SimpleNamespace(
+                request_id="image-prompt",
+                prompt_token_ids=token_ids,
+                mm_features=[self._feature("image-red")],
+            )
+            text_plan = connector.build_connector_meta(
+                self._scheduler_output(text)
+            ).plans[0]
+            connector._restore_flights[text_plan.digest] = (
+                connector_module._RestoreFlight(
+                    digest=text_plan.digest,
+                    span_tokens=text_plan.span_tokens,
+                    leader_request_id="lease-owner",
+                    workers_finished=True,
+                    lease_digest=text_plan.digest,
+                    lease_span_tokens=text_plan.span_tokens,
+                    lease_published_at=1.0,
+                    lease_expires_at=float("inf"),
+                )
+            )
+
+            self.assertIsNone(connector.get_shared_prefix_lease_candidate(image))
+
+    def test_chunked_multimodal_store_never_adopts_token_only_tail_base(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                block_size=64,
+                extra_config={"spark_cache_publication_schema": "tail-cow-v1"},
+                role=KVConnectorRole.SCHEDULER,
+            )
+            token_ids = list(range(2100))
+            request_id = "chunked-image-prompt"
+            connector._quorum[connector._digest(token_ids, 1024)] = {0, 1, 2, 3}
+            first = types.SimpleNamespace(
+                scheduled_new_reqs=[
+                    types.SimpleNamespace(
+                        req_id=request_id,
+                        prompt_token_ids=token_ids,
+                        num_computed_tokens=0,
+                        block_ids=(list(range(10, 18)),),
+                        mm_features=[self._feature("image-red")],
+                    )
+                ],
+                num_scheduled_tokens={request_id: 512},
+                scheduled_cached_reqs=types.SimpleNamespace(
+                    req_ids=[],
+                    resumed_req_ids=set(),
+                    num_computed_tokens=[],
+                    new_block_ids=[],
+                ),
+            )
+            self.assertEqual(connector.build_connector_meta(first).plans, [])
+            second = types.SimpleNamespace(
+                scheduled_new_reqs=[],
+                num_scheduled_tokens={request_id: 1536},
+                scheduled_cached_reqs=types.SimpleNamespace(
+                    req_ids=[request_id],
+                    resumed_req_ids=set(),
+                    num_computed_tokens=[512],
+                    new_block_ids=[(list(range(18, 42)),)],
+                ),
+            )
+
+            plan = connector.build_connector_meta(second).plans[0]
+            self.assertTrue(plan.has_multimodal_identity)
+            self.assertEqual(plan.base_context_digest, "")
+            self.assertEqual(plan.base_span_tokens, 0)
+
+    def test_legacy_token_only_namespace_is_not_restored(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(
                 Path(directory),
@@ -2209,57 +2442,53 @@ class DefectD19MultimodalPromptAliasingTests(unittest.TestCase):
             )
             token_ids = list(range(1100))
             span = connector._aligned_span(len(token_ids))
-            connector._quorum[connector._digest(token_ids, span)] = {0, 1, 2, 3}
-            image = types.SimpleNamespace(
-                request_id="image-prompt",
-                prompt_token_ids=token_ids,
-                mm_features=[object()],
+            legacy_salt = connector._config.build_identity(0, 0).storage_key
+            legacy_digest = connector_module.context_prefix_digest(
+                token_ids,
+                legacy_salt,
+                token_count=span,
             )
+            self.assertNotEqual(legacy_digest, connector._digest(token_ids, span))
+            connector._quorum[legacy_digest] = {0, 1, 2, 3}
             text = types.SimpleNamespace(
                 request_id="text-prompt",
                 prompt_token_ids=token_ids,
                 mm_features=[],
             )
 
-            self.assertEqual(connector.get_num_new_matched_tokens(image, 0), (0, False))
-            self.assertNotIn(image.request_id, connector._need_load)
-            self.assertNotIn(image.request_id, connector._restore_flight_leaders)
-            self.assertEqual(connector.counters["multimodal_bypass"], 1)
-            self.assertEqual(connector.counters["restore_hit"], 0)
+            self.assertEqual(connector.get_num_new_matched_tokens(text, 0), (0, False))
 
-            self.assertEqual(
-                connector.get_num_new_matched_tokens(text, 0), (span, True)
-            )
-            self.assertIn(text.request_id, connector._need_load)
-            self.assertEqual(connector.counters["restore_hit"], 1)
-
-    def test_store_planning_ignores_requests_with_multimodal_features(self) -> None:
+    def test_unprovable_multimodal_identity_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(
                 Path(directory),
                 0,
                 block_size=64,
+                extra_config={"spark_cache_scheduler_probe": "none"},
                 role=KVConnectorRole.SCHEDULER,
             )
             token_ids = list(range(1100))
-            image = types.SimpleNamespace(
-                request_id="image-prompt",
+            missing_identifier = types.SimpleNamespace(
+                request_id="missing-identifier",
                 prompt_token_ids=token_ids,
-                mm_features=[object()],
+                mm_features=[self._feature(identifier=None)],
             )
-            text = types.SimpleNamespace(
-                request_id="text-prompt",
+            legacy_hash_only = types.SimpleNamespace(
+                request_id="legacy-hash-only",
                 prompt_token_ids=token_ids,
-                mm_features=[],
-            )
-
-            metadata = connector.build_connector_meta(
-                self._scheduler_output(image, text)
+                mm_hashes=["image-red"],
             )
 
             self.assertEqual(
-                [plan.request_id for plan in metadata.plans], [text.request_id]
+                connector.get_num_new_matched_tokens(missing_identifier, 0),
+                (0, False),
             )
-            self.assertNotIn(image.request_id, connector._store_progress)
-            self.assertNotIn(image.request_id, connector._store_token_ids)
-            self.assertEqual(connector.counters["multimodal_bypass"], 1)
+            metadata = connector.build_connector_meta(
+                self._scheduler_output(missing_identifier)
+            )
+            self.assertEqual(metadata.plans, [])
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(legacy_hash_only, 0),
+                (0, False),
+            )
+            self.assertEqual(connector.counters["multimodal_bypass"], 3)

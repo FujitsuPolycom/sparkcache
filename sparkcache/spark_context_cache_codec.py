@@ -22,15 +22,104 @@ import struct
 import sys
 from array import array
 from dataclasses import dataclass
-from typing import Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 CHUNK_TOKENS = 256
 _POSITION_STRUCT = struct.Struct("<I")
+_MULTIMODAL_FEATURE_STRUCT = struct.Struct("<QQII")
+_MULTIMODAL_DIGEST_DOMAIN = b"\x00sparkcache-multimodal-context-v1\x00"
 
 
 class CodecError(ValueError):
     """Deterministic packing/unpacking failure. Callers convert this to a
     cache miss and recomputation; it must never crash a serving process."""
+
+
+@dataclass(frozen=True)
+class MultimodalFeatureIdentity:
+    """Content and placeholder geometry that affect a multimodal KV prefix."""
+
+    modality: str
+    identifier: str
+    offset: int
+    length: int
+
+
+def validate_multimodal_features(
+    features: Sequence[MultimodalFeatureIdentity],
+    token_count: int,
+) -> tuple[MultimodalFeatureIdentity, ...]:
+    """Return canonical ordered features or reject unprovable geometry."""
+
+    try:
+        normalized = tuple(features)
+    except TypeError as error:
+        raise CodecError("multimodal features must be a sequence") from error
+    if len(normalized) > 2**32 - 1:
+        raise CodecError("too many multimodal features")
+    previous_end = 0
+    for feature in normalized:
+        if not isinstance(feature, MultimodalFeatureIdentity):
+            raise CodecError("multimodal feature identity has an invalid type")
+        if not isinstance(feature.modality, str) or not feature.modality:
+            raise CodecError("multimodal feature modality must be a non-empty string")
+        if not isinstance(feature.identifier, str) or not feature.identifier:
+            raise CodecError(
+                "multimodal feature identifier must be a non-empty string"
+            )
+        if (
+            isinstance(feature.offset, bool)
+            or not isinstance(feature.offset, int)
+            or feature.offset < 0
+            or isinstance(feature.length, bool)
+            or not isinstance(feature.length, int)
+            or feature.length <= 0
+        ):
+            raise CodecError(
+                "multimodal feature range must contain non-negative integer"
+                " offsets and positive integer lengths"
+            )
+        end = feature.offset + feature.length
+        if feature.offset < previous_end:
+            raise CodecError("multimodal feature ranges must be ordered and disjoint")
+        if end > token_count:
+            raise CodecError("multimodal feature range exceeds the prompt tokens")
+        try:
+            modality = feature.modality.encode("utf-8")
+            identifier = feature.identifier.encode("utf-8")
+        except UnicodeError as error:
+            raise CodecError("multimodal feature identity is not valid UTF-8") from error
+        if len(modality) > 2**32 - 1 or len(identifier) > 2**32 - 1:
+            raise CodecError("multimodal feature identity is too large")
+        if end > 2**64 - 1:
+            raise CodecError("multimodal feature range is too large")
+        previous_end = end
+    return normalized
+
+
+def _extend_with_multimodal_identity(
+    digest: Any,
+    features: Sequence[MultimodalFeatureIdentity],
+    token_count: int,
+) -> None:
+    active = tuple(feature for feature in features if feature.offset < token_count)
+    if not active:
+        return
+    digest.update(_MULTIMODAL_DIGEST_DOMAIN)
+    digest.update(_POSITION_STRUCT.pack(len(active)))
+    for feature in active:
+        modality = feature.modality.encode("utf-8")
+        identifier = feature.identifier.encode("utf-8")
+        digest.update(
+            _MULTIMODAL_FEATURE_STRUCT.pack(
+                feature.offset,
+                feature.length,
+                len(modality),
+                len(identifier),
+            )
+        )
+        digest.update(modality)
+        digest.update(identifier)
 
 
 def _u32_array(values: Iterable[int], label: str) -> array:
@@ -89,11 +178,21 @@ def local_slots_for_positions(
     return tuple(slots)
 
 
-def context_digest(token_ids: Iterable[int], identity_salt: str) -> str:
+def context_digest(
+    token_ids: Iterable[int],
+    identity_salt: str,
+    *,
+    multimodal_features: Sequence[MultimodalFeatureIdentity] = (),
+) -> str:
     """Content digest for a block-aligned prompt span. The identity salt
     binds the digest to the cache identity so distinct configurations can
     never alias to the same key even inside one store root."""
-    return context_prefix_digest(token_ids, identity_salt, token_count=None)
+    return context_prefix_digest(
+        token_ids,
+        identity_salt,
+        token_count=None,
+        multimodal_features=multimodal_features,
+    )
 
 
 def context_prefix_digest(
@@ -101,8 +200,9 @@ def context_prefix_digest(
     identity_salt: str,
     *,
     token_count: int | None,
+    multimodal_features: Sequence[MultimodalFeatureIdentity] = (),
 ) -> str:
-    """Digest a packed token prefix without allocating a Python list slice."""
+    """Digest tokens and any media whose placeholder range overlaps a prefix."""
 
     packed = _u32_array(token_ids, "token_ids")
     if token_count is None:
@@ -113,10 +213,12 @@ def context_prefix_digest(
         or not 0 <= token_count <= len(packed)
     ):
         raise CodecError("token_count must identify a prefix of token_ids")
+    features = validate_multimodal_features(multimodal_features, len(packed))
     digest = hashlib.sha256()
     digest.update(identity_salt.encode("ascii"))
     digest.update(b"\x00")
     digest.update(memoryview(packed).cast("B")[: token_count * packed.itemsize])
+    _extend_with_multimodal_identity(digest, features, token_count)
     return digest.hexdigest()
 
 
@@ -125,8 +227,9 @@ def chunk_prefix_digests(
     identity_salt: str,
     *,
     boundaries: Iterable[int],
+    multimodal_features: Sequence[MultimodalFeatureIdentity] = (),
 ) -> tuple[tuple[int, str], ...]:
-    """Return existing exact-context digests in one incremental hash pass."""
+    """Return exact token-and-media prefix digests in one token hash pass."""
 
     packed = _u32_array(token_ids, "token_ids")
     try:
@@ -149,6 +252,7 @@ def chunk_prefix_digests(
         if boundary > len(packed):
             raise CodecError("boundary must identify a prefix of token_ids")
         previous = boundary
+    features = validate_multimodal_features(multimodal_features, len(packed))
     if not requested:
         return ()
     digest = hashlib.sha256()
@@ -159,7 +263,9 @@ def chunk_prefix_digests(
     previous = 0
     for boundary in requested:
         digest.update(raw[previous * packed.itemsize : boundary * packed.itemsize])
-        result.append((boundary, digest.copy().hexdigest()))
+        candidate = digest.copy()
+        _extend_with_multimodal_identity(candidate, features, boundary)
+        result.append((boundary, candidate.hexdigest()))
         previous = boundary
     return tuple(result)
 

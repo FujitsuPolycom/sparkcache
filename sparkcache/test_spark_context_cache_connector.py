@@ -285,6 +285,71 @@ class CodecTests(unittest.TestCase):
                     boundaries=boundaries,
                 )
 
+    def test_multimodal_prefix_digests_bind_content_and_range(self) -> None:
+        tokens = list(range(1024))
+        red = codec.MultimodalFeatureIdentity("image", "red", 300, 200)
+        blue = codec.MultimodalFeatureIdentity("image", "blue", 300, 200)
+        moved_red = codec.MultimodalFeatureIdentity("image", "red", 301, 200)
+        boundaries = (256, 512, 1024)
+        produced = codec.chunk_prefix_digests(
+            tokens,
+            "identity",
+            boundaries=boundaries,
+            multimodal_features=(red,),
+        )
+
+        self.assertEqual(
+            produced,
+            tuple(
+                (
+                    boundary,
+                    codec.context_prefix_digest(
+                        tokens,
+                        "identity",
+                        token_count=boundary,
+                        multimodal_features=(red,),
+                    ),
+                )
+                for boundary in boundaries
+            ),
+        )
+        self.assertEqual(
+            produced[0][1],
+            codec.context_prefix_digest(tokens, "identity", token_count=256),
+        )
+        for feature in (blue, moved_red):
+            self.assertNotEqual(
+                produced[-1][1],
+                codec.context_prefix_digest(
+                    tokens,
+                    "identity",
+                    token_count=1024,
+                    multimodal_features=(feature,),
+                ),
+            )
+
+    def test_multimodal_feature_geometry_is_strict(self) -> None:
+        tokens = list(range(1024))
+        invalid_features = (
+            (codec.MultimodalFeatureIdentity("", "red", 10, 20),),
+            (codec.MultimodalFeatureIdentity("image", "", 10, 20),),
+            (codec.MultimodalFeatureIdentity("image", "red", -1, 20),),
+            (codec.MultimodalFeatureIdentity("image", "red", 10, 0),),
+            (codec.MultimodalFeatureIdentity("image", "red", 1000, 25),),
+            (
+                codec.MultimodalFeatureIdentity("image", "red", 100, 100),
+                codec.MultimodalFeatureIdentity("image", "blue", 150, 100),
+            ),
+        )
+        for features in invalid_features:
+            with self.subTest(features=features), self.assertRaises(codec.CodecError):
+                codec.context_prefix_digest(
+                    tokens,
+                    "identity",
+                    token_count=1024,
+                    multimodal_features=features,
+                )
+
     def test_vectorized_integer_codec_matches_v1_wire_bytes(self) -> None:
         tokens = [0, 1, 255, 65535, 2**32 - 1]
         v1_reference_bytes = b"".join(
@@ -1125,7 +1190,7 @@ def _deepseek_tp4_group_tables(
 
 
 class CheckpointIdentityTests(unittest.TestCase):
-    def test_prompt_digest_reuses_identity_salt_without_slicing_tokens(self) -> None:
+    def test_prompt_digest_reuses_namespaced_salt_without_slicing_tokens(self) -> None:
         class UnsliceableTokens(list[int]):
             def __getitem__(self, index):
                 if isinstance(index, slice):
@@ -1134,12 +1199,14 @@ class CheckpointIdentityTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(Path(directory), 0)
-            salt = connector._identity(0, tp_shard_rank=0).storage_key
             tokens = UnsliceableTokens(range(1100))
-            expected = codec.context_digest(range(1024), salt)
+            expected = codec.context_digest(
+                range(1024),
+                connector._context_digest_salt,
+            )
             connector._identity = mock.Mock(
                 side_effect=AssertionError(
-                    "prompt digest must reuse its immutable identity salt"
+                    "prompt digest must reuse its immutable namespaced salt"
                 )
             )
 
