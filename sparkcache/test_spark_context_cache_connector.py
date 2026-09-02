@@ -5024,12 +5024,23 @@ class AsyncRestoreTests(unittest.TestCase):
         table = list(block_ids or self.BLOCKS)
         return types.SimpleNamespace(get_block_ids=lambda: (table,))
 
-    def _cohort_connector(self, root: Path, *, max_pending: int = 2):
+    def _cohort_connector(
+        self,
+        root: Path,
+        *,
+        max_pending: int = 2,
+        lease_ttl_seconds: float = 15.0,
+    ):
         connector = _make_connector(
             root,
             0,
             64,
-            extra_config={"spark_cache_max_pending_restores": str(max_pending)},
+            extra_config={
+                "spark_cache_max_pending_restores": str(max_pending),
+                "spark_cache_shared_prefix_lease_ttl_seconds": str(
+                    lease_ttl_seconds
+                ),
+            },
         )
         connector._scheduler_probe = "none"
         return connector
@@ -5361,6 +5372,71 @@ class AsyncRestoreTests(unittest.TestCase):
             connector.shared_prefix_lease_attached(early.request_id, digest)
             connector.shared_prefix_lease_attached(late.request_id, digest)
             self.assertEqual(connector.counters["shared_prefix_leases_attached"], 2)
+
+    def test_configured_shared_prefix_lease_ttl_controls_publication_and_expiry(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(
+                Path(directory), lease_ttl_seconds=300.0
+            )
+            tokens = list(range(1100))
+            digest = self._offer(connector, tokens)
+            leader = types.SimpleNamespace(
+                request_id="retained-leader", prompt_token_ids=tokens
+            )
+            connector.get_num_new_matched_tokens(leader, 0)
+            connector.update_state_after_alloc(
+                leader, self._blocks_stub(), self.SPAN
+            )
+            connector.build_connector_meta(_empty_scheduler_output())
+            connector.update_connector_output(
+                types.SimpleNamespace(
+                    invalid_block_ids=set(), finished_recving={leader.request_id}
+                )
+            )
+
+            self.assertEqual(
+                connector.get_shared_prefix_lease_to_publish(leader),
+                (digest, self.SPAN, 300.0),
+            )
+            with mock.patch(
+                "sparkcache.spark_context_cache_connector.time.monotonic",
+                return_value=10.0,
+            ):
+                self.assertTrue(
+                    connector.shared_prefix_lease_published(
+                        leader.request_id, digest
+                    )
+                )
+
+            attached = types.SimpleNamespace(
+                request_id="retained-follower", prompt_token_ids=tokens
+            )
+            with mock.patch(
+                "sparkcache.spark_context_cache_connector.time.monotonic",
+                return_value=309.999,
+            ):
+                self.assertEqual(
+                    connector.get_shared_prefix_lease_candidate(attached),
+                    (digest, self.SPAN),
+                )
+            connector.shared_prefix_lease_attached(attached.request_id, digest)
+
+            late = types.SimpleNamespace(
+                request_id="expired-follower", prompt_token_ids=tokens
+            )
+            with mock.patch(
+                "sparkcache.spark_context_cache_connector.time.monotonic",
+                return_value=310.001,
+            ):
+                self.assertIsNone(
+                    connector.get_shared_prefix_lease_candidate(late)
+                )
+            self.assertNotIn(digest, connector._restore_flights)
+            self.assertEqual(
+                connector.counters["shared_prefix_leases_expired"], 1
+            )
 
     def test_c16_distinct_roots_share_one_authenticated_trunk_restore(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

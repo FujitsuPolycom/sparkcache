@@ -134,7 +134,6 @@ _QUORUM_DELTA_PROTOCOL = "sparkcache-quorum-delta-v1"
 _MAX_RESTORE_FLIGHT_FOLLOWERS = 16
 _MAX_SHARED_PREFIX_LEASES = 2
 _MAX_SHAREABLE_PREFIXES_PER_FLIGHT = 64
-_SHARED_PREFIX_LEASE_TTL_SECONDS = 15.0
 _MAX_PAGE_BASE_READ_FLIGHTS = 2
 _MAX_PAGE_BASE_READ_MEMBERS = 16
 _MAX_PAGE_BASE_BYTES_PER_FLIGHT = 1024**3
@@ -827,6 +826,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         # update_state_after_alloc / build_connector_meta and cleared by
         # request_finished, so the map cannot grow past in-flight requests.
         self._max_pending_restores = config.max_pending_restores
+        self._shared_prefix_lease_ttl_seconds = (
+            config.shared_prefix_lease_ttl_seconds
+        )
         # Coalesce requests selecting the same persistent digest around one
         # restore. Followers own no restore blocks: they remain ordinary
         # waiting requests until vLLM publishes the leader's verified blocks
@@ -941,7 +943,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             "spark-context-cache: role=%s root=%s dcp=%d access_mode=%s"
             " store=%s restore=%s"
             " cuda_restore=%s max_span=%d load_threads=%d max_bytes=%d"
-            " low_bytes=%d ttl_seconds=%d",
+            " low_bytes=%d ttl_seconds=%d shared_prefix_lease_ttl_seconds=%.3g",
             role.name,
             self._root,
             self._dcp_degree,
@@ -954,6 +956,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self._capacity_policy.max_bytes,
             self._capacity_policy.low_watermark_bytes,
             self._capacity_policy.ttl_seconds,
+            self._shared_prefix_lease_ttl_seconds,
         )
 
     def _install_streaming_runtime(self, role: KVConnectorRole) -> None:
@@ -1393,10 +1396,16 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 (
                     flight.segment_digest,
                     flight.segment_span_tokens,
-                    _SHARED_PREFIX_LEASE_TTL_SECONDS,
+                    self._shared_prefix_lease_ttl_seconds,
                 ),
             )
-        return ((flight.digest, flight.span_tokens, _SHARED_PREFIX_LEASE_TTL_SECONDS),)
+        return (
+            (
+                flight.digest,
+                flight.span_tokens,
+                self._shared_prefix_lease_ttl_seconds,
+            ),
+        )
 
     def get_shared_prefix_lease_to_publish(
         self, request: "Request"
@@ -1432,7 +1441,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         flight.lease_digest = lease_key
         flight.lease_span_tokens = span
         flight.lease_published_at = now
-        flight.lease_expires_at = now + _SHARED_PREFIX_LEASE_TTL_SECONDS
+        flight.lease_expires_at = now + self._shared_prefix_lease_ttl_seconds
         self.counters["shared_prefix_leases_published"] += 1
 
         published = sorted(

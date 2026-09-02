@@ -44,6 +44,7 @@ configuration leaves SparkCache unloaded.
     "spark_cache_target_checkpoint_sha256": "<64 lowercase hex characters>",
     "spark_cache_draft_policy": "colocated_target",
     "spark_cache_access_mode": "read-write",
+    "spark_cache_shared_prefix_lease_ttl_seconds": 15,
     "spark_cache_max_bytes": 214748364800,
     "spark_cache_low_watermark_bytes": 193273528320,
     "spark_cache_ttl_seconds": 0,
@@ -124,6 +125,15 @@ slot coordinates, or transport sequence numbers.
   changed rows or pages.
 - **Shared restores:** let bounded followers attach to one verified GPU prefix
   through ordinary vLLM block references.
+
+Verified shared GPU prefixes remain retained for
+`spark_cache_shared_prefix_lease_ttl_seconds`. The default is 15 seconds; the
+maximum is 300 seconds. Longer retention can serve later queued requests
+without another persistent restore.
+
+The two-prefix limit and vLLM's memory-pressure eviction remain active
+regardless of the configured duration. The equivalent environment variable is
+`SPARK_CONTEXT_CACHE_SHARED_PREFIX_LEASE_TTL_SECONDS`.
 
 Page graphs admit at most two deltas. Another extension compacts the graph into
 a complete snapshot.
