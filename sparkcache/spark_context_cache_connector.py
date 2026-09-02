@@ -634,6 +634,22 @@ class SparkCacheStats(KVConnectorStats):
         return not self.data.get("reports")
 
 
+def _has_multimodal_inputs(request: object) -> bool:
+    """Return True when a request carries image, video, or audio items.
+
+    vLLM stands each multimodal item in for a run of identical placeholder
+    token ids, so two prompts with different media in the same layout have
+    equal ``prompt_token_ids``. The exact-context digest covers token ids only
+    and therefore cannot distinguish them. Both the scheduler ``Request`` and
+    ``NewRequestData`` expose ``mm_features``; older engines expose
+    ``mm_hashes``. An empty list means a text-only prompt.
+    """
+
+    if getattr(request, "mm_features", None):
+        return True
+    return bool(getattr(request, "mm_hashes", None))
+
+
 class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     """Store/restore each rank's DCP shard on rank-local NVMe."""
 
@@ -924,6 +940,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             "store_skipped_busy": 0,
             "store_skipped_present": 0,
             "store_skipped_quorum": 0,
+            "multimodal_bypass": 0,
             "page_delta_compactions": 0,
             "recurrent_boundary_metadata_rejected": 0,
             "prefix_alias_publication_attempted": 0,
@@ -1607,6 +1624,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> tuple[int | None, bool]:
         if not self._restore_enabled:
             return 0, False
+        if _has_multimodal_inputs(request):
+            # Token identity does not name the media content. Serve from
+            # recompute; vLLM's own prefix cache keys these blocks by media
+            # hash and remains available.
+            self.counters["multimodal_bypass"] += 1
+            return 0, False
         request_id = request.request_id
         follower_digest = self._restore_flight_followers.get(request_id)
         if follower_digest is not None:
@@ -1942,6 +1965,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             token_ids = list(new_req.prompt_token_ids or [])
             req_id = new_req.req_id
             self._need_load.pop(req_id, None)
+            if _has_multimodal_inputs(new_req):
+                # Never publish an entry whose token-id digest would alias a
+                # different image or video with the same placeholder layout.
+                self.counters["multimodal_bypass"] += 1
+                continue
             scheduled = scheduler_output.num_scheduled_tokens.get(req_id, 0)
             group_blocks = self._normalize_group_blocks(new_req.block_ids)
             block_ids = group_blocks[0]

@@ -2162,3 +2162,104 @@ class IntegritySweepPublicationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DefectD19MultimodalPromptAliasingTests(unittest.TestCase):
+    """Multimodal prompts bypass token-identity publication and restore.
+
+    vLLM replaces each image or video with a run of identical placeholder token
+    ids, so two prompts carrying different media in the same layout have equal
+    ``prompt_token_ids``. The exact-context digest hashes token ids only, so a
+    published multimodal entry would be restored for any other prompt with the
+    same layout and serve the wrong media's KV state. Requests that carry
+    ``mm_features`` must therefore neither publish nor restore by digest; a
+    text-only request with an empty ``mm_features`` list keeps both paths.
+    """
+
+    @staticmethod
+    def _scheduler_output(*requests) -> types.SimpleNamespace:
+        return types.SimpleNamespace(
+            scheduled_new_reqs=[
+                types.SimpleNamespace(
+                    req_id=request.request_id,
+                    prompt_token_ids=request.prompt_token_ids,
+                    num_computed_tokens=0,
+                    block_ids=([10, 11, 12, 13],),
+                    mm_features=list(getattr(request, "mm_features", ())),
+                )
+                for request in requests
+            ],
+            num_scheduled_tokens={request.request_id: 1024 for request in requests},
+            scheduled_cached_reqs=types.SimpleNamespace(
+                req_ids=[],
+                resumed_req_ids=set(),
+                num_computed_tokens=[],
+                new_block_ids=[],
+            ),
+        )
+
+    def test_restore_lookup_ignores_requests_with_multimodal_features(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                block_size=64,
+                extra_config={"spark_cache_scheduler_probe": "none"},
+                role=KVConnectorRole.SCHEDULER,
+            )
+            token_ids = list(range(1100))
+            span = connector._aligned_span(len(token_ids))
+            connector._quorum[connector._digest(token_ids, span)] = {0, 1, 2, 3}
+            image = types.SimpleNamespace(
+                request_id="image-prompt",
+                prompt_token_ids=token_ids,
+                mm_features=[object()],
+            )
+            text = types.SimpleNamespace(
+                request_id="text-prompt",
+                prompt_token_ids=token_ids,
+                mm_features=[],
+            )
+
+            self.assertEqual(connector.get_num_new_matched_tokens(image, 0), (0, False))
+            self.assertNotIn(image.request_id, connector._need_load)
+            self.assertNotIn(image.request_id, connector._restore_flight_leaders)
+            self.assertEqual(connector.counters["multimodal_bypass"], 1)
+            self.assertEqual(connector.counters["restore_hit"], 0)
+
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(text, 0), (span, True)
+            )
+            self.assertIn(text.request_id, connector._need_load)
+            self.assertEqual(connector.counters["restore_hit"], 1)
+
+    def test_store_planning_ignores_requests_with_multimodal_features(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                block_size=64,
+                role=KVConnectorRole.SCHEDULER,
+            )
+            token_ids = list(range(1100))
+            image = types.SimpleNamespace(
+                request_id="image-prompt",
+                prompt_token_ids=token_ids,
+                mm_features=[object()],
+            )
+            text = types.SimpleNamespace(
+                request_id="text-prompt",
+                prompt_token_ids=token_ids,
+                mm_features=[],
+            )
+
+            metadata = connector.build_connector_meta(
+                self._scheduler_output(image, text)
+            )
+
+            self.assertEqual(
+                [plan.request_id for plan in metadata.plans], [text.request_id]
+            )
+            self.assertNotIn(image.request_id, connector._store_progress)
+            self.assertNotIn(image.request_id, connector._store_token_ids)
+            self.assertEqual(connector.counters["multimodal_bypass"], 1)
