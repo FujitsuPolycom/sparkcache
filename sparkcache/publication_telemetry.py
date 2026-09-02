@@ -86,6 +86,10 @@ class PublicationTelemetrySnapshot:
     committed_publications: int
     aborted_publications: int
     failed_publications: int
+    aborted_unique_object_bytes: int
+    aborted_staged_write_bytes: int
+    failed_unique_object_bytes: int
+    failed_staged_write_bytes: int
     logical_payload_bytes: int
     reused_base_bytes: int
     unique_object_bytes: int
@@ -114,7 +118,9 @@ class PublicationTelemetrySnapshot:
             f"dedup={self.deduplicated_bytes}B "
             f"reused_base={self.reused_base_bytes}B "
             f"aborted={self.aborted_publications} "
-            f"failed={self.failed_publications}"
+            f"aborted_staged={self.aborted_staged_write_bytes}B "
+            f"failed={self.failed_publications} "
+            f"failed_staged={self.failed_staged_write_bytes}B"
         )
 
 
@@ -231,6 +237,10 @@ class PublicationTelemetry:
         self._committed = 0
         self._aborted = 0
         self._failed = 0
+        self._aborted_unique_object_bytes = 0
+        self._aborted_staged_write_bytes = 0
+        self._failed_unique_object_bytes = 0
+        self._failed_staged_write_bytes = 0
 
     def begin(self, kind: PublicationKind) -> PublicationAttempt:
         """Create an uncounted attempt; terminal accounting occurs at finish."""
@@ -244,8 +254,12 @@ class PublicationTelemetry:
                 self._committed += 1
             elif receipt.outcome == "aborted":
                 self._aborted += 1
+                self._aborted_unique_object_bytes += receipt.unique_object_bytes
+                self._aborted_staged_write_bytes += receipt.staged_write_bytes
             else:
                 self._failed += 1
+                self._failed_unique_object_bytes += receipt.unique_object_bytes
+                self._failed_staged_write_bytes += receipt.staged_write_bytes
             for field in self._FIELDS:
                 self._totals[field] += int(getattr(receipt, field))
 
@@ -259,5 +273,9 @@ class PublicationTelemetry:
                 committed_publications=self._committed,
                 aborted_publications=self._aborted,
                 failed_publications=self._failed,
+                aborted_unique_object_bytes=self._aborted_unique_object_bytes,
+                aborted_staged_write_bytes=self._aborted_staged_write_bytes,
+                failed_unique_object_bytes=self._failed_unique_object_bytes,
+                failed_staged_write_bytes=self._failed_staged_write_bytes,
                 **self._totals,
             )

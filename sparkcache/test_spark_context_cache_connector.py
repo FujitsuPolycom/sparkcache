@@ -6688,6 +6688,8 @@ class QuorumStatsAggregationTests(unittest.TestCase):
                         "committed_unique_object_bytes": 80 * (rank + 1),
                         "staged_write_bytes": 120 * (rank + 1),
                         "deduplicated_bytes": 20 * (rank + 1),
+                        "aborted_staged_write_bytes": 10 * rank,
+                        "failed_staged_write_bytes": 5 * rank,
                         "aborted_publications": rank,
                         "failed_publications": 0,
                     },
@@ -6702,6 +6704,8 @@ class QuorumStatsAggregationTests(unittest.TestCase):
         self.assertEqual(reduced["sparkcache_unique_bytes"], 240)
         self.assertEqual(reduced["sparkcache_staged_bytes"], 360)
         self.assertEqual(reduced["sparkcache_dedup_bytes"], 60)
+        self.assertEqual(reduced["sparkcache_aborted_bytes"], 10)
+        self.assertEqual(reduced["sparkcache_failed_bytes"], 5)
         self.assertEqual(reduced["sparkcache_publication_aborted"], 1)
         self.assertNotIn("sparkcache_publication_failed", reduced)
 

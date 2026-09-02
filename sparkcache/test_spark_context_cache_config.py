@@ -382,6 +382,15 @@ class ParseConnectorConfigTests(unittest.TestCase):
 
         self.assertEqual(config.shared_prefix_lease_ttl_seconds, 300.0)
 
+    def test_shared_prefix_lease_ttl_accepts_one_second_minimum(self) -> None:
+        vllm, _ = _make_vllm_config(
+            {"spark_cache_shared_prefix_lease_ttl_seconds": "1"}
+        )
+
+        config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+
+        self.assertEqual(config.shared_prefix_lease_ttl_seconds, 1.0)
+
     def test_shared_prefix_lease_ttl_does_not_change_cache_identity(self) -> None:
         default_vllm, _ = _make_vllm_config()
         retained_vllm, _ = _make_vllm_config(
@@ -704,6 +713,7 @@ class ErrorPathTests(unittest.TestCase):
             "malformed": "not-a-duration",
             "negative": "-1",
             "zero": "0",
+            "below-minimum": "0.5",
             "excessive": "300.001",
             "infinite": "inf",
             "boolean": True,

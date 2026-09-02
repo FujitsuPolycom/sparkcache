@@ -19,6 +19,7 @@ RECEIPT_SCHEMA = "sparkcache-page-tail-qualification/v1"
 
 _RUNNERS = frozenset({"local", "live"})
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_COMMIT = re.compile(r"[0-9a-f]{40}")
 _DELTA_SCHEMAS = frozenset(
     {
         "sparkcache-page-delta-manifest/v2",
@@ -129,8 +130,14 @@ def validate_receipt(receipt: Any) -> list[str]:
     deltas = receipt.get("deltas")
     require(isinstance(deltas, list) and deltas, "deltas are absent")
     if isinstance(deltas, list) and deltas:
-        prior_tokens = base["committed_tokens"] if isinstance(base, dict) else 0
-        prior_digest = base["context_digest"] if isinstance(base, dict) else ""
+        base_tokens = base.get("committed_tokens") if isinstance(base, dict) else None
+        base_digest = base.get("context_digest") if isinstance(base, dict) else None
+        prior_tokens = (
+            base_tokens
+            if isinstance(base_tokens, int) and not isinstance(base_tokens, bool)
+            else 0
+        )
+        prior_digest = base_digest if isinstance(base_digest, str) else ""
         for index, delta in enumerate(deltas):
             require(isinstance(delta, dict), f"delta {index} is not an object")
             if not isinstance(delta, dict):
@@ -184,20 +191,26 @@ def validate_receipt(receipt: Any) -> list[str]:
                     and delta["base_snapshot_bytes"] > 0,
                     f"delta {index} has no base snapshot bytes",
                 )
-            prior_tokens = delta.get(
-                "committed_tokens", prior_tokens + 1
+            committed_tokens = delta.get("committed_tokens")
+            prior_tokens = (
+                committed_tokens
+                if isinstance(committed_tokens, int)
+                and not isinstance(committed_tokens, bool)
+                else prior_tokens + 1
             )
-            prior_digest = delta.get("context_digest", "")
+            context_digest = delta.get("context_digest")
+            prior_digest = context_digest if isinstance(context_digest, str) else ""
 
     result = receipt.get("result")
     require(isinstance(result, dict), "result is not an object")
-    if isinstance(result, dict) and isinstance(deltas, list) and deltas:
+    final_delta = deltas[-1] if isinstance(deltas, list) and deltas else None
+    if isinstance(result, dict) and isinstance(final_delta, dict):
         require(
-            result.get("context_digest") == deltas[-1].get("context_digest"),
+            result.get("context_digest") == final_delta.get("context_digest"),
             "result digest does not match the last delta",
         )
         require(
-            result.get("committed_tokens") == deltas[-1].get("committed_tokens"),
+            result.get("committed_tokens") == final_delta.get("committed_tokens"),
             "result boundary does not match the last delta",
         )
         require(
@@ -252,7 +265,116 @@ def validate_receipt(receipt: Any) -> list[str]:
     if receipt.get("runner") == "live":
         require(isinstance(live, dict), "live receipt lacks the live section")
         if isinstance(live, dict):
-            for field in ("base_bytes", "delta_bytes", "commit_ms_by_rank"):
-                require(field in live, f"live receipt lacks {field}")
+            def rank_values(field: str, *, integers: bool = False) -> list[Any]:
+                values = live.get(field)
+                valid = (
+                    isinstance(values, list)
+                    and len(values) == 4
+                    and all(
+                        (
+                            isinstance(value, int)
+                            and not isinstance(value, bool)
+                            and value > 0
+                        )
+                        if integers
+                        else _nonnegative_ms(value)
+                        for value in values
+                    )
+                )
+                require(valid, f"live {field} must contain four rank values")
+                return values if isinstance(values, list) else []
+
+            image_id = live.get("image_id")
+            require(
+                isinstance(image_id, str)
+                and image_id.startswith("sha256:")
+                and _digest(image_id.removeprefix("sha256:")),
+                "live image_id is invalid",
+            )
+            for field in ("sparkcache_commit", "sparkring_commit"):
+                value = live.get(field)
+                require(
+                    isinstance(value, str) and _COMMIT.fullmatch(value) is not None,
+                    f"live {field} is invalid",
+                )
+            for field in ("target_checkpoint", "draft_checkpoint"):
+                value = live.get(field)
+                require(
+                    isinstance(value, str)
+                    and "@" in value
+                    and _COMMIT.fullmatch(value.rsplit("@", 1)[-1]) is not None,
+                    f"live {field} is not revision-pinned",
+                )
+            require(live.get("topology") == "TP4/DCP4", "live topology differs")
+
+            base_bytes = rank_values("base_bytes", integers=True)
+            delta_bytes = rank_values("delta_bytes", integers=True)
+            restart_ms = rank_values("restart_restore_ms_by_rank")
+            rank_values("post_repair_restore_ms_by_rank")
+            if isinstance(base, dict) and isinstance(base.get("snapshot_bytes"), int):
+                require(
+                    all(value == base["snapshot_bytes"] for value in base_bytes),
+                    "live base bytes differ across ranks",
+                )
+            if isinstance(deltas, list) and deltas and isinstance(deltas[-1], dict):
+                delta_bytes_expected = deltas[-1].get("delta_encoded_bytes")
+                if isinstance(delta_bytes_expected, int):
+                    require(
+                        all(value == delta_bytes_expected for value in delta_bytes),
+                        "live delta bytes differ across ranks",
+                    )
+
+            commit_ms = live.get("commit_ms_by_rank")
+            require(isinstance(commit_ms, dict), "live commit_ms_by_rank is invalid")
+            if isinstance(commit_ms, dict):
+                for field in ("base", "delta"):
+                    values = commit_ms.get(field)
+                    require(
+                        isinstance(values, list)
+                        and len(values) == 4
+                        and all(_nonnegative_ms(value) for value in values),
+                        f"live commit_ms_by_rank.{field} must contain four rank values",
+                    )
+
+            if isinstance(result, dict) and _nonnegative_ms(
+                result.get("restart_restore_ms")
+            ):
+                require(
+                    result["restart_restore_ms"] in restart_ms,
+                    "restart_restore_ms is not a recorded restart rank value",
+                )
+            base_semantic = live.get("base_semantic")
+            result_semantic = live.get("extension_semantic")
+            require(
+                isinstance(base_semantic, str) and bool(base_semantic),
+                "live base semantic result is absent",
+            )
+            require(
+                isinstance(result_semantic, str) and bool(result_semantic),
+                "live extension semantic result is absent",
+            )
+            for field in (
+                "restart_semantic",
+                "corruption_fallback_semantic",
+                "post_repair_semantic",
+            ):
+                require(
+                    live.get(field) == result_semantic,
+                    f"live {field} differs from the extension result",
+                )
+            if isinstance(base, dict):
+                require(
+                    live.get("corruption_fallback_tokens")
+                    == base.get("committed_tokens"),
+                    "live corruption fallback boundary differs",
+                )
+            for field in (
+                "corruption_fallback_elapsed_seconds",
+                "post_repair_elapsed_seconds",
+            ):
+                require(
+                    _nonnegative_ms(live.get(field)),
+                    f"live {field} is invalid",
+                )
 
     return errors

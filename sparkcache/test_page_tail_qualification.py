@@ -224,6 +224,36 @@ class ReceiptValidationTests(unittest.TestCase):
                 Path(directory), corrupt_result=False, **kwargs
             )
 
+    def _live_receipt(self) -> dict:
+        path = (
+            Path(__file__).resolve().parents[1]
+            / "evidence"
+            / "glm53-flash-dcp4-page-tail"
+            / "qualification.json"
+        )
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_checked_in_live_receipt_is_valid(self) -> None:
+        self.assertEqual(validate_receipt(self._live_receipt()), [])
+
+    def test_live_receipt_requires_four_rank_measurements(self) -> None:
+        broken = self._live_receipt()
+        broken["live"]["restart_restore_ms_by_rank"].pop()
+        errors = validate_receipt(broken)
+        self.assertIn(
+            "live restart_restore_ms_by_rank must contain four rank values",
+            errors,
+        )
+
+    def test_live_receipt_binds_summary_to_rank_measurement(self) -> None:
+        broken = self._live_receipt()
+        broken["result"]["restart_restore_ms"] = 1.0
+        errors = validate_receipt(broken)
+        self.assertIn(
+            "restart_restore_ms is not a recorded restart rank value",
+            errors,
+        )
+
     def test_schema_rejects_missing_restart_measurement(self) -> None:
         receipt = self._receipt()
         broken = json.loads(json.dumps(receipt))
@@ -256,6 +286,22 @@ class ReceiptValidationTests(unittest.TestCase):
 
     def test_schema_rejects_non_object_receipt(self) -> None:
         self.assertEqual(validate_receipt(None), ["receipt is not an object"])
+
+    def test_schema_rejects_incomplete_base_without_raising(self) -> None:
+        receipt = self._receipt()
+        broken = json.loads(json.dumps(receipt))
+        del broken["base"]["committed_tokens"]
+        del broken["base"]["context_digest"]
+        errors = validate_receipt(broken)
+        self.assertIn("base committed_tokens is invalid", errors)
+        self.assertIn("base digest is not a digest", errors)
+
+    def test_schema_rejects_non_object_final_delta_without_raising(self) -> None:
+        receipt = self._receipt()
+        broken = json.loads(json.dumps(receipt))
+        broken["deltas"][-1] = "not-an-object"
+        errors = validate_receipt(broken)
+        self.assertIn("delta 1 is not an object", errors)
 
 
 if __name__ == "__main__":

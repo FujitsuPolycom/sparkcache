@@ -89,6 +89,10 @@ def test_abort_reports_unreferenced_unique_objects_without_a_commit(tmp_path: Pa
     assert counters.publication_attempts == 1
     assert counters.committed_publications == 0
     assert counters.aborted_publications == 1
+    assert counters.aborted_unique_object_bytes == chunk_receipt.encoded_bytes
+    assert counters.aborted_staged_write_bytes == chunk_receipt.encoded_bytes
+    assert counters.failed_unique_object_bytes == 0
+    assert counters.failed_staged_write_bytes == 0
     assert counters.unique_object_bytes == chunk_receipt.encoded_bytes
     assert counters.committed_unique_object_bytes == 0
     assert counters.uncommitted_unique_object_bytes == chunk_receipt.encoded_bytes
@@ -112,13 +116,20 @@ def test_failed_manifest_publication_preserves_attempted_write_accounting(
         with pytest.raises(OSError, match="synthetic publication failure"):
             transaction.commit_manifest()
 
+    transaction.abort()
+
     counters = store.publication_telemetry_snapshot()
+    assert counters.publication_attempts == 1
     assert counters.failed_publications == 1
+    assert counters.aborted_publications == 0
+    assert counters.failed_unique_object_bytes == chunk_receipt.encoded_bytes
+    assert counters.failed_staged_write_bytes > chunk_receipt.encoded_bytes
+    assert counters.aborted_unique_object_bytes == 0
+    assert counters.aborted_staged_write_bytes == 0
     assert counters.committed_publications == 0
     assert counters.unique_object_bytes == chunk_receipt.encoded_bytes
     assert counters.uncommitted_unique_object_bytes == chunk_receipt.encoded_bytes
     assert counters.staged_write_bytes > chunk_receipt.encoded_bytes
-    transaction.abort()
 
 
 def test_row_tail_receipt_separates_extension_from_reused_base(tmp_path: Path) -> None:

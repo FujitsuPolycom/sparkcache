@@ -608,6 +608,8 @@ class SparkCacheStats(KVConnectorStats):
                 ),
                 "staged_write_bytes": "sparkcache_staged_bytes",
                 "deduplicated_bytes": "sparkcache_dedup_bytes",
+                "aborted_staged_write_bytes": "sparkcache_aborted_bytes",
+                "failed_staged_write_bytes": "sparkcache_failed_bytes",
             }
             reduced.update(
                 {

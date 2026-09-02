@@ -44,7 +44,7 @@
     "context_digest": "c3b026cb8c6a87198a8cd835910aed889f641e1babc3507b326804235f14dcf1",
     "committed_tokens": 131072,
     "expected_snapshot_sha256": "93e0817999e920e07c83608a74e58777b56d7256c0707e68b4e3729662f5d958",
-    "restart_restore_ms": 605.1
+    "restart_restore_ms": 631.9
   },
   "unique_publication_bytes": 302854905,
   "logical_snapshot_bytes": 302849720,
@@ -78,6 +78,7 @@
     "extension_semantic": "BLUE",
     "restart_semantic": "BLUE",
     "corruption_fallback_semantic": "BLUE",
+    "post_repair_semantic": "BLUE",
     "corruption_fallback_tokens": 98304,
     "corruption_fallback_elapsed_seconds": 15.299,
     "post_repair_elapsed_seconds": 2.67

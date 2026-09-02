@@ -1772,10 +1772,14 @@ class ManifestTransaction:
                     _ACTIVE_PUBLICATION.reset(token)
             except Exception:
                 self._publication.finish("failed")
+                # A manifest durability failure may be uncertain: the linked
+                # manifest can already be complete and readable. Keep the
+                # transaction retryable, but give a retry its own accounting
+                # attempt. Cleanup of an untouched retry must not record a
+                # second terminal outcome for the failed attempt.
                 self._publication = self._store.publication_telemetry.begin(
                     "complete_snapshot"
                 )
-                self._publication.describe_payload(logical_payload_bytes)
                 raise
             publication = self._publication.finish("committed")
             receipt = CommitReceipt(
@@ -1805,7 +1809,8 @@ class ManifestTransaction:
             if self._state == "aborted":
                 return
             self._state = "aborted"
-            self._publication.finish("aborted")
+            if self._publication.has_activity:
+                self._publication.finish("aborted")
             self._descriptors.clear()
             self._release_root_guard()
 

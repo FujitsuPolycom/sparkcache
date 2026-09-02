@@ -127,9 +127,11 @@ slot coordinates, or transport sequence numbers.
   through ordinary vLLM block references.
 
 Verified shared GPU prefixes remain retained for
-`spark_cache_shared_prefix_lease_ttl_seconds`. The default is 15 seconds; the
-maximum is 300 seconds. Longer retention can serve later queued requests
-without another persistent restore.
+`spark_cache_shared_prefix_lease_ttl_seconds`. The accepted range is 1–300
+seconds and the default is 15 seconds.
+
+Longer retention can serve later queued requests without another persistent
+restore.
 
 The two-prefix limit and vLLM's memory-pressure eviction remain active
 regardless of the configured duration. The equivalent environment variable is
@@ -218,6 +220,8 @@ process-local totals are available from
 | `uncommitted_unique_object_bytes` | Immutable bytes left unreachable after an aborted or failed attempt. |
 | `staged_write_bytes` | Payload bytes submitted to temporary-file writes, including later deduplication. |
 | `deduplicated_bytes` | Identical immutable bytes already present at their content-addressed paths. |
+| `aborted_staged_write_bytes` | Bytes staged by publications explicitly abandoned before commit. |
+| `failed_staged_write_bytes` | Bytes staged by publications that ended with an error. |
 
 The counters describe host-side operations. They do not report filesystem
 allocation, NVMe Data Units Written, controller write amplification, or NAND

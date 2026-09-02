@@ -194,6 +194,7 @@ def _bounded_positive_config_float(
     value: Any,
     label: str,
     *,
+    minimum: float,
     maximum: float,
 ) -> float:
     """Parse a finite positive duration with an explicit upper bound."""
@@ -210,9 +211,9 @@ def _bounded_positive_config_float(
         raise RuntimeError(
             f"spark-context-cache: {label} must be a finite number"
         )
-    if not 0.0 < parsed <= maximum:
+    if not minimum <= parsed <= maximum:
         raise RuntimeError(
-            f"spark-context-cache: {label} must be greater than zero and at most"
+            f"spark-context-cache: {label} must be at least {minimum:g} and at most"
             f" {maximum:g} seconds"
         )
     return parsed
@@ -923,6 +924,7 @@ def parse_connector_config(
             ),
         ),
         "spark_cache_shared_prefix_lease_ttl_seconds",
+        minimum=1.0,
         maximum=_MAX_SHARED_PREFIX_LEASE_TTL_SECONDS,
     )
     return ConnectorConfig(
