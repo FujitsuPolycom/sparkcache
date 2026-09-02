@@ -204,6 +204,28 @@ tokens, observed elapsed time, effective token rate, and copied bytes.
 The separate commit log reports durable-storage time. The two records separate
 capture interference from background storage work.
 
+Each completed store also emits one compact `sparkcache: publish` line. Exact
+process-local totals are available from
+`ManifestStore.publication_telemetry_snapshot()` using schema
+`sparkcache-publication-telemetry/v1`.
+
+| Counter | Meaning |
+|---|---|
+| `logical_payload_bytes` | Encoded state represented by committed roots. A row tail or page delta counts only its extension. |
+| `reused_base_bytes` | Encoded base payload referenced without staging it again. |
+| `unique_object_bytes` | Complete immutable files newly linked or repaired, including metadata roots. |
+| `committed_unique_object_bytes` | Newly retained immutable bytes reachable from committed roots. |
+| `uncommitted_unique_object_bytes` | Immutable bytes left unreachable after an aborted or failed attempt. |
+| `staged_write_bytes` | Payload bytes submitted to temporary-file writes, including later deduplication. |
+| `deduplicated_bytes` | Identical immutable bytes already present at their content-addressed paths. |
+
+The counters describe host-side operations. They do not report filesystem
+allocation, NVMe Data Units Written, controller write amplification, or NAND
+writes.
+
+Telemetry is observational. It cannot change publication, restore, cache
+identity, or serving decisions.
+
 Timing is diagnostic only. Missing timing data does not change whether a
 stored entry may be used.
 

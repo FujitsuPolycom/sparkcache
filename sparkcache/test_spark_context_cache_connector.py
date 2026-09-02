@@ -6674,6 +6674,37 @@ class QuorumStatsAggregationTests(unittest.TestCase):
         self.assertEqual(reduced["sparkcache_ranks"], 4)
         self.assertEqual(reduced["sparkcache_entries"], 4)
 
+    def test_publication_byte_counters_reduce_across_ranks(self) -> None:
+        cls = connector_module.SparkCacheStats
+        reports = []
+        for rank in range(2):
+            reports.append(
+                {
+                    "rank": rank,
+                    "held": [],
+                    "publication": {
+                        "committed_publications": rank + 1,
+                        "logical_payload_bytes": 100 * (rank + 1),
+                        "committed_unique_object_bytes": 80 * (rank + 1),
+                        "staged_write_bytes": 120 * (rank + 1),
+                        "deduplicated_bytes": 20 * (rank + 1),
+                        "aborted_publications": rank,
+                        "failed_publications": 0,
+                    },
+                }
+            )
+        stats = cls(data={"reports": reports})
+
+        reduced = stats.reduce()
+
+        self.assertEqual(reduced["sparkcache_publications"], 3)
+        self.assertEqual(reduced["sparkcache_payload_bytes"], 300)
+        self.assertEqual(reduced["sparkcache_unique_bytes"], 240)
+        self.assertEqual(reduced["sparkcache_staged_bytes"], 360)
+        self.assertEqual(reduced["sparkcache_dedup_bytes"], 60)
+        self.assertEqual(reduced["sparkcache_publication_aborted"], 1)
+        self.assertNotIn("sparkcache_publication_failed", reduced)
+
     def test_later_report_replaces_same_rank(self) -> None:
         cls = connector_module.SparkCacheStats
         acc = cls(

@@ -502,7 +502,13 @@ class SparkCacheStats(KVConnectorStats):
                 normalized = dict(report)
                 if isinstance(report.get("held"), list):
                     normalized["held"] = list(report["held"])
-                for field in ("delta", "checkpoint", "streaming", "capacity"):
+                for field in (
+                    "delta",
+                    "checkpoint",
+                    "streaming",
+                    "capacity",
+                    "publication",
+                ):
                     if isinstance(report.get(field), dict):
                         normalized[field] = dict(report[field])
                 merged[report["rank"]] = normalized
@@ -588,6 +594,38 @@ class SparkCacheStats(KVConnectorStats):
                 ),
             }
             reduced.update({key: value for key, value in alerts.items() if value})
+        publication = [
+            report.get("publication")
+            for report in reports
+            if isinstance(report.get("publication"), dict)
+        ]
+        if publication:
+            fields = {
+                "committed_publications": "sparkcache_publications",
+                "logical_payload_bytes": "sparkcache_payload_bytes",
+                "committed_unique_object_bytes": (
+                    "sparkcache_unique_bytes"
+                ),
+                "staged_write_bytes": "sparkcache_staged_bytes",
+                "deduplicated_bytes": "sparkcache_dedup_bytes",
+            }
+            reduced.update(
+                {
+                    metric: sum(int(status.get(field, 0)) for status in publication)
+                    for field, metric in fields.items()
+                }
+            )
+            failures = {
+                "sparkcache_publication_aborted": sum(
+                    int(status.get("aborted_publications", 0))
+                    for status in publication
+                ),
+                "sparkcache_publication_failed": sum(
+                    int(status.get("failed_publications", 0))
+                    for status in publication
+                ),
+            }
+            reduced.update({key: value for key, value in failures.items() if value})
         return reduced
 
     def is_empty(self) -> bool:
@@ -4873,6 +4911,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         receipt.manifest_digest[:12],
                         1e3 * (time.perf_counter() - commit_started),
                     )
+                    if receipt.publication is not None:
+                        logger.info(receipt.publication.format_compact())
                     self._finish_store(
                         snapshot.plan.digest,
                         committed=not evicted,
@@ -5597,6 +5637,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 maintenance_retries=self.counters["capacity_retries"],
             )
             report["capacity"] = capacity
+        report["publication"] = self._store.publication_telemetry_snapshot().as_dict()
         return SparkCacheStats(data={"reports": [report]})
 
     def get_handshake_metadata(self) -> SparkCacheHandshakeMetadata | None:
