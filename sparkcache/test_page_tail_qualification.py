@@ -261,6 +261,16 @@ class ReceiptValidationTests(unittest.TestCase):
         errors = validate_receipt(broken)
         self.assertIn("restart_restore_ms is invalid", errors)
 
+    def test_schema_rejects_expected_snapshot_digest_mismatch(self) -> None:
+        receipt = self._receipt()
+        broken = json.loads(json.dumps(receipt))
+        broken["result"]["expected_snapshot_sha256"] = "0" * 64
+        errors = validate_receipt(broken)
+        self.assertIn(
+            "result expected snapshot digest differs from the final delta",
+            errors,
+        )
+
     def test_schema_rejects_unchained_base_digest(self) -> None:
         receipt = self._receipt(steps=(1, 1))
         broken = json.loads(json.dumps(receipt))

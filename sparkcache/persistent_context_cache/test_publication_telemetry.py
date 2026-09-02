@@ -132,6 +132,40 @@ def test_failed_manifest_publication_preserves_attempted_write_accounting(
     assert counters.staged_write_bytes > chunk_receipt.encoded_bytes
 
 
+def test_retried_manifest_publication_commits_one_reachable_attempt(
+    tmp_path: Path,
+) -> None:
+    store = ManifestStore(tmp_path)
+    transaction = store.begin_context(
+        identity=_identity(),
+        context_digest=_digest(b"retried"),
+    )
+    transaction.append_chunk(_chunk(0, b"retried"))
+    original_link = cache_manifest.os.link
+    failed_once = False
+
+    def fail_first_manifest_link(source: Path, destination: Path) -> None:
+        nonlocal failed_once
+        if Path(destination).suffix == ".json" and not failed_once:
+            failed_once = True
+            raise OSError("synthetic one-time publication failure")
+        original_link(source, destination)
+
+    with mock.patch.object(cache_manifest.os, "link", fail_first_manifest_link):
+        with pytest.raises(OSError, match="one-time publication failure"):
+            transaction.commit_manifest()
+        receipt = transaction.commit_manifest()
+
+    counters = store.publication_telemetry_snapshot()
+    assert receipt.publication is not None
+    assert receipt.publication.outcome == "committed"
+    assert counters.publication_attempts == 1
+    assert counters.committed_publications == 1
+    assert counters.failed_publications == 0
+    assert counters.failed_unique_object_bytes == 0
+    assert counters.uncommitted_unique_object_bytes == 0
+
+
 def test_row_tail_receipt_separates_extension_from_reused_base(tmp_path: Path) -> None:
     from sparkcache.spark_context_cache_codec import context_prefix_digest
 

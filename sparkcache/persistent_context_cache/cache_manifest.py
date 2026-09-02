@@ -1602,6 +1602,7 @@ class ManifestTransaction:
         self._descriptors: list[dict[str, Any]] = []
         self._expected_start = 0
         self._state = "open"
+        self._commit_failed = False
         self._receipt: CommitReceipt | None = None
         self._publication = self._store.publication_telemetry.begin(
             "complete_snapshot"
@@ -1771,15 +1772,12 @@ class ManifestTransaction:
                 finally:
                     _ACTIVE_PUBLICATION.reset(token)
             except Exception:
-                self._publication.finish("failed")
-                # A manifest durability failure may be uncertain: the linked
-                # manifest can already be complete and readable. Keep the
-                # transaction retryable, but give a retry its own accounting
-                # attempt. Cleanup of an untouched retry must not record a
-                # second terminal outcome for the failed attempt.
-                self._publication = self._store.publication_telemetry.begin(
-                    "complete_snapshot"
-                )
+                # Manifest publication is retryable because a durability
+                # failure can occur after the complete manifest is linked.
+                # Defer the terminal telemetry outcome until retry succeeds
+                # or the caller abandons the transaction, so reachable chunk
+                # bytes are never classified as uncommitted.
+                self._commit_failed = True
                 raise
             publication = self._publication.finish("committed")
             receipt = CommitReceipt(
@@ -1810,7 +1808,9 @@ class ManifestTransaction:
                 return
             self._state = "aborted"
             if self._publication.has_activity:
-                self._publication.finish("aborted")
+                self._publication.finish(
+                    "failed" if self._commit_failed else "aborted"
+                )
             self._descriptors.clear()
             self._release_root_guard()
 

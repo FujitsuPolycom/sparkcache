@@ -218,6 +218,11 @@ def validate_receipt(receipt: Any) -> list[str]:
             "result expected snapshot digest is invalid",
         )
         require(
+            result.get("expected_snapshot_sha256")
+            == final_delta.get("result_snapshot_sha256"),
+            "result expected snapshot digest differs from the final delta",
+        )
+        require(
             _nonnegative_ms(result.get("restart_restore_ms")),
             "restart_restore_ms is invalid",
         )
