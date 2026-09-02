@@ -47,6 +47,9 @@ def _install_vllm_stubs() -> None:
     logger_mod = types.ModuleType("vllm.logger")
 
     class _Logger:
+        def debug(self, *args, **kwargs):
+            pass
+
         def info(self, *args, **kwargs):
             pass
 
@@ -340,6 +343,128 @@ class HybridAllocatorContractTests(unittest.TestCase):
         self.assertEqual(connector._admitted, {})
         self.assertEqual(connector._store_progress, {})
 
+
+class StartupInventoryLogTests(unittest.TestCase):
+    @staticmethod
+    def _render_log_calls(calls: list[mock._Call]) -> list[str]:
+        return [call.args[0] % call.args[1:] for call in calls]
+
+    @staticmethod
+    def _page_config() -> types.SimpleNamespace:
+        class FullAttentionSpec:
+            block_size = 256
+            storage_block_size = 256
+            page_size_bytes = 20
+
+        spec = FullAttentionSpec()
+        return types.SimpleNamespace(
+            num_blocks=2,
+            kv_cache_groups=(
+                types.SimpleNamespace(
+                    kv_cache_spec=spec,
+                    is_eagle_group=False,
+                    layer_names=("model.layers.0.attn",),
+                ),
+            ),
+        )
+
+    def test_info_inventory_is_compact_and_preserves_geometry_totals(self) -> None:
+        storage = torch.zeros(48, dtype=torch.uint8)
+        split_page_tensor = torch.as_strided(
+            storage,
+            size=(4, 1, 8),
+            stride=(12, 8, 1),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                extra_config={
+                    "spark_cache_model_profile": "glm53-flash-hybrid",
+                },
+                tp=1,
+                dcp=1,
+                kv_cache_config=self._page_config(),
+            )
+            test_logger = mock.Mock()
+            with mock.patch.object(connector_module, "logger", test_logger):
+                connector.register_kv_caches(
+                    {"model.layers.0.attn": split_page_tensor}
+                )
+
+        info_lines = self._render_log_calls(test_logger.info.call_args_list)
+        self.assertEqual(
+            info_lines,
+            [
+                "sparkcache: manager_pages blocks=2 layers=1"
+                " split_kernel_layers=1 tail_layers=1 tail_bytes_per_page=4",
+                "sparkcache: layers total=1 storage=block_pages_v1"
+                ' records={"target_ckv":1} item_bytes={"20":1}'
+                " draft_policy=separate",
+            ],
+        )
+        self.assertNotIn("model.layers.0.attn", "\n".join(info_lines))
+        self.assertEqual(connector.counters["startup_layers_registered"], 1)
+        self.assertEqual(connector.counters["startup_record_kinds"], 1)
+        self.assertEqual(connector.counters["startup_item_byte_widths"], 1)
+        self.assertEqual(connector.counters["startup_manager_blocks"], 2)
+        self.assertEqual(connector.counters["startup_split_kernel_layers"], 1)
+        self.assertEqual(connector.counters["startup_physical_tail_layers"], 1)
+        self.assertEqual(
+            connector.counters["startup_physical_tail_bytes_per_page"],
+            4,
+        )
+
+    def test_debug_inventory_retains_layer_names_widths_and_records(self) -> None:
+        storage = torch.zeros(48, dtype=torch.uint8)
+        split_page_tensor = torch.as_strided(
+            storage,
+            size=(4, 1, 8),
+            stride=(12, 8, 1),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                extra_config={
+                    "spark_cache_model_profile": "glm53-flash-hybrid",
+                },
+                tp=1,
+                dcp=1,
+                kv_cache_config=self._page_config(),
+            )
+            test_logger = mock.Mock()
+            with mock.patch.object(connector_module, "logger", test_logger):
+                connector.register_kv_caches(
+                    {"model.layers.0.attn": split_page_tensor}
+                )
+
+        debug_lines = self._render_log_calls(test_logger.debug.call_args_list)
+        self.assertEqual(len(debug_lines), 1)
+        prefix = "sparkcache: layer_inventory "
+        self.assertTrue(debug_lines[0].startswith(prefix))
+        inventory = json.loads(debug_lines[0][len(prefix) :])
+        self.assertEqual(inventory, connector._startup_layer_inventory)
+        self.assertEqual(
+            inventory["layers"],
+            [
+                {
+                    "name": "model.layers.0.attn",
+                    "item_bytes": 20,
+                    "record": "target_ckv",
+                }
+            ],
+        )
+        self.assertEqual(
+            inventory["manager_pages"],
+            {
+                "blocks": 2,
+                "layers": 1,
+                "split_kernel_layers": 1,
+                "physical_tail_layers": 1,
+                "physical_tail_bytes_per_page": 4,
+            },
+        )
 
 class HybridPageRoundTripTests(unittest.TestCase):
     def test_dcp_recurrent_align_uses_replicated_position_width(
