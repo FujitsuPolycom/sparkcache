@@ -18,14 +18,23 @@ import time
 import uuid
 from collections import Counter
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, field as dataclass_field, replace
 from enum import Enum
+from functools import wraps
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Sequence
 
 from sparkcache.page_base_read_flights import PageBaseReadEvidence
+from sparkcache.publication_telemetry import (
+    PublicationAttempt,
+    PublicationByteReceipt,
+    PublicationKind,
+    PublicationTelemetry,
+    PublicationTelemetrySnapshot,
+)
 
 try:
     import fcntl as _fcntl
@@ -77,6 +86,10 @@ _CACHE_DATA_DIRECTORIES = (
     "manifests",
     "prefix-aliases",
     "prefix-index",
+)
+_ACTIVE_PUBLICATION: ContextVar[PublicationAttempt | None] = ContextVar(
+    "sparkcache_active_publication",
+    default=None,
 )
 
 
@@ -373,6 +386,10 @@ class CommitReceipt:
     committed_tokens: int
     encoded_bytes: int
     allocated_bytes_upper_bound: int
+    publication: PublicationByteReceipt | None = dataclass_field(
+        default=None,
+        compare=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -389,6 +406,10 @@ class PrefixAliasReceipt:
     aliases_published: int
     segments_published: int
     alias_keys: tuple["EntryKey", ...]
+    publication: PublicationByteReceipt | None = dataclass_field(
+        default=None,
+        compare=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -721,18 +742,26 @@ def _clear_once_completed(path: Path, token_digest: str) -> bool:
     )
 
 
-def _publish_immutable(path: Path, payload: bytes) -> None:
+def _publish_immutable(
+    path: Path,
+    payload: bytes,
+) -> None:
     """Durably publish complete bytes once without an overwrite race."""
 
     _ensure_durable_directory(path.parent)
     temporary = path.with_name(f".{path.name}.writing-{uuid.uuid4().hex}")
     try:
+        publication = _ACTIVE_PUBLICATION.get()
         with temporary.open("xb") as stream:
+            if publication is not None:
+                publication.record_staged(len(payload))
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
         try:
             os.link(temporary, path)
+            if publication is not None:
+                publication.record_unique(len(payload))
         except FileExistsError:
             try:
                 existing = path.read_bytes()
@@ -744,6 +773,8 @@ def _publish_immutable(path: Path, payload: bytes) -> None:
                 raise CommitConflict(
                     f"different immutable object already committed at {path}"
                 )
+            if publication is not None:
+                publication.record_deduplicated(len(payload))
     finally:
         try:
             temporary.unlink()
@@ -782,10 +813,12 @@ def _publish_immutable_batch(
         )
         for path, payload in objects
     ]
-
+    publication = _ACTIVE_PUBLICATION.get()
     def stage(item: tuple[Path, bytes, Path]) -> None:
         _path, payload, temporary = item
         with temporary.open("xb") as stream:
+            if publication is not None:
+                publication.record_staged(len(payload))
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
@@ -797,6 +830,8 @@ def _publish_immutable_batch(
         for path, payload, temporary in staged:
             try:
                 os.link(temporary, path)
+                if publication is not None:
+                    publication.record_unique(len(payload))
             except FileExistsError:
                 try:
                     existing = path.read_bytes()
@@ -811,6 +846,10 @@ def _publish_immutable_batch(
                             f"different immutable object already committed at {path}"
                         )
                     os.replace(temporary, path)
+                    if publication is not None:
+                        publication.record_unique(len(payload))
+                elif publication is not None:
+                    publication.record_deduplicated(len(payload))
     finally:
         for _path, _payload, temporary in staged:
             try:
@@ -1563,7 +1602,11 @@ class ManifestTransaction:
         self._descriptors: list[dict[str, Any]] = []
         self._expected_start = 0
         self._state = "open"
+        self._commit_failed = False
         self._receipt: CommitReceipt | None = None
+        self._publication = self._store.publication_telemetry.begin(
+            "complete_snapshot"
+        )
         self._lock = threading.RLock()
         self._root_guard: _RootGuard | None = _RootGuard(
             self._store.root,
@@ -1678,7 +1721,11 @@ class ManifestTransaction:
                 expected_start = chunk.logical_end
                 previous = descriptor
 
-            _publish_immutable_batch(pending_objects)
+            token = _ACTIVE_PUBLICATION.set(self._publication)
+            try:
+                _publish_immutable_batch(pending_objects)
+            finally:
+                _ACTIVE_PUBLICATION.reset(token)
             self._descriptors.extend(pending_descriptors)
             self._expected_start = expected_start
             return tuple(receipts)
@@ -1708,13 +1755,35 @@ class ManifestTransaction:
                 "chunks": list(self._descriptors),
             }
             encoded_manifest = _canonical_json(manifest)
+            logical_payload_bytes = sum(
+                int(item["bytes"]) for item in self._descriptors
+            )
+            self._publication.describe_payload(logical_payload_bytes)
+            try:
+                token = _ACTIVE_PUBLICATION.set(self._publication)
+                try:
+                    _publish_immutable(
+                        self._store._manifest_path(
+                            self._identity,
+                            self._context_digest,
+                        ),
+                        encoded_manifest,
+                    )
+                finally:
+                    _ACTIVE_PUBLICATION.reset(token)
+            except Exception:
+                # Manifest publication is retryable because a durability
+                # failure can occur after the complete manifest is linked.
+                # Defer the terminal telemetry outcome until retry succeeds
+                # or the caller abandons the transaction, so reachable chunk
+                # bytes are never classified as uncommitted.
+                self._commit_failed = True
+                raise
+            publication = self._publication.finish("committed")
             receipt = CommitReceipt(
                 manifest_digest=_sha256(encoded_manifest),
                 committed_tokens=self._expected_start,
-                encoded_bytes=(
-                    len(encoded_manifest)
-                    + sum(int(item["bytes"]) for item in self._descriptors)
-                ),
+                encoded_bytes=len(encoded_manifest) + logical_payload_bytes,
                 allocated_bytes_upper_bound=sum(
                     (size + 4095) // 4096 * 4096
                     for size in (
@@ -1722,13 +1791,7 @@ class ManifestTransaction:
                         *(int(item["bytes"]) for item in self._descriptors),
                     )
                 ),
-            )
-            _publish_immutable(
-                self._store._manifest_path(
-                    self._identity,
-                    self._context_digest,
-                ),
-                encoded_manifest,
+                publication=publication,
             )
             self._receipt = receipt
             self._state = "committed"
@@ -1744,15 +1807,62 @@ class ManifestTransaction:
             if self._state == "aborted":
                 return
             self._state = "aborted"
+            if self._publication.has_activity:
+                self._publication.finish(
+                    "failed" if self._commit_failed else "aborted"
+                )
             self._descriptors.clear()
             self._release_root_guard()
+
+
+def _tracked_publication(kind: PublicationKind):
+    """Attach observational byte accounting to one store publication method."""
+
+    def decorate(method):
+        @wraps(method)
+        def wrapped(store: "ManifestStore", *args, **kwargs):
+            attempt = store.publication_telemetry.begin(kind)
+            token = _ACTIVE_PUBLICATION.set(attempt)
+            try:
+                result = method(store, *args, **kwargs)
+            except Exception:
+                if attempt.has_activity:
+                    attempt.finish("failed")
+                raise
+            finally:
+                _ACTIVE_PUBLICATION.reset(token)
+            receipt = attempt.finish("committed")
+            if isinstance(result, (CommitReceipt, PrefixAliasReceipt)):
+                return replace(result, publication=receipt)
+            return result
+
+        return wrapped
+
+    return decorate
 
 
 class ManifestStore:
     """Atomic local-NVMe publisher and verified-or-miss reader."""
 
-    def __init__(self, root: Path | str) -> None:
+    def __init__(
+        self,
+        root: Path | str,
+        *,
+        publication_telemetry: PublicationTelemetry | None = None,
+    ) -> None:
         self.root = Path(root)
+        self.publication_telemetry = publication_telemetry or PublicationTelemetry()
+
+    def publication_telemetry_snapshot(self) -> PublicationTelemetrySnapshot:
+        """Return monotonic observational byte counters for this store."""
+
+        return self.publication_telemetry.snapshot()
+
+    def _active_publication(self) -> PublicationAttempt:
+        attempt = _ACTIVE_PUBLICATION.get()
+        if attempt is None:
+            raise RuntimeError("publication telemetry scope is missing")
+        return attempt
 
     def clear_once(
         self,
@@ -2624,6 +2734,7 @@ class ManifestStore:
             raise CacheFormatError("page snapshot payload checksum mismatch")
         return result
 
+    @_tracked_publication("prefix_alias")
     def publish_prefix_aliases(
         self,
         *,
@@ -2735,6 +2846,11 @@ class ManifestStore:
                 raise ValueError("prefix token boundary is not a source chunk boundary")
 
         maximum_chunks = max(descriptor_ends[boundary] for boundary in boundaries)
+        publication = self._active_publication()
+        publication.describe_payload(
+            0,
+            sum(int(item["bytes"]) for item in descriptors[:maximum_chunks]),
+        )
         segment_digests: list[str] = []
         segment_objects: list[tuple[Path, bytes]] = []
         parent_digest: str | None = None
@@ -2794,6 +2910,7 @@ class ManifestStore:
             alias_keys=tuple(alias_keys),
         )
 
+    @_tracked_publication("row_tail")
     def commit_extension(
         self,
         *,
@@ -2896,6 +3013,11 @@ class ManifestStore:
                 _segment_count,
                 segment_allocated_bytes,
             ) = self._publish_descriptor_chain(identity, base_descriptors)
+            publication = self._active_publication()
+            publication.describe_payload(
+                sum(int(item["bytes"]) for item in tail_descriptors),
+                sum(int(item["bytes"]) for item in base_descriptors),
+            )
             _publish_immutable_batch(tail_objects)
             root = {
                 "schema": _TAIL_MANIFEST_SCHEMA,
@@ -2936,6 +3058,7 @@ class ManifestStore:
                 ),
             )
 
+    @_tracked_publication("page_snapshot")
     def commit_page_snapshot(
         self,
         *,
@@ -2990,6 +3113,8 @@ class ManifestStore:
                 )
 
         with _RootGuard(self.root, shared=True, blocking=True):
+            publication = self._active_publication()
+            publication.describe_payload(snapshot_bytes)
             descriptors: list[dict[str, Any]] = []
             objects: list[tuple[Path, bytes]] = []
             snapshot_digest = hashlib.sha256()
@@ -3054,6 +3179,7 @@ class ManifestStore:
                 ),
             )
 
+    @_tracked_publication("page_delta")
     def commit_page_extension(
         self,
         *,
@@ -3122,6 +3248,8 @@ class ManifestStore:
                 base_boundary_tokens=base_boundary_tokens,
                 result_boundary_tokens=result_boundary_tokens,
             )
+            publication = self._active_publication()
+            publication.describe_payload(len(delta), len(base_snapshot))
             descriptors: list[dict[str, Any]] = []
             objects: list[tuple[Path, bytes]] = []
             delta_view = memoryview(delta)

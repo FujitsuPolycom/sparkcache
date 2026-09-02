@@ -134,7 +134,6 @@ _QUORUM_DELTA_PROTOCOL = "sparkcache-quorum-delta-v1"
 _MAX_RESTORE_FLIGHT_FOLLOWERS = 16
 _MAX_SHARED_PREFIX_LEASES = 2
 _MAX_SHAREABLE_PREFIXES_PER_FLIGHT = 64
-_SHARED_PREFIX_LEASE_TTL_SECONDS = 15.0
 _MAX_PAGE_BASE_READ_FLIGHTS = 2
 _MAX_PAGE_BASE_READ_MEMBERS = 16
 _MAX_PAGE_BASE_BYTES_PER_FLIGHT = 1024**3
@@ -503,7 +502,13 @@ class SparkCacheStats(KVConnectorStats):
                 normalized = dict(report)
                 if isinstance(report.get("held"), list):
                     normalized["held"] = list(report["held"])
-                for field in ("delta", "checkpoint", "streaming", "capacity"):
+                for field in (
+                    "delta",
+                    "checkpoint",
+                    "streaming",
+                    "capacity",
+                    "publication",
+                ):
                     if isinstance(report.get(field), dict):
                         normalized[field] = dict(report[field])
                 merged[report["rank"]] = normalized
@@ -589,6 +594,40 @@ class SparkCacheStats(KVConnectorStats):
                 ),
             }
             reduced.update({key: value for key, value in alerts.items() if value})
+        publication = [
+            report.get("publication")
+            for report in reports
+            if isinstance(report.get("publication"), dict)
+        ]
+        if publication:
+            fields = {
+                "committed_publications": "sparkcache_publications",
+                "logical_payload_bytes": "sparkcache_payload_bytes",
+                "committed_unique_object_bytes": (
+                    "sparkcache_unique_bytes"
+                ),
+                "staged_write_bytes": "sparkcache_staged_bytes",
+                "deduplicated_bytes": "sparkcache_dedup_bytes",
+                "aborted_staged_write_bytes": "sparkcache_aborted_bytes",
+                "failed_staged_write_bytes": "sparkcache_failed_bytes",
+            }
+            reduced.update(
+                {
+                    metric: sum(int(status.get(field, 0)) for status in publication)
+                    for field, metric in fields.items()
+                }
+            )
+            failures = {
+                "sparkcache_publication_aborted": sum(
+                    int(status.get("aborted_publications", 0))
+                    for status in publication
+                ),
+                "sparkcache_publication_failed": sum(
+                    int(status.get("failed_publications", 0))
+                    for status in publication
+                ),
+            }
+            reduced.update({key: value for key, value in failures.items() if value})
         return reduced
 
     def is_empty(self) -> bool:
@@ -827,6 +866,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         # update_state_after_alloc / build_connector_meta and cleared by
         # request_finished, so the map cannot grow past in-flight requests.
         self._max_pending_restores = config.max_pending_restores
+        self._shared_prefix_lease_ttl_seconds = (
+            config.shared_prefix_lease_ttl_seconds
+        )
         # Coalesce requests selecting the same persistent digest around one
         # restore. Followers own no restore blocks: they remain ordinary
         # waiting requests until vLLM publishes the leader's verified blocks
@@ -938,10 +980,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             "streaming_capacity_shutdown_dropped": 0,
         }
         logger.info(
-            "spark-context-cache: role=%s root=%s dcp=%d access_mode=%s"
+            "sparkcache: config role=%s root=%s dcp=%d access_mode=%s"
             " store=%s restore=%s"
             " cuda_restore=%s max_span=%d load_threads=%d max_bytes=%d"
-            " low_bytes=%d ttl_seconds=%d",
+            " low_bytes=%d ttl_seconds=%d shared_prefix_lease_ttl_seconds=%.3g",
             role.name,
             self._root,
             self._dcp_degree,
@@ -954,6 +996,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self._capacity_policy.max_bytes,
             self._capacity_policy.low_watermark_bytes,
             self._capacity_policy.ttl_seconds,
+            self._shared_prefix_lease_ttl_seconds,
         )
 
     def _install_streaming_runtime(self, role: KVConnectorRole) -> None:
@@ -1393,10 +1436,16 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 (
                     flight.segment_digest,
                     flight.segment_span_tokens,
-                    _SHARED_PREFIX_LEASE_TTL_SECONDS,
+                    self._shared_prefix_lease_ttl_seconds,
                 ),
             )
-        return ((flight.digest, flight.span_tokens, _SHARED_PREFIX_LEASE_TTL_SECONDS),)
+        return (
+            (
+                flight.digest,
+                flight.span_tokens,
+                self._shared_prefix_lease_ttl_seconds,
+            ),
+        )
 
     def get_shared_prefix_lease_to_publish(
         self, request: "Request"
@@ -1432,7 +1481,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         flight.lease_digest = lease_key
         flight.lease_span_tokens = span
         flight.lease_published_at = now
-        flight.lease_expires_at = now + _SHARED_PREFIX_LEASE_TTL_SECONDS
+        flight.lease_expires_at = now + self._shared_prefix_lease_ttl_seconds
         self.counters["shared_prefix_leases_published"] += 1
 
         published = sorted(
@@ -2235,6 +2284,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         registered_tensors = dict(kv_caches)
+        manager_page_summary: dict[str, int] | None = None
         if self._storage_mode == "block_pages_v1":
             groups = tuple(getattr(self._kv_cache_config, "kv_cache_groups", ()) or ())
             manager_blocks = int(getattr(self._kv_cache_config, "num_blocks", 0) or 0)
@@ -2282,15 +2332,22 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 )
                 for name, tensor in registered_tensors.items()
             }
+            manager_page_summary = {
+                "blocks": manager_blocks,
+                "layers": len(registered_tensors),
+                "split_kernel_layers": split_kernel_layers,
+                "physical_tail_layers": physical_tail_layers,
+                "physical_tail_bytes_per_page": physical_tail_bytes,
+            }
             logger.info(
-                "spark-context-cache: manager-page inventory blocks=%d layers=%d"
-                " split_kernel_layers=%d physical_tail_layers=%d"
-                " physical_tail_bytes_per_manager_page=%d",
-                manager_blocks,
-                len(registered_tensors),
-                split_kernel_layers,
-                physical_tail_layers,
-                physical_tail_bytes,
+                "sparkcache: manager_pages blocks=%d layers=%d"
+                " split_kernel_layers=%d tail_layers=%d"
+                " tail_bytes_per_page=%d",
+                manager_page_summary["blocks"],
+                manager_page_summary["layers"],
+                manager_page_summary["split_kernel_layers"],
+                manager_page_summary["physical_tail_layers"],
+                manager_page_summary["physical_tail_bytes_per_page"],
             )
         self._layer_tensors = registered_tensors
         if self._storage_mode == "block_pages_v1":
@@ -2346,11 +2403,6 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 )
             row = tensor[0, 0]
             widths[name] = int(row.numel() * row.element_size())
-        logger.info(
-            "spark-context-cache: layer inventory (%d layers): %s",
-            len(widths),
-            {name: widths[name] for name in sorted(widths)},
-        )
         profile = self._profile
         draft_named = any(
             classify_layer(name, profile.classification_rules, profile.default_family)
@@ -2379,11 +2431,61 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         kinds: dict[str, int] = {}
         for plan in self._plans:
             kinds[plan.record_kind] = kinds.get(plan.record_kind, 0) + 1
+        item_bytes: dict[int, int] = {}
+        for width in widths.values():
+            item_bytes[width] = item_bytes.get(width, 0) + 1
+        layer_records = {plan.name: plan.record_kind for plan in self._plans}
+        self._startup_layer_inventory = {
+            "storage": self._storage_mode,
+            "draft_policy": self._identity_base.get("draft_kv_policy", "separate"),
+            "layer_count": len(self._plans),
+            "record_counts": dict(sorted(kinds.items())),
+            "item_byte_counts": {
+                str(width): count for width, count in sorted(item_bytes.items())
+            },
+            "manager_pages": manager_page_summary,
+            "layers": [
+                {
+                    "name": name,
+                    "item_bytes": widths[name],
+                    "record": layer_records[name],
+                }
+                for name in sorted(widths)
+            ],
+        }
+        self.counters["startup_layers_registered"] = len(self._plans)
+        self.counters["startup_record_kinds"] = len(kinds)
+        self.counters["startup_item_byte_widths"] = len(item_bytes)
+        if manager_page_summary is not None:
+            self.counters["startup_manager_blocks"] = manager_page_summary["blocks"]
+            self.counters["startup_split_kernel_layers"] = manager_page_summary[
+                "split_kernel_layers"
+            ]
+            self.counters["startup_physical_tail_layers"] = manager_page_summary[
+                "physical_tail_layers"
+            ]
+            self.counters["startup_physical_tail_bytes_per_page"] = (
+                manager_page_summary["physical_tail_bytes_per_page"]
+            )
         logger.info(
-            "spark-context-cache: registered %d layers %s policy=%s",
+            "sparkcache: layers total=%d storage=%s records=%s item_bytes=%s"
+            " draft_policy=%s",
             len(self._plans),
-            kinds,
+            self._storage_mode,
+            json.dumps(dict(sorted(kinds.items())), separators=(",", ":")),
+            json.dumps(
+                self._startup_layer_inventory["item_byte_counts"],
+                separators=(",", ":"),
+            ),
             self._identity_base.get("draft_kv_policy", "separate"),
+        )
+        logger.debug(
+            "sparkcache: layer_inventory %s",
+            json.dumps(
+                self._startup_layer_inventory,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
         )
         if self._native_restore_enabled and self._role is KVConnectorRole.WORKER:
             self._configure_native_restore()
@@ -2549,7 +2651,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._native_required_record_mask = required
         self.counters["native_configured"] = 1
         logger.info(
-            "spark-context-cache: SparkCache CUDA restore configured library=%s"
+            "sparkcache: cuda_restore library=%s"
             " sha256=%s arena_mib=%d destinations=%d slots=%d"
             " max_chunks_per_slab=%d",
             self._native_library_path,
@@ -2635,7 +2737,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._native_execute_hybrid_placement = execute_placement
         self.counters["native_hybrid_configured"] = 1
         logger.info(
-            "spark-context-cache: SparkCache CUDA restore configured"
+            "sparkcache: cuda_restore"
             " destinations=%d max_slots=%d arena_mib=%d lanes=%d",
             destination_count,
             max_slots,
@@ -4811,6 +4913,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         receipt.manifest_digest[:12],
                         1e3 * (time.perf_counter() - commit_started),
                     )
+                    if receipt.publication is not None:
+                        logger.info(receipt.publication.format_compact())
                     self._finish_store(
                         snapshot.plan.digest,
                         committed=not evicted,
@@ -5535,6 +5639,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 maintenance_retries=self.counters["capacity_retries"],
             )
             report["capacity"] = capacity
+        report["publication"] = self._store.publication_telemetry_snapshot().as_dict()
         return SparkCacheStats(data={"reports": [report]})
 
     def get_handshake_metadata(self) -> SparkCacheHandshakeMetadata | None:

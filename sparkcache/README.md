@@ -44,6 +44,7 @@ configuration leaves SparkCache unloaded.
     "spark_cache_target_checkpoint_sha256": "<64 lowercase hex characters>",
     "spark_cache_draft_policy": "colocated_target",
     "spark_cache_access_mode": "read-write",
+    "spark_cache_shared_prefix_lease_ttl_seconds": 15,
     "spark_cache_max_bytes": 214748364800,
     "spark_cache_low_watermark_bytes": 193273528320,
     "spark_cache_ttl_seconds": 0,
@@ -125,6 +126,17 @@ slot coordinates, or transport sequence numbers.
 - **Shared restores:** let bounded followers attach to one verified GPU prefix
   through ordinary vLLM block references.
 
+Verified shared GPU prefixes remain retained for
+`spark_cache_shared_prefix_lease_ttl_seconds`. The accepted range is 1–300
+seconds and the default is 15 seconds.
+
+Longer retention can serve later queued requests without another persistent
+restore.
+
+The two-prefix limit and vLLM's memory-pressure eviction remain active
+regardless of the configured duration. The equivalent environment variable is
+`SPARK_CONTEXT_CACHE_SHARED_PREFIX_LEASE_TTL_SECONDS`.
+
 Page graphs admit at most two deltas. Another extension compacts the graph into
 a complete snapshot.
 
@@ -193,6 +205,30 @@ tokens, observed elapsed time, effective token rate, and copied bytes.
 
 The separate commit log reports durable-storage time. The two records separate
 capture interference from background storage work.
+
+Each completed store also emits one compact `sparkcache: publish` line. Exact
+process-local totals are available from
+`ManifestStore.publication_telemetry_snapshot()` using schema
+`sparkcache-publication-telemetry/v1`.
+
+| Counter | Meaning |
+|---|---|
+| `logical_payload_bytes` | Encoded state represented by committed roots. A row tail or page delta counts only its extension. |
+| `reused_base_bytes` | Encoded base payload referenced without staging it again. |
+| `unique_object_bytes` | Complete immutable files newly linked or repaired, including metadata roots. |
+| `committed_unique_object_bytes` | Newly retained immutable bytes reachable from committed roots. |
+| `uncommitted_unique_object_bytes` | Immutable bytes left unreachable after an aborted or failed attempt. |
+| `staged_write_bytes` | Payload bytes submitted to temporary-file writes, including later deduplication. |
+| `deduplicated_bytes` | Identical immutable bytes already present at their content-addressed paths. |
+| `aborted_staged_write_bytes` | Bytes staged by publications explicitly abandoned before commit. |
+| `failed_staged_write_bytes` | Bytes staged by publications that ended with an error. |
+
+The counters describe host-side operations. They do not report filesystem
+allocation, NVMe Data Units Written, controller write amplification, or NAND
+writes.
+
+Telemetry is observational. It cannot change publication, restore, cache
+identity, or serving decisions.
 
 Timing is diagnostic only. Missing timing data does not change whether a
 stored entry may be used.

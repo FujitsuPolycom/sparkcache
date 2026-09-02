@@ -55,6 +55,10 @@ The BF16 draft is distinct from Local Inference Lab's
 
 ## Evidence and historical records
 
+- [`qualification.json`](../../evidence/glm53-flash-dcp4-page-tail/qualification.json)
+  records byte-exact 98,304-to-131,072-token page-tail publication, restart
+  restore, corruption rejection, valid-base fallback, and repaired restore on
+  the GLM-5.3 Flash TP4/DCP4 deployment identified inside the receipt.
 - [`GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md`](../../GLM53_SPARKCACHE_CUDA_RESTORE_PERFORMANCE_VALIDATION.md)
   records source-bound SparkCache CUDA placement and shared-prefix evidence.
 - [`GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md`](../../GLM53_PR535_PAGE_DELTA_RESEARCH_VALIDATION.md)

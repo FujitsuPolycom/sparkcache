@@ -366,6 +366,49 @@ class ParseConnectorConfigTests(unittest.TestCase):
         config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
         self.assertEqual(config.max_pending_restores, 64)
 
+    def test_shared_prefix_lease_ttl_defaults_to_15_seconds(self) -> None:
+        vllm, _ = _make_vllm_config()
+
+        config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+
+        self.assertEqual(config.shared_prefix_lease_ttl_seconds, 15.0)
+
+    def test_shared_prefix_lease_ttl_accepts_bounded_override(self) -> None:
+        vllm, _ = _make_vllm_config(
+            {"spark_cache_shared_prefix_lease_ttl_seconds": "300"}
+        )
+
+        config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+
+        self.assertEqual(config.shared_prefix_lease_ttl_seconds, 300.0)
+
+    def test_shared_prefix_lease_ttl_accepts_one_second_minimum(self) -> None:
+        vllm, _ = _make_vllm_config(
+            {"spark_cache_shared_prefix_lease_ttl_seconds": "1"}
+        )
+
+        config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+
+        self.assertEqual(config.shared_prefix_lease_ttl_seconds, 1.0)
+
+    def test_shared_prefix_lease_ttl_does_not_change_cache_identity(self) -> None:
+        default_vllm, _ = _make_vllm_config()
+        retained_vllm, _ = _make_vllm_config(
+            {"spark_cache_shared_prefix_lease_ttl_seconds": "300"}
+        )
+
+        default = cfg.parse_connector_config(
+            default_vllm, default_vllm.kv_transfer_config, None
+        )
+        retained = cfg.parse_connector_config(
+            retained_vllm, retained_vllm.kv_transfer_config, None
+        )
+
+        self.assertEqual(
+            default.build_identity(0, 0).storage_key,
+            retained.build_identity(0, 0).storage_key,
+        )
+
     def test_scheduler_probe_default_tp0(self) -> None:
         vllm, _ = _make_vllm_config()
         config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
@@ -664,6 +707,29 @@ class ErrorPathTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
         self.assertIn("must be an integer", str(ctx.exception))
+
+    def test_shared_prefix_lease_ttl_rejects_invalid_values(self) -> None:
+        invalid = {
+            "malformed": "not-a-duration",
+            "negative": "-1",
+            "zero": "0",
+            "below-minimum": "0.5",
+            "excessive": "300.001",
+            "infinite": "inf",
+            "boolean": True,
+        }
+        for label, value in invalid.items():
+            with self.subTest(label=label):
+                vllm, _ = _make_vllm_config(
+                    {"spark_cache_shared_prefix_lease_ttl_seconds": value}
+                )
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "spark_cache_shared_prefix_lease_ttl_seconds",
+                ):
+                    cfg.parse_connector_config(
+                        vllm, vllm.kv_transfer_config, None
+                    )
 
     def test_nnegative_config_int_rejects_float(self) -> None:
         with self.assertRaises(RuntimeError) as ctx:

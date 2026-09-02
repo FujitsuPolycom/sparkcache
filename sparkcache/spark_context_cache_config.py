@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import threading
@@ -57,6 +58,8 @@ _LEGACY_CUDA_RESTORE_WARNING_LOCK = threading.Lock()
 _LEGACY_CUDA_RESTORE_WARNING_EMITTED = False
 _ASYNC_PAGE_CAPTURE_CONFIG = "spark_cache_async_page_capture"
 _ASYNC_PAGE_CAPTURE_ENV = "SPARK_CONTEXT_CACHE_ASYNC_PAGE_CAPTURE"
+_DEFAULT_SHARED_PREFIX_LEASE_TTL_SECONDS = 15.0
+_MAX_SHARED_PREFIX_LEASE_TTL_SECONDS = 300.0
 
 
 def _warn_legacy_cuda_restore_config() -> None:
@@ -184,6 +187,35 @@ def _nonnegative_config_int(value: Any, label: str) -> int:
         ) from error
     if parsed < 0:
         raise RuntimeError(f"spark-context-cache: {label} must be non-negative")
+    return parsed
+
+
+def _bounded_positive_config_float(
+    value: Any,
+    label: str,
+    *,
+    minimum: float,
+    maximum: float,
+) -> float:
+    """Parse a finite positive duration with an explicit upper bound."""
+
+    try:
+        if isinstance(value, bool):
+            raise ValueError("Boolean values are not durations")
+        parsed = float(value)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"spark-context-cache: {label} must be a finite number"
+        ) from error
+    if not math.isfinite(parsed):
+        raise RuntimeError(
+            f"spark-context-cache: {label} must be a finite number"
+        )
+    if not minimum <= parsed <= maximum:
+        raise RuntimeError(
+            f"spark-context-cache: {label} must be at least {minimum:g} and at most"
+            f" {maximum:g} seconds"
+        )
     return parsed
 
 
@@ -385,6 +417,7 @@ class ConnectorConfig:
     identity_base: Mapping[str, Any]
     load_thread_limit: int
     max_pending_restores: int
+    shared_prefix_lease_ttl_seconds: float
 
     @property
     def native_restore_enabled(self) -> bool:
@@ -882,6 +915,18 @@ def parse_connector_config(
         raise RuntimeError(
             "spark-context-cache: spark_cache_max_pending_restores must be at least 1"
         )
+    shared_prefix_lease_ttl_seconds = _bounded_positive_config_float(
+        extra(
+            "spark_cache_shared_prefix_lease_ttl_seconds",
+            os.environ.get(
+                "SPARK_CONTEXT_CACHE_SHARED_PREFIX_LEASE_TTL_SECONDS",
+                str(_DEFAULT_SHARED_PREFIX_LEASE_TTL_SECONDS),
+            ),
+        ),
+        "spark_cache_shared_prefix_lease_ttl_seconds",
+        minimum=1.0,
+        maximum=_MAX_SHARED_PREFIX_LEASE_TTL_SECONDS,
+    )
     return ConnectorConfig(
         tp_degree=tp_degree,
         dcp_degree=dcp_degree,
@@ -911,4 +956,5 @@ def parse_connector_config(
         identity_base=_freeze_config_value(identity_base),
         load_thread_limit=load_thread_limit,
         max_pending_restores=max_pending_restores,
+        shared_prefix_lease_ttl_seconds=shared_prefix_lease_ttl_seconds,
     )
