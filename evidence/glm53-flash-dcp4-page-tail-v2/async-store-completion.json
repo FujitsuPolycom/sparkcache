@@ -1,0 +1,72 @@
+{
+  "schema": "sparkcache-async-store-completion-validation/v1",
+  "status": "qualified",
+  "scope": {
+    "model": "GLM-5.3-Flash-NVFP4",
+    "target_checkpoint_sha256": "a35e6bf2875c1875609b8deaec404c07c6cc80259e4222fc0b51e649498bd6b9",
+    "draft_checkpoint_sha256": "b33c03475ba7322cf398828f2d8d1be376df30dc05c6b40c28c8ea8da23e410b",
+    "topology": "TP4/DCP4",
+    "vllm_commit": "3633d61c3c7b04bb4d598cadbdc342f3be40482d",
+    "base_image": "ghcr.io/fujitsupolycom/sparkring-glm53-sparkcache@sha256:4ce98659c30d9e9c313b1018a2675e5f135a0404e7cc00951b4ade161c0a711f",
+    "sparkcache_commit": "f559fbd845134a870125841c71434824d4bb5eb3",
+    "sparkcache_source_sha256": "f8adb4ecdadd524e79cf1ef14e7f3d83d1f20ff07c79333b2c7c0d9ea12919d5",
+    "cuda_placement_sha256": "d57509052b73853bcc8e3c3f47bb81748d87b9cbd8d908fc20d4c79a09aa400c",
+    "cuda_snapshot_sha256": "4398f18b8913e743e7bf1ed8fe29560d4580e61b6a1e2ab8b16684b19b6573b5"
+  },
+  "configuration": {
+    "max_model_tokens": 1048576,
+    "kv_cache_dtype": "fp8",
+    "kv_cache_bytes_per_rank": 25769803776,
+    "access_mode": "read-write",
+    "publication_schema": "page-tail-cow-v2",
+    "asynchronous_page_capture": true,
+    "shared_prefix_lease_ttl_seconds": 1,
+    "lease_ttl_purpose": "Expire intentional shared-prefix retention quickly so delayed-free references remain distinguishable in the idle-KV assertion."
+  },
+  "skipped_store_reclamation": {
+    "cycles": 3,
+    "workload_per_cycle": {
+      "large_request_tokens": 129024,
+      "overlapping_small_requests": 8,
+      "small_request_tokens": 4096
+    },
+    "busy_saver_skips_per_rank": [12, 12, 12, 12],
+    "already_present_skips_per_rank": [1, 1, 1, 1],
+    "successful_prefix_cache_resets": 3,
+    "idle_running_requests": 0,
+    "idle_waiting_requests": 0,
+    "idle_kv_cache_usage_percent": 0.0,
+    "preemptions": 0,
+    "cuda_errors": 0,
+    "nccl_errors": 0,
+    "conclusion": "Every worker reported terminal completion for stores skipped before CUDA submission, allowing vLLM to reclaim the finished requests' KV blocks."
+  },
+  "combined_image_check": {
+    "sparkcache_commit": "f559fbd845134a870125841c71434824d4bb5eb3",
+    "sparkring_main_commit": "d1f01e3f3a930a014ae7c53519701c44f67a5261",
+    "authenticated_readiness_commit": "c6f7f4615a9dbe3fde716b86b8d4be6560ffb658",
+    "internal_authenticated_warmup_requests": 40,
+    "keyed_model_list_http_status": 200,
+    "anonymous_model_list_http_status": 401,
+    "docker_health": "healthy",
+    "overlap_cycles": 1,
+    "busy_saver_skips_per_rank": [3, 3, 3, 3],
+    "successful_prefix_cache_resets": 1,
+    "idle_kv_cache_usage_percent": 0.0,
+    "preemptions": 0,
+    "cuda_errors": 0,
+    "nccl_errors": 0
+  },
+  "validation": {
+    "sparkcache_tests_passed": 982,
+    "sparkcache_tests_skipped": 7,
+    "deployment_tests_passed": 111,
+    "deployment_tests_skipped": 1,
+    "ruff": "passed"
+  },
+  "distribution": {
+    "published": false,
+    "note": "The source-layer images were built independently on four validation hosts from the same commits. This record does not identify a pullable registry artifact."
+  },
+  "completed_at": "2026-09-03T23:22:38Z"
+}

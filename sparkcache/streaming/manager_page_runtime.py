@@ -271,6 +271,26 @@ class ManagerPageCaptureRuntime:
             self._completed.add(request_id)
             self._cv.notify_all()
 
+    def finish_without_capture(self, request_id: str) -> None:
+        """Report a terminal store outcome when no CUDA work was submitted.
+
+        Scheduler-side asynchronous publication eligibility delays KV-block
+        reclamation before workers decide whether they can accept the store.
+        A worker that skips before submission therefore owes the same terminal
+        completion as a drained capture. An in-flight request cannot use this
+        path because its pages remain owned by the native completion fence.
+        """
+
+        with self._cv:
+            if self._closed:
+                raise RuntimeError("manager-page capture runtime is closed")
+            if request_id in self._pending:
+                raise RuntimeError(
+                    "cannot finish a manager-page capture before its fence drains"
+                )
+            self._completed.add(request_id)
+            self._cv.notify_all()
+
     def take_finished(self, finished_request_ids: set[str]) -> set[str]:
         with self._cv:
             if self._fatal is not None:

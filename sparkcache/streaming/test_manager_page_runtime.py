@@ -156,6 +156,60 @@ def _plan(request_id: str = "request"):
     )
 
 
+def test_finish_without_capture_is_terminal_and_idempotent() -> None:
+    connector = FakeConnector()
+    runtime = ManagerPageCaptureRuntime(
+        connector,
+        ring=FakeRing(b""),
+        progress_poll_seconds=0.001,
+        progress_thread_initializer=lambda: None,
+    )
+
+    runtime.finish_without_capture("skipped")
+    runtime.finish_without_capture("skipped")
+
+    assert runtime.take_finished({"skipped"}) == {"skipped"}
+    assert runtime.take_finished({"skipped"}) == set()
+    runtime.shutdown()
+
+
+def test_finish_without_capture_does_not_release_an_active_capture() -> None:
+    connector = FakeConnector()
+    runtime = ManagerPageCaptureRuntime(
+        connector,
+        ring=FakeRing(b""),
+        progress_poll_seconds=0.001,
+        progress_thread_initializer=lambda: None,
+    )
+    assert runtime.submit(_plan("active"), producer_stream=91)
+
+    with pytest.raises(RuntimeError, match="before its fence drains"):
+        runtime.finish_without_capture("active")
+
+    assert runtime.take_finished({"active"}) == set()
+    runtime.preempt("active")
+    assert runtime.take_finished({"active"}) == {"active"}
+    runtime.shutdown()
+
+
+def test_skipped_request_finishes_while_another_capture_is_pending() -> None:
+    connector = FakeConnector()
+    runtime = ManagerPageCaptureRuntime(
+        connector,
+        ring=FakeRing(b""),
+        progress_poll_seconds=0.001,
+        progress_thread_initializer=lambda: None,
+    )
+    assert runtime.submit(_plan("active"), producer_stream=91)
+
+    runtime.finish_without_capture("skipped")
+
+    assert runtime.take_finished({"active", "skipped"}) == {"skipped"}
+    runtime.preempt("active")
+    assert runtime.take_finished({"active"}) == {"active"}
+    runtime.shutdown()
+
+
 def test_runtime_completes_native_capture_then_hands_off_encoded_snapshot(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

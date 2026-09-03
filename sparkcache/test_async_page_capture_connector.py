@@ -7,6 +7,7 @@ from collections import Counter
 from pathlib import Path
 
 import torch
+import pytest
 
 import sparkcache.test_spark_context_cache_connector  # noqa: F401
 
@@ -14,8 +15,12 @@ from sparkcache.spark_context_cache_connector import (
     SparkCacheConnectorMetadata,
     SparkContextCacheConnector,
     _ReqPlan,
+    configure_async_page_capture_runtime,
 )
-from sparkcache.test_spark_context_cache_connector import _make_connector
+from sparkcache.test_spark_context_cache_connector import (
+    _hybrid_kv_cache_config,
+    _make_connector,
+)
 from sparkcache.streaming.manager_page_runtime import ManagerPageCaptureRuntime
 
 
@@ -25,6 +30,9 @@ class FakeRuntime:
         self.preempted: list[str] = []
         self.finished: set[str] = set()
         self.submit_error: Exception | None = None
+
+    def finish_without_capture(self, request_id: str) -> None:
+        self.finished.add(request_id)
 
     def submit(self, plan: object, *, producer_stream: int) -> bool:
         if self.submit_error is not None:
@@ -36,7 +44,54 @@ class FakeRuntime:
         self.preempted.append(request_id)
 
     def take_finished(self, finished_req_ids: set[str]) -> set[str]:
-        return self.finished & finished_req_ids
+        ready = self.finished & finished_req_ids
+        self.finished.difference_update(ready)
+        return ready
+
+
+def test_runtime_contract_requires_terminal_skip_completion(monkeypatch) -> None:
+    class RuntimeWithoutTerminalSkipCompletion:
+        submit = staticmethod(lambda *_args, **_kwargs: True)
+        preempt = staticmethod(lambda *_args, **_kwargs: None)
+        take_finished = staticmethod(lambda *_args, **_kwargs: set())
+        quiesce = staticmethod(lambda *_args, **_kwargs: None)
+        shutdown = staticmethod(lambda *_args, **_kwargs: None)
+
+    with tempfile.TemporaryDirectory() as directory:
+        monkeypatch.setattr(
+            "sparkcache.streaming.manager_page_factory."
+            "verify_manager_page_lease_contract",
+            lambda _settings: (),
+        )
+        configure_async_page_capture_runtime(
+            lambda _connector: RuntimeWithoutTerminalSkipCompletion()
+        )
+        try:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                extra_config={
+                    "spark_cache_model_profile": "deepseek-v4-fp8-hma",
+                    "spark_cache_publication_schema": "tail-cow-v1",
+                    "spark_cache_async_page_capture": "1",
+                    "spark_cache_async_page_capture_library": "/tmp/libsparkcache-snapshot.so",
+                    "spark_cache_async_page_capture_library_sha256": "a" * 64,
+                    "spark_cache_async_page_capture_slot_bytes": "1024",
+                },
+                tp=1,
+                dcp=1,
+                kv_cache_config=_hybrid_kv_cache_config(),
+            )
+            pools = {
+                "compressed": torch.zeros((10, 2, 8), dtype=torch.uint8),
+                "full": torch.zeros((10, 64, 8), dtype=torch.uint8),
+                "state": torch.zeros((10, 4, 16), dtype=torch.float32),
+            }
+
+            with pytest.raises(RuntimeError, match="finish_without_capture"):
+                connector.register_kv_caches(pools)
+        finally:
+            configure_async_page_capture_runtime(None)
 
 
 class FakeSparseRing:

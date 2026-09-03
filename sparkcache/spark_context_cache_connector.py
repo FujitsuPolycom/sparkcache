@@ -2661,6 +2661,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             required = (
                 "submit",
                 "preempt",
+                "finish_without_capture",
                 "take_finished",
                 "quiesce",
                 "shutdown",
@@ -4751,6 +4752,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             # Admission is atomic and precedes the multi-GB CPU snapshot.
             # At most one snapshot may be queued or committing per rank; a
             # busy store is a cache miss opportunity, never a serving stall.
+            skipped_before_submit = False
             with self._store_cv:
                 if plan.digest in self._held:
                     self.counters["store_skipped_present"] += 1
@@ -4759,15 +4761,26 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         " present digest=%s",
                         plan.digest[:12],
                     )
-                    continue
-                if not self._store_accepting or self._store_inflight:
+                    skipped_before_submit = True
+                elif not self._store_accepting or self._store_inflight:
                     self.counters["store_skipped_busy"] += 1
                     logger.warning(
                         "spark-context-cache: store skipped while saver busy digest=%s",
                         plan.digest[:12],
                     )
-                    continue
-                self._store_inflight = 1
+                    skipped_before_submit = True
+                else:
+                    self._store_inflight = 1
+            if skipped_before_submit:
+                if self._async_page_capture_enabled:
+                    runtime = self._async_page_capture_runtime
+                    if runtime is None:
+                        raise RuntimeError(
+                            "manager-page capture runtime vanished before"
+                            " a skipped store completed"
+                        )
+                    runtime.finish_without_capture(plan.request_id)
+                continue
             if self._async_page_capture_enabled:
                 runtime = self._async_page_capture_runtime
                 if runtime is None:
