@@ -78,7 +78,20 @@ class FakeConnector:
                 ),
             )
         )
+        self._group_topology = (
+            {
+                "logical_tokens_per_block": 256,
+                "reuse_policy": "full",
+            },
+            {
+                "logical_tokens_per_block": 2304,
+                "reuse_policy": "recurrent_align",
+            },
+        )
         self.completed: list[tuple[object, bytes, tuple[int, ...]]] = []
+        self.completed_extensions: list[
+            tuple[object, bytes, tuple[int, ...], tuple[int, ...]]
+        ] = []
         self.aborted: list[tuple[str, str]] = []
         self.completed_event = threading.Event()
 
@@ -96,12 +109,27 @@ class FakeConnector:
         del span_tokens, recurrent_boundary_blocks
         return groups
 
+    @staticmethod
+    def _group_block_counts_for_span(span_tokens: int) -> tuple[int, int]:
+        return ((span_tokens + 255) // 256, 1)
+
     def _complete_async_page_capture(
         self,
         plan: object,
         encoded_pages: bytes,
         block_counts: tuple[int, ...],
     ) -> None:
+        reused = getattr(encoded_pages, "reused_pages_by_group", None)
+        if reused is not None:
+            materialized = encoded_pages.read_range(
+                0, encoded_pages.total_bytes
+            )
+            encoded_pages.release()
+            self.completed_extensions.append(
+                (plan, materialized, block_counts, tuple(reused))
+            )
+            self.completed_event.set()
+            return
         if hasattr(encoded_pages, "read_range"):
             materialized = encoded_pages.read_range(
                 0, encoded_pages.total_bytes
@@ -123,6 +151,8 @@ def _plan(request_id: str = "request"):
         span_tokens=512,
         group_block_ids=((2, 5), (7,)),
         recurrent_boundary_blocks=((1, 7),),
+        base_context_digest="",
+        base_span_tokens=0,
     )
 
 
@@ -169,6 +199,55 @@ def test_runtime_completes_native_capture_then_hands_off_encoded_snapshot(
     assert "bytes=0.0MiB" in capture_lines[0]
     runtime.shutdown()
     assert ring.closed
+
+
+def test_runtime_submits_only_unreused_pages_for_an_extension() -> None:
+    connector = FakeConnector()
+    ring = FakeRing(b"")
+    runtime = ManagerPageCaptureRuntime(
+        connector,
+        ring=ring,
+        progress_poll_seconds=0.001,
+        progress_thread_initializer=lambda: None,
+    )
+    plan = _plan("extension")
+    plan.base_context_digest = "b" * 64
+    plan.base_span_tokens = 256
+
+    assert runtime.submit(plan, producer_stream=91)
+
+    submission = dict(ring.submissions[0])
+    assert submission["logical_start"] == 256
+    assert submission["physical_pages_by_group"] == ((5,), (7,))
+    runtime.preempt("extension")
+    runtime.shutdown()
+
+
+def test_runtime_hands_off_sparse_extension_geometry() -> None:
+    connector = FakeConnector()
+    ring = FakeRing(b"a5r07")
+    runtime = ManagerPageCaptureRuntime(
+        connector,
+        ring=ring,
+        progress_poll_seconds=0.001,
+        progress_thread_initializer=lambda: None,
+    )
+    plan = _plan("extension-complete")
+    plan.base_context_digest = "b" * 64
+    plan.base_span_tokens = 256
+
+    assert runtime.submit(plan, producer_stream=91)
+    ring.ready.set()
+    assert connector.completed_event.wait(timeout=1)
+
+    assert connector.completed == []
+    assert connector.completed_extensions == [
+        (plan, b"a5r07", (2, 1), (1, 0))
+    ]
+    assert runtime.take_finished({"extension-complete"}) == {
+        "extension-complete"
+    }
+    runtime.shutdown()
 
 
 def test_capture_telemetry_failure_does_not_abort_publication(

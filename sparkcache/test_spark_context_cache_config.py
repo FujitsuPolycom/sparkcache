@@ -488,6 +488,42 @@ class IdentityBaseTests(unittest.TestCase):
             "page-tail-cow-v1",
         )
 
+    def test_flat_page_tail_publication_uses_a_distinct_namespace(self) -> None:
+        class FullAttentionSpec:
+            block_size = 512
+            storage_block_size = 512
+            page_size_bytes = 528
+
+        kv_cache_config = types.SimpleNamespace(
+            kv_cache_groups=(
+                types.SimpleNamespace(
+                    kv_cache_spec=FullAttentionSpec(),
+                    is_eagle_group=False,
+                    layer_names=("full",),
+                ),
+            )
+        )
+        vllm, _ = _make_vllm_config(
+            {
+                "spark_cache_model_profile": "deepseek-v4-fp8-hma",
+                "spark_cache_publication_schema": "tail-cow-v2",
+            },
+            tp=1,
+            dcp=1,
+        )
+
+        config = cfg.parse_connector_config(
+            vllm,
+            vllm.kv_transfer_config,
+            kv_cache_config,
+        )
+
+        self.assertEqual(config.publication_schema, "page-tail-cow-v2")
+        self.assertEqual(
+            config.build_identity(0, 0).publication_schema,
+            "page-tail-cow-v2",
+        )
+
     def test_identity_base_contains_required_fields(self) -> None:
         vllm, _ = _make_vllm_config()
         config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
@@ -881,12 +917,13 @@ class ErrorPathTests(unittest.TestCase):
                 "spark_cache_publication_schema": "tail-cow-v1",
             }
         )
-        with self.assertRaisesRegex(RuntimeError, "complete snapshot publication only"):
-            cfg.parse_connector_config(
-                tail_store,
-                tail_store.kv_transfer_config,
-                kv_cache_config,
-            )
+        tail = cfg.parse_connector_config(
+            tail_store,
+            tail_store.kv_transfer_config,
+            kv_cache_config,
+        )
+        self.assertTrue(tail.async_page_capture_enabled)
+        self.assertEqual(tail.publication_schema, "page-tail-cow-v1")
 
 
 class KvGroupTopologyTests(unittest.TestCase):

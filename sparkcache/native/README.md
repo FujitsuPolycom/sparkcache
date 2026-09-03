@@ -5,7 +5,7 @@ SparkCache includes two optional C++/CUDA libraries:
 | Library | What it does | Status |
 |---|---|---|
 | `libspark_cache_placement.so` | Places authenticated cache records into request-owned GPU blocks. | **implemented** |
-| `libspark_cache_snapshot.so` | Gathers completed cache rows or manager pages into a bounded write-behind ring. | **research-only** |
+| `libspark_cache_snapshot.so` | Gathers completed cache rows or selected manager pages into a bounded write-behind ring. | **implemented** |
 
 A deployment profile pins the library SHA-256, describes the memory layout,
 and records the live tests performed with that exact artifact.
@@ -62,8 +62,9 @@ adapter = CudaPlacementAdapter.create(
 lifetime, slab submission, and request completion.
 `ParkedRestore.finish()` is the only success path that resumes the request.
 
-Symbols containing `native` remain compatibility interfaces. New code uses
-the `spark_cache_cuda` and `spark_context_cache_cuda_*` modules.
+Symbols containing `native` remain compatibility interfaces. The canonical
+interfaces are the `spark_cache_cuda` and `spark_context_cache_cuda_*`
+modules.
 
 ## Placement ABI
 
@@ -82,6 +83,21 @@ kinds, digest syntax, and logical-position ownership.
 The caller authenticates each complete encoded object before parsing it.
 Per-record hashing would reread the same bytes without strengthening the
 manifest's integrity boundary.
+
+Manager-page delta restore uses two mapped host arenas. A bounded read pool
+authenticates the following object batch while CUDA places the preceding
+batch, then the arenas alternate.
+
+The placement ABI fixes the arena count at two.
+`spark_cache_cuda_placement_arena_bytes` changes each arena's bounded size,
+and `spark_cache_cuda_restore_io_workers` changes storage-read parallelism.
+
+A third placement arena would consume another arena's worth of pinned unified
+memory without increasing storage-read parallelism.
+
+Deployment evidence must show sustained arena waits before changing the ABI
+and accepting that memory cost. Snapshot-ring slots are a separate resource
+and do not change placement arena count.
 
 ## Arena modes
 
@@ -114,8 +130,8 @@ forward pass can use those blocks; SparkCache frees them before recomputation.
 
 ## Snapshot gather ring
 
-`libspark_cache_snapshot.so` gathers completed rows into bounded staging arenas
-for optional write-behind publication. See
+`libspark_cache_snapshot.so` gathers completed rows or selected manager pages
+into bounded staging arenas for optional write-behind publication. See
 [`SNAPSHOT_RING_STATE_MODEL.md`](SNAPSHOT_RING_STATE_MODEL.md).
 
 Backpressure or failure may cancel publication. It must not delay serving or
@@ -124,11 +140,13 @@ expose a partial manifest.
 Opaque hybrid-memory-allocator pages require group-qualified page tables and
 all-group block leases.
 
-The GPU-free descriptor and payload-layout foundation is documented in
+The descriptor, sparse manager-page selection, payload layout, and ownership
+contract are documented in
 [`MANAGER_PAGE_CAPTURE_CONTRACT.md`](MANAGER_PAGE_CAPTURE_CONTRACT.md).
 
-Its C++/CUDA and connector path is research-only and requires explicit opt-in.
-No serving profile enables it by default.
+The C++/CUDA path requires explicit opt-in and an attested vLLM page-ownership
+contract. Deployment profiles link live evidence for exact compiled artifacts,
+model layouts, runtime revisions, and topologies.
 
 ## Build and test
 

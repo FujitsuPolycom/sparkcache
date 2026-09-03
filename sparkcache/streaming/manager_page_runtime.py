@@ -12,6 +12,9 @@ from sparkcache.spark_context_cache_hybrid import (
     PageLayout,
     encode_page_snapshot_header,
 )
+from sparkcache.streaming.manager_page_capture import (
+    select_manager_page_extension_pages,
+)
 
 logger = logging.getLogger("vllm.spark_context_cache")
 
@@ -58,7 +61,9 @@ class _PendingCapture:
     context_sequence: int
     plan: Any
     ticket: Any
-    block_counts: tuple[int, ...]
+    capture_block_counts: tuple[int, ...]
+    result_block_counts: tuple[int, ...]
+    reused_pages_by_group: tuple[int, ...]
     submitted_ns: int
 
 
@@ -95,6 +100,44 @@ class PageSnapshotScatter:
             body_end = end - header_length
             parts.append(self._body[body_start:body_end].tobytes())
         return b"".join(parts)
+
+    def release(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._release_callback()
+            self._body.release()
+            self._released = True
+
+
+class PageExtensionScatter:
+    """Claimed changed-page bytes plus their authenticated base geometry."""
+
+    def __init__(
+        self,
+        body: memoryview,
+        *,
+        reused_pages_by_group: tuple[int, ...],
+        result_block_counts: tuple[int, ...],
+        release: Callable[[], None],
+    ) -> None:
+        self._body = body.toreadonly()
+        self.reused_pages_by_group = reused_pages_by_group
+        self.result_block_counts = result_block_counts
+        self._release_callback = release
+        self._released = False
+        self._lock = threading.Lock()
+
+    @property
+    def total_bytes(self) -> int:
+        return self._body.nbytes
+
+    def read_range(self, start: int, end: int) -> bytes:
+        if self._released:
+            raise RuntimeError("page extension scatter view was released")
+        if not 0 <= start <= end <= self.total_bytes:
+            raise ValueError("page extension scatter range is invalid")
+        return self._body[start:end].tobytes()
 
     def release(self) -> None:
         with self._lock:
@@ -146,6 +189,29 @@ class ManagerPageCaptureRuntime:
             plan.span_tokens,
             recurrent_boundary_blocks=plan.recurrent_boundary_blocks,
         )
+        capture_groups = groups
+        result_block_counts = tuple(len(group) for group in groups)
+        reused_pages_by_group = tuple(0 for _ in groups)
+        logical_start = 0
+        if plan.base_context_digest:
+            capture_groups, _base_counts, result_block_counts, reused_pages_by_group = (
+                select_manager_page_extension_pages(
+                    groups,
+                    base_page_counts=self._connector._group_block_counts_for_span(
+                        plan.base_span_tokens
+                    ),
+                    logical_tokens_per_page=tuple(
+                        int(group["logical_tokens_per_block"])
+                        for group in self._connector._group_topology
+                    ),
+                    reuse_policies=tuple(
+                        str(group["reuse_policy"])
+                        for group in self._connector._group_topology
+                    ),
+                    base_boundary_tokens=plan.base_span_tokens,
+                )
+            )
+            logical_start = plan.base_span_tokens
         with self._cv:
             if self._closed:
                 raise RuntimeError("manager-page capture runtime is closed")
@@ -162,8 +228,8 @@ class ManagerPageCaptureRuntime:
             try:
                 ticket = self._ring.submit(
                     context_sequence=context_sequence,
-                    logical_start=0,
-                    physical_pages_by_group=groups,
+                    logical_start=logical_start,
+                    physical_pages_by_group=capture_groups,
                     producer_stream=producer_stream,
                 )
             except Exception:
@@ -182,7 +248,9 @@ class ManagerPageCaptureRuntime:
                 context_sequence=context_sequence,
                 plan=plan,
                 ticket=ticket,
-                block_counts=tuple(len(group) for group in groups),
+                capture_block_counts=tuple(len(group) for group in capture_groups),
+                result_block_counts=result_block_counts,
+                reused_pages_by_group=reused_pages_by_group,
                 submitted_ns=submitted_ns,
             )
             self._ensure_thread_locked()
@@ -300,18 +368,29 @@ class ManagerPageCaptureRuntime:
                     elapsed_ns=elapsed_ns,
                     payload_bytes=claimed.payload.nbytes,
                 )
-                header = encode_page_snapshot_header(
-                    self._layout, capture.block_counts
-                )
-                scatter = PageSnapshotScatter(
-                    header,
-                    claimed.payload,
-                    lambda ticket=capture.ticket: self._ring.release(ticket),
-                )
+                def release(ticket=capture.ticket) -> None:
+                    self._ring.release(ticket)
+
+                if capture.plan.base_context_digest:
+                    scatter = PageExtensionScatter(
+                        claimed.payload,
+                        reused_pages_by_group=capture.reused_pages_by_group,
+                        result_block_counts=capture.result_block_counts,
+                        release=release,
+                    )
+                else:
+                    header = encode_page_snapshot_header(
+                        self._layout, capture.capture_block_counts
+                    )
+                    scatter = PageSnapshotScatter(
+                        header,
+                        claimed.payload,
+                        release,
+                    )
                 self._connector._complete_async_page_capture(
                     capture.plan,
                     scatter,
-                    capture.block_counts,
+                    capture.result_block_counts,
                 )
             except Exception as error:  # noqa: BLE001 - serving continues
                 if scatter is not None:
@@ -324,4 +403,8 @@ class ManagerPageCaptureRuntime:
                 )
 
 
-__all__ = ["ManagerPageCaptureRuntime", "PageSnapshotScatter"]
+__all__ = [
+    "ManagerPageCaptureRuntime",
+    "PageExtensionScatter",
+    "PageSnapshotScatter",
+]

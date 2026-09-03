@@ -1,39 +1,22 @@
 # CUDA manager-page capture contract
 
-Status: **research-only**. The descriptor, C++/CUDA submission source,
-connector integration, exact-hash vLLM ownership contract, and GPU-free tests
-are implemented. No compiled artifact or serving result supports enabling it
-in an operator profile.
+Status: **implemented**. The descriptor, C++/CUDA submission source, connector
+integration, exact-hash vLLM ownership contract, and GPU-free tests are part of
+SparkCache. Live qualification remains specific to the compiled artifact,
+model layout, vLLM source contract, and topology named in an evidence record.
 
 ## Purpose
 
 Opaque manager-page storage preserves every byte owned by vLLM's hybrid memory
 allocator, including split kernel rows and bytes outside a tensor's logical
-shape. The ordinary publication path copies those pages in
-`SparkContextCacheConnector._snapshot_hybrid_store()` before handing an
-immutable snapshot to the background commit thread.
+shape. Asynchronous capture moves eligible request-owned pages to a bounded
+mapped-host ring on a low-priority CUDA stream. A background publisher hashes
+and writes the claimed view before releasing its ring slot.
 
-The copy is synchronous from the inference callback's perspective:
-
-```text
-select request-owned manager pages
-  -> gather each layer with PyTorch
-  -> copy each gathered tensor to CPU memory
-  -> concatenate the encoded snapshot
-  -> queue the filesystem commit
-```
-
-Only the filesystem commit is asynchronous. The GPU gathers, device-to-host
-copies, CPU allocations, and snapshot encoding happen before the log reports
-that the background commit was queued.
-
-[SparkCache issue 45](https://github.com/FujitsuPolycom/sparkcache/issues/45)
-records a GLM-5.3 TP4/DCP1 publication of 942,592 tokens. Under image
-`sha256:77da063d1d51fa181eb39e519dda7c5ae4eb59a47e169cb4c33bd2cd42120225`,
-each rank spent 16.6–17.9 seconds in capture while unrelated generation fell
-to approximately 0–2 tokens per second. The result establishes interference in
-the pre-commit capture phase; it does not isolate one hardware resource as the
-sole cause.
+Complete snapshots capture every request page. A `page-tail-cow-v2` extension
+captures only pages whose bytes cannot be reused from its authenticated base.
+SparkCache conservatively captures partial terminal attention pages and
+mutable recurrent or sliding-window state again.
 
 ## Implemented CPU contract
 
@@ -56,10 +39,12 @@ validates that:
 - every arithmetic operation fits its declared integer range; and
 - the raw payload fits the configured ring slot.
 
-The result is group-major, then layer-major. Each layer span contains request
-pages in block-table order. Concatenating the spans produces the exact opaque
-body consumed by `encode_page_snapshot()` after its deterministic header.
-Physical page IDs and CUDA pointers never enter persistent data.
+The result is group-major, then layer-major. Each layer span contains selected
+request pages in block-table order. Complete capture produces the opaque body
+consumed by `encode_page_snapshot()` after its deterministic header. Sparse
+extension capture carries base-reuse geometry with the claimed ring view so
+the background publisher can encode a page delta directly. Physical page IDs
+and CUDA pointers never enter persistent data.
 
 [`../streaming/manager_page_capture.py`](../streaming/manager_page_capture.py)
 provides the same planning seam for GPU-free adapter tests. The connector
@@ -80,7 +65,8 @@ request owns every selected page in every group
   -> record completion event on the capture stream
   -> completion releases all source-page leases
   -> background progress queues a small header plus claimed ring view
-  -> hash and write bounded extents from that scatter view
+  -> verify the base once when the publication references one
+  -> construct and hash bounded snapshot or delta extents from the ring view
   -> durable objects precede the manifest
   -> release the ring slot
 ```
@@ -135,8 +121,11 @@ waits for `producer_ready` before reading any manager page.
    than permitting page reuse.
 7. Ring bytes remain immutable until the durable worker finishes every bounded
    extent read and releases the slot. No whole-snapshot Python copy is made.
-8. Persistent block-page bytes and cache identity remain unchanged. Enabling a
-   different physical format requires a distinct cache namespace.
+8. Direct sparse-delta encoding consumes the verified base once. It does not
+   reconstruct a complete result snapshot or compare all result pages.
+9. `page-tail-cow-v2` has its own cache-identity wire value. Entries from
+   `snapshot-v1` and `page-tail-cow-v1` therefore miss cleanly rather than
+   being treated as compatible state.
 
 ## Explicit opt-in
 
@@ -144,6 +133,7 @@ The feature flag and every artifact setting are required:
 
 ```text
 spark_cache_async_page_capture=1
+spark_cache_publication_schema=tail-cow-v2
 spark_cache_async_page_capture_library=/absolute/libspark_cache_snapshot.so
 spark_cache_async_page_capture_library_sha256=<64 lowercase hex characters>
 spark_cache_async_page_capture_slot_bytes=<complete per-rank snapshot bytes>
@@ -157,23 +147,26 @@ The environment equivalents use the
 configuration stops connector initialization. When the feature flag is absent,
 the connector uses synchronous capture without loading the page-capture ABI.
 
-## Qualification conditions
+## Evidence and limitations
 
-The implementation must remain absent from default profiles until all of these
-conditions are recorded for an exact library and model-serving artifact:
+[`../../evidence/glm53-flash-dcp4-page-tail-v2/qualification.json`](../../evidence/glm53-flash-dcp4-page-tail-v2/qualification.json)
+records byte-exact chained growth, restart restore, corruption rejection, and
+foreground-interference measurements for one GLM-5.3 TP4/DCP4 artifact. The
+result qualifies only the identities in that record.
 
-- native bytes match the Python snapshot byte-for-byte for split kernel rows,
-  physical page tails, attention pages, and recurrent pages;
-- cancellation, preemption, stale tickets, event errors, writer errors, and
-  shutdown preserve the ownership invariants above;
-- a bounded ring returns immediately under saturation; and
-- live cache-on/cache-off tests establish the effect on decode throughput,
-  prefill throughput, latency, unified-memory headroom, and Python heartbeat
-  delay during each bounded extent copy.
+The following limits remain:
 
-Until every condition is recorded, operator profiles must leave
-`spark_cache_async_page_capture=0` and use the synchronous Python/PyTorch
-capture path.
+- `page-tail-cow-v2` supports opaque manager-page profiles only.
+- A flat manifest retains one ordered descriptor stage per published
+  extension. Metadata and restore work therefore grow with retained stages.
+- Partial terminal attention pages and recurrent or sliding-window state are
+  captured again because their earlier bytes cannot be proven immutable from
+  token boundaries alone.
+- Two or three snapshot-ring slots are supported. Every additional slot
+  consumes its full configured size in pinned unified memory.
+- Ring saturation skips publication. It never waits for storage capacity.
+- A vLLM revision without the attested producer-stream and page-lease contract
+  cannot enable asynchronous capture.
 
 ## GPU-free validation
 

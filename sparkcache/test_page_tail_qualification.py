@@ -1,8 +1,8 @@
 """Regression tests for the page-tail qualification harness.
 
 The suite covers the observable qualification contract: byte-exact fixture
-reuse, complete-snapshot comparison, bounded page-delta publication with a
-complete-snapshot compaction fallback, restart restoration from on-disk state
+reuse, complete-snapshot comparison, bounded page-delta publication with
+authenticated ancestry flattening, restart restoration from on-disk state
 alone, corruption rejection, cache-identity namespace separation, and the
 receipt schema's rejection of understated evidence.
 """
@@ -115,14 +115,18 @@ class CohortTests(unittest.TestCase):
             )
             self.assertLess(delta_total, 2 * base_bytes)
 
-    def test_depth_exceeded_compacts_to_a_complete_snapshot(self) -> None:
+    def test_depth_limit_flattens_ancestry_without_a_complete_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             receipt = run_page_tail_qualification(root, steps=(1, 1, 1))
             self.assertEqual(validate_receipt(receipt), [])
             schemas = [step["manifest_schema"] for step in receipt["deltas"]]
-            self.assertEqual(schemas, [PAGE_DELTA_SCHEMA, PAGE_DELTA_SCHEMA, PAGE_SNAPSHOT_SCHEMA])
-            self.assertTrue(receipt["deltas"][2]["compacted"])
+            self.assertEqual(
+                schemas,
+                [PAGE_DELTA_SCHEMA, PAGE_DELTA_SCHEMA, PAGE_DELTA_SCHEMA],
+            )
+            self.assertTrue(receipt["deltas"][2]["flattened"])
+            self.assertFalse(receipt["deltas"][2]["compacted"])
             self.assertFalse(receipt["deltas"][0]["compacted"])
 
     def test_restart_restoration_succeeds_without_in_memory_state(self) -> None:

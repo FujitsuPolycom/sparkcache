@@ -6,8 +6,10 @@ from pathlib import Path
 import pytest
 
 from sparkcache.streaming.manager_page_capture import (
+    ManagerPageExtensionCapturePlan,
     ManagerPageCaptureError,
     ManagerPageSource,
+    plan_manager_page_extension_capture,
     plan_manager_page_capture,
 )
 from sparkcache.spark_context_cache_hybrid import (
@@ -97,6 +99,43 @@ def test_manager_page_plan_is_group_then_layer_ordered() -> None:
         3 * 4096 + 3 * 6144,
     ]
     assert [span.physical_page_offset for span in plan.spans] == [0, 0, 3]
+
+
+def test_extension_capture_reuses_complete_attention_pages_and_replaces_state() -> None:
+    plan = plan_manager_page_extension_capture(
+        _sources(),
+        ((17, 3, 91, 44), (8,)),
+        base_page_counts=(2, 1),
+        logical_tokens_per_page=(256, 2304),
+        reuse_policies=("full", "recurrent_align"),
+        base_boundary_tokens=512,
+        slot_bytes=64 * 1024,
+    )
+
+    assert isinstance(plan, ManagerPageExtensionCapturePlan)
+    assert plan.base_page_counts == (2, 1)
+    assert plan.result_page_counts == (4, 1)
+    assert plan.reused_pages_by_group == (2, 0)
+    assert plan.capture.physical_pages == (91, 44, 8)
+    assert plan.capture.group_page_counts == (2, 1)
+    assert plan.capture.used_bytes == 2 * 4096 + 2 * 6144 + 192
+
+
+def test_extension_capture_replaces_a_partial_terminal_attention_page() -> None:
+    plan = plan_manager_page_extension_capture(
+        _sources(),
+        ((17, 3, 91), (8, 5)),
+        base_page_counts=(2, 1),
+        logical_tokens_per_page=(256, 512),
+        reuse_policies=("full", "sliding"),
+        base_boundary_tokens=384,
+        slot_bytes=64 * 1024,
+    )
+
+    assert plan.reused_pages_by_group == (1, 0)
+    assert plan.capture.physical_pages == (3, 91, 8, 5)
+    assert plan.capture.group_page_counts == (2, 2)
+    assert plan.capture.used_bytes == 2 * 4096 + 2 * 6144 + 2 * 192
 
 
 def test_manager_page_plan_matches_block_page_codec_body_order() -> None:

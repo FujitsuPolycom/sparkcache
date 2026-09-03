@@ -58,6 +58,16 @@ class ManagerPageCapturePlan:
     used_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class ManagerPageExtensionCapturePlan:
+    """Changed manager pages and the base pages they replace or extend."""
+
+    capture: ManagerPageCapturePlan
+    base_page_counts: tuple[int, ...]
+    result_page_counts: tuple[int, ...]
+    reused_pages_by_group: tuple[int, ...]
+
+
 def _uint(value: object, *, name: str, maximum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ManagerPageCaptureError(f"{name} must be an integer")
@@ -213,13 +223,126 @@ def plan_manager_page_capture(
     )
 
 
+def plan_manager_page_extension_capture(
+    sources: Sequence[ManagerPageSource],
+    result_physical_pages_by_group: Sequence[Sequence[int]],
+    *,
+    base_page_counts: Sequence[int],
+    logical_tokens_per_page: Sequence[int],
+    reuse_policies: Sequence[str],
+    base_boundary_tokens: int,
+    slot_bytes: int,
+) -> ManagerPageExtensionCapturePlan:
+    """Select pages whose bytes cannot be reused from an authenticated base.
+
+    Full-attention pages preceding a complete base boundary are immutable.
+    A partial terminal page is captured again. Sliding-window and recurrent
+    state can change when the sequence grows, so their retained pages are
+    captured conservatively.
+    """
+
+    selected, bases, result_counts, reused = select_manager_page_extension_pages(
+        result_physical_pages_by_group,
+        base_page_counts=base_page_counts,
+        logical_tokens_per_page=logical_tokens_per_page,
+        reuse_policies=reuse_policies,
+        base_boundary_tokens=base_boundary_tokens,
+    )
+    capture = plan_manager_page_capture(
+        sources,
+        selected,
+        slot_bytes=slot_bytes,
+    )
+    return ManagerPageExtensionCapturePlan(
+        capture=capture,
+        base_page_counts=bases,
+        result_page_counts=result_counts,
+        reused_pages_by_group=reused,
+    )
+
+
+def select_manager_page_extension_pages(
+    result_physical_pages_by_group: Sequence[Sequence[int]],
+    *,
+    base_page_counts: Sequence[int],
+    logical_tokens_per_page: Sequence[int],
+    reuse_policies: Sequence[str],
+    base_boundary_tokens: int,
+) -> tuple[
+    tuple[tuple[int, ...], ...],
+    tuple[int, ...],
+    tuple[int, ...],
+    tuple[int, ...],
+]:
+    """Return changed physical pages and authenticated base-page counts."""
+
+    groups = tuple(tuple(group) for group in result_physical_pages_by_group)
+    bases = tuple(base_page_counts)
+    page_tokens = tuple(logical_tokens_per_page)
+    policies = tuple(reuse_policies)
+    if not groups or not (
+        len(groups) == len(bases) == len(page_tokens) == len(policies)
+    ):
+        raise ManagerPageCaptureError(
+            "extension capture geometry must describe every manager-page group"
+        )
+    boundary = _positive_uint(
+        base_boundary_tokens,
+        name="base_boundary_tokens",
+        maximum=_UINT64_MAX,
+    )
+    reused: list[int] = []
+    selected: list[tuple[int, ...]] = []
+    for group_index, (group, base_count, logical_width, policy) in enumerate(
+        zip(groups, bases, page_tokens, policies, strict=True)
+    ):
+        base = _positive_uint(
+            base_count,
+            name=f"base_page_counts[{group_index}]",
+            maximum=_UINT32_MAX,
+        )
+        width = _positive_uint(
+            logical_width,
+            name=f"logical_tokens_per_page[{group_index}]",
+            maximum=_UINT64_MAX,
+        )
+        if base > len(group):
+            raise ManagerPageCaptureError(
+                "base page count exceeds the result manager-page group"
+            )
+        if policy == "full":
+            reusable = base if boundary % width == 0 else base - 1
+        elif policy in {"sliding", "recurrent_align"}:
+            reusable = 0
+        else:
+            raise ManagerPageCaptureError(
+                "extension capture reuse policy is unsupported"
+            )
+        tail = group[reusable:]
+        if not tail:
+            raise ManagerPageCaptureError(
+                "extension capture must include a page from every group"
+            )
+        reused.append(reusable)
+        selected.append(tail)
+    return (
+        tuple(selected),
+        tuple(int(value) for value in bases),
+        tuple(len(group) for group in groups),
+        tuple(reused),
+    )
+
+
 __all__ = [
     "MAX_CAPTURE_GROUPS",
     "MAX_CAPTURE_SOURCES",
     "ManagerPageCaptureError",
+    "ManagerPageExtensionCapturePlan",
     "ManagerPageCapturePlan",
     "ManagerPageCaptureSpan",
     "ManagerPageSource",
     "PAGE_CAPTURE_CONTRACT_VERSION",
     "plan_manager_page_capture",
+    "plan_manager_page_extension_capture",
+    "select_manager_page_extension_pages",
 ]

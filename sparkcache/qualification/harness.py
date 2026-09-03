@@ -142,12 +142,7 @@ def _extend(
     result_page_count: int,
     base_snapshot_bytes: int,
 ) -> dict[str, Any]:
-    """Publish one page delta over the verified base and restore it.
-
-    ``PageDeltaDepthExceeded`` follows the connector's compaction fallback
-    (spark_context_cache_connector.py): the extension becomes one fresh
-    complete page snapshot in the same identity namespace.
-    """
+    """Publish one bounded-depth page delta and restore it exactly."""
 
     result_tokens = result_page_count * fixture.tokens_per_page
     base_boundary_tokens = base_page_count * fixture.tokens_per_page
@@ -198,6 +193,13 @@ def _extend(
         "commit_ms": commit_ms,
         "restore_ms": restore_ms,
         "base_context_digest": tokens.base_digest,
+        "stored_base_context_digest": manifest.get(
+            "base_context_digest", tokens.base_digest
+        ),
+        "flattened": manifest.get("base_context_digest") not in (
+            None,
+            tokens.base_digest,
+        ),
         "base_committed_tokens": base_boundary_tokens,
         "committed_tokens": result_tokens,
         "base_snapshot_bytes": base_snapshot_bytes,

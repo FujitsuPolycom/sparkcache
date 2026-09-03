@@ -44,6 +44,7 @@ configuration leaves SparkCache unloaded.
     "spark_cache_target_checkpoint_sha256": "<64 lowercase hex characters>",
     "spark_cache_draft_policy": "colocated_target",
     "spark_cache_access_mode": "read-write",
+    "spark_cache_publication_schema": "snapshot-v1",
     "spark_cache_shared_prefix_lease_ttl_seconds": 15,
     "spark_cache_max_bytes": 214748364800,
     "spark_cache_low_watermark_bytes": 193273528320,
@@ -92,16 +93,31 @@ namespace change.
 
 ## Publication options
 
-`spark_cache_publication_schema` defaults to `snapshot-v1`, which publishes a
-complete aligned snapshot.
+`spark_cache_publication_schema` chooses the persistent layout. It defaults to
+`snapshot-v1`.
 
-| Storage layout | `tail-cow-v1` behavior |
-|---|---|
-| Row-oriented | Store immutable row tails and authenticated descriptor chains. |
-| Opaque manager pages | Store changed physical pages and an authenticated base graph. |
+| Setting | Storage layout | Behavior |
+|---|---|---|
+| `snapshot-v1` | Rows or opaque manager pages | Publish a complete aligned snapshot. |
+| `tail-cow-v1` | Rows | Publish immutable row tails and authenticated descriptor chains. |
+| `tail-cow-v1` | Opaque manager pages | Publish changed pages over a bounded nested base graph. |
+| `tail-cow-v2` | Opaque manager pages only | Publish changed pages as an ordered, authenticated stage list rooted at one immutable base snapshot. |
 
-Each schema has its own cache namespace. Entries written by one schema cannot
-be mistaken for entries written by another.
+The connector maps the operator setting `tail-cow-v2` to the cache-identity
+wire value `page-tail-cow-v2`.
+
+The v2 manifest keeps one base root plus a flat list of delta stages instead
+of nesting each result under the following extension.
+
+Every stage binds its base digest, token boundary, block geometry, payload
+digest, and immutable object descriptors.
+
+Restore validates the whole chain before any stage reaches request-owned GPU
+blocks.
+
+Every publication schema has a distinct cache identity. Changing the setting
+produces a clean cache miss against entries written by another schema; it
+cannot alias their objects as compatible state.
 
 ## Storage and integrity
 
@@ -137,8 +153,14 @@ The two-prefix limit and vLLM's memory-pressure eviction remain active
 regardless of the configured duration. The equivalent environment variable is
 `SPARK_CONTEXT_CACHE_SHARED_PREFIX_LEASE_TTL_SECONDS`.
 
-Page graphs admit at most two deltas. Another extension compacts the graph into
-a complete snapshot.
+Manager-page `tail-cow-v1` graphs admit at most two nested deltas before
+flattening against an earlier verified base.
+
+`tail-cow-v2` retains a flat ordered stage list, so growing conversations do
+not periodically rewrite a large flattened delta.
+
+The v2 descriptor list grows with the number of stored extensions. Restore
+must authenticate and apply every retained stage.
 
 ## SparkCache CUDA restore
 
@@ -167,8 +189,48 @@ Enablement requires an attested `libspark_cache_snapshot` library, bounded
 slot sizes, and the exact vLLM ownership contract described in
 [`native/MANAGER_PAGE_CAPTURE_CONTRACT.md`](native/MANAGER_PAGE_CAPTURE_CONTRACT.md).
 
-This path supports complete page snapshots. Page-tail publication remains a
-separate implementation path.
+The asynchronous ring can feed complete `snapshot-v1` publication or either
+manager-page tail schema.
+
+With `tail-cow-v2`, SparkCache selects only pages whose bytes cannot be reused
+from the authenticated base.
+
+Complete immutable full-attention pages are reused. Partial terminal pages
+and mutable recurrent or sliding-window state are captured again.
+
+The background publisher reads and verifies the base once, constructs the
+authenticated delta directly from the bounded sparse ring view, and computes
+the logical result digest incrementally.
+
+The publisher does not reconstruct a complete Python snapshot or compare
+every result page with the base. Ring pressure or an unverifiable base skips
+publication without delaying unrelated serving.
+
+The required page-tail settings are profile-specific:
+
+```json
+{
+  "spark_cache_access_mode": "read-write",
+  "spark_cache_publication_schema": "tail-cow-v2",
+  "spark_cache_async_page_capture": true,
+  "spark_cache_async_page_capture_library": "/absolute/libspark_cache_snapshot.so",
+  "spark_cache_async_page_capture_library_sha256": "<64 lowercase hex characters>",
+  "spark_cache_async_page_capture_slot_bytes": 3221225472,
+  "spark_cache_async_page_capture_slot_count": 2,
+  "spark_cache_async_page_capture_vllm_root": "/absolute/vllm/source",
+  "spark_cache_async_page_capture_lease_contract": "/absolute/ownership-contract.json"
+}
+```
+
+`spark_cache_async_page_capture_slot_bytes` must hold the largest selected
+page set for one rank.
+
+Two slots normally allow one capture to be consumed while another completes.
+Three slots can absorb short writer jitter but use another slot's worth of
+pinned unified memory.
+
+Saturation always skips the optional publication instead of waiting for a
+slot.
 
 ## Capacity and cleanup
 
@@ -206,8 +268,12 @@ tokens, observed elapsed time, effective token rate, and copied bytes.
 The separate commit log reports durable-storage time. The two records separate
 capture interference from background storage work.
 
-Each completed store also emits one compact `sparkcache: publish` line. Exact
-process-local totals are available from
+Each completed store also emits one compact `sparkcache: publish` line.
+
+Scheduler aggregate telemetry is split into `sparkcache: capacity`,
+`sparkcache: publications`, and `sparkcache: writes` lines.
+
+Exact process-local totals are available from
 `ManifestStore.publication_telemetry_snapshot()` using schema
 `sparkcache-publication-telemetry/v1`.
 

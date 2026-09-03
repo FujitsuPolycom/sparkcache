@@ -54,8 +54,13 @@ _PREFIX_ALIAS_SCHEMA = "sparkcache-prefix-alias/v1"
 _TAIL_MANIFEST_SCHEMA = "sparkcache-tail-manifest/v1"
 _PAGE_DELTA_MANIFEST_SCHEMA = "sparkcache-page-delta-manifest/v1"
 _PAGE_DELTA_MANIFEST_SCHEMA_V2 = "sparkcache-page-delta-manifest/v2"
+_PAGE_DELTA_MANIFEST_SCHEMA_V3 = "sparkcache-page-delta-manifest/v3"
 _PAGE_DELTA_MANIFEST_SCHEMAS = frozenset(
-    (_PAGE_DELTA_MANIFEST_SCHEMA, _PAGE_DELTA_MANIFEST_SCHEMA_V2)
+    (
+        _PAGE_DELTA_MANIFEST_SCHEMA,
+        _PAGE_DELTA_MANIFEST_SCHEMA_V2,
+        _PAGE_DELTA_MANIFEST_SCHEMA_V3,
+    )
 )
 _PAGE_SNAPSHOT_MANIFEST_SCHEMA = "sparkcache-page-snapshot-manifest/v2"
 # The v2 physical geometry is independent of the 256-token digest and
@@ -277,6 +282,7 @@ class CacheIdentity:
             "",
             "tail-cow-v1",
             "page-tail-cow-v1",
+            "page-tail-cow-v2",
         ):
             raise ValueError("publication_schema is unsupported")
 
@@ -1228,6 +1234,169 @@ def _validate_page_delta_root(
     if not isinstance(manifest, dict):
         raise CacheFormatError("page delta manifest is not an object")
     schema = manifest.get("schema")
+    if schema == _PAGE_DELTA_MANIFEST_SCHEMA_V3:
+        _strict_keys(
+            manifest,
+            {
+                "schema",
+                "format_abi",
+                "identity",
+                "context_digest",
+                "committed_tokens",
+                "base_context_digest",
+                "base_committed_tokens",
+                "base_root",
+                "base_root_sha256",
+                "layout_sha256",
+                "base_block_counts",
+                "result_block_counts",
+                "delta_stages",
+                "logical_chunk_tokens",
+                "metadata_sha256",
+            },
+            "flat page delta manifest",
+        )
+        authenticated = dict(manifest)
+        metadata_digest = authenticated.pop("metadata_sha256")
+        try:
+            for field in (
+                "metadata_sha256",
+                "context_digest",
+                "base_context_digest",
+                "base_root_sha256",
+                "layout_sha256",
+            ):
+                _validate_digest(
+                    metadata_digest if field == "metadata_sha256" else manifest[field],
+                    f"flat page delta {field}",
+                )
+        except ValueError as error:
+            raise CacheFormatError(str(error)) from error
+        if (
+            _sha256(_canonical_json(authenticated)) != metadata_digest
+            or manifest["format_abi"] != FORMAT_ABI
+            or identity.publication_schema != "page-tail-cow-v2"
+            or manifest["identity"] != identity.to_wire()
+            or manifest["context_digest"] != context_digest
+            or manifest["logical_chunk_tokens"] != identity.chunk_tokens
+            or not isinstance(manifest["base_root"], dict)
+            or _sha256(_canonical_json(manifest["base_root"]))
+            != manifest["base_root_sha256"]
+        ):
+            raise _IncompatibleManifestError(
+                "flat page delta manifest identity differs"
+            )
+        base_counts = manifest["base_block_counts"]
+        result_counts = manifest["result_block_counts"]
+        stages = manifest["delta_stages"]
+        if (
+            type(manifest["base_committed_tokens"]) is not int
+            or type(manifest["committed_tokens"]) is not int
+            or manifest["committed_tokens"]
+            <= manifest["base_committed_tokens"]
+            <= 0
+            or not isinstance(base_counts, list)
+            or not base_counts
+            or not isinstance(result_counts, list)
+            or len(result_counts) != len(base_counts)
+            or not isinstance(stages, list)
+            or not stages
+        ):
+            raise CacheFormatError("flat page delta geometry differs")
+        prior_digest = manifest["base_context_digest"]
+        prior_tokens = manifest["base_committed_tokens"]
+        prior_counts = base_counts
+        descriptors: list[Mapping[str, Any]] = []
+        for stage in stages:
+            if not isinstance(stage, dict):
+                raise CacheFormatError("flat page delta stage is not an object")
+            _strict_keys(
+                stage,
+                {
+                    "context_digest",
+                    "committed_tokens",
+                    "base_context_digest",
+                    "base_committed_tokens",
+                    "base_block_counts",
+                    "result_block_counts",
+                    "delta_encoded_bytes",
+                    "delta_object_bytes",
+                    "delta_objects",
+                    "delta_sha256",
+                },
+                "flat page delta stage",
+            )
+            try:
+                _validate_digest(stage["context_digest"], "stage context digest")
+                _validate_digest(stage["delta_sha256"], "stage delta sha256")
+            except ValueError as error:
+                raise CacheFormatError(str(error)) from error
+            objects = stage["delta_objects"]
+            if (
+                stage["base_context_digest"] != prior_digest
+                or stage["base_committed_tokens"] != prior_tokens
+                or stage["base_block_counts"] != prior_counts
+                or type(stage["committed_tokens"]) is not int
+                or stage["committed_tokens"] <= prior_tokens
+                or not isinstance(stage["result_block_counts"], list)
+                or len(stage["result_block_counts"]) != len(base_counts)
+                or type(stage["delta_encoded_bytes"]) is not int
+                or stage["delta_encoded_bytes"] <= 0
+                or stage["delta_object_bytes"] != _PAGE_DELTA_OBJECT_BYTES
+                or not isinstance(objects, list)
+                or not objects
+            ):
+                raise CacheFormatError("flat page delta stage geometry differs")
+            expected_start = 0
+            for index, descriptor in enumerate(objects):
+                if not isinstance(descriptor, dict):
+                    raise CacheFormatError(
+                        "flat page delta object descriptor is not an object"
+                    )
+                _strict_keys(
+                    descriptor,
+                    {"sha256", "bytes", "encoded_start", "encoded_end"},
+                    "flat page delta object descriptor",
+                )
+                try:
+                    _validate_digest(
+                        descriptor["sha256"], "flat page delta object sha256"
+                    )
+                except ValueError as error:
+                    raise CacheFormatError(str(error)) from error
+                size = descriptor["bytes"]
+                start = descriptor["encoded_start"]
+                end = descriptor["encoded_end"]
+                if (
+                    type(size) is not int
+                    or type(start) is not int
+                    or type(end) is not int
+                    or size <= 0
+                    or start != expected_start
+                    or end != start + size
+                    or (
+                        index < len(objects) - 1
+                        and size != _PAGE_DELTA_OBJECT_BYTES
+                    )
+                    or size > _PAGE_DELTA_OBJECT_BYTES
+                ):
+                    raise CacheFormatError(
+                        "flat page delta object descriptor geometry differs"
+                    )
+                descriptors.append(descriptor)
+                expected_start = end
+            if expected_start != stage["delta_encoded_bytes"]:
+                raise CacheFormatError("flat page delta object coverage differs")
+            prior_digest = stage["context_digest"]
+            prior_tokens = stage["committed_tokens"]
+            prior_counts = stage["result_block_counts"]
+        if (
+            prior_digest != manifest["context_digest"]
+            or prior_tokens != manifest["committed_tokens"]
+            or prior_counts != result_counts
+        ):
+            raise CacheFormatError("flat page delta terminal stage differs")
+        return manifest["base_root"], tuple(descriptors)
     if schema == _PAGE_DELTA_MANIFEST_SCHEMA:
         delta_keys = {"delta_chunks"}
     elif schema == _PAGE_DELTA_MANIFEST_SCHEMA_V2:
@@ -1401,7 +1570,8 @@ def _validate_page_snapshot_root(
         or type(manifest["format_abi"]) is not int
         or manifest["format_abi"] != FORMAT_ABI
         or manifest["storage_mode"] != "block_pages_v1"
-        or identity.publication_schema not in ("", "page-tail-cow-v1")
+        or identity.publication_schema
+        not in ("", "page-tail-cow-v1", "page-tail-cow-v2")
         or identity.required_records
         != frozenset((StateRecord.TARGET_CKV, StateRecord.LOGICAL_POSITIONS))
         or manifest["identity"] != identity.to_wire()
@@ -3076,7 +3246,11 @@ class ManifestStore:
         """
 
         _validate_digest(context_digest, "context_digest")
-        if identity.publication_schema not in ("", "page-tail-cow-v1"):
+        if identity.publication_schema not in (
+            "",
+            "page-tail-cow-v1",
+            "page-tail-cow-v2",
+        ):
             raise ValueError(
                 "page snapshot publication requires the flat or page-tail"
                 " publication schema"
@@ -3192,31 +3366,37 @@ class ManifestStore:
         result_block_counts: Sequence[int],
         base_boundary_tokens: int,
         result_boundary_tokens: int,
-        result_snapshot: bytes | bytearray,
+        result_snapshot: object,
+        verified_base_snapshot: bytes | bytearray | None = None,
     ) -> CommitReceipt:
         """Publish a page-semantic delta over one verified opaque snapshot."""
 
-        if identity.publication_schema != "page-tail-cow-v1":
+        if identity.publication_schema not in (
+            "page-tail-cow-v1",
+            "page-tail-cow-v2",
+        ):
             raise ValueError(
-                "page tail publication requires publication_schema page-tail-cow-v1"
+                "page tail publication requires a page-tail-cow schema"
             )
         from sparkcache.spark_context_cache_codec import (
             context_prefix_digest,
         )
         from sparkcache.spark_context_cache_hybrid import (
             encode_page_delta,
+            encode_page_delta_from_capture,
         )
 
         with _RootGuard(self.root, shared=True, blocking=True):
-            base = self.lookup(identity, base_context_digest, verify_chunks=True)
+            base = self.lookup(
+                identity,
+                base_context_digest,
+                verify_chunks=verified_base_snapshot is None,
+                verify_chunk_metadata=True,
+            )
             if not base.is_hit or base._manifest is None:
                 raise CacheFormatError(f"base context is not reusable: {base.reason}")
             if int(base._manifest["committed_tokens"]) != base_boundary_tokens:
                 raise CacheFormatError("base context boundary differs")
-            if self._page_delta_root_count(base._manifest) >= _MAX_PAGE_DELTA_DEPTH:
-                raise PageDeltaDepthExceeded(
-                    "page delta depth requires a fresh full snapshot"
-                )
             if (
                 context_prefix_digest(
                     token_ids,
@@ -3228,26 +3408,104 @@ class ManifestStore:
                 raise CommitConflict(
                     "base digest disagrees with supplied token sequence"
                 )
+            publication_base = base
+            publication_base_digest = base_context_digest
+            publication_base_boundary = base_boundary_tokens
+            publication_base_block_counts = tuple(base_block_counts)
+            if (
+                identity.publication_schema == "page-tail-cow-v1"
+                and self._page_delta_root_count(base._manifest)
+                >= _MAX_PAGE_DELTA_DEPTH
+            ):
+                terminal_delta = base._manifest
+                while _is_page_delta_root(terminal_delta["base_root"]):
+                    terminal_delta = terminal_delta["base_root"]
+                terminal_root = terminal_delta["base_root"]
+                publication_base_digest = terminal_delta["base_context_digest"]
+                publication_base_boundary = terminal_delta["base_committed_tokens"]
+                publication_base_block_counts = tuple(
+                    terminal_delta["base_block_counts"]
+                )
+                if (
+                    context_prefix_digest(
+                        token_ids,
+                        identity_salt,
+                        token_count=publication_base_boundary,
+                    )
+                    != publication_base_digest
+                ):
+                    raise CommitConflict(
+                        "flattened base digest disagrees with supplied token sequence"
+                    )
+                publication_base = LookupResult(
+                    True,
+                    "hit",
+                    manifest_digest=terminal_delta["base_root_sha256"],
+                    _manifest=terminal_root,
+                    root_kind=(
+                        "page_snapshot"
+                        if _is_page_snapshot_root(terminal_root)
+                        else "manifest"
+                    ),
+                )
             result_context_digest = context_prefix_digest(
                 token_ids,
                 identity_salt,
                 token_count=result_boundary_tokens,
             )
-            base_snapshot = self.restore_page_snapshot(
-                base,
-                layout=layout,
-                result_block_counts=base_block_counts,
-                result_boundary_tokens=base_boundary_tokens,
-            )
-            delta = encode_page_delta(
-                layout,
-                base_snapshot,
+            if (
+                verified_base_snapshot is not None
+                and publication_base is base
+            ):
+                from sparkcache.spark_context_cache_hybrid import (
+                    plan_page_snapshot,
+                )
+
+                plan_page_snapshot(
+                    layout,
+                    verified_base_snapshot,
+                    publication_base_block_counts,
+                )
+                base_snapshot = verified_base_snapshot
+            else:
+                base_snapshot = self.restore_page_snapshot(
+                    publication_base,
+                    layout=layout,
+                    result_block_counts=publication_base_block_counts,
+                    result_boundary_tokens=publication_base_boundary,
+                )
+            captured_reuse = getattr(
                 result_snapshot,
-                base_block_counts=base_block_counts,
-                result_block_counts=result_block_counts,
-                base_boundary_tokens=base_boundary_tokens,
-                result_boundary_tokens=result_boundary_tokens,
+                "reused_pages_by_group",
+                None,
             )
+            if captured_reuse is not None:
+                if identity.publication_schema != "page-tail-cow-v2":
+                    raise ValueError(
+                        "direct sparse page deltas require page-tail-cow-v2"
+                    )
+                delta = encode_page_delta_from_capture(
+                    layout,
+                    base_snapshot,
+                    result_snapshot,
+                    base_block_counts=publication_base_block_counts,
+                    result_block_counts=result_block_counts,
+                    reused_pages_by_group=captured_reuse,
+                    base_boundary_tokens=publication_base_boundary,
+                    result_boundary_tokens=result_boundary_tokens,
+                )
+            else:
+                if not isinstance(result_snapshot, (bytes, bytearray)):
+                    raise ValueError("page delta result snapshot is invalid")
+                delta = encode_page_delta(
+                    layout,
+                    base_snapshot,
+                    result_snapshot,
+                    base_block_counts=publication_base_block_counts,
+                    result_block_counts=result_block_counts,
+                    base_boundary_tokens=publication_base_boundary,
+                    result_boundary_tokens=result_boundary_tokens,
+                )
             publication = self._active_publication()
             publication.describe_payload(len(delta), len(base_snapshot))
             descriptors: list[dict[str, Any]] = []
@@ -3276,26 +3534,75 @@ class ManifestStore:
                     objects.clear()
             if objects:
                 _publish_immutable_batch(objects)
-            base_root = dict(base._manifest)
-            root = {
-                "schema": _PAGE_DELTA_MANIFEST_SCHEMA_V2,
-                "format_abi": FORMAT_ABI,
-                "identity": identity.to_wire(),
-                "context_digest": result_context_digest,
-                "committed_tokens": result_boundary_tokens,
-                "base_context_digest": base_context_digest,
-                "base_committed_tokens": base_boundary_tokens,
-                "base_root": base_root,
-                "base_root_sha256": _sha256(_canonical_json(base_root)),
-                "layout_sha256": layout.digest,
-                "base_block_counts": list(base_block_counts),
-                "result_block_counts": list(result_block_counts),
-                "delta_encoded_bytes": len(delta),
-                "delta_object_bytes": _PAGE_DELTA_OBJECT_BYTES,
-                "delta_objects": descriptors,
-                "delta_sha256": _sha256(delta),
-                "logical_chunk_tokens": identity.chunk_tokens,
-            }
+            base_root = dict(publication_base._manifest)
+            if identity.publication_schema == "page-tail-cow-v2":
+                if base._manifest.get("schema") == _PAGE_DELTA_MANIFEST_SCHEMA_V3:
+                    _validate_page_delta_root(
+                        base._manifest,
+                        identity=identity,
+                        context_digest=base_context_digest,
+                    )
+                    flat_base_root = dict(base._manifest["base_root"])
+                    flat_base_digest = base._manifest["base_context_digest"]
+                    flat_base_boundary = base._manifest["base_committed_tokens"]
+                    flat_base_counts = list(base._manifest["base_block_counts"])
+                    stages = [dict(stage) for stage in base._manifest["delta_stages"]]
+                else:
+                    flat_base_root = dict(base._manifest)
+                    flat_base_digest = base_context_digest
+                    flat_base_boundary = base_boundary_tokens
+                    flat_base_counts = list(base_block_counts)
+                    stages = []
+                stages.append(
+                    {
+                        "context_digest": result_context_digest,
+                        "committed_tokens": result_boundary_tokens,
+                        "base_context_digest": base_context_digest,
+                        "base_committed_tokens": base_boundary_tokens,
+                        "base_block_counts": list(base_block_counts),
+                        "result_block_counts": list(result_block_counts),
+                        "delta_encoded_bytes": len(delta),
+                        "delta_object_bytes": _PAGE_DELTA_OBJECT_BYTES,
+                        "delta_objects": descriptors,
+                        "delta_sha256": _sha256(delta),
+                    }
+                )
+                root = {
+                    "schema": _PAGE_DELTA_MANIFEST_SCHEMA_V3,
+                    "format_abi": FORMAT_ABI,
+                    "identity": identity.to_wire(),
+                    "context_digest": result_context_digest,
+                    "committed_tokens": result_boundary_tokens,
+                    "base_context_digest": flat_base_digest,
+                    "base_committed_tokens": flat_base_boundary,
+                    "base_root": flat_base_root,
+                    "base_root_sha256": _sha256(_canonical_json(flat_base_root)),
+                    "layout_sha256": layout.digest,
+                    "base_block_counts": flat_base_counts,
+                    "result_block_counts": list(result_block_counts),
+                    "delta_stages": stages,
+                    "logical_chunk_tokens": identity.chunk_tokens,
+                }
+            else:
+                root = {
+                    "schema": _PAGE_DELTA_MANIFEST_SCHEMA_V2,
+                    "format_abi": FORMAT_ABI,
+                    "identity": identity.to_wire(),
+                    "context_digest": result_context_digest,
+                    "committed_tokens": result_boundary_tokens,
+                    "base_context_digest": publication_base_digest,
+                    "base_committed_tokens": publication_base_boundary,
+                    "base_root": base_root,
+                    "base_root_sha256": _sha256(_canonical_json(base_root)),
+                    "layout_sha256": layout.digest,
+                    "base_block_counts": list(publication_base_block_counts),
+                    "result_block_counts": list(result_block_counts),
+                    "delta_encoded_bytes": len(delta),
+                    "delta_object_bytes": _PAGE_DELTA_OBJECT_BYTES,
+                    "delta_objects": descriptors,
+                    "delta_sha256": _sha256(delta),
+                    "logical_chunk_tokens": identity.chunk_tokens,
+                }
             root["metadata_sha256"] = _sha256(_canonical_json(root))
             encoded_root = _canonical_json(root)
             _publish_immutable(
@@ -3357,6 +3664,60 @@ class ManifestStore:
             if chunks is None:
                 raise CacheFormatError("page snapshot restore failed")
             return b"".join(chunk.records[StateRecord.TARGET_CKV] for chunk in chunks)
+        if manifest.get("schema") == _PAGE_DELTA_MANIFEST_SCHEMA_V3:
+            identity_wire = dict(manifest["identity"])
+            if "record_schema" in identity_wire:
+                identity_wire["record_schema"] = tuple(
+                    identity_wire["record_schema"]
+                )
+            identity = CacheIdentity(**identity_wire)
+            base_root, _descriptors = _validate_page_delta_root(
+                manifest,
+                identity=identity,
+                context_digest=manifest["context_digest"],
+            )
+            if (
+                manifest["layout_sha256"] != layout.digest
+                or tuple(manifest["result_block_counts"])
+                != tuple(result_block_counts)
+                or manifest["committed_tokens"] != result_boundary_tokens
+            ):
+                raise CacheFormatError("flat page delta restore geometry differs")
+            base_lookup = LookupResult(
+                True,
+                "hit",
+                manifest_digest=manifest["base_root_sha256"],
+                _manifest=base_root,
+                root_kind=(
+                    "page_snapshot"
+                    if _is_page_snapshot_root(base_root)
+                    else "manifest"
+                ),
+            )
+            snapshot = self.restore_page_snapshot(
+                base_lookup,
+                layout=layout,
+                result_block_counts=manifest["base_block_counts"],
+                result_boundary_tokens=manifest["base_committed_tokens"],
+            )
+            from sparkcache.spark_context_cache_hybrid import apply_page_delta
+
+            for stage in manifest["delta_stages"]:
+                encoded_delta = self._read_page_delta_objects(
+                    stage["delta_objects"],
+                    encoded_bytes=stage["delta_encoded_bytes"],
+                    encoded_sha256=stage["delta_sha256"],
+                )
+                snapshot = apply_page_delta(
+                    layout,
+                    snapshot,
+                    encoded_delta,
+                    base_block_counts=stage["base_block_counts"],
+                    result_block_counts=stage["result_block_counts"],
+                    base_boundary_tokens=stage["base_committed_tokens"],
+                    result_boundary_tokens=stage["committed_tokens"],
+                )
+            return snapshot
         if _depth >= _MAX_PAGE_DELTA_DEPTH:
             raise CacheFormatError("page delta graph exceeds the depth limit")
         evidence = self.page_delta_base_read_evidence(
