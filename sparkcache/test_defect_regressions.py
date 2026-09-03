@@ -36,6 +36,104 @@ from sparkcache.test_spark_context_cache_connector import (
     _ReqPlan,
 )
 from sparkcache.spark_context_cache_store import IncompleteEntry
+from sparkcache.test_async_page_capture_connector import (
+    FakeRuntime as AsyncPageFakeRuntime,
+    _connector as make_async_page_connector,
+)
+
+
+class DefectD19SkippedAsyncPublicationCompletionTests(unittest.TestCase):
+    """D-19: store skips release delayed finished-request KV blocks."""
+
+    @staticmethod
+    def _plan(request_id: str = "request") -> _ReqPlan:
+        return _ReqPlan(request_id, "a" * 64, 512, (2, 5), True)
+
+    def _assert_terminal_skip(self, *, busy: bool, present: bool) -> None:
+        plan = self._plan()
+        runtime = AsyncPageFakeRuntime()
+        connector = make_async_page_connector(plan, runtime)
+        connector._store_inflight = int(busy)
+        if present:
+            connector._held.add(plan.digest)
+
+        connector.wait_for_save()
+
+        request = types.SimpleNamespace(request_id=plan.request_id)
+        self.assertEqual(
+            connector.request_finished_all_groups(request, ([2, 5], [7])),
+            (True, None),
+        )
+        self.assertEqual(connector.get_finished({plan.request_id})[0], {plan.request_id})
+        self.assertIsNone(connector.get_finished({plan.request_id})[0])
+        self.assertEqual(runtime.submitted, [])
+
+    def test_busy_saver_skip_reports_terminal_completion(self) -> None:
+        self._assert_terminal_skip(busy=True, present=False)
+
+    def test_already_present_skip_reports_terminal_completion(self) -> None:
+        self._assert_terminal_skip(busy=False, present=True)
+
+    def test_partial_rank_busy_skip_reaches_terminal_completion(self) -> None:
+        workers = []
+        for rank in range(4):
+            plan = self._plan()
+            runtime = AsyncPageFakeRuntime()
+            connector = make_async_page_connector(plan, runtime)
+            connector._store_inflight = int(rank == 2)
+            with mock.patch(
+                "sparkcache.spark_context_cache_connector.torch.cuda.current_stream",
+                return_value=types.SimpleNamespace(cuda_stream=91),
+            ):
+                connector.wait_for_save()
+            if rank != 2:
+                runtime.finished.add(plan.request_id)
+            workers.append((connector, plan))
+
+        for connector, plan in workers:
+            request = types.SimpleNamespace(request_id=plan.request_id)
+            self.assertEqual(
+                connector.request_finished_all_groups(request, ([2, 5], [7])),
+                (True, None),
+            )
+            self.assertEqual(
+                connector.get_finished({plan.request_id})[0],
+                {plan.request_id},
+            )
+
+    def test_second_plan_finishes_while_first_capture_remains_active(self) -> None:
+        first = self._plan("first")
+        skipped = _ReqPlan("skipped", "b" * 64, 512, (7, 8), True)
+        runtime = AsyncPageFakeRuntime()
+        connector = make_async_page_connector(first, runtime)
+        connector._async_page_capture_eligible.add(skipped.request_id)
+        connector._get_connector_metadata = lambda: SparkCacheConnectorMetadata(
+            plans=[first, skipped]
+        )
+        with mock.patch(
+            "sparkcache.spark_context_cache_connector.torch.cuda.current_stream",
+            return_value=types.SimpleNamespace(cuda_stream=91),
+        ):
+            connector.wait_for_save()
+
+        self.assertEqual(runtime.submitted, [(first, 91)])
+        self.assertEqual(runtime.finished, {skipped.request_id})
+        for plan in (first, skipped):
+            request = types.SimpleNamespace(request_id=plan.request_id)
+            self.assertEqual(
+                connector.request_finished_all_groups(request, ([2, 5], [7])),
+                (True, None),
+            )
+        self.assertIsNone(connector.get_finished({first.request_id})[0])
+        self.assertEqual(
+            connector.get_finished({skipped.request_id})[0],
+            {skipped.request_id},
+        )
+        runtime.finished.add(first.request_id)
+        self.assertEqual(
+            connector.get_finished({first.request_id})[0],
+            {first.request_id},
+        )
 
 
 class DefectD6QuorumDeltaReportingTests(unittest.TestCase):

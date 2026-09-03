@@ -26,6 +26,9 @@ class FakeRuntime:
         self.finished: set[str] = set()
         self.submit_error: Exception | None = None
 
+    def finish_without_capture(self, request_id: str) -> None:
+        self.finished.add(request_id)
+
     def submit(self, plan: object, *, producer_stream: int) -> bool:
         if self.submit_error is not None:
             raise self.submit_error
@@ -36,7 +39,9 @@ class FakeRuntime:
         self.preempted.append(request_id)
 
     def take_finished(self, finished_req_ids: set[str]) -> set[str]:
-        return self.finished & finished_req_ids
+        ready = self.finished & finished_req_ids
+        self.finished.difference_update(ready)
+        return ready
 
 
 class FakeSparseRing:
