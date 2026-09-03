@@ -2661,6 +2661,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             required = (
                 "submit",
                 "preempt",
+                "finish_without_capture",
                 "take_finished",
                 "quiesce",
                 "shutdown",
