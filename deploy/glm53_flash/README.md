@@ -19,12 +19,6 @@ The quickstart is the source of truth for the image digest, model revisions,
 launch variables, storage paths, and four-host procedure. Keeping those values
 in SparkRing prevents a copied deployment recipe here from becoming stale.
 
-The published image named by the guide is:
-
-```text
-ghcr.io/fujitsupolycom/sparkring-glm53-sparkcache@sha256:380283a506aeb8f9d486a3c64cd738e44268c3cc21590913ea9e4685869f256a
-```
-
 ## SparkCache contract
 
 The `glm53-flash-hybrid` profile stores target-model manager pages owned by

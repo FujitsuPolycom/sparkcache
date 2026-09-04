@@ -46,11 +46,6 @@ R8_QUICKSTART_URL = (
     "https://github.com/FujitsuPolycom/sparkring/blob/main/"
     + R8_QUICKSTART_PATH
 )
-R8_MANIFEST = (
-    "sha256:380283a506aeb8f9d486a3c64cd738e44268c3cc21590913ea9e4685869f256a"
-)
-
-
 def _receipt() -> dict[str, object]:
     return json.loads(RECEIPT.read_text(encoding="utf-8"))
 
@@ -208,7 +203,7 @@ def test_public_arm64_receipt_binds_bounded_c4_smoke() -> None:
     assert "general deployment qualification" in smoke["not_established"]
 
 
-def test_public_arm64_docs_route_by_digest_without_overclaiming() -> None:
+def test_public_arm64_docs_route_deployments_to_sparkring() -> None:
     image_record = " ".join(IMAGE_RECORD.read_text(encoding="utf-8").split())
 
     assert MANIFEST in image_record
@@ -223,18 +218,18 @@ def test_public_arm64_docs_route_by_digest_without_overclaiming() -> None:
     assert QUICKSTART_DURABLE_URL in image_record
     deployment = DEPLOYMENT_GUIDE.read_text(encoding="utf-8")
     assert R8_QUICKSTART_URL in deployment
-    assert R8_MANIFEST in deployment
+    assert "ghcr.io/fujitsupolycom/sparkring-glm53-sparkcache@sha256:" not in deployment
     assert MANIFEST not in deployment
 
 
-def test_canonical_docs_route_to_public_arm64_manifest() -> None:
+def test_canonical_deployment_guide_delegates_image_identity_to_sparkring() -> None:
     image_record = IMAGE_RECORD.read_text(encoding="utf-8")
     assert MANIFEST in image_record
     assert "not generally qualified" in image_record.casefold()
 
     deployment = DEPLOYMENT_GUIDE.read_text(encoding="utf-8")
     assert R8_QUICKSTART_URL in deployment
-    assert R8_MANIFEST in deployment
+    assert "ghcr.io/fujitsupolycom/sparkring-glm53-sparkcache@sha256:" not in deployment
     assert "source of truth for the image digest" in deployment
 
 
