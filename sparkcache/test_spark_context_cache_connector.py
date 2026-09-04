@@ -93,6 +93,20 @@ def _install_vllm_stubs() -> None:
 
     metrics.KVConnectorStats = KVConnectorStats
 
+    class KVConnectorPromMetrics:
+        def __init__(
+            self,
+            _vllm_config,
+            metric_types,
+            labelnames,
+            per_engine_labelvalues,
+        ):
+            self._gauge_cls = next(iter(metric_types.values()))
+            self._labelnames = labelnames
+            self.per_engine_labelvalues = per_engine_labelvalues
+
+    metrics.KVConnectorPromMetrics = KVConnectorPromMetrics
+
     import enum
 
     class KVConnectorRole(enum.Enum):
@@ -5476,6 +5490,33 @@ class AsyncRestoreTests(unittest.TestCase):
                 (0, False),
             )
 
+    def test_waiting_request_reuses_its_prefix_digest_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            request = types.SimpleNamespace(
+                request_id="capacity-waiter",
+                prompt_token_ids=list(range(1100)),
+            )
+
+            with mock.patch(
+                "sparkcache.spark_context_cache_connector.chunk_prefix_digests",
+                wraps=codec.chunk_prefix_digests,
+            ) as digest_chain:
+                self.assertIsNone(
+                    connector.get_shared_prefix_lease_candidate(request)
+                )
+                self.assertIsNone(
+                    connector.get_shared_prefix_lease_candidate(request)
+                )
+                digest_chain.assert_called_once()
+
+                connector.request_finished(request, [])
+                self.assertNotIn(request.request_id, connector._prefix_digest_candidates)
+                self.assertIsNone(
+                    connector.get_shared_prefix_lease_candidate(request)
+                )
+                self.assertEqual(digest_chain.call_count, 2)
+
     def test_partially_computed_request_does_not_wait_for_zero_token_lease(
         self,
     ) -> None:
@@ -6776,6 +6817,63 @@ class QuorumStatsAggregationTests(unittest.TestCase):
         self.assertEqual(reduced["sparkcache_publication_aborted"], 1)
         self.assertNotIn("sparkcache_publication_failed", reduced)
 
+    def test_prometheus_metrics_expose_capture_ownership(self) -> None:
+        class GaugeValue:
+            def __init__(self) -> None:
+                self.value = None
+
+            def set(self, value) -> None:
+                self.value = value
+
+        class GaugeDefinition:
+            definitions: dict[str, "GaugeDefinition"] = {}
+
+            def __init__(self, *, name, documentation, labelnames) -> None:
+                self.name = name
+                self.documentation = documentation
+                self.labelnames = labelnames
+                self.children: dict[tuple[object, ...], GaugeValue] = {}
+                self.definitions[name] = self
+
+            def labels(self, *values):
+                return self.children.setdefault(tuple(values), GaugeValue())
+
+        metrics = connector_module.SparkCachePromMetrics(
+            types.SimpleNamespace(),
+            {object: GaugeDefinition},
+            ["engine"],
+            {0: ["0"]},
+        )
+        metrics.observe(
+            {
+                "reports": [
+                    {
+                        "rank": rank,
+                        "held": [],
+                        "async_capture": {
+                            "pending_requests": 0,
+                            "completed_notifications": 1,
+                            "delayed_requests": 1,
+                            "retained_manager_pages": 3,
+                            "oldest_delayed_ms": 125.0,
+                            "ownership_uncertain": rank == 3,
+                            "store_inflight": False,
+                        },
+                    }
+                    for rank in range(4)
+                ]
+            }
+        )
+
+        def value(name: str):
+            return GaugeDefinition.definitions[name].children[("0",)].value
+
+        self.assertEqual(value("vllm:sparkcache_capture_delayed_requests"), 1)
+        self.assertEqual(value("vllm:sparkcache_capture_delayed_rank_slots"), 4)
+        self.assertEqual(value("vllm:sparkcache_capture_retained_manager_pages"), 12)
+        self.assertEqual(value("vllm:sparkcache_capture_oldest_delayed_seconds"), 0.125)
+        self.assertEqual(value("vllm:sparkcache_capture_ownership_uncertain_ranks"), 1)
+
     def test_aggregate_log_summary_is_split_by_operator_concern(self) -> None:
         cls = connector_module.SparkCacheStats
         stats = cls(
@@ -6788,6 +6886,15 @@ class QuorumStatsAggregationTests(unittest.TestCase):
                             "bytes": 300 * 1024**2,
                             "max_bytes": 40 * 1024**3,
                             "capacity_satisfied": True,
+                        },
+                        "async_capture": {
+                            "pending_requests": 0,
+                            "completed_notifications": 1,
+                            "delayed_requests": 1,
+                            "retained_manager_pages": 3,
+                            "oldest_delayed_ms": 125.0,
+                            "ownership_uncertain": False,
+                            "store_inflight": False,
                         },
                         "publication": {
                             "committed_publications": 3,
@@ -6813,8 +6920,15 @@ class QuorumStatsAggregationTests(unittest.TestCase):
                 "unique=1.2GiB",
                 "sparkcache: writes staged=1.2GiB dedup=0B "
                 "aborted=0B failed=0B",
+                "sparkcache: capture requests=1 rank_slots=4 "
+                "pages=12 oldest=125ms",
             ),
         )
+        reduced = stats.reduce()
+        self.assertEqual(reduced["sparkcache_capture_delayed_requests"], 1)
+        self.assertEqual(reduced["sparkcache_capture_delayed_rank_slots"], 4)
+        self.assertEqual(reduced["sparkcache_capture_retained_pages"], 12)
+        self.assertEqual(reduced["sparkcache_capture_oldest_delayed_ms"], 125.0)
 
     def test_later_report_replaces_same_rank(self) -> None:
         cls = connector_module.SparkCacheStats

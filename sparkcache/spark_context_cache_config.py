@@ -417,6 +417,7 @@ class ConnectorConfig:
     identity_base: Mapping[str, Any]
     load_thread_limit: int
     max_pending_restores: int
+    max_delayed_stores: int
     shared_prefix_lease_ttl_seconds: float
 
     @property
@@ -920,6 +921,17 @@ def parse_connector_config(
         raise RuntimeError(
             "spark-context-cache: spark_cache_max_pending_restores must be at least 1"
         )
+    max_delayed_stores = _nonnegative_config_int(
+        extra(
+            "spark_cache_max_delayed_stores",
+            os.environ.get("SPARK_CONTEXT_CACHE_MAX_DELAYED_STORES", "16"),
+        ),
+        "spark_cache_max_delayed_stores",
+    )
+    if max_delayed_stores < 1:
+        raise RuntimeError(
+            "spark-context-cache: spark_cache_max_delayed_stores must be at least 1"
+        )
     shared_prefix_lease_ttl_seconds = _bounded_positive_config_float(
         extra(
             "spark_cache_shared_prefix_lease_ttl_seconds",
@@ -961,5 +973,6 @@ def parse_connector_config(
         identity_base=_freeze_config_value(identity_base),
         load_thread_limit=load_thread_limit,
         max_pending_restores=max_pending_restores,
+        max_delayed_stores=max_delayed_stores,
         shared_prefix_lease_ttl_seconds=shared_prefix_lease_ttl_seconds,
     )

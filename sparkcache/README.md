@@ -217,6 +217,7 @@ The required page-tail settings are profile-specific:
   "spark_cache_async_page_capture_library_sha256": "<64 lowercase hex characters>",
   "spark_cache_async_page_capture_slot_bytes": 3221225472,
   "spark_cache_async_page_capture_slot_count": 2,
+  "spark_cache_max_delayed_stores": 16,
   "spark_cache_async_page_capture_vllm_root": "/absolute/vllm/source",
   "spark_cache_async_page_capture_lease_contract": "/absolute/ownership-contract.json"
 }
@@ -231,6 +232,10 @@ pinned unified memory.
 
 Saturation always skips the optional publication instead of waiting for a
 slot.
+
+The delayed-store limit reserves at most 16 request lifetimes by default.
+When the limit is full, SparkCache omits another optional store plan before
+worker capture begins, so vLLM can release that request's pages normally.
 
 ## Capacity and cleanup
 
@@ -272,6 +277,22 @@ Each completed store also emits one compact `sparkcache: publish` line.
 
 Scheduler aggregate telemetry is split into `sparkcache: capacity`,
 `sparkcache: publications`, and `sparkcache: writes` lines.
+
+While capture owns finished-request pages, a `sparkcache: capture` aggregate
+line reports delayed requests, request-rank ownership records, retained manager
+pages, and the oldest ownership age.
+
+The line disappears after every rank reports its terminal completion.
+
+The same ownership state is available from the vLLM Prometheus endpoint:
+
+| Gauge | Meaning |
+|---|---|
+| `vllm:sparkcache_capture_delayed_requests` | Maximum delayed request count on any physical rank. |
+| `vllm:sparkcache_capture_delayed_rank_slots` | Request ownership records summed across physical ranks. |
+| `vllm:sparkcache_capture_retained_manager_pages` | Physical manager pages retained across ranks. |
+| `vllm:sparkcache_capture_oldest_delayed_seconds` | Age of the oldest retained request ownership. |
+| `vllm:sparkcache_capture_ownership_uncertain_ranks` | Ranks that cannot prove whether capture still owns source pages. |
 
 Exact process-local totals are available from
 `ManifestStore.publication_telemetry_snapshot()` using schema

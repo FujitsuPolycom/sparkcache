@@ -1,0 +1,143 @@
+{
+  "schema": "sparkcache-asymmetric-async-store-completion-validation/v1",
+  "status": "qualified",
+  "purpose": "Verify that finished-request pages are released when physical ranks reach different asynchronous publication outcomes and completion times.",
+  "scope": {
+    "model": "GLM-5.3-Flash-NVFP4",
+    "target_checkpoint_sha256": "a35e6bf2875c1875609b8deaec404c07c6cc80259e4222fc0b51e649498bd6b9",
+    "draft_checkpoint_sha256": "b33c03475ba7322cf398828f2d8d1be376df30dc05c6b40c28c8ea8da23e410b",
+    "topology": "TP4/DCP4",
+    "vllm_commit": "3633d61c3c7b04bb4d598cadbdc342f3be40482d",
+    "sparkcache_runtime_commit": "105cccc6627e309917e7d37a23d3ee00b6ef49a5",
+    "sparkcache_runtime_source_sha256": "212cefb027675ddea73843544f26e0f22cb312cbacac36b0311a27695143a937",
+    "cuda_placement_sha256": "d57509052b73853bcc8e3c3f47bb81748d87b9cbd8d908fc20d4c79a09aa400c",
+    "cuda_snapshot_sha256": "4398f18b8913e743e7bf1ed8fe29560d4580e61b6a1e2ab8b16684b19b6573b5"
+  },
+  "configuration": {
+    "max_model_tokens": 1048576,
+    "kv_cache_dtype": "fp8",
+    "kv_cache_bytes_per_rank": 25769803776,
+    "access_mode": "read-write",
+    "publication_schema": "page-tail-cow-v2",
+    "asynchronous_page_capture": true,
+    "shared_prefix_lease_ttl_seconds": 300,
+    "cache_root": "/cache/jit/sparkcache-context/glm53-issue55-followups-0c8ad7b-dcp4-page-tail-cow-v2"
+  },
+  "execution_commands": [
+    "python tools/validate_async_store_completion.py --endpoint http://192.168.0.157:8015 --model glm-5.3-flash --cycles 1 --large-repetitions 131000 --small-repetitions 4096 --concurrency 8 --output async-store-probe.json",
+    "curl --fail --request POST http://192.168.0.157:8015/reset_prefix_cache",
+    "curl --fail http://192.168.0.157:8015/metrics"
+  ],
+  "defect_reproduction": {
+    "sparkcache_commit": "070c53a754cd35cd36d4d88d64ada15d78414e01",
+    "condition": "One 129024-token request followed by eight concurrent 4096-token requests produced asynchronous completions after vLLM had stopped repeating their finished request IDs.",
+    "busy_saver_skips_per_rank": [3, 3, 3, 4],
+    "idle_running_requests": 0,
+    "idle_kv_cache_usage_percent": 3.0699959066721294,
+    "retained_delayed_requests": 1,
+    "retained_request_rank_slots": 3,
+    "retained_manager_pages": 30,
+    "oldest_retained_seconds_observed": 12.868,
+    "conclusion": "Requiring four aggregator acknowledgements was insufficient because the manager-page runtime forgot a request ID when capture completed after the scheduler supplied that ID."
+  },
+  "asymmetric_rank_validation": {
+    "sparkcache_commit": "1939e5b7bd8f7c3d6879e87e7ca49c124a69de9c",
+    "condition": "The 30720-token manifest for digest 95b69d30d242c6c650f2876078c38ccec71d4897700e3757d3487710589478ef existed on rank 2 and was absent on ranks 0, 1, and 3 before process startup.",
+    "rank_outcomes": {
+      "0": "committed",
+      "1": "committed",
+      "2": "skipped_already_present",
+      "3": "committed"
+    },
+    "idle_running_requests": 0,
+    "idle_waiting_requests": 0,
+    "idle_kv_cache_usage_percent": 0.0,
+    "retained_delayed_requests": 0,
+    "retained_request_rank_slots": 0,
+    "retained_manager_pages": 0,
+    "preemptions": 0,
+    "runtime_errors": 0,
+    "conclusion": "The worker retained vLLM's one-time finished request ID until its capture completed, and vLLM released scheduler blocks after every physical rank acknowledged the request."
+  },
+  "concurrent_publication_validation": {
+    "sparkcache_commit": "1939e5b7bd8f7c3d6879e87e7ca49c124a69de9c",
+    "condition": "One 129024-token request was followed by eight concurrent 4096-token requests.",
+    "busy_saver_skips_per_rank": [3, 3, 3, 3],
+    "peak_delayed_requests": 4,
+    "peak_request_rank_slots": 16,
+    "peak_retained_manager_pages": 656,
+    "idle_running_requests": 0,
+    "idle_waiting_requests": 0,
+    "idle_kv_cache_usage_percent": 0.0,
+    "preemptions": 0,
+    "runtime_errors": 0,
+    "cuda_errors": 0,
+    "nccl_errors": 0,
+    "conclusion": "Repeated concurrent publication allowed every finished request and retained manager page to return to the free pool."
+  },
+  "prometheus_validation": {
+    "sparkcache_commit": "105cccc6627e309917e7d37a23d3ee00b6ef49a5",
+    "condition": "The same large-plus-eight-small workload was sampled every 200 milliseconds through vLLM's Prometheus endpoint.",
+    "maximum_values": {
+      "vllm:sparkcache_capture_delayed_requests": 3,
+      "vllm:sparkcache_capture_delayed_rank_slots": 12,
+      "vllm:sparkcache_capture_retained_manager_pages": 616,
+      "vllm:sparkcache_capture_oldest_delayed_seconds": 2.675580597,
+      "vllm:sparkcache_capture_ownership_uncertain_ranks": 0
+    },
+    "idle_values": {
+      "vllm:sparkcache_capture_delayed_requests": 0,
+      "vllm:sparkcache_capture_delayed_rank_slots": 0,
+      "vllm:sparkcache_capture_retained_manager_pages": 0,
+      "vllm:sparkcache_capture_oldest_delayed_seconds": 0,
+      "vllm:sparkcache_capture_ownership_uncertain_ranks": 0,
+      "vllm:num_requests_running": 0,
+      "vllm:num_requests_waiting": 0,
+      "vllm:kv_cache_usage_perc": 0
+    },
+    "busy_saver_skips_per_rank": [3, 3, 3, 3],
+    "runtime_errors_per_rank": [0, 0, 0, 0],
+    "conclusion": "The Prometheus gauges exposed active ownership during publication and returned to zero when every rank acknowledged completion."
+  },
+  "repository_probe_validation": {
+    "schema": "sparkcache-async-store-completion-probe/v1",
+    "cycles": 1,
+    "large_request_seconds": 46.235,
+    "small_request_seconds": [6.937, 9.625, 1.656, 11.703, 9.625, 12.0, 11.703, 12.0],
+    "idle_running_requests": 0,
+    "idle_waiting_requests": 0,
+    "idle_kv_cache_usage_percent": 0,
+    "idle_delayed_requests": 0,
+    "idle_request_rank_slots": 0,
+    "idle_retained_manager_pages": 0,
+    "conclusion": "The repository-provided probe reproduced the publication-pressure shape and observed complete idle ownership recovery."
+  },
+  "persistent_restore_smoke": {
+    "digest": "95b69d30d242c6c650f2876078c38ccec71d4897700e3757d3487710589478ef",
+    "restored_tokens": 30720,
+    "rank_zero_restore_milliseconds": 190.9,
+    "rank_zero_effective_tokens_per_second": 161000,
+    "client_seconds_including_tokenization_and_generation": 2.094,
+    "prefix_cache_reset_before_restore": "succeeded",
+    "conclusion": "The completion-lifecycle changes did not prevent verified persistent restoration after vLLM prefix-cache eviction."
+  },
+  "runtime_images": {
+    "published": false,
+    "tag": "sparkring-glm53-sparkcache:issue55-observability-105cccc",
+    "per_rank_image_ids": [
+      "sha256:9e77ccf5d6482be72e86769e655a70abbcc6ab0f29d976186643ce90eced9271",
+      "sha256:3ccac5b7279067742c6e4df044d825e0796ea0b5e49f4d7d376d23c404aa55e3",
+      "sha256:3fa2fe3650f194b2001482940b1ee0f7183df8a51533b5ca42cb54fd41724ca4",
+      "sha256:2dcd3775ff5569e0b82c43ddbd89d4f4d318678c76e8cefb08b4c020628ab8b3"
+    ],
+    "note": "Each rank built the same SparkCache source overlay on its locally composed SIRCL validation image. This record does not identify a pullable registry artifact."
+  },
+  "validation": {
+    "sparkcache_tests_passed": 989,
+    "sparkcache_tests_skipped": 7,
+    "deployment_tests_passed": 111,
+    "deployment_tests_skipped": 1,
+    "ruff": "passed"
+  },
+  "completed_at": "2026-09-04T01:07:31Z"
+}

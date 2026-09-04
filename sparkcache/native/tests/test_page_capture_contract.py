@@ -116,4 +116,4 @@ def test_background_handoff_keeps_claimed_ring_bytes_scattered() -> None:
     assert "PageSnapshotScatter(" in runtime
     assert "bytes(claimed.payload)" not in runtime
     assert "header + body" not in runtime
-    assert "self._completed.add(capture.request_id)" in runtime
+    assert "self._mark_completed_locked(" in runtime
