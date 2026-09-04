@@ -167,6 +167,8 @@ def test_finish_without_capture_is_terminal_and_idempotent() -> None:
 
     runtime.finish_without_capture("skipped")
     runtime.finish_without_capture("skipped")
+    with pytest.raises(ValueError, match="cannot be negative"):
+        runtime.finish_without_capture("invalid", retained_manager_pages=-1)
 
     assert runtime.take_finished({"skipped"}) == {"skipped"}
     assert runtime.take_finished({"skipped"}) == set()
@@ -192,6 +194,24 @@ def test_finish_without_capture_does_not_release_an_active_capture() -> None:
     runtime.shutdown()
 
 
+def test_finished_request_seen_before_capture_completion_is_reported_later() -> None:
+    connector = FakeConnector()
+    runtime = ManagerPageCaptureRuntime(
+        connector,
+        ring=FakeRing(b""),
+        progress_poll_seconds=0.001,
+        progress_thread_initializer=lambda: None,
+    )
+    assert runtime.submit(_plan("late-completion"), producer_stream=91)
+
+    assert runtime.take_finished({"late-completion"}) == set()
+    runtime.preempt("late-completion")
+
+    assert runtime.take_finished(set()) == {"late-completion"}
+    assert runtime.take_finished({"late-completion"}) == set()
+    runtime.shutdown()
+
+
 def test_skipped_request_finishes_while_another_capture_is_pending() -> None:
     connector = FakeConnector()
     runtime = ManagerPageCaptureRuntime(
@@ -207,6 +227,37 @@ def test_skipped_request_finishes_while_another_capture_is_pending() -> None:
     assert runtime.take_finished({"active", "skipped"}) == {"skipped"}
     runtime.preempt("active")
     assert runtime.take_finished({"active"}) == {"active"}
+    runtime.shutdown()
+
+
+def test_status_reports_delayed_request_ownership() -> None:
+    connector = FakeConnector()
+    runtime = ManagerPageCaptureRuntime(
+        connector,
+        ring=FakeRing(b""),
+        progress_poll_seconds=0.001,
+        progress_thread_initializer=lambda: None,
+    )
+    assert runtime.submit(_plan("active"), producer_stream=91)
+    runtime.finish_without_capture("skipped")
+
+    status = runtime.status()
+    assert status["pending_requests"] == 1
+    assert status["completed_notifications"] == 1
+    assert status["delayed_requests"] == 0
+    assert status["retained_manager_pages"] == 0
+
+    assert runtime.take_finished({"active", "skipped"}) == {"skipped"}
+    status = runtime.status()
+    assert runtime.status()["completed_notifications"] == 0
+    assert status["delayed_requests"] == 1
+    assert status["retained_manager_pages"] == 3
+    assert status["oldest_delayed_ms"] >= 0.0
+    assert status["ownership_uncertain"] is False
+    runtime.preempt("active")
+    assert runtime.status()["pending_requests"] == 0
+    assert runtime.take_finished({"active"}) == {"active"}
+    assert runtime.status()["delayed_requests"] == 0
     runtime.shutdown()
 
 
@@ -379,8 +430,8 @@ def test_unknown_background_ownership_never_reports_finished() -> None:
     )
     assert runtime.submit(_plan("uncertain"), producer_stream=91)
     assert not runtime.wait_idle(timeout=0.05)
-    with pytest.raises(RuntimeError, match="ownership is uncertain"):
-        runtime.take_finished({"uncertain"})
+    assert runtime.take_finished({"uncertain"}) == set()
+    assert runtime.status()["ownership_uncertain"] is True
     runtime.shutdown()
 
 

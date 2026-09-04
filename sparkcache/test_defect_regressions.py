@@ -67,12 +67,56 @@ class DefectD19SkippedAsyncPublicationCompletionTests(unittest.TestCase):
         self.assertEqual(connector.get_finished({plan.request_id})[0], {plan.request_id})
         self.assertIsNone(connector.get_finished({plan.request_id})[0])
         self.assertEqual(runtime.submitted, [])
+        self.assertEqual(
+            runtime.finished_manager_pages[plan.request_id],
+            sum(len(group) for group in plan.group_block_ids),
+        )
 
     def test_busy_saver_skip_reports_terminal_completion(self) -> None:
         self._assert_terminal_skip(busy=True, present=False)
 
     def test_already_present_skip_reports_terminal_completion(self) -> None:
         self._assert_terminal_skip(busy=False, present=True)
+
+    def test_completion_requires_every_physical_rank(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            scheduler = _make_connector(
+                Path(directory),
+                0,
+                64,
+                role=KVConnectorRole.SCHEDULER,
+                tp=4,
+                dcp=4,
+            )
+
+            self.assertEqual(scheduler.get_finished_count(), 4)
+
+    def test_scheduler_bounds_delayed_async_store_ownership(self) -> None:
+        connector = object.__new__(connector_module.SparkContextCacheConnector)
+        connector._async_page_capture_enabled = True
+        connector._role = KVConnectorRole.SCHEDULER
+        connector._max_delayed_stores = 1
+        connector._async_page_capture_reservations = {}
+        connector._async_page_capture_eligible = set()
+        connector.counters = {"store_skipped_delayed_limit": 0}
+        first = self._plan("first")
+        second = _ReqPlan("second", "b" * 64, 512, (7, 8), True)
+        load = _ReqPlan("load", "d" * 64, 512, (9, 10), False)
+        metadata = SparkCacheConnectorMetadata(plans=[first, second, load])
+
+        connector._reserve_async_page_capture_plans(metadata)
+
+        self.assertEqual(metadata.plans, [first, load])
+        self.assertEqual(connector._async_page_capture_eligible, {"first"})
+        self.assertEqual(connector._async_page_capture_reservations, {"first": 2})
+        self.assertEqual(connector.counters["store_skipped_delayed_limit"], 1)
+
+        connector._release_async_page_capture_reservations(("first",))
+        retry = SparkCacheConnectorMetadata(plans=[second])
+        connector._reserve_async_page_capture_plans(retry)
+
+        self.assertEqual(retry.plans, [second])
+        self.assertEqual(connector._async_page_capture_eligible, {"second"})
 
     def test_partial_rank_busy_skip_reaches_terminal_completion(self) -> None:
         workers = []
@@ -88,6 +132,11 @@ class DefectD19SkippedAsyncPublicationCompletionTests(unittest.TestCase):
                 connector.wait_for_save()
             if rank != 2:
                 runtime.finished.add(plan.request_id)
+            else:
+                self.assertEqual(
+                    runtime.finished_manager_pages[plan.request_id],
+                    sum(len(group) for group in plan.group_block_ids),
+                )
             workers.append((connector, plan))
 
         for connector, plan in workers:
@@ -134,6 +183,51 @@ class DefectD19SkippedAsyncPublicationCompletionTests(unittest.TestCase):
             connector.get_finished({first.request_id})[0],
             {first.request_id},
         )
+
+    def test_partial_rank_store_reports_converge_without_pending_deltas(self) -> None:
+        digest = "c" * 64
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scheduler = _make_connector(
+                root / "scheduler",
+                0,
+                64,
+                role=KVConnectorRole.SCHEDULER,
+            )
+            workers = [
+                _make_connector(root / f"rank-{rank}", rank, 64)
+                for rank in range(4)
+            ]
+
+            def publish(rank: int) -> None:
+                stats = workers[rank].get_kv_connector_stats()
+                scheduler._absorb_quorum(
+                    types.SimpleNamespace(kv_connector_stats=stats)
+                )
+
+            for rank in range(4):
+                publish(rank)
+            for rank in (0, 1, 3):
+                workers[rank]._held.add(digest)
+                publish(rank)
+
+            self.assertEqual(scheduler._quorum[digest], {0, 1, 3})
+            self.assertFalse(scheduler._has_full_quorum(digest))
+            self.assertTrue(
+                all(not item for item in scheduler._worker_pending_deltas.values())
+            )
+            self.assertEqual(scheduler._worker_desynchronized, set())
+            self.assertEqual(scheduler._worker_requires_checkpoint, set())
+
+            workers[2]._held.add(digest)
+            publish(2)
+
+            self.assertTrue(scheduler._has_full_quorum(digest))
+            self.assertTrue(
+                all(not item for item in scheduler._worker_pending_deltas.values())
+            )
+            self.assertEqual(scheduler._worker_desynchronized, set())
+            self.assertEqual(scheduler._worker_requires_checkpoint, set())
 
 
 class DefectD6QuorumDeltaReportingTests(unittest.TestCase):

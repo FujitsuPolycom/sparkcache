@@ -179,8 +179,32 @@ class ManagerPageCaptureRuntime:
         self._next_sequence = 1
         self._pending: dict[str, _PendingCapture] = {}
         self._completed: set[str] = set()
+        # vLLM supplies each finished request ID once, but permits a connector
+        # to report its asynchronous completion on a later get_finished call.
+        # Retain only IDs that this runtime currently owns, and retire each ID
+        # with the corresponding completion notification.
+        self._pending_finished_requests: set[str] = set()
+        self._completed_started_ns: dict[str, int] = {}
+        self._completed_manager_pages: dict[str, int] = {}
         self._closed = False
         self._fatal: BaseException | None = None
+
+    def _mark_completed_locked(
+        self,
+        request_id: str,
+        retained_manager_pages: int,
+        *,
+        started_ns: int | None = None,
+    ) -> None:
+        self._completed.add(request_id)
+        self._completed_started_ns.setdefault(
+            request_id,
+            time.perf_counter_ns() if started_ns is None else started_ns,
+        )
+        self._completed_manager_pages[request_id] = max(
+            retained_manager_pages,
+            self._completed_manager_pages.get(request_id, 0),
+        )
 
     def submit(self, plan: Any, *, producer_stream: int) -> bool:
         request_id = str(plan.request_id)
@@ -221,7 +245,10 @@ class ManagerPageCaptureRuntime:
                 ) from self._fatal
             if request_id in self._pending:
                 raise RuntimeError("request already has a manager-page capture")
+            self._pending_finished_requests.discard(request_id)
             self._completed.discard(request_id)
+            self._completed_started_ns.pop(request_id, None)
+            self._completed_manager_pages.pop(request_id, None)
             context_sequence = self._next_sequence
             self._next_sequence += 1
             submitted_ns = time.perf_counter_ns()
@@ -233,11 +260,19 @@ class ManagerPageCaptureRuntime:
                     producer_stream=producer_stream,
                 )
             except Exception:
-                self._completed.add(request_id)
+                self._mark_completed_locked(
+                    request_id,
+                    sum(result_block_counts),
+                    started_ns=submitted_ns,
+                )
                 self._cv.notify_all()
                 raise
             if ticket is None:
-                self._completed.add(request_id)
+                self._mark_completed_locked(
+                    request_id,
+                    sum(result_block_counts),
+                    started_ns=submitted_ns,
+                )
                 self._connector._abort_async_page_capture(
                     plan.digest, "capture ring is busy or the payload was rejected"
                 )
@@ -268,10 +303,19 @@ class ManagerPageCaptureRuntime:
             self._connector._abort_async_page_capture(
                 pending.plan.digest, "request was preempted"
             )
-            self._completed.add(request_id)
+            self._mark_completed_locked(
+                request_id,
+                sum(pending.result_block_counts),
+                started_ns=pending.submitted_ns,
+            )
             self._cv.notify_all()
 
-    def finish_without_capture(self, request_id: str) -> None:
+    def finish_without_capture(
+        self,
+        request_id: str,
+        *,
+        retained_manager_pages: int = 0,
+    ) -> None:
         """Report a terminal store outcome when no CUDA work was submitted.
 
         Scheduler-side asynchronous publication eligibility delays KV-block
@@ -281,6 +325,8 @@ class ManagerPageCaptureRuntime:
         path because its pages remain owned by the native completion fence.
         """
 
+        if retained_manager_pages < 0:
+            raise ValueError("retained manager pages cannot be negative")
         with self._cv:
             if self._closed:
                 raise RuntimeError("manager-page capture runtime is closed")
@@ -288,18 +334,61 @@ class ManagerPageCaptureRuntime:
                 raise RuntimeError(
                     "cannot finish a manager-page capture before its fence drains"
                 )
-            self._completed.add(request_id)
+            self._mark_completed_locked(request_id, retained_manager_pages)
             self._cv.notify_all()
 
     def take_finished(self, finished_request_ids: set[str]) -> set[str]:
         with self._cv:
+            owned = set(finished_request_ids) & (
+                self._completed | set(self._pending)
+            )
+            self._pending_finished_requests.update(owned)
             if self._fatal is not None:
-                raise RuntimeError(
-                    "manager-page capture ownership is uncertain"
-                ) from self._fatal
-            ready = self._completed & set(finished_request_ids)
+                # Withhold completion so vLLM retains every possibly owned
+                # page, but allow the following connector-statistics call to
+                # transport ownership_uncertain to logs and Prometheus.
+                return set()
+            ready = self._completed & self._pending_finished_requests
             self._completed.difference_update(ready)
+            self._pending_finished_requests.difference_update(ready)
+            for request_id in ready:
+                self._completed_started_ns.pop(request_id, None)
+                self._completed_manager_pages.pop(request_id, None)
             return ready
+
+    def status(self) -> dict[str, int | float | bool]:
+        """Describe request-owned pages awaiting a terminal acknowledgement."""
+
+        with self._cv:
+            delayed_ids = set(self._pending_finished_requests)
+            timestamps = [
+                self._pending[request_id].submitted_ns
+                if request_id in self._pending
+                else self._completed_started_ns[request_id]
+                for request_id in delayed_ids
+                if request_id in self._pending
+                or request_id in self._completed_started_ns
+            ]
+            now_ns = time.perf_counter_ns()
+            oldest_delayed_ms = (
+                max(0, now_ns - min(timestamps)) / 1_000_000
+                if timestamps
+                else 0.0
+            )
+            retained_manager_pages = sum(
+                sum(self._pending[request_id].result_block_counts)
+                if request_id in self._pending
+                else self._completed_manager_pages.get(request_id, 0)
+                for request_id in delayed_ids
+            )
+            return {
+                "pending_requests": len(self._pending),
+                "completed_notifications": len(self._completed),
+                "delayed_requests": len(delayed_ids),
+                "retained_manager_pages": retained_manager_pages,
+                "oldest_delayed_ms": oldest_delayed_ms,
+                "ownership_uncertain": self._fatal is not None,
+            }
 
     def wait_idle(self, timeout: float | None = None) -> bool:
         with self._cv:
@@ -372,7 +461,11 @@ class ManagerPageCaptureRuntime:
                     continue
                 claimed = self._ring.claim(capture.ticket)
                 if self._pending.pop(capture.request_id, None) is not None:
-                    self._completed.add(capture.request_id)
+                    self._mark_completed_locked(
+                        capture.request_id,
+                        sum(capture.result_block_counts),
+                        started_ns=capture.submitted_ns,
+                    )
                     ready.append((capture, claimed, time.perf_counter_ns()))
                 if not self._pending:
                     self._wake.clear()
