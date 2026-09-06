@@ -2435,12 +2435,12 @@ class ManifestStore:
             manifests_root = self.root / "manifests"
             aliases_root = self.root / "prefix-aliases"
             manifest_paths = (
-                tuple(sorted(manifests_root.glob("*/*.json")))
+                tuple(sorted(manifests_root.glob("*/*.json"), key=os.fspath))
                 if manifests_root.is_dir()
                 else ()
             )
             alias_paths = (
-                tuple(sorted(aliases_root.glob("*/*.json")))
+                tuple(sorted(aliases_root.glob("*/*.json"), key=os.fspath))
                 if aliases_root.is_dir()
                 else ()
             )
@@ -2461,11 +2461,12 @@ class ManifestStore:
                     return ()
                 return tuple(
                     sorted(
-                        path
+                        (path
                         for directory in root.iterdir()
                         if directory.is_dir()
                         for path in directory.iterdir()
-                        if path.is_file()
+                        if path.is_file()),
+                        key=os.fspath,
                     )
                 )
 
@@ -2500,7 +2501,8 @@ class ManifestStore:
             chunk_directory = self.root / "chunks"
             chunk_paths = (
                 tuple(
-                    sorted(path for path in chunk_directory.iterdir() if path.is_file())
+                    sorted((path for path in chunk_directory.iterdir() if path.is_file()),
+                           key=os.fspath)
                 )
                 if chunk_directory.is_dir()
                 else ()
@@ -2604,7 +2606,10 @@ class ManifestStore:
                         if path is not None:
                             projected_bytes -= segment_sizes.get(path, 0)
 
-            ordered = sorted(entries, key=lambda entry: (entry.mtime_ns, entry.path))
+            # Cache namespaces and digests have fixed-width canonical names.
+            # Compare each path's string once instead of normalizing Path
+            # components throughout every comparison in the inventory sort.
+            ordered = sorted(entries, key=lambda entry: (entry.mtime_ns, os.fspath(entry.path)))
             for entry in ordered:
                 expired = policy.ttl_seconds > 0 and (
                     current_ns - entry.mtime_ns >= policy.ttl_seconds * 10**9
@@ -2649,7 +2654,7 @@ class ManifestStore:
             # Root removals are durable before any object they authorized can
             # be collected. A failed root-directory barrier stops maintenance
             # with every shared segment and chunk still present.
-            for directory in sorted(affected_root_directories):
+            for directory in sorted(affected_root_directories, key=os.fspath):
                 _fsync_directory(directory)
 
             remaining_references: Counter[str] = Counter()
@@ -2692,7 +2697,7 @@ class ManifestStore:
                 affected_segment_directories.add(path.parent)
                 if path in initial_orphan_segments:
                     orphan_segments_deleted += 1
-            for directory in sorted(affected_segment_directories):
+            for directory in sorted(affected_segment_directories, key=os.fspath):
                 _fsync_directory(directory)
 
             chunks_deleted = 0
