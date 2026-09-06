@@ -8,12 +8,17 @@ rereading roots or probing shared payload files once per reference.
 
 The [CPU benchmark record](maintenance-inventory-validation.json) measures the
 complete maintenance and reconciliation call on Windows 11 with NTFS. It
-compares equivalent fixtures against source revision `78ca0bd`.
+compares equivalent fixtures against source revision `7fc9f85509624a0f9c5bc6bd7c5f70f1a43d389e`.
 
 | Fixture | Baseline median | Inventory median | Root reads | Chunk metadata probes |
 |---|---:|---:|---:|---:|
 | Eight branches, 32 flat page extensions each | 175.23 ms | 72.22 ms | 514 to 257 | 4,995 to 514 |
 | 64 token-row roots sharing 32 chunks | 37.38 ms | 10.14 ms | 128 to 64 | 2,112 to 64 |
+
+A repeat with combined source `11658f0a3b9f155af1d95ff78a807c9b374f6093`,
+including canonical string ordering, measured 78.41 ms for the flat-page fixture
+and retained the same reduced I/O counts. The JSON records that source and its
+seven observations separately.
 
 The page fixture includes attention and recurrent-state bytes. It exercises
 257 roots and 4,481 chunk references with tiny payloads, not a loaded model.

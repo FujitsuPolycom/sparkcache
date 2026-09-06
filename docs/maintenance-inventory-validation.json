@@ -8,8 +8,17 @@
     "python_execution": "native Windows",
     "paired_method": "Separate sequential processes constructed equivalent temporary caches and invoked SparkContextCacheConnector._maintain_capacity(force=True).",
     "timing": "Median of seven complete maintenance/reconciliation passes after an untimed instrumented pass; garbage collection precedes each timer.",
-    "excluded": ["fixture construction", "publication", "Python imports", "I/O counting instrumentation"],
-    "included": ["exclusive cache lock", "complete reference inventory", "offer reconciliation"],
+    "excluded": [
+      "fixture construction",
+      "publication",
+      "Python imports",
+      "I/O counting instrumentation"
+    ],
+    "included": [
+      "exclusive cache lock",
+      "complete reference inventory",
+      "offer reconciliation"
+    ],
     "eviction": "disabled by a 1000000000-byte capacity ceiling",
     "gpu_execution": false,
     "serving_or_nvme_qualification": false,
@@ -17,9 +26,10 @@
   },
   "sources": {
     "baseline": {
-      "revision": "78ca0bdc5d63629ef6ee6239546921898956fa2e",
+      "revision": "7fc9f85509624a0f9c5bc6bd7c5f70f1a43d389e",
       "cache_manifest_sha256_lf": "88caa5b104407a212b4344b82ab914d6c5c7e72d021976ba6d1c44d13f7f2f2e",
-      "connector_sha256_lf": "082f2820f45cdf951629d045b5d316461f86372fae70425be9b5903825395a97"
+      "connector_sha256_lf": "082f2820f45cdf951629d045b5d316461f86372fae70425be9b5903825395a97",
+      "revision_matches_recorded_source_hashes": true
     },
     "survivor_inventory": {
       "mechanism": "MaintenanceReport.surviving_entries supplies metadata-qualified offers from the exclusive inventory pass.",
@@ -39,13 +49,29 @@
     "baseline": {
       "root_reads": 514,
       "chunk_stats": 4995,
-      "elapsed_ms": [185.0543999898946, 183.6131000018213, 173.09400001249742, 178.17310000828002, 174.59690000396222, 174.0127999946708, 175.22859999735374],
+      "elapsed_ms": [
+        185.0543999898946,
+        183.6131000018213,
+        173.09400001249742,
+        178.17310000828002,
+        174.59690000396222,
+        174.0127999946708,
+        175.22859999735374
+      ],
       "median_ms": 175.22859999735374
     },
     "survivor_inventory": {
       "root_reads": 257,
       "chunk_stats": 514,
-      "elapsed_ms": [72.49789999332279, 70.9155000076862, 72.2200000018347, 70.33850000880193, 76.28729999123607, 89.75840000493918, 72.21110000682529],
+      "elapsed_ms": [
+        72.49789999332279,
+        70.9155000076862,
+        72.2200000018347,
+        70.33850000880193,
+        76.28729999123607,
+        89.75840000493918,
+        72.21110000682529
+      ],
       "median_ms": 72.2200000018347
     },
     "conclusion": "Complete pass latency decreased 58.8 percent in this CPU fixture. Each root was read once; shared-chunk metadata probes scaled with unique files rather than root references. This does not establish a serving-throughput improvement."
@@ -55,14 +81,57 @@
     "unique_chunks": 32,
     "chunk_references": 2048,
     "baseline": {
-      "root_reads": 128, "chunk_stats": 2112,
-      "elapsed_ms": [37.09349999553524, 37.26160000951495, 37.37550000369083, 37.524400002439506, 37.23980000359006, 41.24779999256134, 52.597900008549914],
+      "root_reads": 128,
+      "chunk_stats": 2112,
+      "elapsed_ms": [
+        37.09349999553524,
+        37.26160000951495,
+        37.37550000369083,
+        37.524400002439506,
+        37.23980000359006,
+        41.24779999256134,
+        52.597900008549914
+      ],
       "median_ms": 37.37550000369083
     },
     "survivor_inventory": {
-      "root_reads": 64, "chunk_stats": 64,
-      "elapsed_ms": [10.044100010418333, 10.23929999792017, 10.25409999419935, 10.973099997499958, 10.138300000107847, 9.93929999822285, 9.973099993658252],
+      "root_reads": 64,
+      "chunk_stats": 64,
+      "elapsed_ms": [
+        10.044100010418333,
+        10.23929999792017,
+        10.25409999419935,
+        10.973099997499958,
+        10.138300000107847,
+        9.93929999822285,
+        9.973099993658252
+      ],
       "median_ms": 10.138300000107847
     }
+  },
+  "combined_source_repeat": {
+    "revision": "11658f0a3b9f155af1d95ff78a807c9b374f6093",
+    "kind": "pages",
+    "roots": 257,
+    "unique_chunks": 257,
+    "references": 4481,
+    "platform": "Windows-11-10.0.26200-SP0",
+    "filesystem": "NTFS",
+    "manifest_source_sha256": "f2cc0bc7570b59ed068ad3273b234c0f8c9bd945a6a68dca0014012a118d1400",
+    "connector_source_sha256": "f92b1fcaf3385e5d4487b246f06c1de3fb02e8f05b67c055ab760d91ccd86eb4",
+    "io_counts": {
+      "root_reads": 257,
+      "chunk_stats": 514
+    },
+    "elapsed_ms": [
+      76.01800000702497,
+      72.13889999547973,
+      73.28540000889916,
+      82.84220000496134,
+      89.14029999868944,
+      79.15170000342187,
+      78.41010000265669
+    ],
+    "median_ms": 78.41010000265669
   }
 }
