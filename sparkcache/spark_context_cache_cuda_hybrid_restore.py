@@ -9,7 +9,8 @@ import os
 import re
 import struct
 import time
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -120,6 +121,7 @@ class CudaPageDeltaRestorePlan:
     prefetched_objects: tuple[CudaAuthenticatedPageObject, ...]
     referenced_object_bytes: int
     skipped_base_object_bytes: int
+    planning_read_source_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -231,7 +233,7 @@ def _read_authenticated_page_base(
 
 
 def _validated_shared_page_base(
-    result: PageBaseReadResult | bytes,
+    result: PageBaseReadResult | bytes | None,
     objects: Sequence[CudaPageObject],
 ) -> tuple[CudaAuthenticatedPageObject, ...]:
     # The only producer is _read_authenticated_page_base, which hashes every
@@ -312,7 +314,7 @@ def plan_cuda_page_delta_restore(
     arena_bytes: int,
     base_reader: Callable[
         [PageBaseReadEvidence, Callable[[], PageBaseReadResult]],
-        PageBaseReadResult | bytes,
+        PageBaseReadResult | bytes | None,
     ]
     | None = None,
 ) -> CudaPageDeltaRestorePlan:
@@ -371,7 +373,29 @@ def plan_cuda_page_delta_restore(
         raise CudaHybridRestoreError("page-delta root identity is not authenticated")
 
     stages_newest_first: list[_CudaPageDeltaStage] = []
-    prefetched: dict[Path, CudaAuthenticatedPageObject] = {}
+    prefetched: OrderedDict[Path, CudaAuthenticatedPageObject] = OrderedDict()
+    prefetch_limit = min(arena_bytes, _MAX_PAGE_OBJECT_PREFETCH_BYTES)
+    prefetched_bytes = 0
+    planning_read_source_bytes = 0
+
+    def read_header_object(source: CudaPageObject) -> CudaAuthenticatedPageObject:
+        nonlocal prefetched_bytes, planning_read_source_bytes
+        cached = prefetched.get(source.path)
+        if cached is not None:
+            return CudaAuthenticatedPageObject(source, cached.payload)
+        # Full-object authentication is required before trusting a header.
+        # Retain only a bounded working set as flat histories can grow without
+        # the nested-manifest depth limit. Evict before allocating the read.
+        while prefetched and prefetched_bytes + source.encoded_bytes > prefetch_limit:
+            _, evicted = prefetched.popitem(last=False)
+            prefetched_bytes -= evicted.source.encoded_bytes
+            del evicted
+        authenticated = _read_authenticated_page_object(source)
+        planning_read_source_bytes += source.encoded_bytes
+        prefetched[source.path] = authenticated
+        prefetched_bytes += source.encoded_bytes
+        return authenticated
+
     root = manifest
     root_digest = context_digest
     try:
@@ -393,24 +417,8 @@ def plan_cuda_page_delta_restore(
                     label="flat page delta",
                 )
                 flat_stages.append((stage, objects))
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(
-                    _MAX_PAGE_OBJECT_READ_WORKERS,
-                    len(flat_stages),
-                )
-            ) as executor:
-                first_objects = tuple(
-                    executor.map(
-                        _read_authenticated_page_object,
-                        (objects[0] for _stage, objects in flat_stages),
-                    )
-                )
-            for (stage, objects), authenticated in zip(
-                flat_stages,
-                first_objects,
-                strict=True,
-            ):
-                prefetched[objects[0].path] = authenticated
+            for stage, objects in flat_stages:
+                authenticated = read_header_object(objects[0])
                 delta_plan = plan_page_delta(
                     layout,
                     authenticated.payload,
@@ -423,6 +431,7 @@ def plan_cuda_page_delta_restore(
                 stages_newest_first.append(
                     _CudaPageDeltaStage(delta_plan, objects)
                 )
+                del authenticated
             root_digest = root["base_context_digest"]
             root = base_root
         else:
@@ -447,8 +456,7 @@ def plan_cuda_page_delta_restore(
                     arena_bytes=arena_bytes,
                     label="page delta",
                 )
-                authenticated = _read_authenticated_page_object(objects[0])
-                prefetched[objects[0].path] = authenticated
+                authenticated = read_header_object(objects[0])
                 delta_plan = plan_page_delta(
                     layout,
                     authenticated.payload,
@@ -461,6 +469,7 @@ def plan_cuda_page_delta_restore(
                 stages_newest_first.append(
                     _CudaPageDeltaStage(delta_plan, objects)
                 )
+                del authenticated
                 if base_root.get("committed_tokens") != root["base_committed_tokens"]:
                     raise CudaHybridRestoreError(
                         "page-delta base boundary differs"
@@ -512,18 +521,22 @@ def plan_cuda_page_delta_restore(
                 raise CudaHybridRestoreError(
                     f"SparkCache CUDA shared page-base read was rejected: {error}"
                 ) from error
-            authenticated_base_objects = _validated_shared_page_base(
-                shared_base,
-                base_objects,
-            )
-            prefetched.update(
-                (item.source.path, item)
-                for item in authenticated_base_objects
-            )
-            authenticated_base = authenticated_base_objects[0]
-        else:
-            authenticated_base = _read_authenticated_page_object(base_objects[0])
-            prefetched[base_objects[0].path] = authenticated_base
+            shared_base_used = shared_base is not None
+            if shared_base_used:
+                authenticated_base_objects = _validated_shared_page_base(
+                    shared_base,
+                    base_objects,
+                )
+                prefetched.update(
+                    (item.source.path, item)
+                    for item in authenticated_base_objects
+                )
+                planning_read_source_bytes += sum(
+                    item.source.encoded_bytes for item in authenticated_base_objects
+                )
+                authenticated_base = authenticated_base_objects[0]
+        if not shared_base_used:
+            authenticated_base = read_header_object(base_objects[0])
         base_counts = stages[0].plan.base_block_counts
         base_page_plan = plan_page_snapshot(
             layout,
@@ -651,6 +664,7 @@ def plan_cuda_page_delta_restore(
                 and path != base_objects[0].path
             )
         ),
+        planning_read_source_bytes=planning_read_source_bytes,
     )
 
 
@@ -1238,7 +1252,7 @@ def _execute_page_delta_restore(
     io_workers: int,
     base_reader: Callable[
         [PageBaseReadEvidence, Callable[[], PageBaseReadResult]],
-        PageBaseReadResult | bytes,
+        PageBaseReadResult | bytes | None,
     ]
     | None,
 ) -> CudaHybridRestoreResult:
@@ -1264,9 +1278,20 @@ def _execute_page_delta_restore(
     for path in tuple(prefetched):
         if path not in referenced_paths:
             prefetched.pop(path)
-    read_source_bytes = sum(
+    read_source_bytes = plan.planning_read_source_bytes or sum(
         item.source.encoded_bytes for item in plan.prefetched_objects
     )
+    # The plan must not keep a second reference to every retained object after
+    # its final submission; admitted bases can be much larger than one arena.
+    plan = replace(plan, prefetched_objects=())
+    last_use = {
+        span.source.path: batch_index
+        for batch_index, batch in enumerate(batches)
+        for span in batch
+    }
+    source_cache: OrderedDict[Path, CudaAuthenticatedPageObject] = OrderedDict()
+    cache_bytes = 0
+    cache_limit = min(arena_bytes, _MAX_PAGE_OBJECT_PREFETCH_BYTES)
     transaction = adapter.begin_parked_page_restore(
         request_id,
         group_slots,
@@ -1298,6 +1323,11 @@ def _execute_page_delta_restore(
                     for path in sources
                     if path in prefetched
                 }
+                loaded.update(
+                    (path, source_cache[path])
+                    for path in sources
+                    if path in source_cache
+                )
                 pending = tuple(
                     source
                     for path, source in sources.items()
@@ -1312,6 +1342,7 @@ def _execute_page_delta_restore(
                     for item in authenticated:
                         loaded[item.source.path] = item
                         read_source_bytes += item.source.encoded_bytes
+                    del authenticated, item
 
                 arena_index = batch_index % cuda.ARENA_COUNT
                 started = time.perf_counter()
@@ -1333,6 +1364,7 @@ def _execute_page_delta_restore(
                             ] = payload_view[span.source_offset_bytes:source_end]
                         finally:
                             payload_view.release()
+                        del payload
                         native_spans.append(
                             cuda.PageCopySpan(
                                 arena_offset,
@@ -1355,6 +1387,27 @@ def _execute_page_delta_restore(
                     spans=native_spans,
                 )
                 submit_call_ms += 1e3 * (time.perf_counter() - started)
+                # Source bytes are no longer needed by CUDA after the host
+                # copy into the fenced arena. Release their final use promptly;
+                # retain recurring objects within a separate bounded cache.
+                for path, item in loaded.items():
+                    if last_use[path] == batch_index:
+                        prefetched.pop(path, None)
+                        cached = source_cache.pop(path, None)
+                        if cached is not None:
+                            cache_bytes -= cached.source.encoded_bytes
+                        del cached
+                    elif path not in prefetched and path not in source_cache:
+                        size = item.source.encoded_bytes
+                        if size <= cache_limit:
+                            while source_cache and cache_bytes + size > cache_limit:
+                                _, evicted = source_cache.popitem(last=False)
+                                cache_bytes -= evicted.source.encoded_bytes
+                                del evicted
+                            source_cache[path] = item
+                            cache_bytes += size
+                del item
+                loaded.clear()
         if final_sha256.hexdigest() != plan.result_snapshot_sha256:
             raise CudaHybridRestoreError(
                 "page-delta reconstructed snapshot checksum mismatch"
@@ -1415,7 +1468,7 @@ def execute_cuda_hybrid_restore(
     dcp_rank: int = 0,
     base_reader: Callable[
         [PageBaseReadEvidence, Callable[[], PageBaseReadResult]],
-        PageBaseReadResult | bytes,
+        PageBaseReadResult | bytes | None,
     ]
     | None = None,
 ) -> CudaHybridRestoreResult:

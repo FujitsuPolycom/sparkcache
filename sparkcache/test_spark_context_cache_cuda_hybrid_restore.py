@@ -5,6 +5,7 @@ import hashlib
 import json
 import threading
 import time
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -690,6 +691,40 @@ def test_page_delta_planner_authenticates_graph_and_applies_delta_precedence(
     )
 
 
+def test_rejected_base_admission_uses_selective_restore(tmp_path, monkeypatch):
+    fixture = _page_delta_fixture(tmp_path, monkeypatch)
+    evidence = fixture.store.page_delta_base_read_evidence(
+        fixture.lookup, layout=fixture.layout,
+        result_block_counts=(fixture.result_blocks,),
+        result_boundary_tokens=fixture.result_tokens,
+    )
+    flights = PageBaseReadFlights(max_bytes_per_flight=1, max_bytes_total=2)
+    key = PageBaseReadFlightKey("worker", "block_pages_v1", evidence)
+    assert not flights.register_cohort(key, ("request",)).member_ids
+    monkeypatch.setattr(
+        cuda_hybrid, "_read_authenticated_page_base",
+        lambda objects: pytest.fail("rejected admission read the whole base"),
+    )
+    adapter = _PageCaptureAdapter(fixture.object_bytes)
+    monkeypatch.setattr(
+        cuda_hybrid.cuda, "arena_memoryview",
+        lambda arena, *, length: memoryview(arena.payload)[:length],
+    )
+    result = execute_cuda_hybrid_restore(
+        adapter=adapter, request_id="request", lookup=fixture.lookup,
+        cache_root=tmp_path, layout=fixture.layout,
+        group_slots=(tuple(range(fixture.result_blocks)),),
+        expected_span_tokens=fixture.result_tokens, arena_bytes=fixture.object_bytes,
+        base_reader=lambda actual, reader: flights.resolve(
+            "request", PageBaseReadFlightKey("worker", "block_pages_v1", actual),
+            reader, allow_independent=False,
+        ),
+    )
+    assert result.skipped_base_object_bytes > 0
+    assert flights.snapshot().retained_bytes == 0
+    assert adapter.transaction.can_resume
+
+
 def test_flat_page_delta_planner_reads_descriptor_stages(
     tmp_path, monkeypatch
 ) -> None:
@@ -772,6 +807,145 @@ def test_flat_page_delta_planner_reads_descriptor_stages(
         (final_blocks,),
     )
     assert reconstructed == final_snapshot[snapshot_plan.header_bytes :]
+
+
+def test_flat_delta_history_has_bounded_header_object_retention(tmp_path, monkeypatch):
+    fixture = _page_delta_fixture(
+        tmp_path, monkeypatch, publication_schema="page-tail-cow-v2",
+        minimum_object_bytes=4096,
+    )
+    snapshot = fixture.result
+    blocks = fixture.result_blocks
+    digest = fixture.result_digest
+    for stage in range(8):
+        snapshot_plan = plan_page_snapshot(fixture.layout, snapshot, (blocks,))
+        snapshot = encode_page_snapshot(
+            fixture.layout, (blocks + 8,),
+            {"page": snapshot[snapshot_plan.header_bytes:] + bytes((stage,)) * 1024},
+        )
+        tokens = tuple(range((blocks + 8) * 256))
+        fixture.store.commit_page_extension(
+            identity=fixture.identity, base_context_digest=digest,
+            token_ids=tokens, identity_salt=fixture.salt, layout=fixture.layout,
+            base_block_counts=(blocks,), result_block_counts=(blocks + 8,),
+            base_boundary_tokens=blocks * 256,
+            result_boundary_tokens=(blocks + 8) * 256, result_snapshot=snapshot,
+        )
+        blocks += 8
+        digest = context_prefix_digest(tokens, fixture.salt, token_count=len(tokens))
+    lookup = fixture.store.lookup(fixture.identity, digest, verify_chunks=False)
+    assert len(lookup._manifest["delta_stages"]) == 9
+    live_bytes = 0
+    peak_bytes = 0
+    read_bytes = 0
+    original = cuda_hybrid._read_authenticated_page_object
+
+    def released(size):
+        nonlocal live_bytes
+        live_bytes -= size
+
+    def track(source):
+        nonlocal live_bytes, peak_bytes, read_bytes
+        item = original(source)
+        read_bytes += source.encoded_bytes
+        live_bytes += len(item.payload)
+        peak_bytes = max(peak_bytes, live_bytes)
+        weakref.finalize(item, released, len(item.payload))
+        return item
+
+    monkeypatch.setattr(cuda_hybrid, "_read_authenticated_page_object", track)
+    plan = plan_cuda_page_delta_restore(
+        lookup, cache_root=tmp_path, layout=fixture.layout,
+        group_slots=(tuple(range(blocks)),), expected_span_tokens=blocks * 256,
+        arena_bytes=fixture.object_bytes,
+    )
+    assert sum(len(item.payload) for item in plan.prefetched_objects) <= fixture.object_bytes
+    assert peak_bytes <= 2 * fixture.object_bytes
+    assert plan.planning_read_source_bytes == read_bytes
+    assert read_bytes > sum(len(item.payload) for item in plan.prefetched_objects)
+    reconstructed = b"".join(
+        span.source.path.read_bytes()[
+            span.source_offset_bytes:span.source_offset_bytes + span.byte_count
+        ] for span in plan.source_spans
+    )
+    assert reconstructed == snapshot[plan.page_plan.header_bytes:]
+
+
+def test_delta_restore_reuses_nonadjacent_source_with_bounded_cache(tmp_path, monkeypatch):
+    layout = PageLayout((PageGroup(256, (PageLayer("page", "torch.uint8", (128,), 128),)),))
+    first, middle = b"a" * 128 + b"c" * 128, b"b" * 256
+    snapshot = encode_page_snapshot(layout, (4,), {"page": first[:128] + middle + first[128:]})
+    sources = []
+    for name, payload in (("first", first), ("middle", middle)):
+        path = tmp_path / name
+        path.write_bytes(payload)
+        sources.append(cuda_hybrid.CudaPageObject(
+            path, hashlib.sha256(payload).hexdigest(), len(payload), 0, len(payload),
+        ))
+    first_source, middle_source = sources
+    plan = cuda_hybrid.CudaPageDeltaRestorePlan(
+        plan_page_snapshot(layout, snapshot, (4,)), hashlib.sha256(snapshot).hexdigest(),
+        (cuda_hybrid.CudaPageSourceSpan(first_source, 0, 0, 0, 128, 0),
+         cuda_hybrid.CudaPageSourceSpan(middle_source, 0, 128, 128, 256, 0),
+         cuda_hybrid.CudaPageSourceSpan(first_source, 128, 384, 384, 128, 0)),
+        (), 512, 0,
+    )
+    monkeypatch.setattr(cuda_hybrid, "plan_cuda_page_delta_restore", lambda *a, **kw: plan)
+    monkeypatch.setattr(
+        cuda_hybrid.cuda, "arena_memoryview",
+        lambda arena, *, length: memoryview(arena.payload)[:length],
+    )
+    adapter = _PageCaptureAdapter(256)
+    result = cuda_hybrid._execute_page_delta_restore(
+        adapter=adapter, request_id="request", lookup=None, cache_root=tmp_path,
+        layout=layout, group_slots=((0, 1, 2, 3),), expected_span_tokens=1024,
+        arena_bytes=256, io_workers=4, base_reader=None,
+    )
+    assert result.read_source_bytes == plan.referenced_object_bytes == 512
+    assert adapter.transaction.can_resume
+
+
+def test_delta_restore_evicts_recurring_sources_when_cache_is_full(tmp_path, monkeypatch):
+    layout = PageLayout((PageGroup(256, (PageLayer("page", "torch.uint8", (128,), 128),)),))
+    sources = []
+    for name in ("a", "b", "c"):
+        payload = name.encode() * 256
+        path = tmp_path / name
+        path.write_bytes(payload)
+        sources.append(cuda_hybrid.CudaPageObject(
+            path, hashlib.sha256(payload).hexdigest(), 256, 0, 256,
+        ))
+    spans = []
+    offset = 0
+    for index, source_offset, size in ((0, 0, 128), (1, 0, 128), (2, 0, 256),
+                                       (0, 128, 128), (1, 128, 128)):
+        spans.append(cuda_hybrid.CudaPageSourceSpan(
+            sources[index], source_offset, offset, offset, size, 0,
+        ))
+        offset += size
+    snapshot = encode_page_snapshot(
+        layout, (6,), {"page": b"a" * 128 + b"b" * 128 + b"c" * 256 + b"a" * 128 + b"b" * 128},
+    )
+    plan = cuda_hybrid.CudaPageDeltaRestorePlan(
+        plan_page_snapshot(layout, snapshot, (6,)), hashlib.sha256(snapshot).hexdigest(),
+        tuple(spans), (), 768, 0,
+    )
+    monkeypatch.setattr(cuda_hybrid, "plan_cuda_page_delta_restore", lambda *a, **kw: plan)
+    monkeypatch.setattr(cuda_hybrid, "_MAX_PAGE_OBJECT_PREFETCH_BYTES", 256)
+    monkeypatch.setattr(
+        cuda_hybrid.cuda, "arena_memoryview",
+        lambda arena, *, length: memoryview(arena.payload)[:length],
+    )
+    adapter = _PageCaptureAdapter(256)
+    result = cuda_hybrid._execute_page_delta_restore(
+        adapter=adapter, request_id="request", lookup=None, cache_root=tmp_path,
+        layout=layout, group_slots=(tuple(range(6)),), expected_span_tokens=1536,
+        arena_bytes=256, io_workers=4, base_reader=None,
+    )
+    # The cache can retain only one object. B displaces A; C and A's final
+    # use do not displace B, so only A must be authenticated again.
+    assert result.read_source_bytes == 4 * 256
+    assert adapter.transaction.can_resume
 
 
 def test_nested_page_deltas_resolve_newest_over_middle_over_flat_base(

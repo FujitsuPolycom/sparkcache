@@ -66,6 +66,68 @@ def _make_vllm_config(
 _SHA = "a" * 64
 
 
+class RestoreArenaBudgetTests(unittest.TestCase):
+    def parse(self, budget=None, *, pages=True, enabled=True, threads=8):
+        class FullAttentionSpec:
+            block_size = 512
+            storage_block_size = 512
+            page_size_bytes = 528
+
+        groups = types.SimpleNamespace(kv_cache_groups=(types.SimpleNamespace(
+            kv_cache_spec=FullAttentionSpec(), is_eagle_group=False, layer_names=("full",),
+        ),)) if pages else None
+        extra = {
+            "spark_cache_model_profile": "glm53-flash-hybrid" if pages else "glm52-nvfp4",
+            "spark_cache_load_threads": threads,
+            "spark_cache_cuda_restore": str(int(enabled)),
+            "spark_cache_cuda_placement_library": _ABS_LIB,
+            "spark_cache_cuda_placement_library_sha256": _SHA,
+            "spark_cache_cuda_placement_arena_bytes": 256 * 1024**2,
+        }
+        if budget is not None:
+            extra["spark_cache_cuda_restore_arena_budget_bytes"] = budget
+        vllm, transfer = _make_vllm_config(extra, tp=1, dcp=1)
+        return cfg.parse_connector_config(vllm, transfer, groups)
+
+    def test_default_budget_preserves_lanes_and_cache_identity(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            unlimited = self.parse()
+            bounded = self.parse(1024**3)
+        self.assertEqual(unlimited.cuda_restore_arena_budget_bytes, 0)
+        self.assertEqual(unlimited.load_thread_limit, 8)
+        self.assertEqual(bounded.load_thread_limit, 2)
+        self.assertEqual(unlimited.build_identity(0, 0), bounded.build_identity(0, 0))
+
+    def test_budget_caps_complete_arena_pairs_and_respects_requested_lanes(self):
+        for budget, threads, expected in (
+            (512 * 1024**2, 8, 1), (1024**3 + 1, 8, 2),
+            (4 * 1024**3, 8, 8), (4 * 1024**3, 2, 2), (0, 8, 8),
+        ):
+            with self.subTest(budget=budget, threads=threads):
+                self.assertEqual(self.parse(budget, threads=threads).load_thread_limit, expected)
+
+    def test_budget_rejects_less_than_one_arena_pair(self):
+        for pages in (True, False):
+            with self.subTest(pages=pages), self.assertRaisesRegex(RuntimeError, "at least.*two"):
+                self.parse(512 * 1024**2 - 1, pages=pages)
+
+    def test_budget_rejects_invalid_integers(self):
+        for value in (-1, True, 1.5, "bad", "1.5"):
+            with self.subTest(value=value), self.assertRaisesRegex(RuntimeError, "arena_budget_bytes"):
+                self.parse(value)
+
+    def test_budget_environment_and_explicit_precedence(self):
+        with mock.patch.dict(os.environ, {
+            "SPARK_CONTEXT_CACHE_CUDA_RESTORE_ARENA_BUDGET_BYTES": str(1024**3),
+        }):
+            self.assertEqual(self.parse().load_thread_limit, 2)
+            self.assertEqual(self.parse(0).load_thread_limit, 8)
+
+    def test_budget_keeps_row_restore_serial_and_disabled_restore_unrestricted(self):
+        self.assertEqual(self.parse(1024**3, pages=False).load_thread_limit, 1)
+        self.assertEqual(self.parse(1, enabled=False).load_thread_limit, 8)
+
+
 class ParseConnectorConfigTests(unittest.TestCase):
     """Focused tests for parse_connector_config field extraction and defaults."""
 

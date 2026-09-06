@@ -27,6 +27,63 @@ read objects into a mapped host arena
 If any step fails, SparkCache discards the request's private blocks and lets
 vLLM compute the prompt normally.
 
+### Page-copy correctness and timing
+
+Status: **implemented** benchmark and opt-in GPU tests. Page scatter divides
+slabs into 64 KiB tiles and locates their extents in the validated span table.
+
+Aligned page fragments use 16-byte or 4-byte copies; unaligned fragments use
+byte copies. Blocks handle additional tiles when the grid reaches its limit.
+No expanded span table is allocated.
+
+[`app/spark_cache_page_copy_benchmark.cu`](app/spark_cache_page_copy_benchmark.cu)
+loads a selected library through its public ABI.
+
+It compares destination bytes with the independent CPU reference, including
+padding, unused physical pages, and guard bytes.
+
+Fixtures cover 64 MiB spans, a 257 MiB capped-grid continuation, large pages, 1,024 spans across eight layers,
+irregular framing, odd page widths, shuffled slots, and split submissions.
+
+Each iteration clears the destination outside the timed region to expose
+missing writes.
+
+On a CUDA host, build `spark_cache_page_copy_benchmark` with CMake. Enable
+`-DSPARK_CACHE_PLACEMENT_GPU_TESTS=ON` to register serial CTest checks for all
+three arena modes.
+
+GPU tests are disabled by default: CPU test hosts may have a CUDA compiler
+without a GPU. Run `ctest --test-dir BUILD -L page-copy --output-on-failure`,
+replacing `BUILD` with the build directory.
+
+For comparison runs, pass a library path, iteration count, and arena mode:
+
+```bash
+BUILD/spark_cache_page_copy_benchmark /absolute/path/libspark_cache_placement.so 15 1
+BUILD/spark_cache_page_copy_benchmark /absolute/path/libspark_cache_placement.so 15 2
+BUILD/spark_cache_page_copy_benchmark /absolute/path/libspark_cache_placement.so 15 3
+```
+
+Modes 1, 2, and 3 use mapped host, managed, and staged device memory,
+respectively. Three warmups precede timed iterations.
+
+The measured interval includes begin, acquire, submission, and completion
+fences; it is not an isolated kernel measurement. Source filling and byte
+comparisons are excluded.
+
+Managed mode reuses the filled source after warmup, without optional prefetch
+or CPU refills between iterations. Its timing does not measure migration for
+fresh CPU-produced slabs.
+
+Explicit data allocations stay below 400 MiB, excluding CUDA context and
+library overhead.
+
+Compare libraries in separate processes, then reverse their order. Retain
+compiler settings, library SHA-256 values, GPU identity, and serving activity.
+
+A microbenchmark improvement does not establish an end-to-end restore or
+serving improvement.
+
 ## Python interface
 
 [`../spark_cache_cuda.py`](../spark_cache_cuda.py) defines the Python ABI.

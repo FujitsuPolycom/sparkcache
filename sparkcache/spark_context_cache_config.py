@@ -412,6 +412,7 @@ class ConnectorConfig:
     cuda_placement_library_path: str
     cuda_placement_library_sha256: str
     cuda_placement_arena_bytes: int
+    cuda_restore_arena_budget_bytes: int
     cuda_restore_io_workers: int
     scheduler_probe: str
     identity_base: Mapping[str, Any]
@@ -888,9 +889,8 @@ def parse_connector_config(
             "spark-context-cache: spark_cache_scheduler_probe must be"
             f" 'tp0' or 'none' (configured: {scheduler_probe!r})"
         )
-    # Page restores use one CUDA placement adapter and mapped arena per lane.
-    # Eight lanes bound concurrent placement memory while allowing one bounded
-    # request cohort to make progress without serializing every private delta.
+    # Each CUDA placement lane owns two arenas. Limit page concurrency by both
+    # the requested threads and an optional rank-wide arena allocation budget.
     load_thread_limit = min(
         8,
         max(
@@ -905,6 +905,25 @@ def parse_connector_config(
     )
     if cuda_restore_enabled and storage_mode != "block_pages_v1":
         load_thread_limit = 1
+    cuda_restore_arena_budget_bytes = _nonnegative_config_int(
+        extra(
+            "spark_cache_cuda_restore_arena_budget_bytes",
+            os.environ.get("SPARK_CONTEXT_CACHE_CUDA_RESTORE_ARENA_BUDGET_BYTES", "0"),
+        ),
+        "spark_cache_cuda_restore_arena_budget_bytes",
+    )
+    if cuda_restore_enabled and cuda_restore_arena_budget_bytes:
+        from sparkcache.spark_cache_cuda import ARENA_COUNT
+
+        lane_bytes = ARENA_COUNT * cuda_placement_arena_bytes
+        if cuda_restore_arena_budget_bytes < lane_bytes:
+            raise RuntimeError(
+                "spark-context-cache: spark_cache_cuda_restore_arena_budget_bytes"
+                f" must be at least {lane_bytes} bytes for one lane's two arenas"
+            )
+        load_thread_limit = min(
+            load_thread_limit, cuda_restore_arena_budget_bytes // lane_bytes
+        )
     max_pending_restores_raw = extra(
         "spark_cache_max_pending_restores",
         os.environ.get("SPARK_CONTEXT_CACHE_MAX_PENDING_RESTORES", "64"),
@@ -968,6 +987,7 @@ def parse_connector_config(
         cuda_placement_library_path=cuda_placement_library_path,
         cuda_placement_library_sha256=cuda_placement_library_sha256,
         cuda_placement_arena_bytes=cuda_placement_arena_bytes,
+        cuda_restore_arena_budget_bytes=cuda_restore_arena_budget_bytes,
         cuda_restore_io_workers=cuda_restore_io_workers,
         scheduler_probe=scheduler_probe,
         identity_base=_freeze_config_value(identity_base),
