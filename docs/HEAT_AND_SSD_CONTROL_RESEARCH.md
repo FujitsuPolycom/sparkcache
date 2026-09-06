@@ -13,7 +13,7 @@ specification, not a history.
 | Staged-write versus unique-object byte accounting | implemented (research prototype) |
 | SMART/Health log-page parsing and Data Units Written deltas | implemented (research prototype) |
 | GPU-free behavior and production-import isolation tests | implemented (`research/heat_ssd_control/test_prototype.py`) |
-| Per-rank publication-byte telemetry from the serving connector | unsupported |
+| Per-rank publication-byte telemetry from the serving connector | implemented; research-ledger ingestion is not connected |
 | Wiring heat metadata into the vLLM connector, `ManifestStore`, or any serving path | unsupported |
 | Publication or eviction decisions that consume heat metadata | research-only |
 | Budget enforcement (rejecting or delaying a publication when over budget) | unsupported |
@@ -386,15 +386,14 @@ Events are recorded per publication with the fields of schema
   (alias files plus added descriptor segments), `metadata_touch` (recency
   metadata), or `repair` (invalidation-driven republish).
 - `unique_object_bytes` is the encoded size of objects that did not exist
-  before publication and remain reachable afterward. `CommitReceipt` does
-  not expose this quantity: `CommitReceipt.encoded_bytes` describes the
-  complete root or delta represented by the receipt, including referenced
-  objects that may already exist. Serving integration therefore requires
-  explicit per-object publication instrumentation.
+  before publication and remain reachable afterward. Serving publication reports
+  expose `committed_unique_object_bytes` for this quantity. Do not substitute
+  `CommitReceipt.encoded_bytes`, which includes referenced objects that may
+  already exist. The research ledger does not ingest serving reports automatically.
 - `staged_write_bytes` counts payload bytes passed to temporary-file writes,
   including re-staging of identical content (section 9). The prototype
-  requires the caller to supply this value because the publication helpers do
-  not expose it.
+  requires the caller to supply this value. Serving reports already expose
+  `staged_write_bytes`; connecting those reports to the ledger remains unsupported.
 
 Windows are UTC-aligned from absolute nanoseconds: the hourly window index
 is `at_ns // 3_600_000_000_000` and the daily index is
@@ -434,8 +433,8 @@ Three byte quantities are distinct and all three are measured or modeled:
 
 | Quantity | Meaning | Source |
 |---|---|---|
-| `unique_object_bytes` | bytes of newly retained durable state | caller-supplied ledger events; no serving receipt exposes this value |
-| `staged_write_bytes` | payload bytes pushed through temporary-file writes, including staging of identical content | caller-supplied ledger events; publication helpers do not expose this value |
+| `unique_object_bytes` | bytes of newly retained durable state | caller-supplied events; serving reports expose `committed_unique_object_bytes` |
+| `staged_write_bytes` | payload bytes pushed through temporary-file writes, including staging of identical content | caller-supplied events; serving reports expose `staged_write_bytes` |
 | `host_written_bytes` | device-side counter of host writes over an interval | NVMe Data Units Written delta (section 10) |
 
 Derived ratios the prototype reports:
@@ -639,9 +638,9 @@ the GPU-free prototype tests:
    surfaces: if heat is persisted, its files live outside
    `_CACHE_DATA_DIRECTORIES` and clear-once semantics must be extended
    explicitly.
-4. A measured qualification showing cache-active time-to-first-token and
-   decode throughput within 2% of the cache-off profile (the standing
-   model-serving qualification requirement in `ROADMAP.md`).
+4. A matched workload comparison measuring time to first token, decode throughput,
+   publication rate, and write volume with the policy enabled and disabled.
+   Specify acceptable tradeoffs before changing serving defaults.
 
 ## 13. GPU-free validation
 
