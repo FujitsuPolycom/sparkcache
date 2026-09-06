@@ -59,3 +59,23 @@ def test_pacing_totals_aggregate_physical_ranks():
     assert reduced["sparkcache_maintenance_deletion_attempts"] == 512
     assert reduced["sparkcache_maintenance_budget_exhausted"] == 6
     assert reduced["sparkcache_maintenance_skipped_cooldown"] == 8
+
+
+def test_latched_pressure_runs_maintenance_below_high_watermark(tmp_path):
+    connector = fixtures.AsyncRestoreTests()._cohort_connector(tmp_path)
+    connector._capacity_policy = CapacityPolicy(
+        max_bytes=10, low_watermark_bytes=8, maintenance_max_deletions=1
+    )
+    connector._capacity_estimated_bytes = 9
+    connector._capacity_status["maintenance_work_pending"] = True
+    try:
+        with mock.patch.object(
+            connector,
+            "_perform_capacity_maintenance_locked",
+            return_value=MaintenanceReport(work_pending=True),
+        ) as run:
+            report = connector._maintain_capacity(force=False)
+        run.assert_called_once()
+        assert report.work_pending
+    finally:
+        connector.shutdown()

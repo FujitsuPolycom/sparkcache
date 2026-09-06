@@ -173,3 +173,38 @@ def test_budgeted_alias_cleanup_keeps_protected_descriptor_chain(tmp_path):
     else:
         pytest.fail("descriptor and payload cleanup did not converge")
     assert report.bytes_after == 0
+
+
+@pytest.mark.parametrize("budget", [1, 2, 4])
+def test_pressure_target_survives_crossing_high_watermark(tmp_path, budget):
+    import shutil
+
+    seed = tmp_path / "seed"
+    store, _, _ = populate(seed, 20)
+    before = store.maintain(
+        CapacityPolicy(max_bytes=10**9, low_watermark_bytes=10**9)
+    ).bytes_after
+    high = before * 99 // 100
+    low = before * 80 // 100
+    baseline_path = tmp_path / "baseline"
+    shutil.copytree(seed, baseline_path)
+    baseline = ManifestStore(baseline_path).maintain(
+        CapacityPolicy(max_bytes=high, low_watermark_bytes=low)
+    )
+    policy = CapacityPolicy(
+        max_bytes=high, low_watermark_bytes=low, maintenance_max_deletions=budget
+    )
+    saw_pending_below_high = False
+    for _ in range(100):
+        report = store.maintain(policy)
+        saw_pending_below_high |= (
+            low < report.bytes_after <= high and report.work_pending
+        )
+        if report.capacity_satisfied and not report.work_pending:
+            break
+    else:
+        pytest.fail("maintenance did not reach its retained low watermark")
+    assert saw_pending_below_high
+    assert report.bytes_after == baseline.bytes_after
+    assert report.bytes_after <= low
+    assert store._maintenance_pressure_target is None

@@ -2528,8 +2528,18 @@ class ManifestStore:
                 + sum(segment_sizes.values())
                 + sum(chunk_sizes.values())
             )
-            pressure_triggered = (
-                policy.max_bytes > 0 and bytes_before > policy.max_bytes
+            pressure_target = (policy.max_bytes, policy.low_watermark_bytes)
+            retained_target = getattr(self, "_maintenance_pressure_target", None)
+            pressure_triggered = policy.max_bytes > 0 and (
+                bytes_before > policy.max_bytes
+                or (policy.maintenance_max_deletions > 0
+                    and retained_target == pressure_target
+                    and bytes_before > policy.low_watermark_bytes)
+            )
+            # Preserve high-to-low hysteresis across bounded passes. Falling
+            # below the high watermark alone does not complete reclamation.
+            self._maintenance_pressure_target = (
+                pressure_target if pressure_triggered and policy.maintenance_max_deletions > 0 else None
             )
             projected_bytes = (
                 bytes_before
@@ -2722,6 +2732,11 @@ class ManifestStore:
                 - segment_bytes_deleted
                 - chunk_bytes_deleted,
             )
+            if (pressure_triggered and policy.maintenance_max_deletions > 0
+                    and bytes_after > policy.low_watermark_bytes):
+                work_pending = True
+            else:
+                self._maintenance_pressure_target = None
             exact_removed = sum(entry.key.root_kind == "manifest" for entry in removed)
             aliases_removed = sum(
                 entry.key.root_kind == "prefix_alias" for entry in removed

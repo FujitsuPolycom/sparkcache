@@ -3328,7 +3328,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         if not policy.enabled:
             return None
         if not force and (
-            policy.max_bytes == 0 or self._capacity_estimated_bytes <= policy.max_bytes
+            (policy.max_bytes == 0 or self._capacity_estimated_bytes <= policy.max_bytes)
+            and not self._capacity_status.get("maintenance_work_pending", False)
         ):
             return None
         self._capacity_maintenance_depth = getattr(self, "_capacity_maintenance_depth", 0) + 1
@@ -3394,6 +3395,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             bytes=report.bytes_after,
             bytes_exact=True,
             capacity_satisfied=report.capacity_satisfied,
+            maintenance_work_pending=report.work_pending,
         )
         self.counters["capacity_deletion_attempts"] = (
             self.counters.get("capacity_deletion_attempts", 0) + report.deletion_attempts
@@ -3838,7 +3840,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     with self._capacity_handoff_cv:
                         self._streaming_capacity_pending.difference_update(resolved)
                         self._capacity_handoff_cv.notify_all()
-                    retry_unsatisfied = False
+                    retry_unsatisfied = bool(
+                        self._capacity_status.get("maintenance_work_pending", False)
+                    )
                 else:
                     self.counters["streaming_capacity_retries"] += 1
                     retry_unsatisfied = True

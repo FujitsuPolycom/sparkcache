@@ -336,6 +336,10 @@ A pass can stop above the low watermark
 or the capacity maximum; optional store admission remains blocked while
 capacity is unsatisfied.
 
+A process-local pressure target retains the low watermark across passes,
+even after usage falls below the high watermark. Restarting the process
+loses this target; a later high-watermark crossing establishes it again.
+
 Background retries complete deferred cleanup without
 making serving wait. Root-directory durability barriers still precede object
 removal, and protected publication roots retain their complete object graphs.
