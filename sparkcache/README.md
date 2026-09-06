@@ -255,6 +255,44 @@ pinned unified memory.
 Saturation always skips the optional publication instead of waiting for a
 slot.
 
+`spark_cache_page_snapshot_interval_tokens` optionally selects complete
+asynchronous page captures at token boundaries. It accepts a non-negative
+integer and defaults to `0`, which disables the policy.
+
+The environment fallback is
+`SPARK_CONTEXT_CACHE_PAGE_SNAPSHOT_INTERVAL_TOKENS`; an explicit connector
+setting takes precedence. For example:
+
+```json
+"spark_cache_page_snapshot_interval_tokens": 16384
+```
+
+A dependent publication captures complete state when its result span and
+selected base span fall into different interval buckets, measured from token
+zero. The choice happens before sparse capture, without reading history.
+
+For interval 16,384, base 14,336 to result 16,384 selects full capture;
+base 16,384 to result 18,432 remains sparse. This is a token cadence, not a
+universal bound on history depth for arbitrary prompt increments.
+
+Full captures keep the same cache identity and format. Existing ring size and
+admission limits still apply.
+
+The counter
+`publication_periodic_full_capture_selected` counts selections, including
+attempts later rejected by a busy or undersized ring.
+
+Performance status: **research-only**. A CPU fixture used 25 extensions of
+2,048 tokens, eight appended attention layers, and four overwritten recurrent
+layers. Payload widths and macro-object size were scaled down by eight.
+
+With a full snapshot every eight extensions, staged writes increased from
+160.36 to 238.21 MiB, about **49%**, with no deduplication savings. Source
+preparation was excluded from commit timing; no GPU work was executed.
+
+This CPU measurement does not establish GPU capture interference, eviction
+behavior, or a causal end-to-end serving improvement from the interval policy.
+
 The delayed-store limit reserves at most 16 request lifetimes by default.
 When the limit is full, SparkCache omits another optional store plan before
 worker capture begins, so vLLM can release that request's pages normally.
@@ -264,6 +302,14 @@ worker capture begins, so vLLM can release that request's pages normally.
 `spark_cache_max_bytes` is the high watermark for one cache root. Crossing it
 evicts least-recently-used manifests down to
 `spark_cache_low_watermark_bytes`, which defaults to 90% of the high watermark.
+
+Choose capacity and the high-to-low watermark gap from the reusable working
+set, largest admitted publication, and measured publication and reclamation
+rates.
+
+A larger gap amortizes maintenance across more writes, but each pass evicts
+more data and can increase future misses. Compare those costs with observed
+publication age and maintenance activity before changing the gap.
 
 `spark_cache_ttl_seconds` expires manifests by recency; zero disables TTL.
 Maintenance preserves shared objects referenced by surviving manifests.
@@ -322,6 +368,21 @@ pages, and the oldest ownership age.
 
 The line disappears after every rank reports its terminal completion.
 
+`sparkcache: publication_work` reports pending saver admissions, their oldest
+age, and ranks performing capacity maintenance. Admission age includes capture,
+queue time, commit, and post-commit reconciliation.
+
+Each worker admits at most one saver publication. The pending rank-slot gauge
+sums these admissions across physical ranks; it is not a count of unique user
+requests. Age is the maximum reported across ranks.
+
+The maintenance flag covers the scan and survivor reconciliation, including
+failure cleanup. Metrics sample it without taking the capacity lock or reading
+the filesystem.
+
+Completed, failed, and aborted publications clear their age. A timed-out
+shutdown with a live saver remains pending instead of falsely reporting idle.
+
 The same ownership state is available from the vLLM Prometheus endpoint:
 
 | Gauge | Meaning |
@@ -331,6 +392,17 @@ The same ownership state is available from the vLLM Prometheus endpoint:
 | `vllm:sparkcache_capture_retained_manager_pages` | Physical manager pages retained across ranks. |
 | `vllm:sparkcache_capture_oldest_delayed_seconds` | Age of the oldest retained request ownership. |
 | `vllm:sparkcache_capture_ownership_uncertain_ranks` | Ranks that cannot prove whether capture still owns source pages. |
+| `vllm:sparkcache_publication_pending_rank_slots` | Pending saver admissions summed across physical ranks. |
+| `vllm:sparkcache_publication_oldest_pending_seconds` | Maximum admission age at the last worker reports. |
+| `vllm:sparkcache_maintenance_active_ranks` | Ranks reporting an active scan or survivor reconciliation. |
+
+These gauges describe the last worker reports received through the existing
+statistics channel. Reports may stop refreshing while the engine is idle;
+scraping Prometheus again does not make a cached age a live clock.
+
+Use report freshness when correlating idle-probe slowdowns with pending work.
+The existing streaming-publication handoff count remains separate from saver
+admissions and capture ownership.
 
 Exact process-local totals are available from
 `ManifestStore.publication_telemetry_snapshot()` using schema

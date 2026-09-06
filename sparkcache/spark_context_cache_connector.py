@@ -103,6 +103,7 @@ from sparkcache.page_base_read_flights import (
 )
 from sparkcache.spark_context_cache_store import (
     CacheIdentity,
+    CapacityPolicy,
     ContextChunk,
     EntryKey,
     LookupResult,
@@ -527,6 +528,7 @@ class SparkCacheStats(KVConnectorStats):
                     "capacity",
                     "async_capture",
                     "publication",
+                    "publication_work",
                 ):
                     if isinstance(report.get(field), dict):
                         normalized[field] = dict(report[field])
@@ -654,6 +656,23 @@ class SparkCacheStats(KVConnectorStats):
                     for status in async_capture
                 ),
             )
+        publication_work = [
+            report["publication_work"]
+            for report in reports
+            if isinstance(report.get("publication_work"), dict)
+        ]
+        if publication_work:
+            reduced.update(
+                sparkcache_publication_pending_rank_slots=sum(
+                    int(status.get("pending", 0)) for status in publication_work
+                ),
+                sparkcache_publication_oldest_pending_ms=max(
+                    float(status.get("oldest_pending_ms", 0.0)) for status in publication_work
+                ),
+                sparkcache_maintenance_active_ranks=sum(
+                    int(bool(status.get("maintenance_active", False))) for status in publication_work
+                ),
+            )
         publication = [
             report.get("publication")
             for report in reports
@@ -740,6 +759,15 @@ class SparkCacheStats(KVConnectorStats):
             if uncertain_ranks:
                 line += f" uncertain_ranks={uncertain_ranks}"
             lines.append(line)
+        pending_publications = int(reduced.get("sparkcache_publication_pending_rank_slots", 0))
+        maintenance_ranks = int(reduced.get("sparkcache_maintenance_active_ranks", 0))
+        if pending_publications or maintenance_ranks:
+            lines.append(
+                "sparkcache: publication_work"
+                f" pending_rank_slots={pending_publications}"
+                f" oldest={float(reduced.get('sparkcache_publication_oldest_pending_ms', 0.0)):.0f}ms"
+                f" maintenance_ranks={maintenance_ranks}"
+            )
         return tuple(lines)
 
     def is_empty(self) -> bool:
@@ -747,9 +775,24 @@ class SparkCacheStats(KVConnectorStats):
 
 
 class SparkCachePromMetrics(KVConnectorPromMetrics):
-    """Prometheus gauges for asynchronous capture-page ownership."""
+    """Prometheus gauges for reported capture, publication, and maintenance work."""
 
     _GAUGES = {
+        "sparkcache_publication_pending_rank_slots": (
+            "vllm:sparkcache_publication_pending_rank_slots",
+            "Pending saver admissions summed across physical ranks at their last worker reports.",
+            1.0,
+        ),
+        "sparkcache_publication_oldest_pending_ms": (
+            "vllm:sparkcache_publication_oldest_pending_seconds",
+            "Oldest saver admission age in seconds at the last worker reports.",
+            0.001,
+        ),
+        "sparkcache_maintenance_active_ranks": (
+            "vllm:sparkcache_maintenance_active_ranks",
+            "Physical ranks reporting an active capacity scan or reconciliation at their last worker reports.",
+            1.0,
+        ),
         "sparkcache_capture_delayed_requests": (
             "vllm:sparkcache_capture_delayed_requests",
             "Maximum delayed SparkCache capture requests on any physical rank.",
@@ -971,6 +1014,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 " start while persistent cache initialization is unavailable"
             )
         self._async_page_capture_enabled = config.async_page_capture_enabled
+        self._page_snapshot_interval_tokens = config.page_snapshot_interval_tokens
         self._async_page_capture_runtime: Any = None
         self._async_page_capture_settings: Any = None
         self._async_page_capture_eligible: set[str] = set()
@@ -1037,6 +1081,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         # capacity operation. This lock is never taken by inference callbacks;
         # streaming callbacks enqueue a receipt and wake the janitor instead.
         self._capacity_lock = threading.RLock()
+        self._capacity_maintenance_depth = 0
         self._capacity_commit_queue: "queue.SimpleQueue[tuple[str, Any]]" = (
             queue.SimpleQueue()
         )
@@ -1072,6 +1117,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._store_queue: "queue.SimpleQueue[_StoreSnapshot | _HybridStoreSnapshot | None]" = queue.SimpleQueue()
         self._store_thread: threading.Thread | None = None
         self._store_inflight = 0
+        self._store_pending_started_ns: int | None = None
         self._publication_base_pins: dict[str, EntryKey] = {}
         self._store_accepting = True
         self._load_queue: "queue.SimpleQueue[_QueuedLoad | _QueuedLoadBatch | None]" = queue.SimpleQueue()
@@ -3215,6 +3261,22 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             policy.max_bytes == 0 or self._capacity_estimated_bytes <= policy.max_bytes
         ):
             return None
+        self._capacity_maintenance_depth = getattr(self, "_capacity_maintenance_depth", 0) + 1
+        try:
+            return self._perform_capacity_maintenance_locked(
+                policy, force=force, wake_worker_on_unsatisfied=wake_worker_on_unsatisfied
+            )
+        finally:
+            self._capacity_maintenance_depth -= 1
+
+    def _perform_capacity_maintenance_locked(
+        self,
+        policy: CapacityPolicy,
+        *,
+        force: bool,
+        wake_worker_on_unsatisfied: bool,
+    ) -> MaintenanceReport | None:
+        """Keep scans and survivor reconciliation within the maintenance activity gauge."""
         try:
             with self._store_cv:
                 protected = tuple(
@@ -5132,6 +5194,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         """
         if not plan.base_context_digest:
             return plan
+        interval = getattr(self, "_page_snapshot_interval_tokens", 0)
+        if interval and plan.span_tokens // interval > plan.base_span_tokens // interval:
+            self.counters["publication_periodic_full_capture_selected"] = (
+                self.counters.get("publication_periodic_full_capture_selected", 0) + 1
+            )
+            return replace(plan, base_context_digest="", base_span_tokens=0)
         if self._capacity_lock.acquire(blocking=False):
             try:
                 with self._store_cv:
@@ -5221,6 +5289,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     skipped_before_submit = True
                 else:
                     self._store_inflight = 1
+                    self._store_pending_started_ns = time.perf_counter_ns()
             if skipped_before_submit:
                 if self._async_page_capture_enabled:
                     runtime = self._async_page_capture_runtime
@@ -5750,6 +5819,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self._held.difference_update(additional_digests)
                 self.counters["store_evicted" if evicted else "store_failed"] += 1
             self._store_inflight = 0
+            self._store_pending_started_ns = None
             self._store_cv.notify_all()
         if error is not None:
             logger.warning(
@@ -6354,6 +6424,18 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             return None
         with self._load_lock:
             report = self._build_quorum_report_locked()
+            pending = int(bool(self._store_inflight))
+            started_ns = getattr(self, "_store_pending_started_ns", None)
+            report["publication_work"] = {
+                "pending": pending,
+                "oldest_pending_ms": (
+                    max(0, time.perf_counter_ns() - started_ns) / 1_000_000
+                    if pending and started_ns is not None else 0.0
+                ),
+                # Reading the activity counter must not wait for the capacity
+                # lock held by the scan being measured.
+                "maintenance_active": bool(getattr(self, "_capacity_maintenance_depth", 0)),
+            }
         runtime = self._streaming_runtime
         status = getattr(runtime, "status", None)
         if self._streaming_snapshots_enabled and callable(status):
