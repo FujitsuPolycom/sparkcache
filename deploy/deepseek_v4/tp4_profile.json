@@ -4,7 +4,7 @@
   "cache_model_profile": "deepseek-v4-fp8-hma",
   "published_runtime_base": "ghcr.io/fujitsupolycom/gb10-vllm-serving@sha256:6fc26fdad81a18f0fff67ce0a05f6d90165625ea2e1cac8a6f39bfb462017028",
   "sparkcache": {
-    "source_sha256": "72f33311d1ee5811c2b3e4eefda98c9d17b5afe8d9d015a2e3c26c893f25aabc"
+    "source_sha256": "5c0395839d4a1b4bcc9955482830c6050127886c14ec2e6663242ba251e6f090"
   },
   "model": {
     "repository": "deepseek-ai/DeepSeek-V4-Flash-0731",
@@ -23,7 +23,7 @@
     "kv_cache_bytes_per_rank": 34359738368,
     "max_model_len": 524288,
     "max_num_seqs": 32,
-    "gpu_memory_utilization": 0.70,
+    "gpu_memory_utilization": 0.7,
     "tokenizer_mode": "deepseek_v4",
     "speculation_method": "dspark",
     "speculation_tokens": 5,

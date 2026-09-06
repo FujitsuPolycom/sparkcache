@@ -94,6 +94,7 @@ from sparkcache.spark_context_cache_hybrid import (
     split_snapshot,
 )
 from sparkcache.spark_context_cache_restore_timing import RestoreTiming
+from sparkcache.request_attribution import RequestAttribution
 from sparkcache.held_inventory import HeldInventory
 from sparkcache.page_base_read_flights import (
     PageBaseReadEvidence,
@@ -961,6 +962,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         )
         self._config = config
         self._trace_reuse_enabled = os.environ.get("SPARK_CONTEXT_CACHE_TRACE_REUSE") == "1"
+        self.request_cache_events_enabled = (
+            self._trace_reuse_enabled and role is KVConnectorRole.SCHEDULER
+        )
+        self._request_attribution: dict[str, RequestAttribution] = {}
         self._block_size = config.block_size
         self._tp_degree = config.tp_degree
         self._dcp_degree = config.dcp_degree
@@ -1976,6 +1981,52 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 "spark-context-cache-reuse:%s",
                 json.dumps(record, sort_keys=True, separators=(",", ":")),
             )
+
+    def record_request_cache_event(self, request: "Request", event: str, **fields) -> None:
+        """Consume optional scheduler observations without changing serving.
+
+        Matching offers and worker-local completion traces never call this
+        accounting path. The runtime must report adopted prefixes, final
+        receive outcomes, and accepted target-model execution explicitly.
+        """
+        if not getattr(self, "request_cache_events_enabled", False):
+            return
+        request_id = request.request_id
+        state = self._request_attribution.get(request_id)
+        try:
+            if event == "finished":
+                state = self._request_attribution.pop(request_id, None)
+                if state is None:
+                    return
+                status = fields.get("status", getattr(request, "status", "unknown"))
+                status = str(getattr(status, "name", status))
+                summary = state.summary(status)
+                category = "complete" if summary["attribution_complete"] else "incomplete"
+                key = f"attribution_requests_{category}"
+                self.counters[key] = self.counters.get(key, 0) + 1
+                if summary["attribution_complete"]:
+                    for field in ("local_tokens_reused", "external_tokens_reused",
+                                  "prompt_tokens_computed"):
+                        key = "attribution_completed_" + field
+                        self.counters[key] = self.counters.get(key, 0) + summary[field]
+                self._trace_reuse("request_cache_attribution", request_id, **summary)
+                return
+            if state is None:
+                if event != "admitted":
+                    # Late receive drains for retired requests do not allocate
+                    # another ledger or credit an aborted response.
+                    return
+                prompt_tokens = getattr(request, "num_prompt_tokens", None)
+                if prompt_tokens is None:
+                    prompt_tokens = len(request.prompt_token_ids or ())
+                state = RequestAttribution(prompt_tokens)
+                self._request_attribution[request_id] = state
+            state.record(event, **fields)
+        except Exception:  # Diagnostics cannot interrupt verified-or-recompute.
+            if state is not None:
+                state.valid = False
+            key = "attribution_invalid_events"
+            self.counters[key] = self.counters.get(key, 0) + 1
 
     def shared_prefix_lease_attached(self, request_id: str, lease_key: str) -> None:
         follower = self._restore_flight_followers.get(request_id)
@@ -4940,6 +4991,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
+        self.record_request_cache_event(request, "finished")
         # A finished request id never recurs, so its scheduler-side tracking
         # state is dropped here. This is what keeps _need_load, _admitted,
         # and _store_progress bounded without evicting live entries.

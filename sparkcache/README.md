@@ -424,6 +424,39 @@ The counters describe host-side operations. They do not report filesystem
 allocation, NVMe Data Units Written, controller write amplification, or NAND
 writes.
 
+### Request reuse attribution
+
+Status: **implemented** with an optional scheduler callback. A runtime without
+that callback cannot produce exact request attribution from connector offers.
+
+Set `SPARK_CONTEXT_CACHE_TRACE_REUSE=1` before startup. An instrumented scheduler
+emits one `request_cache_attribution` event in `sparkcache-reuse-trace/v1` at
+request cleanup. No request IDs are added to Prometheus labels.
+
+| Field | Meaning |
+|---|---|
+| `local_tokens_reused` | GPU-resident prompt tokens consumed by accepted target execution, including resident shared leases. |
+| `external_tokens_reused` | Prompt tokens consumed after a successful all-rank persistent restore and the scheduler's final-token adjustment. |
+| `prompt_tokens_computed` | Prompt intervals completed by accepted target execution, accumulated across preemption attempts. |
+| `preemptions` | Request preemption generation observed by the scheduler. |
+| `attribution_complete` | True only for normal completion with observed prompt completion and no missing or invalid accounting boundary. |
+
+Counts cover accepted target-prompt work across attempts. They can exceed the
+original prompt length after preemption. They exclude output tokens, draft
+execution, replay inside kernels, and rejected worker output.
+
+An offered restore earns no credit. A verified restore aborted before target
+execution earns no reused-token credit. A follower consuming a resident GPU
+lease records local reuse, even if a different request restored that lease.
+
+The restored state span and external prompt tokens reused are distinct. A
+restore can write an already-local prefix, and a full prompt hit still needs
+the final prompt token recomputed for sampling logits.
+
+Incomplete observations remain labeled incomplete. Their token fields are not
+added to the connector's `attribution_completed_*` aggregate counters. Request
+cleanup releases the ledger even when logging fails.
+
 Telemetry is observational. It cannot change publication, restore, cache
 identity, or serving decisions.
 
