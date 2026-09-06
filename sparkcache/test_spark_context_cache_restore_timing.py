@@ -44,6 +44,7 @@ class RestoreTimingTests(unittest.TestCase):
         self.assertEqual(
             set(record["phase_ms"]),
             {
+                "metadata_preparation",
                 "manifest_lookup",
                 "prior_cuda_work",
                 "restore_read",

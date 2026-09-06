@@ -70,7 +70,8 @@ def test_complete_snapshot_receipt_distinguishes_deduplication(tmp_path: Path) -
     assert second.publication.logical_payload_bytes == first.publication.logical_payload_bytes
     assert second.publication.unique_object_bytes == 0
     assert second.publication.deduplicated_bytes == first.encoded_bytes
-    assert second.publication.staged_write_bytes == first.encoded_bytes
+    assert second.publication.staged_write_bytes == 0
+    assert second.publication.staged_objects == 0
     assert second.publication.format_compact().startswith(
         "sparkcache: publish kind=complete_snapshot outcome=committed "
     )

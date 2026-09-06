@@ -215,8 +215,16 @@ class PageBaseReadFlights:
         request_id: str,
         key: PageBaseReadFlightKey,
         reader: Callable[[], bytes | bytearray | PageBaseReadResult],
-    ) -> bytes | PageBaseReadResult:
-        """Return cohort-shared bytes or execute the ordinary independent read."""
+        *,
+        allow_independent: bool = True,
+    ) -> bytes | PageBaseReadResult | None:
+        """Resolve an admitted base, optionally reading unadmitted bases.
+
+        Callers with a selective restore path set ``allow_independent=False``
+        and receive ``None`` when admission is absent or evidence differs.
+        This decision stays under the coordinator lock so an unadmitted read
+        cannot allocate a complete base outside its memory reservation.
+        """
 
         with self._condition:
             if self._closed:
@@ -228,7 +236,9 @@ class PageBaseReadFlights:
                 if registered_key is not None:
                     self._finish_locked(request_id)
                     self._counters["evidence_mismatch_bypasses"] += 1
-                self._counters["independent_reads"] += 1
+                self._counters[
+                    "independent_reads" if allow_independent else "selective_read_bypasses"
+                ] += 1
                 flight = None
                 leader = False
             elif request_id in flight.cancelled or self._closed:
@@ -247,7 +257,7 @@ class PageBaseReadFlights:
                 leader = False
 
         if flight is None:
-            return reader()
+            return reader() if allow_independent else None
         if leader:
             try:
                 readable = reader()

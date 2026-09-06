@@ -64,6 +64,10 @@ option(
     "Build the mapped/managed/staged CUDA placement engine"
     ON)
 option(
+    SPARK_CACHE_PLACEMENT_GPU_TESTS
+    "Register GPU page-copy correctness tests for all placement arena modes"
+    OFF)
+option(
     SPARK_CACHE_SNAPSHOT_TEST_FORCE_EVENT_RECORD_FAILURE
     "Test seam: force every snapshot completion-event record to fail"
     OFF)
@@ -110,6 +114,27 @@ if(SPARK_CACHE_PLACEMENT_ENABLE_CUDA)
             app/spark_cache_hybrid_page_probe.cu)
         target_link_libraries(spark_cache_hybrid_page_probe
             PRIVATE spark_cache_placement CUDA::cudart)
+
+        if(UNIX)
+            # Resolve the tested placement library dynamically so one binary
+            # can compare independently built libraries without interposition.
+            add_executable(spark_cache_page_copy_benchmark
+                app/spark_cache_page_copy_benchmark.cu)
+            target_include_directories(spark_cache_page_copy_benchmark PRIVATE include)
+            target_link_libraries(spark_cache_page_copy_benchmark
+                PRIVATE CUDA::cudart ${CMAKE_DL_LIBS})
+            add_dependencies(spark_cache_page_copy_benchmark spark_cache_placement)
+            if(BUILD_TESTING AND SPARK_CACHE_PLACEMENT_GPU_TESTS)
+                foreach(arena_mode RANGE 1 3)
+                    add_test(
+                        NAME spark_cache_page_copy_mode_${arena_mode}
+                        COMMAND spark_cache_page_copy_benchmark
+                            $<TARGET_FILE:spark_cache_placement> 3 ${arena_mode})
+                    set_tests_properties(spark_cache_page_copy_mode_${arena_mode}
+                        PROPERTIES LABELS "gpu;page-copy" RUN_SERIAL TRUE TIMEOUT 180)
+                endforeach()
+            endif()
+        endif()
 
         add_library(spark_cache_snapshot SHARED
             src/spark_cache_snapshot.cu)

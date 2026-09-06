@@ -28,6 +28,8 @@ using spark_cache::placement::validate_transposed_slab;
 constexpr std::uint32_t kThreadsPerBlock = 256;
 constexpr std::uint32_t kWarpsPerBlock = kThreadsPerBlock / 32;
 constexpr std::uint32_t kTransposedRowsPerBlock = 64;
+constexpr std::uint64_t kPageTileBytes = 64 * 1024;
+constexpr std::uint32_t kMaximumPageBlocks = 4096;
 thread_local std::array<char, 512> g_runtime_error{};
 
 enum DeviceError : std::uint32_t {
@@ -287,11 +289,65 @@ __global__ void scatter_transposed_kernel(
   }
 }
 
+__device__ __forceinline__ std::uint64_t page_min_bytes(
+    std::uint64_t left, std::uint64_t right) {
+  return left < right ? left : right;
+}
+
+template <typename Word>
+__device__ void copy_page_fragment_words(
+    const std::uint8_t* source,
+    std::uint8_t* destination,
+    std::uint64_t bytes) {
+  const std::uint64_t leading = page_min_bytes(
+      bytes,
+      (sizeof(Word) - (reinterpret_cast<std::uintptr_t>(source) &
+                       (sizeof(Word) - 1))) & (sizeof(Word) - 1));
+  for (std::uint64_t index = threadIdx.x; index < leading;
+       index += blockDim.x) {
+    destination[index] = source[index];
+  }
+  source += leading;
+  destination += leading;
+  bytes -= leading;
+  const auto* source_words = reinterpret_cast<const Word*>(source);
+  auto* destination_words = reinterpret_cast<Word*>(destination);
+  const std::uint64_t words = bytes / sizeof(Word);
+  for (std::uint64_t index = threadIdx.x; index < words;
+       index += blockDim.x) {
+    destination_words[index] = source_words[index];
+  }
+  for (std::uint64_t index = words * sizeof(Word) + threadIdx.x;
+       index < bytes; index += blockDim.x) {
+    destination[index] = source[index];
+  }
+}
+
+__device__ void copy_page_fragment(
+    const std::uint8_t* source,
+    std::uint8_t* destination,
+    std::uint64_t bytes) {
+  const auto differing_alignment =
+      reinterpret_cast<std::uintptr_t>(source) ^
+      reinterpret_cast<std::uintptr_t>(destination);
+  if ((differing_alignment & 15U) == 0) {
+    copy_page_fragment_words<uint4>(source, destination, bytes);
+  } else if ((differing_alignment & 3U) == 0) {
+    copy_page_fragment_words<std::uint32_t>(source, destination, bytes);
+  } else {
+    for (std::uint64_t index = threadIdx.x; index < bytes;
+         index += blockDim.x) {
+      destination[index] = source[index];
+    }
+  }
+}
+
 __global__ void scatter_page_kernel(
     const std::uint8_t* arena,
     std::uint64_t arena_used_bytes,
     const SparkCachePageCopySpan* spans,
     std::uint32_t span_count,
+    std::uint64_t slab_bytes,
     const SparkCachePageDestinationDescriptor* destinations,
     std::uint32_t destination_count,
     const SparkCachePageGroupDescriptor* groups,
@@ -299,51 +355,79 @@ __global__ void scatter_page_kernel(
     const std::uint32_t* slots,
     std::uint32_t slot_count,
     std::uint32_t* device_error) {
-  const std::uint32_t span_index = blockIdx.x;
-  if (span_index >= span_count) {
-    return;
-  }
-  const SparkCachePageCopySpan span = spans[span_index];
-  if (span.destination_index >= destination_count ||
-      span.arena_offset_bytes + span.byte_count < span.arena_offset_bytes ||
-      span.arena_offset_bytes + span.byte_count > arena_used_bytes) {
-    set_device_error(device_error, kDeviceChunkBounds);
-    return;
-  }
-  const SparkCachePageDestinationDescriptor destination =
-      destinations[span.destination_index];
-  if (destination.group_index >= group_count ||
-      destination.bytes_per_page == 0) {
-    set_device_error(device_error, kDeviceDestinationBounds);
-    return;
-  }
-  const SparkCachePageGroupDescriptor group = groups[destination.group_index];
-  const auto* source = arena + span.arena_offset_bytes;
-  auto* destination_base = reinterpret_cast<std::uint8_t*>(
-      static_cast<std::uintptr_t>(destination.destination_base));
-  for (std::uint64_t index = threadIdx.x; index < span.byte_count;
-       index += blockDim.x) {
-    const std::uint64_t logical_byte =
-        span.destination_byte_offset + index;
-    const std::uint64_t logical_page =
-        logical_byte / destination.bytes_per_page;
-    if (logical_page >= group.slot_count ||
-        group.first_slot_index + logical_page >= slot_count) {
-      set_device_error(device_error, kDeviceSlotBounds);
-      return;
+  // Host validation proves a contiguous snapshot interval, even when source
+  // arena extents are discontiguous. Tile that interval without allocating a
+  // span-by-largest-span grid or an expanded descriptor table.
+  const std::uint64_t snapshot_begin = spans[0].snapshot_offset_bytes;
+  for (std::uint64_t tile = static_cast<std::uint64_t>(blockIdx.x) * kPageTileBytes;
+       tile < slab_bytes;
+       tile += static_cast<std::uint64_t>(gridDim.x) * kPageTileBytes) {
+    std::uint64_t cursor = snapshot_begin + tile;
+    const std::uint64_t tile_end =
+        cursor + page_min_bytes(kPageTileBytes, slab_bytes - tile);
+    std::uint32_t first = 0;
+    std::uint32_t last = span_count;
+    while (first + 1 < last) {
+      const std::uint32_t middle = first + (last - first) / 2;
+      if (spans[middle].snapshot_offset_bytes <= cursor) {
+        first = middle;
+      } else {
+        last = middle;
+      }
     }
-    const std::uint32_t physical_page =
-        slots[group.first_slot_index + logical_page];
-    if (physical_page >= destination.destination_pages) {
-      set_device_error(device_error, kDeviceDestinationBounds);
-      return;
+    for (std::uint32_t span_index = first; cursor < tile_end; ++span_index) {
+      if (span_index >= span_count) {
+        set_device_error(device_error, kDeviceChunkBounds);
+        return;
+      }
+      const SparkCachePageCopySpan span = spans[span_index];
+      if (span.destination_index >= destination_count ||
+          span.arena_offset_bytes + span.byte_count < span.arena_offset_bytes ||
+          span.arena_offset_bytes + span.byte_count > arena_used_bytes ||
+          cursor < span.snapshot_offset_bytes ||
+          cursor - span.snapshot_offset_bytes >= span.byte_count) {
+        set_device_error(device_error, kDeviceChunkBounds);
+        return;
+      }
+      const SparkCachePageDestinationDescriptor destination =
+          destinations[span.destination_index];
+      if (destination.group_index >= group_count ||
+          destination.bytes_per_page == 0) {
+        set_device_error(device_error, kDeviceDestinationBounds);
+        return;
+      }
+      const SparkCachePageGroupDescriptor group = groups[destination.group_index];
+      auto* destination_base = reinterpret_cast<std::uint8_t*>(
+          static_cast<std::uintptr_t>(destination.destination_base));
+      std::uint64_t index = cursor - span.snapshot_offset_bytes;
+      const std::uint64_t span_end =
+          page_min_bytes(span.byte_count, index + (tile_end - cursor));
+      while (index < span_end) {
+        const std::uint64_t logical_byte = span.destination_byte_offset + index;
+        const std::uint64_t logical_page = logical_byte / destination.bytes_per_page;
+        if (logical_page >= group.slot_count ||
+            group.first_slot_index + logical_page >= slot_count) {
+          set_device_error(device_error, kDeviceSlotBounds);
+          return;
+        }
+        const std::uint32_t physical_page = slots[group.first_slot_index + logical_page];
+        if (physical_page >= destination.destination_pages) {
+          set_device_error(device_error, kDeviceDestinationBounds);
+          return;
+        }
+        const std::uint64_t page_offset = logical_byte % destination.bytes_per_page;
+        const std::uint64_t bytes = page_min_bytes(
+            span_end - index,
+            static_cast<std::uint64_t>(destination.bytes_per_page) - page_offset);
+        copy_page_fragment(
+            arena + span.arena_offset_bytes + index,
+            destination_base + static_cast<std::uint64_t>(physical_page) *
+                destination.destination_page_stride_bytes + page_offset,
+            bytes);
+        index += bytes;
+        cursor += bytes;
+      }
     }
-    const std::uint64_t page_offset =
-        logical_byte % destination.bytes_per_page;
-    destination_base[
-        static_cast<std::uint64_t>(physical_page) *
-            destination.destination_page_stride_bytes +
-        page_offset] = source[index];
   }
 }
 
@@ -1256,11 +1340,17 @@ spark_cache_placement_submit_page_slab(
   if (status != SPARK_CACHE_PLACEMENT_OK) {
     return status;
   }
-  scatter_page_kernel<<<span_count, kThreadsPerBlock, 0, arena->stream>>>(
+  const std::uint64_t slab_bytes =
+      next_snapshot - placement->page_submitted_snapshot_bytes;
+  const auto blocks = static_cast<std::uint32_t>(std::min(
+      (slab_bytes + kPageTileBytes - 1) / kPageTileBytes,
+      static_cast<std::uint64_t>(kMaximumPageBlocks)));
+  scatter_page_kernel<<<blocks, kThreadsPerBlock, 0, arena->stream>>>(
       arena->device,
       arena_used_bytes,
       arena->device_page_spans,
       span_count,
+      slab_bytes,
       placement->device_page_destinations,
       placement->page_destination_count,
       placement->device_page_groups,

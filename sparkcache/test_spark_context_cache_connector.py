@@ -1728,6 +1728,21 @@ def _empty_scheduler_output():
     )
 
 
+def _page_base_members_event(connector, expected):
+    """Observe background enrollment without assuming callback-side I/O."""
+    event = threading.Event()
+    register = connector._page_base_reads.register_cohort
+
+    def observed(*args, **kwargs):
+        result = register(*args, **kwargs)
+        if connector._page_base_reads.snapshot().registered_members == expected:
+            event.set()
+        return result
+
+    connector._page_base_reads.register_cohort = observed
+    return event
+
+
 def _drain(connector: SparkContextCacheConnector, timeout: float = 30.0):
     assert connector.wait_for_pending_loads(timeout=timeout)
     _, received = connector.get_finished(set())
@@ -1882,6 +1897,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
     def test_start_load_kv_joins_eight_seven_and_singleton_batches(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector, evidence, plans = self._page_base_queue_fixture(Path(directory))
+            enrolled = _page_base_members_event(connector, 16)
             started = threading.Event()
             release = threading.Event()
             reads = 0
@@ -1913,10 +1929,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                     connector.start_load_kv(None)
                     if batch_index == 0:
                         self.assertTrue(started.wait(timeout=5))
-                self.assertEqual(
-                    connector._page_base_reads.snapshot().registered_members,
-                    16,
-                )
+                self.assertTrue(enrolled.wait(timeout=5))
                 release.set()
                 self.assertEqual(
                     _drain(connector), set(plan.request_id for plan in plans)
@@ -1939,6 +1952,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector, evidence, plans = self._page_base_queue_fixture(Path(directory))
+            enrolled = _page_base_members_event(connector, 16)
             unrelated = _ReqPlan(
                 "unrelated-after-singleton",
                 "f" * 64,
@@ -1995,10 +2009,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                     SparkCacheConnectorMetadata(plans=plans[1:])
                 )
                 connector.start_load_kv(None)
-                self.assertEqual(
-                    connector._page_base_reads.snapshot().registered_members,
-                    16,
-                )
+                self.assertTrue(enrolled.wait(timeout=5))
 
                 connector.bind_connector_metadata(
                     SparkCacheConnectorMetadata(plans=[unrelated])

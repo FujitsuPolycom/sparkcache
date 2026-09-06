@@ -748,6 +748,28 @@ def _clear_once_completed(path: Path, token_digest: str) -> bool:
     )
 
 
+def _durable_payload_matches(path: Path, payload: bytes) -> bool:
+    """Authenticate and flush an existing object before adopting its bytes."""
+
+    try:
+        # Windows requires a writable handle for FlushFileBuffers; no bytes
+        # are modified. POSIX permits fsync on the read-only handle.
+        with path.open("r+b" if os.name == "nt" else "rb") as stream:
+            if stream.read(len(payload) + 1) != payload:
+                return False
+            # A concurrent publisher can expose its hard link before its
+            # directory barrier. Adoption also needs a data barrier for files
+            # that were populated outside the immutable publisher.
+            os.fsync(stream.fileno())
+            return True
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise CommitConflict(
+            f"cannot verify existing immutable object {path}"
+        ) from error
+
+
 def _publish_immutable(
     path: Path,
     payload: bytes,
@@ -758,6 +780,10 @@ def _publish_immutable(
     temporary = path.with_name(f".{path.name}.writing-{uuid.uuid4().hex}")
     try:
         publication = _ACTIVE_PUBLICATION.get()
+        if _durable_payload_matches(path, payload):
+            if publication is not None:
+                publication.record_deduplicated(len(payload))
+            return
         with temporary.open("xb") as stream:
             if publication is not None:
                 publication.record_staged(len(payload))
@@ -769,13 +795,7 @@ def _publish_immutable(
             if publication is not None:
                 publication.record_unique(len(payload))
         except FileExistsError:
-            try:
-                existing = path.read_bytes()
-            except OSError as error:
-                raise CommitConflict(
-                    f"cannot verify existing immutable object {path}"
-                ) from error
-            if existing != payload:
+            if not _durable_payload_matches(path, payload):
                 raise CommitConflict(
                     f"different immutable object already committed at {path}"
                 )
@@ -811,14 +831,7 @@ def _publish_immutable_batch(
     if any(path.parent != parent for path, _payload in objects):
         raise ValueError("immutable macro-batch must share one directory")
     _ensure_durable_directory(parent)
-    staged = [
-        (
-            path,
-            payload,
-            path.with_name(f".{path.name}.writing-{uuid.uuid4().hex}"),
-        )
-        for path, payload in objects
-    ]
+    staged: list[tuple[Path, bytes, Path]] = []
     publication = _ACTIVE_PUBLICATION.get()
     def stage(item: tuple[Path, bytes, Path]) -> None:
         _path, payload, temporary = item
@@ -830,22 +843,40 @@ def _publish_immutable_batch(
             os.fsync(stream.fileno())
 
     try:
-        worker_count = min(8, len(staged))
-        with ThreadPoolExecutor(max_workers=worker_count) as pool:
-            tuple(pool.map(stage, staged))
+        seen: dict[Path, bytes] = {}
+        for path, payload in objects:
+            previous = seen.get(path)
+            if previous is not None:
+                if previous != payload:
+                    raise CommitConflict(
+                        f"different immutable payloads in one batch for {path}"
+                    )
+                if publication is not None:
+                    publication.record_deduplicated(len(payload))
+                continue
+            seen[path] = payload
+            if _durable_payload_matches(path, payload):
+                if publication is not None:
+                    publication.record_deduplicated(len(payload))
+            else:
+                staged.append(
+                    (
+                        path,
+                        payload,
+                        path.with_name(f".{path.name}.writing-{uuid.uuid4().hex}"),
+                    )
+                )
+        if staged:
+            worker_count = min(8, len(staged))
+            with ThreadPoolExecutor(max_workers=worker_count) as pool:
+                tuple(pool.map(stage, staged))
         for path, payload, temporary in staged:
             try:
                 os.link(temporary, path)
                 if publication is not None:
                     publication.record_unique(len(payload))
             except FileExistsError:
-                try:
-                    existing = path.read_bytes()
-                except OSError as error:
-                    raise CommitConflict(
-                        f"cannot verify existing immutable object {path}"
-                    ) from error
-                if existing != payload:
+                if not _durable_payload_matches(path, payload):
                     expected_name = f"{_sha256(payload)}{path.suffix}"
                     if path.name != expected_name:
                         raise CommitConflict(
@@ -2164,7 +2195,14 @@ class ManifestStore:
                 valid=False,
             )
 
-    def _capacity_alias_entry(self, path: Path) -> _CapacityEntry:
+    def _capacity_alias_entry(
+        self,
+        path: Path,
+        segment_cache: dict[
+            tuple[str, str, int],
+            tuple[tuple[Mapping[str, Any], ...], str | None],
+        ] | None = None,
+    ) -> _CapacityEntry:
         """Describe one alias root only when its complete graph authenticates.
 
         Maintenance may remove malformed metadata, but it must never use an
@@ -2214,23 +2252,34 @@ class ManifestStore:
                     / key.storage_key
                     / f"{segment_digest}.spix"
                 )
-                encoded_segment = segment_path.read_bytes()
-                if _sha256(encoded_segment) != segment_digest:
-                    raise CacheFormatError(
-                        "prefix descriptor segment checksum mismatch"
-                    )
-                segment = json.loads(encoded_segment)
-                descriptors = _validate_prefix_segment(
-                    segment,
-                    storage_key=key.storage_key,
-                    expected_first_chunk=(segment_index * _PREFIX_SEGMENT_DESCRIPTORS),
+                cache_key = (key.storage_key, segment_digest, segment_index)
+                cached = (
+                    segment_cache.get(cache_key) if segment_cache is not None else None
                 )
+                if cached is None:
+                    encoded_segment = segment_path.read_bytes()
+                    if _sha256(encoded_segment) != segment_digest:
+                        raise CacheFormatError(
+                            "prefix descriptor segment checksum mismatch"
+                        )
+                    segment = json.loads(encoded_segment)
+                    descriptors = _validate_prefix_segment(
+                        segment,
+                        storage_key=key.storage_key,
+                        expected_first_chunk=(
+                            segment_index * _PREFIX_SEGMENT_DESCRIPTORS
+                        ),
+                    )
+                    parent = segment["parent_sha256"]
+                    if segment_cache is not None:
+                        segment_cache[cache_key] = (descriptors, parent)
+                else:
+                    descriptors, parent = cached
                 if segment_index < segment_count - 1 and (
                     len(descriptors) != _PREFIX_SEGMENT_DESCRIPTORS
                 ):
                     raise CacheFormatError("non-tail prefix segment is incomplete")
                 reversed_segments.append(descriptors)
-                parent = segment["parent_sha256"]
                 if segment_index == 0:
                     if parent is not None:
                         raise CacheFormatError(
@@ -2341,16 +2390,21 @@ class ManifestStore:
         policy: CapacityPolicy,
         *,
         now_ns: int | None = None,
+        protected_entries: Sequence[EntryKey] = (),
     ) -> MaintenanceReport:
         """Apply metadata-only orphan, TTL, and LRU maintenance.
 
         The exclusive lock is nonblocking. A live transaction therefore makes
         maintenance skip instead of delaying a store or serving callback.
+        Protected valid roots retain their complete object graph for an
+        admitted publication. They remain counted against capacity; a budget
+        that cannot be met reports unsatisfied instead of evicting those roots.
         """
 
         if not policy.enabled:
             return MaintenanceReport()
         current_ns = time.time_ns() if now_ns is None else now_ns
+        protected = frozenset(protected_entries)
         try:
             guard = _RootGuard(self.root, shared=False, blocking=False)
             guard.__enter__()
@@ -2370,7 +2424,16 @@ class ManifestStore:
                 else ()
             )
             entries = [self._capacity_entry(path) for path in manifest_paths]
-            entries.extend(self._capacity_alias_entry(path) for path in alias_paths)
+            # Shared descriptors are immutable while the exclusive root guard
+            # is held. Retain authentication only for this maintenance pass,
+            # keyed by namespace, digest, and position in the descriptor chain.
+            segment_cache: dict[
+                tuple[str, str, int],
+                tuple[tuple[Mapping[str, Any], ...], str | None],
+            ] = {}
+            entries.extend(
+                self._capacity_alias_entry(path, segment_cache) for path in alias_paths
+            )
 
             def root_files(root: Path) -> tuple[Path, ...]:
                 if not root.is_dir():
@@ -2470,7 +2533,9 @@ class ManifestStore:
 
             def select(entry: _CapacityEntry) -> None:
                 nonlocal projected_bytes
-                if entry.path in selected_paths:
+                if entry.path in selected_paths or (
+                    entry.valid and entry.key in protected
+                ):
                     return
                 selected.append(entry)
                 selected_paths.add(entry.path)
@@ -3390,7 +3455,10 @@ class ManifestStore:
             base = self.lookup(
                 identity,
                 base_context_digest,
-                verify_chunks=verified_base_snapshot is None,
+                # Materialization authenticates every payload it consumes.
+                # The probe checks metadata and sizes without reading the
+                # complete base a second time before that restore.
+                verify_chunks=False,
                 verify_chunk_metadata=True,
             )
             if not base.is_hit or base._manifest is None:
@@ -3637,7 +3705,11 @@ class ManifestStore:
         | None = None,
         _depth: int = 0,
     ) -> bytes | bytearray:
-        """Materialize an authenticated flat or delta-backed page snapshot."""
+        """Materialize an authenticated flat or delta-backed page snapshot.
+
+        Flat histories verify every intermediate result in private layer
+        buffers. A complete immutable snapshot is assembled only at the end.
+        """
 
         if not lookup.is_hit or lookup._manifest is None:
             raise ValueError("cannot restore a cache miss")
@@ -3700,24 +3772,48 @@ class ManifestStore:
                 result_block_counts=manifest["base_block_counts"],
                 result_boundary_tokens=manifest["base_committed_tokens"],
             )
-            from sparkcache.spark_context_cache_hybrid import apply_page_delta
+            from sparkcache.spark_context_cache_hybrid import (
+                _PageHistoryReconstruction,
+                _apply_verified_page_delta,
+                _verify_page_snapshot_bytes,
+            )
 
+            if len(manifest["delta_stages"]) == 1:
+                # A single result needs no intermediate allocation to avoid.
+                stage = manifest["delta_stages"][0]
+                encoded_delta = self._read_page_delta_objects(
+                    stage["delta_objects"],
+                    encoded_bytes=stage["delta_encoded_bytes"],
+                    encoded_sha256=stage["delta_sha256"],
+                )
+                return _apply_verified_page_delta(
+                    layout, _verify_page_snapshot_bytes(snapshot), encoded_delta,
+                    base_block_counts=stage["base_block_counts"],
+                    result_block_counts=stage["result_block_counts"],
+                    base_boundary_tokens=stage["base_committed_tokens"],
+                    result_boundary_tokens=stage["committed_tokens"],
+                ).payload
+
+            reconstruction = _PageHistoryReconstruction(
+                layout, snapshot, manifest["base_block_counts"],
+                manifest["base_committed_tokens"],
+            )
+            del snapshot
             for stage in manifest["delta_stages"]:
                 encoded_delta = self._read_page_delta_objects(
                     stage["delta_objects"],
                     encoded_bytes=stage["delta_encoded_bytes"],
                     encoded_sha256=stage["delta_sha256"],
                 )
-                snapshot = apply_page_delta(
-                    layout,
-                    snapshot,
+                reconstruction.apply(
                     encoded_delta,
                     base_block_counts=stage["base_block_counts"],
                     result_block_counts=stage["result_block_counts"],
                     base_boundary_tokens=stage["base_committed_tokens"],
                     result_boundary_tokens=stage["committed_tokens"],
                 )
-            return snapshot
+                del encoded_delta
+            return reconstruction.finish()
         if _depth >= _MAX_PAGE_DELTA_DEPTH:
             raise CacheFormatError("page delta graph exceeds the depth limit")
         evidence = self.page_delta_base_read_evidence(

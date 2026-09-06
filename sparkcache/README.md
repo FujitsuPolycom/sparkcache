@@ -171,6 +171,28 @@ SparkCache authenticates objects, checks logical positions, places bytes into
 request-owned GPU blocks, and resumes the request only after CUDA completion.
 Any error discards those private blocks and recomputes the prompt.
 
+The optional `spark_cache_cuda_restore_arena_budget_bytes` setting bounds
+restore arena allocation per worker rank. Its environment equivalent is
+`SPARK_CONTEXT_CACHE_CUDA_RESTORE_ARENA_BUDGET_BYTES`.
+
+The default, `0`, keeps the configured lane count. A positive budget must fit
+at least one lane's two arenas.
+
+The connector caps page restore lanes at the smaller of
+`spark_cache_load_threads` (maximum eight) and the number of complete arena
+pairs the budget permits. Row restore uses one lane.
+
+For example, 256 MiB arenas and a 1 GiB budget permit two page restore lanes,
+allocating 1 GiB instead of the 4 GiB required by eight lanes. Arenas are
+allocated at startup.
+
+This budget covers restore arenas; capture rings,
+authenticated host objects, GPU KV blocks, and placement metadata have
+separate allocations.
+
+Adjusting the budget preserves cache identities and on-disk compatibility.
+Concurrent restore throughput requires deployment testing.
+
 See [`native/README.md`](native/README.md) for the ABI and memory-ordering
 rules. Deployment profiles record the model layouts tested with this path.
 
@@ -245,6 +267,22 @@ evicts least-recently-used manifests down to
 
 `spark_cache_ttl_seconds` expires manifests by recency; zero disables TTL.
 Maintenance preserves shared objects referenced by surviving manifests.
+
+An admitted asynchronous publication can protect its base and result roots
+until post-commit reconciliation. Only one such publication runs per rank.
+Protected bytes still count against capacity.
+
+Other roots remain eligible for eviction. Capacity may temporarily remain
+unsatisfied while a protected publication finishes; the single inflight
+admission prevents another protected publication from accumulating.
+
+Success releases that protection before post-commit cleanup. Failure,
+preemption, and shutdown completion release it too. An unsatisfied capacity
+budget prevents another base reservation.
+
+If the worker no longer offers the selected base, or maintenance is busy,
+capture switches to a complete snapshot without waiting. The existing ring
+size and admission limits still apply; an oversized snapshot is skipped.
 
 To clear one cache root once, set `spark_cache_clear_once` to a deliberate
 token:

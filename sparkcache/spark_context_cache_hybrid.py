@@ -130,6 +130,25 @@ class PageDeltaPlan:
     tails: tuple[PageDeltaTail, ...]
 
 
+@dataclass(frozen=True)
+class _VerifiedPageSnapshot:
+    """Process-local immutable bytes with their verified full-snapshot digest.
+
+    Only the hashing and delta-application helpers construct this carrier.
+    It is never accepted from persistent metadata or a public restore caller.
+    """
+
+    payload: bytes
+    sha256: str
+
+
+def _verify_page_snapshot_bytes(
+    payload: bytes | bytearray,
+) -> _VerifiedPageSnapshot:
+    immutable = bytes(payload)
+    return _VerifiedPageSnapshot(immutable, hashlib.sha256(immutable).hexdigest())
+
+
 def page_snapshot_encoded_size(
     layout: PageLayout,
     block_counts: Sequence[int],
@@ -273,7 +292,7 @@ def encode_page_snapshot(
                     f"layer {layer.name} carries {len(payload)} bytes, expected {expected}"
                 )
             parts.append(payload)
-    return encode_page_snapshot_header(layout, counts) + b"".join(parts)
+    return b"".join((encode_page_snapshot_header(layout, counts), *parts))
 
 
 def decode_page_snapshot(
@@ -550,11 +569,8 @@ def encode_page_delta(
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-    return (
-        _DELTA_MAGIC
-        + _HEADER_LENGTH.pack(len(header))
-        + header
-        + b"".join(payload_parts)
+    return b"".join(
+        (_DELTA_MAGIC, _HEADER_LENGTH.pack(len(header)), header, *payload_parts)
     )
 
 
@@ -675,11 +691,8 @@ def encode_page_delta_from_capture(
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-    return (
-        _DELTA_MAGIC
-        + _HEADER_LENGTH.pack(len(header))
-        + header
-        + b"".join(payload_parts)
+    return b"".join(
+        (_DELTA_MAGIC, _HEADER_LENGTH.pack(len(header)), header, *payload_parts)
     )
 
 
@@ -695,6 +708,29 @@ def apply_page_delta(
 ) -> bytes:
     """Verify and apply one page-semantic delta to its exact base snapshot."""
 
+    return _apply_verified_page_delta(
+        layout,
+        _verify_page_snapshot_bytes(base_snapshot),
+        encoded_delta,
+        base_block_counts=base_block_counts,
+        result_block_counts=result_block_counts,
+        base_boundary_tokens=base_boundary_tokens,
+        result_boundary_tokens=result_boundary_tokens,
+    ).payload
+
+
+def _apply_verified_page_delta(
+    layout: PageLayout,
+    base: _VerifiedPageSnapshot,
+    encoded_delta: bytes | bytearray,
+    *,
+    base_block_counts: Sequence[int],
+    result_block_counts: Sequence[int],
+    base_boundary_tokens: int,
+    result_boundary_tokens: int,
+) -> _VerifiedPageSnapshot:
+    """Reuse the preceding immutable result proof and verify every delta stage."""
+
     plan = plan_page_delta(
         layout,
         encoded_delta,
@@ -704,30 +740,128 @@ def apply_page_delta(
         result_boundary_tokens=result_boundary_tokens,
         total_bytes=len(encoded_delta),
     )
-    if plan.base_snapshot_sha256 != hashlib.sha256(base_snapshot).hexdigest():
+    if plan.base_snapshot_sha256 != base.sha256:
         raise HybridCodecError("hybrid page delta identity or base differs")
-    base_payloads = decode_page_snapshot(
+    base_plan = plan_page_snapshot(
         layout,
-        base_snapshot,
+        base.payload,
         plan.base_block_counts,
     )
-    encoded_view = memoryview(encoded_delta)
-    result_payloads: dict[str, bytes] = {}
-    layers = [layer for group in layout.groups for layer in group.layers]
-    for tail, layer in zip(plan.tails, layers, strict=True):
-        payload_tail = encoded_view[tail.source_start : tail.source_end]
-        if hashlib.sha256(payload_tail).hexdigest() != tail.sha256:
-            raise HybridCodecError("hybrid page delta payload checksum mismatch")
-        prefix = base_payloads[layer.name][: tail.destination_byte_offset]
-        result_payloads[layer.name] = prefix + payload_tail.tobytes()
-    result = encode_page_snapshot(
-        layout,
-        plan.result_block_counts,
-        result_payloads,
-    )
-    if hashlib.sha256(result).hexdigest() != plan.result_snapshot_sha256:
+    # Join authenticated source views directly into the sole result allocation.
+    # Decoding layers and concatenating their prefixes would copy the complete
+    # base and result repeatedly at every stage of a growing flat history.
+    parts: list[bytes | memoryview] = [
+        encode_page_snapshot_header(layout, plan.result_block_counts)
+    ]
+    with (
+        memoryview(base.payload) as base_view,
+        memoryview(encoded_delta) as encoded_view,
+    ):
+        for tail, span in zip(plan.tails, base_plan.spans, strict=True):
+            payload_tail = encoded_view[tail.source_start : tail.source_end]
+            if hashlib.sha256(payload_tail).hexdigest() != tail.sha256:
+                raise HybridCodecError("hybrid page delta payload checksum mismatch")
+            prefix_end = span.source_start + tail.destination_byte_offset
+            parts.extend((base_view[span.source_start:prefix_end], payload_tail))
+        result = b"".join(parts)
+    if len(result) != page_snapshot_encoded_size(layout, plan.result_block_counts):
+        raise HybridCodecError("hybrid page delta result size differs")
+    result_sha256 = hashlib.sha256(result).hexdigest()
+    if result_sha256 != plan.result_snapshot_sha256:
         raise HybridCodecError("hybrid page delta result checksum mismatch")
-    return result
+    return _VerifiedPageSnapshot(result, result_sha256)
+
+
+class _PageHistoryReconstruction:
+    """Private layer buffers with a complete checksum proof at each boundary.
+
+    A reconstruction owns its mutable buffers for one restore only. Every
+    delta authenticates its exact base, tail bytes, and canonical result before
+    the following stage can use it. Only the final immutable snapshot escapes.
+    """
+
+    def __init__(
+        self,
+        layout: PageLayout,
+        snapshot: bytes | bytearray,
+        block_counts: Sequence[int],
+        boundary_tokens: int,
+    ) -> None:
+        verified = _verify_page_snapshot_bytes(snapshot)
+        plan = plan_page_snapshot(layout, verified.payload, block_counts)
+        self._layout = layout
+        self._counts = plan.block_counts
+        self._boundary = boundary_tokens
+        self._sha256 = verified.sha256
+        self._valid = True
+        self._header = verified.payload[:plan.header_bytes]
+        with memoryview(verified.payload) as view:
+            self._layers = [
+                bytearray(view[span.source_start:span.source_end])
+                for span in plan.spans
+            ]
+
+    def apply(
+        self,
+        encoded_delta: bytes | bytearray,
+        *,
+        base_block_counts: Sequence[int],
+        result_block_counts: Sequence[int],
+        base_boundary_tokens: int,
+        result_boundary_tokens: int,
+    ) -> None:
+        if not self._valid:
+            raise HybridCodecError("hybrid page history has an unverified stage")
+        self._valid = False
+        if (tuple(base_block_counts) != self._counts
+                or base_boundary_tokens != self._boundary):
+            raise HybridCodecError("hybrid page history boundary differs")
+        plan = plan_page_delta(
+            self._layout,
+            encoded_delta,
+            base_block_counts=base_block_counts,
+            result_block_counts=result_block_counts,
+            base_boundary_tokens=base_boundary_tokens,
+            result_boundary_tokens=result_boundary_tokens,
+        )
+        if plan.base_snapshot_sha256 != self._sha256:
+            raise HybridCodecError("hybrid page delta identity or base differs")
+        with memoryview(encoded_delta) as encoded_view:
+            # Check every tail before changing a buffer. A bad intermediate
+            # result is fatal even when a subsequent stage overwrites its data.
+            for tail in plan.tails:
+                if hashlib.sha256(encoded_view[tail.source_start:tail.source_end]).hexdigest() != tail.sha256:
+                    raise HybridCodecError("hybrid page delta payload checksum mismatch")
+            for buffer, tail in zip(self._layers, plan.tails, strict=True):
+                existing = len(buffer) - tail.destination_byte_offset
+                # A bytearray slice assignment can first copy its buffer
+                # source into a temporary bytearray. Assign through a view for
+                # fixed-size overwrites, then release it before growing.
+                with memoryview(buffer) as target:
+                    target[tail.destination_byte_offset:] = encoded_view[
+                        tail.source_start:tail.source_start + existing
+                    ]
+                buffer.extend(encoded_view[tail.source_start + existing:tail.source_end])
+        header = encode_page_snapshot_header(self._layout, plan.result_block_counts)
+        if len(header) + sum(map(len, self._layers)) != page_snapshot_encoded_size(
+            self._layout, plan.result_block_counts):
+            raise HybridCodecError("hybrid page delta result size differs")
+        result_digest = hashlib.sha256(header)
+        for buffer in self._layers:
+            result_digest.update(buffer)
+        result_sha256 = result_digest.hexdigest()
+        if result_sha256 != plan.result_snapshot_sha256:
+            raise HybridCodecError("hybrid page delta result checksum mismatch")
+        self._header = header
+        self._counts = plan.result_block_counts
+        self._boundary = result_boundary_tokens
+        self._sha256 = result_sha256
+        self._valid = True
+
+    def finish(self) -> bytes:
+        if not self._valid:
+            raise HybridCodecError("hybrid page history has an unverified stage")
+        return b"".join((self._header, *self._layers))
 
 
 def materialize_page_extension_capture(

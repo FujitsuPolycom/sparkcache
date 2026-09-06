@@ -507,6 +507,16 @@ def test_sparse_async_capture_publishes_restorable_page_delta(monkeypatch) -> No
             return restore_page_snapshot(*args, **kwargs)
 
         connector._store.restore_page_snapshot = counted_restore
+        base_paths = set((Path(directory) / "chunks").glob("*.spcc"))
+        base_reads = Counter()
+        read_bytes = Path.read_bytes
+
+        def counted_read(path):
+            if path in base_paths:
+                base_reads[path] += 1
+            return read_bytes(path)
+
+        monkeypatch.setattr(Path, "read_bytes", counted_read)
         monkeypatch.setattr(
             "sparkcache.spark_context_cache_connector."
             "materialize_page_extension_capture",
@@ -519,6 +529,9 @@ def test_sparse_async_capture_publishes_restorable_page_delta(monkeypatch) -> No
         ring.ready.set()
         assert runtime.wait_idle(timeout=1)
         assert connector.wait_for_pending_stores(timeout=5)
+
+        assert base_paths
+        assert base_reads == Counter({path: 1 for path in base_paths})
 
         lookup = connector._store.lookup(
             connector._identity(0), extension.digest

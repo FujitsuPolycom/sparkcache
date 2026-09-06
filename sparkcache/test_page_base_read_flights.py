@@ -37,6 +37,33 @@ def _key(
     )
 
 
+@pytest.mark.parametrize("registered", [False, True])
+def test_shared_only_resolution_never_reads_an_unadmitted_base(registered) -> None:
+    flights = PageBaseReadFlights(max_bytes_per_flight=8, max_bytes_total=16)
+    key = _key(encoded_bytes=9)
+    if registered:
+        assert not flights.register_cohort(key, ("request",)).member_ids
+
+    def forbidden_read():
+        pytest.fail("an unadmitted base must use the caller's bounded restore path")
+
+    assert flights.resolve(
+        "request", key, forbidden_read, allow_independent=False
+    ) is None
+    assert flights.snapshot().retained_bytes == 0
+
+
+def test_shared_only_resolution_releases_mismatched_admission() -> None:
+    flights = PageBaseReadFlights()
+    flights.register_cohort(_key(), ("request",))
+    assert flights.resolve(
+        "request", _key("other"), lambda: pytest.fail("unexpected read"),
+        allow_independent=False,
+    ) is None
+    assert flights.snapshot().active_flights == 0
+    assert flights.snapshot().counters["evidence_mismatch_bypasses"] == 1
+
+
 def test_two_load_threads_share_one_base_across_sixteen_queued_results() -> None:
     flights = PageBaseReadFlights()
     key = _key(encoded_bytes=9)
