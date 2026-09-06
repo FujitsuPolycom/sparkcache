@@ -408,6 +408,7 @@ class ConnectorConfig:
     restore_enabled: bool
     streaming_snapshots_enabled: bool
     async_page_capture_enabled: bool
+    page_snapshot_interval_tokens: int
     cuda_restore_enabled: bool
     cuda_placement_library_path: str
     cuda_placement_library_sha256: str
@@ -641,6 +642,13 @@ def parse_connector_config(
             "spark_cache_min_span_tokens",
             os.environ.get("SPARK_CONTEXT_CACHE_MIN_SPAN", "1024"),
         )
+    )
+    page_snapshot_interval_tokens = _nonnegative_config_int(
+        extra(
+            "spark_cache_page_snapshot_interval_tokens",
+            os.environ.get("SPARK_CONTEXT_CACHE_PAGE_SNAPSHOT_INTERVAL_TOKENS", "0"),
+        ),
+        "spark_cache_page_snapshot_interval_tokens",
     )
     model_max = int(getattr(vllm_config.model_config, "max_model_len", 0) or 0)
     default_max_span = str(model_max if model_max > 0 else 1 << 30)
@@ -983,6 +991,7 @@ def parse_connector_config(
         restore_enabled=restore_enabled,
         streaming_snapshots_enabled=streaming_snapshots_enabled,
         async_page_capture_enabled=async_page_capture_enabled,
+        page_snapshot_interval_tokens=page_snapshot_interval_tokens,
         cuda_restore_enabled=cuda_restore_enabled,
         cuda_placement_library_path=cuda_placement_library_path,
         cuda_placement_library_sha256=cuda_placement_library_sha256,
