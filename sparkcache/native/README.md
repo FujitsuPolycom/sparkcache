@@ -42,7 +42,7 @@ loads a selected library through its public ABI.
 It compares destination bytes with the independent CPU reference, including
 padding, unused physical pages, and guard bytes.
 
-Fixtures cover 64 MiB spans, large pages, 1,024 spans across eight layers,
+Fixtures cover 64 MiB spans, a 257 MiB capped-grid continuation, large pages, 1,024 spans across eight layers,
 irregular framing, odd page widths, shuffled slots, and split submissions.
 
 Each iteration clears the destination outside the timed region to expose

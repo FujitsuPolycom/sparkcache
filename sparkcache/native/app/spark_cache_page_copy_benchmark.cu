@@ -182,6 +182,7 @@ int main(int argc, char** argv) {
     cuda_check(cudaSetDevice(0));
     Api api(argv[1]);
     const Case cases[] = {
+        {"grid_stride_257mib", 4096, 65792, 1, 257 * 1024 * 1024, 0, 0, false, false},
         {"single_span_64mib", 4096, 16384, 1, 64 * 1024 * 1024, 0, 0, false, false},
         {"huge_pages_64mib", 32 * 1024 * 1024, 2, 1, 64 * 1024 * 1024, 0, 0, false, false},
         {"layers_many_spans_64mib", 2048, 4096, 8, 65536, 0, 0, false, false},
