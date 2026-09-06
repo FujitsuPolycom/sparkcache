@@ -81,7 +81,8 @@ measurements, and known limits out of the generic cache design.
 
 | Model family | Guide |
 |---|---|
-| GLM-5.3 Flash | [Four-node SparkRing quickstart](https://github.com/FujitsuPolycom/sparkring/blob/main/docs/GLM53_JJ_R8_GB10_SPARKCACHE_TP4_QUICKSTART.md) · [SparkCache integration notes](deploy/glm53_flash/README.md) |
+| GLM-5.3 Flash, native MTP3 | [Four-Spark MTP3 cache/checkpoint quickstart](https://github.com/FujitsuPolycom/sparkring/blob/main/docs/GLM53_MTP3_CACHE_CHECKPOINTS_QUICKSTART.md) · [Implementation and issue status](deploy/glm53_flash/MTP3_STATUS.md) |
+| GLM-5.3 Flash, DFlash2 | [Four-node DFlash2 quickstart](https://github.com/FujitsuPolycom/sparkring/blob/main/docs/GLM53_JJ_R8_GB10_SPARKCACHE_TP4_QUICKSTART.md) · [SparkCache integration notes](deploy/glm53_flash/README.md) |
 | GLM-5.2 EXL3 3.5-bpw | [`deploy/glm52_35bpw/README.md`](deploy/glm52_35bpw/README.md) |
 | DeepSeek-V4 | [`deploy/deepseek_v4/README.md`](deploy/deepseek_v4/README.md) |
 
