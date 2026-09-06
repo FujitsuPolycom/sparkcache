@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interactive lab for the fail-open snapshot-ring state model.
+"""Interactive lab for the serving-preserving snapshot-ring state model.
 
 Question: can two or three staging slots remain safe when GPU completion,
 writer ownership, ring saturation, and context cancellation race?
@@ -26,7 +26,7 @@ def render(ring: SnapshotRing, message: str) -> None:
     print("\x1b[2J\x1b[H", end="")
     print(f"{BOLD}SparkCache snapshot-ring state-model lab{RESET}")
     print(
-        f"{DIM}Question: can saturation/cancellation remain fail-open "
+        f"{DIM}Question: can saturation/cancellation preserve serving "
         f"without reusing owned bytes?{RESET}\n"
     )
     for index, slot in enumerate(ring.slots):

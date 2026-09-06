@@ -31,6 +31,8 @@ CAP_EXTERNAL_STREAM = 1 << 2
 CAP_NONBLOCKING_ACQUIRE = 1 << 3
 CAP_CONTEXT_ABANDON = 1 << 4
 CAP_ORDERLY_SHUTDOWN = 1 << 5
+CAP_MANAGER_PAGE_CAPTURE = 1 << 6
+CAP_LOW_PRIORITY_CAPTURE_STREAM = 1 << 7
 
 
 class SnapshotConfig(ctypes.Structure):
@@ -164,7 +166,7 @@ def _secure_fd_load_path(fd: int) -> str:
     if not sys.platform.startswith("linux"):
         raise NativeSnapshotError(
             "secure snapshot-library loading requires Linux /proc/self/fd; "
-            f"platform {sys.platform!r} is fail-closed"
+            f"platform {sys.platform!r} is unsupported"
         )
     path = f"/proc/self/fd/{fd}"
     try:

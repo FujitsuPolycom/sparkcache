@@ -1,56 +1,36 @@
 # SparkCache package
 
 The `sparkcache` package implements persistent, rank-local context storage for
-vLLM's KV-Connector-V1 interface. The scheduler admits reusable prefixes; each
-worker stores and restores only its physical tensor-parallel shard.
+vLLM's KV-Connector-V1 interface. The scheduler chooses reusable prefixes;
+each worker reads and writes only its physical rank's state.
 
-The package is independent of SparkRing transport. A deployment may use a
-switchless ring, a switched fabric, or ordinary Ethernet for vLLM collectives;
-SparkCache reads and writes only the rank's local filesystem.
+## Request flow
 
-## Request lifecycle
+1. The scheduler hashes each eligible prompt boundary once.
+2. Workers report structurally valid entries and their process generation.
+3. The scheduler chooses the longest entry present on every expected rank.
+4. Each worker authenticates its local manifest and payload objects.
+5. Workers place state only after every required check succeeds.
+6. Any rejection becomes a normal cache miss and prompt recomputation.
+7. A completed prefill publishes immutable objects before its manifest.
 
-1. The scheduler hashes every eligible aligned prompt boundary in one
-   incremental pass and selects the longest reusable digest.
-2. Worker statistics report which digests are structurally valid on each
-   physical rank and identify the worker process generation.
-3. The scheduler admits an external prefix only after every physical rank in
-   the tensor-parallel group reports the digest.
-4. Each worker allocates request blocks, reads its local manifest and chunks,
-   verifies complete encoded-chunk SHA-256 values, and installs the state.
-5. Any rank-local failure publishes invalid block IDs; the patched vLLM
-   scheduler discards the partial prefix and recomputes the request on every
-   rank.
-6. A completed prefill snapshots the aligned span and publishes immutable
-   chunks before the manifest visibility edge.
-7. Row-oriented storage may publish authenticated sparse aliases over the
-   durable exact manifest. Alias failure does not change exact-manifest success.
+Row-oriented storage may also publish authenticated aliases that point to an
+earlier exact manifest. A broken alias does not affect the exact manifest.
 
-## Module interfaces
+### Startup inventory
 
-| Module | Interface |
-|---|---|
-| `spark_context_cache_connector.py` | `SparkContextCacheConnector`; scheduler admission, worker I/O, quorum, hybrid-memory-allocator (HMA) groups, capacity, and vLLM callbacks |
-| `spark_context_cache_config.py` | `ConnectorConfig`; validated immutable settings, topology, and cache-identity construction shared by scheduler and worker roles |
-| `spark_context_cache_profiles.py` | `ModelProfile`; storage mode, record schema, chunk geometry, and deployment validation |
-| `spark_context_cache_codec.py` | DCP row ownership, record packing, and digest helpers for per-token storage |
-| `spark_context_cache_hybrid.py` | opaque HMA page encoding and topology validation |
-| `persistent_context_cache/cache_manifest.py` | `ManifestStore`; exact manifests, row-prefix aliases, durable publication, lookup, restore, invalidation, and maintenance |
-| `spark_context_cache_native_placement.py` | `NativePlacementAdapter`; attested CUDA placement transaction |
-| `spark_context_cache_native_restore.py` | bounded read/hash/slab orchestration for native placement |
-| `spark_context_cache_native_hybrid_restore.py` | authenticated direct reads and multi-slab mapped-arena placement for opaque HMA pages |
-| `spark_context_cache_restore_timing.py` | `sparkcache-restore-timing/v1` asynchronous restore records |
-| `streaming/factory.py` | scheduler and worker adapters for write-behind publication |
-| `replication/` | carrier-independent transaction protocol; no network adapter is implemented |
+Each worker sends at most 512 discovered manifest digests through vLLM's
+one-time connector handshake before API readiness. The scheduler exposes an
+entry only when every physical rank reports the same digest.
 
-`sparkcache.spark_context_cache_store` is the stable manifest-store import. It
-re-exports the durable store interface without introducing another storage
-implementation.
+Larger inventories continue through bounded delta and checkpoint reports
+after the engine starts. Entries outside the startup subset recompute until
+their all-rank reports arrive.
 
-## Configuration
+## Configure the connector
 
-The complete `--kv-transfer-config` argument enables SparkCache. Omitting it
-leaves the connector unloaded.
+Pass SparkCache through vLLM's `--kv-transfer-config`. Omitting the connector
+configuration leaves SparkCache unloaded.
 
 ```json
 {
@@ -59,12 +39,13 @@ leaves the connector unloaded.
   "kv_role": "kv_both",
   "kv_load_failure_policy": "recompute",
   "kv_connector_extra_config": {
-    "spark_cache_root": "/cache/sparkcache-model",
-    "spark_cache_model_profile": "deepseek-v4-fp8-hma",
+    "spark_cache_root": "/cache/sparkcache/deployment-name",
+    "spark_cache_model_profile": "profile-name",
     "spark_cache_target_checkpoint_sha256": "<64 lowercase hex characters>",
     "spark_cache_draft_policy": "colocated_target",
-    "spark_cache_store": true,
-    "spark_cache_restore": true,
+    "spark_cache_access_mode": "read-write",
+    "spark_cache_publication_schema": "snapshot-v1",
+    "spark_cache_shared_prefix_lease_ttl_seconds": 15,
     "spark_cache_max_bytes": 214748364800,
     "spark_cache_low_watermark_bytes": 193273528320,
     "spark_cache_ttl_seconds": 0,
@@ -73,207 +54,296 @@ leaves the connector unloaded.
 }
 ```
 
-The target digest must identify immutable checkpoint contents, not a mutable
-path or tag. A separately loaded drafter requires draft policy `separate` and
-its own `spark_cache_draft_checkpoint_sha256`. Policy `colocated_target`
-derives the draft identity from the target checkpoint.
+The checkpoint digest identifies immutable checkpoint contents, not a mutable
+path or tag. A separately loaded drafter uses policy `separate` and supplies
+its own checkpoint digest.
 
-The model profile is part of cache identity. Implemented profiles are defined
-in `spark_context_cache_profiles.py`; an unknown profile or unsupported
-TP/DCP/PP geometry fails startup.
+The profile is part of cache identity. An unknown profile or unsupported
+parallel geometry stops connector startup before any stored entry is used.
 
-`spark_cache_clear_once` is empty by default. A non-empty value requests the
-one-shot root clear described below; it is an operator action token, not a
-cache-identity field.
+### Restore and publication controls
 
-`spark_cache_publication_schema` defaults to `snapshot-v1`. Profile storage
-mode `per_token_rows` maps `tail-cow-v1` to the row-tail namespace. Storage
-mode `block_pages_v1` maps the same operator value to the page-delta namespace.
-Both values are part of cache identity and therefore cleanly miss
-`snapshot-v1` entries. Streaming-snapshot deployments reject the option.
+`spark_cache_access_mode` selects how the connector uses persistent storage:
+
+| Mode | Restore stored prefixes | Publish completed prefixes |
+|---|---:|---:|
+| `read-write` | Yes | Yes |
+| `restore-only` | Yes | No |
+| `store-only` | No | Yes |
+| `disabled` | No | No |
+
+`read-write` is the default and preserves the behavior of deployments that do
+not set a mode.
+
+`restore-only` is useful when serving prompts with uncertain reuse. Existing
+entries remain available, but completed requests do not capture or publish
+model state. An unavailable or rejected entry is computed normally.
+
+The independent `spark_cache_store` and `spark_cache_restore` booleans remain
+supported. Each explicitly supplied boolean overrides its side of the selected
+mode.
+
+The equivalent environment variables are
+`SPARK_CONTEXT_CACHE_ACCESS_MODE`, `SPARK_CONTEXT_CACHE_STORE`, and
+`SPARK_CONTEXT_CACHE_RESTORE`.
+
+Access controls do not participate in cache identity. Switching between
+`read-write` and `restore-only` can reuse compatible stored entries without a
+namespace change.
+
+## Publication options
+
+`spark_cache_publication_schema` chooses the persistent layout. It defaults to
+`snapshot-v1`.
+
+| Setting | Storage layout | Behavior |
+|---|---|---|
+| `snapshot-v1` | Rows or opaque manager pages | Publish a complete aligned snapshot. |
+| `tail-cow-v1` | Rows | Publish immutable row tails and authenticated descriptor chains. |
+| `tail-cow-v1` | Opaque manager pages | Publish changed pages over a bounded nested base graph. |
+| `tail-cow-v2` | Opaque manager pages only | Publish changed pages as an ordered, authenticated stage list rooted at one immutable base snapshot. |
+
+The connector maps the operator setting `tail-cow-v2` to the cache-identity
+wire value `page-tail-cow-v2`.
+
+The v2 manifest keeps one base root plus a flat list of delta stages instead
+of nesting each result under the following extension.
+
+Every stage binds its base digest, token boundary, block geometry, payload
+digest, and immutable object descriptors.
+
+Restore validates the whole chain before any stage reaches request-owned GPU
+blocks.
+
+Every publication schema has a distinct cache identity. Changing the setting
+produces a clean cache miss against entries written by another schema; it
+cannot alias their objects as compatible state.
 
 ## Storage and integrity
 
-`ManifestStore` publishes files in this order:
+`ManifestStore` writes and synchronizes immutable objects before it exposes an
+atomic manifest. Startup checks identity, geometry, descriptors, alias chains,
+and referenced object sizes.
 
-1. encode, hash, and fsync each immutable chunk;
-2. link each chunk into the content-addressed chunk directory and fsync it;
-3. encode and fsync the manifest;
-4. atomically link the manifest into its identity namespace and fsync the
-   manifest directory.
+Restore reads and hashes the selected payloads before releasing state.
+`sweep_integrity()` performs an explicit full-payload diagnostic.
 
-Startup discovery validates identity, geometry, descriptors, authenticated
-prefix-alias chains, and referenced chunk existence/size without reading every
-payload. Restore is the payload integrity boundary: selected chunks are read
-and hashed before state is released. `sweep_integrity()` is an explicit
-payload-reading diagnostic.
-
-Persistent data never contains CUDA pointers, allocator block tables,
-physical slot coordinates, or transport sequence numbers.
-
-## Capacity policy
-
-`spark_cache_max_bytes` is a high watermark for filesystem-allocated bytes
-under one cache root. Crossing it triggers manifest-recency LRU eviction down
-to `spark_cache_low_watermark_bytes`, which defaults to 90% of the high
-watermark. `spark_cache_ttl_seconds` expires manifests by recency; zero
-disables TTL.
-
-Maintenance counts shared chunks and prefix-descriptor segments once, preserves
-objects referenced by surviving exact or alias roots, removes invalid or
-expired roots, and collects orphan objects and incomplete publication debris.
-The watermark is a post-commit reclamation target, not a preallocation
-reservation. One publisher per rank-local root is qualified; multiple
-publishers can transiently exceed the watermark until maintenance reconciles
-physical use.
-
-## One-shot cache clear
-
-Set `spark_cache_clear_once` to an operator-chosen token when a deployment must
-discard the configured rank-local SparkCache contents before reuse:
-
-```json
-"spark_cache_clear_once": "glm53-native-layout-2026-08-29"
-```
-
-The token must contain 1--128 letters, digits, periods, underscores, colons,
-at signs, plus signs, or hyphens, and must begin with a letter or digit. The
-configured cache root must be an absolute, non-broad path and cannot contain a
-symlinked component.
-
-Each process takes the root's exclusive maintenance lock. If the token has no
-completion marker, SparkCache removes only `chunks/`, `manifests/`,
-`prefix-aliases/`, and `prefix-index/` below that exact root. It never removes
-the root, `.maintenance.lock`, `.sparkcache-clear-once/`, unknown root children,
-or sibling model and JIT paths.
-
-After every owned path is durably removed, SparkCache atomically records schema
-`sparkcache-clear-once/v1` under `.sparkcache-clear-once/`. The marker filename
-contains a domain-separated SHA-256 of the token rather than the token text. A restart
-with the same token is a no-op, even if cache entries were published after the
-clear. A different token requests another clear and preserves every earlier
-completion marker.
-
-Process-local and file-lock acquisition share one 30-second budget. A lock
-timeout or filesystem error leaves the requested token incomplete and disables
-persistent store, restore, streaming publication, and native restore for that
-connector process. Model serving can continue without persistent cache use,
-and a later startup retries the same token.
-
-The option does not change `CacheIdentity`, digest values, chunk geometry, or
-storage schemas. It is a destructive operator action scoped to the configured
-rank-local root; use one deliberate token across the ranks that should clear.
-
-## Restore timing
-
-Every asynchronous restore emits one compact JSON record prefixed with
-`spark-context-cache-restore-timing:`. Schema
-`sparkcache-restore-timing/v1` separates time waiting for a load worker from
-manifest lookup, chunk read/verification/decoding, state reconstruction,
-device-transfer submission, and CUDA-stream synchronization. It also reports
-the selected span, chunk count, encoded hybrid-page bytes, service time, and
-enqueue-to-completion time.
-
-The record is diagnostic only. Missing or malformed timing observations do not
-change whether cached state is accepted: SparkCache restores verified state or
-recomputes the request. The legacy human-readable total remains available for
-existing log consumers. That legacy total includes the best-effort manifest
-recency touch after successful restoration; the structured `service_ms` ends
-when placement completes and intentionally excludes that bookkeeping.
+Persistent data contains no CUDA pointers, allocator block tables, physical
+slot coordinates, or transport sequence numbers.
 
 ## Prefix reuse
 
-- **Longest stored exact boundary — implemented.** The scheduler generates
-  wire-compatible digests at each eligible chunk boundary and selects the
-  longest digest advertised by every expected physical rank. A grown
-  conversation can reuse an earlier request boundary without requiring an
-  exact full-prompt match.
-- **Sparse row-prefix aliases — implemented.** Storage mode `per_token_rows`
-  publishes bounded `sparkcache-prefix-alias/v1` metadata over existing
-  immutable chunks. Descriptor segments contain at most sixteen chunk
-  descriptors; default publication selects 4,096-token boundaries and retains
-  at most 64 aliases. Exact manifests take precedence over aliases with the
-  same digest.
-- **Immutable row tails — implemented.** Setting
-  `spark_cache_publication_schema` to `tail-cow-v1` selects a distinct cache
-  namespace. The scheduler selects the longest earlier prefix advertised by
-  every physical rank. Workers snapshot only rows after that boundary and
-  publish `sparkcache-tail-manifest/v1` metadata over authenticated descriptor
-  chains and immutable replacement-tail objects. A partial terminal chunk is
-  replaced, never modified. Restore rejection recomputes the request. GPU-free
-  regression coverage exists; live model-serving qualification does not.
-- **Opaque-page aliases — unsupported.** A `block_pages_v1` chunk is a byte
-  partition of one complete HMA boundary snapshot, not an independently usable
-  token range, so arbitrary earlier-prefix aliases cannot be derived from its
-  chunks.
-- **Immutable block-page tails — implemented.** The
-  `sparkcache-hybrid-page-delta/v1` codec reuses only byte-identical page
-  prefixes and binds the base snapshot, layout, block counts, and
-  recurrent/sliding boundary. `sparkcache-page-delta-manifest/v1` embeds its
-  authenticated base graph, allowing capacity maintenance to retain shared
-  objects after predecessor roots are removed. Restore reconstructs the verified
-  full snapshot before Python or native page placement. GPU-free regression
-  coverage exists; live model-serving qualification does not. A graph contains
-  at most two deltas. The following extension publishes a fresh flat snapshot,
-  bounding reconstruction work and metadata ancestry.
-- **Concurrent shared GPU prefix — implemented.** One leader restores a
-  persistent digest. After every rank succeeds, up to sixteen waiting followers
-  attach through vLLM block references. Two leases may remain reusable for
-  fifteen seconds. Partial physical pages are copied into immutable blocks
-  before attachment, and allocation pressure releases lease references before
-  ordinary serving allocations are denied.
+- **Exact prefixes:** choose the longest aligned digest reported by every
+  expected rank.
+- **Sparse aliases:** authenticate lightweight row-boundary references to
+  already stored objects.
+- **Copy-on-write tails:** replace a partial terminal object and append only
+  changed rows or pages.
+- **Shared restores:** let bounded followers attach to one verified GPU prefix
+  through ordinary vLLM block references.
 
-## Optional paths
+Verified shared GPU prefixes remain retained for
+`spark_cache_shared_prefix_lease_ttl_seconds`. The accepted range is 1–300
+seconds and the default is 15 seconds.
 
-- **Native direct restore — implemented.** Requires the checksum-attested
-  `libspark_cache_placement` artifact and remains disabled unless the launch
-  supplies its path, SHA-256, and a supported mapped-host arena size. The
-  `glm53-flash-hybrid` profile supports authenticated multi-slab page restore;
-  other block-page profiles must opt in explicitly.
-- **Streaming snapshots — research-only.** The state machines are bounded and
-  tested, but the registered tensor inventory and translator are specific to
-  GLM-5.2 DCP4.
-  The deployment contract uses a source-mounted vLLM lease-contract path;
-  wheel-only streaming is unsupported. Opaque HMA page profiles reject
-  streaming.
-- **Buddy replication — research-only.** Transaction, credit, idempotency,
-  expiry, and reconnect state are implemented. No socket, NIXL, or RDMA
-  carrier is included.
+Longer retention can serve later queued requests without another persistent
+restore.
 
-## Support evidence
+The two-prefix limit and vLLM's memory-pressure eviction remain active
+regardless of the configured duration. The equivalent environment variable is
+`SPARK_CONTEXT_CACHE_SHARED_PREFIX_LEASE_TTL_SECONDS`.
 
-DeepSeek-V4 HMA pages are qualified at TP2/DCP1 and TP4/DCP1. DCP2/DCP4 HMA
-pages are unsupported. GLM-5.2 EXL3 3.5-bpw per-token rows, identified by
-SparkRing serving recipe `R7`, are qualified at TP4/DCP4. Per-token row storage
-also has GPU-free coverage at TP1, TP2, and TP4 with DCP degrees that divide TP
-and chunk geometry.
+Manager-page `tail-cow-v1` graphs admit at most two nested deltas before
+flattening against an earlier verified base.
 
-GLM-5.3 Flash opaque pages are qualified at TP4/DCP1 with BF16 DFlash2 using
-seven draft tokens. Source revision
-`2b86fb9d02fa3595cca5caa864b81aedce44b8bb` qualifies native direct restore,
-multi-group recovery, and shared GPU-prefix reuse through C16 under a
-32-sequence scheduler ceiling. Sparse row-prefix aliases have GPU-free coverage
-but no live model-serving qualification.
+`tail-cow-v2` retains a flat ordered stage list, so growing conversations do
+not periodically rewrite a large flattened delta.
 
-See:
+The v2 descriptor list grows with the number of stored extensions. Restore
+must authenticate and apply every retained stage.
 
-- `../DEEPSEEK_V4_LIVE_VALIDATION.md` for TP2/DCP1 evidence;
-- `../DEEPSEEK_V4_TP4_LIVE_VALIDATION.md` for TP4/DCP1 evidence;
-- `../GLM52_DCP4_HISTORICAL_VALIDATION.md` for the GLM-5.2 EXL3 3.5-bpw
-  TP4/DCP4 evidence;
-- `../GLM53_FLASH_DFLASH7_LIVE_VALIDATION.md` for the GLM-5.3 Python
-  page-placement record;
-- `../GLM53_NATIVE_RESTORE_PERFORMANCE_VALIDATION.md` for GLM-5.3 native
-  restore, recovery, and C2/C8/C16 shared-prefix evidence;
-- `../deploy/deepseek_v4/DCP_SUPPORT.md` for the HMA DCP limitation; and
-- `../ROADMAP.md` for research-only and unsupported work.
+## SparkCache CUDA restore
 
-## Validation
+CUDA restore is optional. It requires an absolute
+`libspark_cache_placement` path, its SHA-256, and a compatible arena size.
+
+SparkCache authenticates objects, checks logical positions, places bytes into
+request-owned GPU blocks, and resumes the request only after CUDA completion.
+Any error discards those private blocks and recomputes the prompt.
+
+See [`native/README.md`](native/README.md) for the ABI and memory-ordering
+rules. Deployment profiles record the model layouts tested with this path.
+
+## SparkCache CUDA publication
+
+Asynchronous manager-page capture is **implemented** and disabled by default.
+
+It records producer readiness on the model-runner stream, gathers complete
+request-owned pages on a low-priority CUDA stream, and hands a claimed mapped
+ring view to the durable writer.
+
+Ring saturation skips optional publication without waiting. Preemption
+synchronizes only the affected capture before its source pages can be reused.
+
+Enablement requires an attested `libspark_cache_snapshot` library, bounded
+slot sizes, and the exact vLLM ownership contract described in
+[`native/MANAGER_PAGE_CAPTURE_CONTRACT.md`](native/MANAGER_PAGE_CAPTURE_CONTRACT.md).
+
+The asynchronous ring can feed complete `snapshot-v1` publication or either
+manager-page tail schema.
+
+With `tail-cow-v2`, SparkCache selects only pages whose bytes cannot be reused
+from the authenticated base.
+
+Complete immutable full-attention pages are reused. Partial terminal pages
+and mutable recurrent or sliding-window state are captured again.
+
+The background publisher reads and verifies the base once, constructs the
+authenticated delta directly from the bounded sparse ring view, and computes
+the logical result digest incrementally.
+
+The publisher does not reconstruct a complete Python snapshot or compare
+every result page with the base. Ring pressure or an unverifiable base skips
+publication without delaying unrelated serving.
+
+The required page-tail settings are profile-specific:
+
+```json
+{
+  "spark_cache_access_mode": "read-write",
+  "spark_cache_publication_schema": "tail-cow-v2",
+  "spark_cache_async_page_capture": true,
+  "spark_cache_async_page_capture_library": "/absolute/libspark_cache_snapshot.so",
+  "spark_cache_async_page_capture_library_sha256": "<64 lowercase hex characters>",
+  "spark_cache_async_page_capture_slot_bytes": 3221225472,
+  "spark_cache_async_page_capture_slot_count": 2,
+  "spark_cache_max_delayed_stores": 16,
+  "spark_cache_async_page_capture_vllm_root": "/absolute/vllm/source",
+  "spark_cache_async_page_capture_lease_contract": "/absolute/ownership-contract.json"
+}
+```
+
+`spark_cache_async_page_capture_slot_bytes` must hold the largest selected
+page set for one rank.
+
+Two slots normally allow one capture to be consumed while another completes.
+Three slots can absorb short writer jitter but use another slot's worth of
+pinned unified memory.
+
+Saturation always skips the optional publication instead of waiting for a
+slot.
+
+The delayed-store limit reserves at most 16 request lifetimes by default.
+When the limit is full, SparkCache omits another optional store plan before
+worker capture begins, so vLLM can release that request's pages normally.
+
+## Capacity and cleanup
+
+`spark_cache_max_bytes` is the high watermark for one cache root. Crossing it
+evicts least-recently-used manifests down to
+`spark_cache_low_watermark_bytes`, which defaults to 90% of the high watermark.
+
+`spark_cache_ttl_seconds` expires manifests by recency; zero disables TTL.
+Maintenance preserves shared objects referenced by surviving manifests.
+
+To clear one cache root once, set `spark_cache_clear_once` to a deliberate
+token:
+
+```json
+"spark_cache_clear_once": "storage-layout-reset-2026-08-31"
+```
+
+SparkCache removes only directories it owns, then writes a completion marker.
+Reusing the token does nothing. A different token requests another clear.
+
+The root must be absolute, narrow, and free of symlinked components. A lock or
+filesystem failure disables caching for that connector while serving continues.
+
+## Diagnostics
+
+Each asynchronous restore emits compact INFO lines with restored tokens,
+latency, effective token rate, bytes, and phase timings. A
+`sparkcache-restore-timing/v1` JSON record with the complete phase breakdown is
+available at DEBUG.
+
+Asynchronous publication emits a `sparkcache: capture` INFO line when the
+progress thread observes GPU-to-host copy completion. It reports rank, digest,
+tokens, observed elapsed time, effective token rate, and copied bytes.
+
+The separate commit log reports durable-storage time. The two records separate
+capture interference from background storage work.
+
+Each completed store also emits one compact `sparkcache: publish` line.
+
+Scheduler aggregate telemetry is split into `sparkcache: capacity`,
+`sparkcache: publications`, and `sparkcache: writes` lines.
+
+While capture owns finished-request pages, a `sparkcache: capture` aggregate
+line reports delayed requests, request-rank ownership records, retained manager
+pages, and the oldest ownership age.
+
+The line disappears after every rank reports its terminal completion.
+
+The same ownership state is available from the vLLM Prometheus endpoint:
+
+| Gauge | Meaning |
+|---|---|
+| `vllm:sparkcache_capture_delayed_requests` | Maximum delayed request count on any physical rank. |
+| `vllm:sparkcache_capture_delayed_rank_slots` | Request ownership records summed across physical ranks. |
+| `vllm:sparkcache_capture_retained_manager_pages` | Physical manager pages retained across ranks. |
+| `vllm:sparkcache_capture_oldest_delayed_seconds` | Age of the oldest retained request ownership. |
+| `vllm:sparkcache_capture_ownership_uncertain_ranks` | Ranks that cannot prove whether capture still owns source pages. |
+
+Exact process-local totals are available from
+`ManifestStore.publication_telemetry_snapshot()` using schema
+`sparkcache-publication-telemetry/v1`.
+
+| Counter | Meaning |
+|---|---|
+| `logical_payload_bytes` | Encoded state represented by committed roots. A row tail or page delta counts only its extension. |
+| `reused_base_bytes` | Encoded base payload referenced without staging it again. |
+| `unique_object_bytes` | Complete immutable files newly linked or repaired, including metadata roots. |
+| `committed_unique_object_bytes` | Newly retained immutable bytes reachable from committed roots. |
+| `uncommitted_unique_object_bytes` | Immutable bytes left unreachable after an aborted or failed attempt. |
+| `staged_write_bytes` | Payload bytes submitted to temporary-file writes, including later deduplication. |
+| `deduplicated_bytes` | Identical immutable bytes already present at their content-addressed paths. |
+| `aborted_staged_write_bytes` | Bytes staged by publications explicitly abandoned before commit. |
+| `failed_staged_write_bytes` | Bytes staged by publications that ended with an error. |
+
+The counters describe host-side operations. They do not report filesystem
+allocation, NVMe Data Units Written, controller write amplification, or NAND
+writes.
+
+Telemetry is observational. It cannot change publication, restore, cache
+identity, or serving decisions.
+
+Timing is diagnostic only. Missing timing data does not change whether a
+stored entry may be used.
+
+## Package map
+
+| Module | Purpose |
+|---|---|
+| `spark_context_cache_connector.py` | Scheduler decisions, worker I/O, all-rank agreement, and vLLM callbacks |
+| `spark_context_cache_config.py` | Validated settings, topology, and cache identity |
+| `spark_context_cache_profiles.py` | Storage layout, record schema, geometry, and profile checks |
+| `persistent_context_cache/cache_manifest.py` | Publication, lookup, restore, invalidation, and maintenance |
+| `spark_context_cache_cuda_placement.py` | Attested C++/CUDA placement transaction |
+| `spark_context_cache_cuda_restore.py` | Bounded reading, verification, and placement |
+| `streaming/` | Default-off streaming publication research |
+| `replication/` | Carrier-independent replication research |
+
+`sparkcache.spark_context_cache_store` is the stable manifest-store import.
+
+## Profiles and tests
+
+Model names, checkpoints, topology, launch commands, measurements, and live
+test records live under [`../deploy/`](../deploy/).
 
 ```bash
 python -m pytest sparkcache -q
 python -m ruff check sparkcache
 ```
 
-The Python suite is GPU-free. Native CUDA execution requires a CUDA 13 build
-from `native/CMakeLists.txt`.
+The Python suite is GPU-free. CUDA execution requires a compatible build from
+[`native/CMakeLists.txt`](native/CMakeLists.txt).

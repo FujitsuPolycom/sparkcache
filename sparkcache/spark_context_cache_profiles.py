@@ -4,7 +4,7 @@ A profile declares how one model family's registered KV-cache layers map
 onto the cache's persistent record vocabulary, plus the identity strings
 that pin cached bytes to a layout. Profiles carry no runtime state and no
 vllm/torch imports; the connector resolves one profile at construction and
-threads its values through the codec and the native placement layer.
+threads its values through the codec and the SparkCache CUDA placement layer.
 
 The profile name itself is never serialized. Cache identity remains the
 tuple of layout strings, checkpoint digests, parallel degrees, geometry,
@@ -13,15 +13,16 @@ values interoperate, and any field difference forks the storage namespace
 into a clean miss (miss-not-alias is the invariant).
 
 The record vocabulary is closed: ``target_ckv``, ``sparse_indexer``,
-``mtp_draft_kv``, plus the non-data ``logical_positions`` and the
-policy-gated ``boundary_hidden``. Profiles map model layers onto these
+``mtp_draft_kv``, plus the non-data ``logical_positions`` and the optional
+``boundary_hidden``. Profiles map model layers onto these
 kinds; unsupported kinds are rejected because the on-disk chunk ABI and the
-native placement ABI (at most ``MAX_RECORD_KINDS`` data records per chunk)
+SparkCache CUDA placement ABI (at most ``MAX_RECORD_KINDS`` data records per chunk)
 are frozen.
 """
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Mapping
 
@@ -31,7 +32,8 @@ DATA_FAMILIES = frozenset(
     {"target_ckv", "sparse_indexer", "mtp_draft_kv", "boundary_hidden"}
 )
 
-# Native placement ABI ordinals (spark_cache_native RECORD_*). Frozen; a
+# SparkCache CUDA placement ABI ordinals (legacy spark_cache_native RECORD_*).
+# Frozen; a
 # profile maps families onto them and must never renumber.
 NATIVE_RECORD_ORDINALS = {
     "target_ckv": 0,
@@ -40,7 +42,7 @@ NATIVE_RECORD_ORDINALS = {
     "boundary_hidden": 3,
 }
 
-# Ceiling from the native chunk descriptor (record_offset/length arrays).
+# Ceiling from the C++/CUDA chunk descriptor (record_offset/length arrays).
 MAX_NATIVE_RECORD_KINDS = 4
 
 _DRAFT_POLICIES = frozenset({"separate", "colocated_target"})
@@ -81,7 +83,7 @@ class ModelProfile:
     # and capacity accounting deliberately remain unchanged; no implemented
     # shared-storage interface consumes this field.
     kv_replicated_across_tp: bool = False
-    native_page_restore: bool = False
+    cuda_page_restore: bool = False
 
     def __post_init__(self) -> None:
         if self.boundary_hidden_policy not in _BOUNDARY_POLICIES:
@@ -100,9 +102,9 @@ class ModelProfile:
             raise ProfileError(
                 f"profile {self.name}: unknown storage mode {self.storage_mode!r}"
             )
-        if self.native_page_restore and self.storage_mode != "block_pages_v1":
+        if self.cuda_page_restore and self.storage_mode != "block_pages_v1":
             raise ProfileError(
-                f"profile {self.name}: native_page_restore requires block pages"
+                f"profile {self.name}: cuda_page_restore requires block pages"
             )
         families = {family for _, family in self.classification_rules}
         families |= self.required_families | self.optional_families
@@ -115,13 +117,15 @@ class ModelProfile:
             )
         for rule in self.classification_rules:
             if not rule[0]:
-                raise ProfileError(
-                    f"profile {self.name}: empty classification pattern"
-                )
+                raise ProfileError(f"profile {self.name}: empty classification pattern")
         if not self.required_families:
-            raise ProfileError(
-                f"profile {self.name}: at least one required family"
-            )
+            raise ProfileError(f"profile {self.name}: at least one required family")
+
+    @property
+    def native_page_restore(self) -> bool:
+        """Compatibility alias for :attr:`cuda_page_restore`."""
+
+        return self.cuda_page_restore
 
     def persisted_families(self, draft_kv_policy: str) -> frozenset[str]:
         """Data families a store must cover under the active draft policy.
@@ -151,8 +155,7 @@ class ModelProfile:
         state registers unmarked inside the target pool.
         """
         return (
-            draft_kv_policy == "separate"
-            and "mtp_draft_kv" in self.required_families
+            draft_kv_policy == "separate" and "mtp_draft_kv" in self.required_families
         )
 
     def validate_for_deployment(
@@ -161,18 +164,14 @@ class ModelProfile:
         dcp_degree: int,
         block_size: int,
         min_span_tokens: int,
-        native_restore: bool,
+        cuda_restore: bool | None = None,
+        native_restore: bool | None = None,
     ) -> None:
         """Fail startup on geometry a store or restore would corrupt or
         silently truncate later.
         """
         if dcp_degree <= 0:
             raise ProfileError("dcp_degree must be positive")
-        if self.storage_mode == "block_pages_v1" and dcp_degree != 1:
-            raise ProfileError(
-                f"profile {self.name}: block-page storage requires"
-                " dcp_degree 1"
-            )
         if self.chunk_tokens % dcp_degree:
             raise ProfileError(
                 f"profile {self.name}: chunk_tokens {self.chunk_tokens} is not"
@@ -192,12 +191,24 @@ class ModelProfile:
                 f"profile {self.name}: min_span_tokens {min_span_tokens} is"
                 f" below one chunk ({self.chunk_tokens} tokens)"
             )
-        if native_restore:
+        if cuda_restore is not None and native_restore is not None:
+            if bool(cuda_restore) != bool(native_restore):
+                raise ProfileError(
+                    "conflicting cuda_restore and legacy native_restore values"
+                )
+        if cuda_restore is None and native_restore is not None:
+            warnings.warn(
+                "native_restore is deprecated; use cuda_restore",
+                FutureWarning,
+                stacklevel=2,
+            )
+            cuda_restore = native_restore
+        if cuda_restore:
             if self.storage_mode == "block_pages_v1":
-                if not self.native_page_restore:
+                if not self.cuda_page_restore:
                     raise ProfileError(
-                        f"profile {self.name}: native restore does not support"
-                        " this block-page layout"
+                        f"profile {self.name}: SparkCache CUDA restore does not"
+                        " support this block-page layout"
                     )
                 return
             persisted = self.persisted_families(self.default_draft_kv_policy)
@@ -208,13 +219,13 @@ class ModelProfile:
             } & persisted
             if unmapped:
                 raise ProfileError(
-                    f"profile {self.name}: families lack native ordinals:"
+                    f"profile {self.name}: families lack C++/CUDA ordinals:"
                     f" {', '.join(sorted(unmapped))}"
                 )
             if len(persisted) > MAX_NATIVE_RECORD_KINDS:
                 raise ProfileError(
                     f"profile {self.name}: {len(persisted)} persisted families"
-                    f" exceed the native ABI ceiling of"
+                    f" exceed the C++/CUDA ABI ceiling of"
                     f" {MAX_NATIVE_RECORD_KINDS}"
                 )
 
@@ -238,9 +249,7 @@ PROFILES: Mapping[str, ModelProfile] = {
             ("mtp", "mtp_draft_kv"),
             ("spec", "mtp_draft_kv"),
         ),
-        required_families=frozenset(
-            {"target_ckv", "sparse_indexer", "mtp_draft_kv"}
-        ),
+        required_families=frozenset({"target_ckv", "sparse_indexer", "mtp_draft_kv"}),
         chunk_tokens=256,
         kv_replicated_across_tp=True,
     ),
@@ -259,7 +268,7 @@ PROFILES: Mapping[str, ModelProfile] = {
         required_families=frozenset({"target_ckv"}),
         chunk_tokens=256,
         storage_mode="block_pages_v1",
-        native_page_restore=True,
+        cuda_page_restore=True,
         kv_replicated_across_tp=True,
     ),
     "deepseek-v4-fp8-hma": ModelProfile(

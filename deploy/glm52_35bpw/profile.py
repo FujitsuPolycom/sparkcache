@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+import warnings
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
@@ -49,6 +50,35 @@ DEFAULT_STREAMING_LEASE_CONTRACT = (
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _PORT_ENVIRONMENT_RE = re.compile(r"(?:^|_)PORT\d*\Z")
+_LEGACY_CUDA_RESTORE_WARNING_EMITTED = False
+
+
+def _resolve_compat_option(
+    canonical: Any,
+    legacy: Any,
+    *,
+    canonical_name: str,
+    legacy_name: str,
+    default: Any,
+) -> Any:
+    global _LEGACY_CUDA_RESTORE_WARNING_EMITTED
+    if canonical is not None and legacy is not None and canonical != legacy:
+        raise ProfileTransformError(
+            f"conflicting {canonical_name} and legacy alias {legacy_name}"
+        )
+    if canonical is not None:
+        return canonical
+    if legacy is not None:
+        if not _LEGACY_CUDA_RESTORE_WARNING_EMITTED:
+            _LEGACY_CUDA_RESTORE_WARNING_EMITTED = True
+            warnings.warn(
+                "legacy SparkCache CUDA profile names are deprecated; use"
+                " canonical SparkCache CUDA restore names",
+                FutureWarning,
+                stacklevel=3,
+            )
+        return legacy
+    return default
 
 
 def _require_sha256(value: str, role: str) -> str:
@@ -263,7 +293,7 @@ def _validate_r7_arguments(arguments: list[str]) -> None:
             )
     if "--disable-prefix-caching" in arguments:
         raise ProfileTransformError(
-            "source GLM-5.2 serving recipe R7 must use its native prefix-cache default or"
+            "source GLM-5.2 serving recipe R7 must use its vLLM prefix-cache default or"
             " --enable-prefix-caching"
         )
     for preserved_flag in (
@@ -294,13 +324,54 @@ def build_kv_transfer_config(
     streaming_native_library: str | None = None,
     streaming_native_library_sha256: str | None = None,
     streaming_timing: bool = False,
-    native_restore: bool = False,
+    cuda_restore: bool | None = None,
+    cuda_placement_library: str | None = None,
+    cuda_placement_library_sha256: str | None = None,
+    cuda_placement_arena_bytes: int | None = None,
+    cuda_restore_io_workers: int | None = None,
+    native_restore: bool | None = None,
     native_restore_library: str | None = None,
     native_restore_library_sha256: str | None = None,
-    native_restore_arena_bytes: int = 128 * 1024 * 1024,
-    native_restore_io_workers: int = 8,
+    native_restore_arena_bytes: int | None = None,
+    native_restore_io_workers: int | None = None,
 ) -> dict[str, Any]:
     """Build the complete connector argument for one deployment instance."""
+
+    cuda_restore = _resolve_compat_option(
+        cuda_restore,
+        native_restore,
+        canonical_name="cuda_restore",
+        legacy_name="native_restore",
+        default=False,
+    )
+    cuda_placement_library = _resolve_compat_option(
+        cuda_placement_library,
+        native_restore_library,
+        canonical_name="cuda_placement_library",
+        legacy_name="native_restore_library",
+        default=None,
+    )
+    cuda_placement_library_sha256 = _resolve_compat_option(
+        cuda_placement_library_sha256,
+        native_restore_library_sha256,
+        canonical_name="cuda_placement_library_sha256",
+        legacy_name="native_restore_library_sha256",
+        default=None,
+    )
+    cuda_placement_arena_bytes = _resolve_compat_option(
+        cuda_placement_arena_bytes,
+        native_restore_arena_bytes,
+        canonical_name="cuda_placement_arena_bytes",
+        legacy_name="native_restore_arena_bytes",
+        default=128 * 1024 * 1024,
+    )
+    cuda_restore_io_workers = _resolve_compat_option(
+        cuda_restore_io_workers,
+        native_restore_io_workers,
+        canonical_name="cuda_restore_io_workers",
+        legacy_name="native_restore_io_workers",
+        default=8,
+    )
 
     checkpoint_sha256 = _require_sha256(checkpoint_sha256, "checkpoint_sha256")
     cache_root = _cache_root(cache_root)
@@ -313,7 +384,7 @@ def build_kv_transfer_config(
         "spark_cache_restore": True,
         "spark_cache_scheduler_probe": "none",
         "spark_cache_streaming_snapshots": bool(streaming_snapshots),
-        "spark_cache_native_restore": bool(native_restore),
+        "spark_cache_cuda_restore": bool(cuda_restore),
         "spark_cache_max_bytes": MAX_BYTES,
         "spark_cache_low_watermark_bytes": LOW_WATERMARK_BYTES,
         "spark_cache_ttl_seconds": TTL_SECONDS,
@@ -324,7 +395,7 @@ def build_kv_transfer_config(
     if streaming_snapshots:
         if streaming_native_library is None or streaming_native_library_sha256 is None:
             raise ProfileTransformError(
-                "streaming snapshots require their native library path and SHA-256"
+                "streaming snapshots require their C++/CUDA library path and SHA-256"
             )
         extra.update(
             {
@@ -341,48 +412,55 @@ def build_kv_transfer_config(
                 "spark_cache_streaming_timing": int(bool(streaming_timing)),
             }
         )
-    elif any(
-        value is not None
-        for value in (streaming_native_library, streaming_native_library_sha256)
-    ) or streaming_timing:
+    elif (
+        any(
+            value is not None
+            for value in (streaming_native_library, streaming_native_library_sha256)
+        )
+        or streaming_timing
+    ):
         raise ProfileTransformError(
-            "streaming native options require streaming_snapshots=True"
+            "streaming C++/CUDA options require streaming_snapshots=True"
         )
 
-    if native_restore:
-        if native_restore_library is None or native_restore_library_sha256 is None:
+    if cuda_restore:
+        if cuda_placement_library is None or cuda_placement_library_sha256 is None:
             raise ProfileTransformError(
-                "native restore requires its placement library path and SHA-256"
+                "SparkCache CUDA restore requires its placement library"
+                " path and SHA-256"
             )
-        if native_restore_arena_bytes not in {
+        if cuda_placement_arena_bytes not in {
             64 * 1024 * 1024,
             128 * 1024 * 1024,
             256 * 1024 * 1024,
         }:
             raise ProfileTransformError(
-                "native_restore_arena_bytes must be 64, 128, or 256 MiB"
+                "cuda_placement_arena_bytes must be 64, 128, or 256 MiB"
             )
-        if not 1 <= native_restore_io_workers <= 32:
-            raise ProfileTransformError("native_restore_io_workers must be in [1, 32]")
+        if not 1 <= cuda_restore_io_workers <= 32:
+            raise ProfileTransformError("cuda_restore_io_workers must be in [1, 32]")
         extra.update(
             {
-                "spark_cache_native_library": _deployment_path(
-                    native_restore_library, "native_restore_library"
+                "spark_cache_cuda_placement_library": _deployment_path(
+                    cuda_placement_library, "cuda_placement_library"
                 ),
-                "spark_cache_native_library_sha256": _require_sha256(
-                    native_restore_library_sha256,
-                    "native_restore_library_sha256",
+                "spark_cache_cuda_placement_library_sha256": _require_sha256(
+                    cuda_placement_library_sha256,
+                    "cuda_placement_library_sha256",
                 ),
-                "spark_cache_native_arena_bytes": native_restore_arena_bytes,
-                "spark_cache_native_io_workers": native_restore_io_workers,
+                "spark_cache_cuda_placement_arena_bytes": (cuda_placement_arena_bytes),
+                "spark_cache_cuda_restore_io_workers": cuda_restore_io_workers,
             }
         )
     elif any(
         value is not None
-        for value in (native_restore_library, native_restore_library_sha256)
+        for value in (
+            cuda_placement_library,
+            cuda_placement_library_sha256,
+        )
     ):
         raise ProfileTransformError(
-            "native restore library options require native_restore=True"
+            "SparkCache CUDA placement library options require cuda_restore=True"
         )
 
     return {
@@ -406,9 +484,7 @@ def transform_vllm_args(
 
     arguments = _vllm_args(list(source_command))
     if len(arguments) < 2 or arguments[0] != "serve" or arguments[1].startswith("-"):
-        raise ProfileTransformError(
-            "source command must begin with 'serve MODEL_PATH'"
-        )
+        raise ProfileTransformError("source command must begin with 'serve MODEL_PATH'")
     api_port = _port(api_port, "api_port")
     master_port = _port(master_port, "master_port")
     effective_api_port = api_port or _single_existing_port(arguments, "--port")
@@ -473,12 +549,8 @@ def _transform_environment(
     required = {
         "SPARKRING_ATTEST_MODEL_REPOSITORY": str(PROFILE["model"]["repository"]),
         "SPARKRING_ATTEST_MODEL_REVISION": str(PROFILE["model"]["revision"]),
-        "SPARKRING_ATTEST_MODEL_CONFIG_SHA256": str(
-            PROFILE["model"]["config_sha256"]
-        ),
-        "SPARKRING_ATTEST_MODEL_INDEX_SHA256": str(
-            PROFILE["model"]["index_sha256"]
-        ),
+        "SPARKRING_ATTEST_MODEL_CONFIG_SHA256": str(PROFILE["model"]["config_sha256"]),
+        "SPARKRING_ATTEST_MODEL_INDEX_SHA256": str(PROFILE["model"]["index_sha256"]),
         "KV_FP8_ROPE": "1",
         "VLLM_NVFP4_MLA_DYNAMIC_SCALE": "1",
         "VLLM_EXL3_PREFILL_CAPACITY": str(serving["max_num_batched_tokens"]),
@@ -489,9 +561,7 @@ def _transform_environment(
         "VLLM_SPARK_MTP_ADAPTIVE_WINDOW": "0",
         "VLLM_SPARK_TRUE_ADAPTIVE_DRAFT": "0",
         "VLLM_B12X_MLA_CKV_GATHER": "1",
-        "VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS": str(
-            serving["max_model_len"]
-        ),
+        "VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS": str(serving["max_model_len"]),
         "VLLM_SPARK_TP4_MODE": "custom",
         "SPARK_TP4_LIBRARY": "/opt/sparkring/spark_transport/"
         "libspark_transport_capi.so",
@@ -509,9 +579,10 @@ def _transform_environment(
             raise ProfileTransformError(
                 f"source GLM-5.2 serving recipe R7 entrypoint would unset required variable {name}"
             )
-    public_q40 = environment.get(
-        "SPARK_Q40_EXACT_STATE_EXPECTED_EXL3_SHA256"
-    ) == "8fad5330c88f55dc57e4d8e298f2af23e16390b97153b569a2e572e0fb5065c2"
+    public_q40 = (
+        environment.get("SPARK_Q40_EXACT_STATE_EXPECTED_EXL3_SHA256")
+        == "8fad5330c88f55dc57e4d8e298f2af23e16390b97153b569a2e572e0fb5065c2"
+    )
     if not public_q40 or "SPARK_Q35_EXACT_STATE_EXPECTED_EXL3_SHA256" in environment:
         raise ProfileTransformError(
             "source GLM-5.2 serving recipe R7 environment must select the public target-only"
@@ -558,11 +629,16 @@ def transform_inspection(
     streaming_native_library: str | None = None,
     streaming_native_library_sha256: str | None = None,
     streaming_timing: bool = False,
-    native_restore: bool = False,
+    cuda_restore: bool | None = None,
+    cuda_placement_library: str | None = None,
+    cuda_placement_library_sha256: str | None = None,
+    cuda_placement_arena_bytes: int | None = None,
+    cuda_restore_io_workers: int | None = None,
+    native_restore: bool | None = None,
     native_restore_library: str | None = None,
     native_restore_library_sha256: str | None = None,
-    native_restore_arena_bytes: int = 128 * 1024 * 1024,
-    native_restore_io_workers: int = 8,
+    native_restore_arena_bytes: int | None = None,
+    native_restore_io_workers: int | None = None,
     api_port: int | None = None,
     master_port: int | None = None,
 ) -> dict[str, Any]:
@@ -605,6 +681,11 @@ def transform_inspection(
         streaming_native_library=streaming_native_library,
         streaming_native_library_sha256=streaming_native_library_sha256,
         streaming_timing=streaming_timing,
+        cuda_restore=cuda_restore,
+        cuda_placement_library=cuda_placement_library,
+        cuda_placement_library_sha256=cuda_placement_library_sha256,
+        cuda_placement_arena_bytes=cuda_placement_arena_bytes,
+        cuda_restore_io_workers=cuda_restore_io_workers,
         native_restore=native_restore,
         native_restore_library=native_restore_library,
         native_restore_library_sha256=native_restore_library_sha256,

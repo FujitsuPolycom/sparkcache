@@ -41,8 +41,8 @@ rewrite it.
 
 ## Repository-specific rules
 
-Follow [AGENTS.md](AGENTS.md) for cache-identity compatibility, fail-closed
-degradation, regression-test requirements, stable defect identifiers, and
+Follow [AGENTS.md](AGENTS.md) for cache-identity compatibility,
+verified-or-recompute behavior, regression-test requirements, stable defect identifiers, and
 commit attribution. When a subagent's output becomes repository prose, include
 the write-without-hidden-context standard in its task.
 

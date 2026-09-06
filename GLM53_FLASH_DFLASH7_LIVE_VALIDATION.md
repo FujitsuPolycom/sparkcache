@@ -4,7 +4,9 @@ Status: **qualified** for persistent target-context store, coordinated engine
 restart, all-rank manifest discovery, external restore, continued generation,
 and DFlash2 speculation with seven draft tokens under the exact source
 deployment recorded here. The shorter name `DFlash7` identifies that
-seven-token deployment profile in commands and metrics.
+seven-token deployment profile in commands and metrics. The served alias
+`glm-5.3-flash-nvfp4-dflash7-bf16-tp4` means DFlash2 BF16 with proposal depth
+seven; it does not identify a separate DFlash7 checkpoint.
 
 ## Artifact and serving contract
 
@@ -170,7 +172,7 @@ visible `message.content` must equal `SPARKCACHE_GLM53_OK` byte for byte.
 
 This evidence does not qualify another SparkCache source tree, vLLM source
 contract, target or draft checkpoint, parallel topology, scheduler budget,
-cache geometry, native direct restore, streaming snapshots, or MTP profile.
+cache geometry, SparkCache direct CUDA restore, streaming snapshots, or MTP profile.
 It does not establish throughput neutrality or restore performance for spans
 larger than 8,192 tokens. Full reasoning-trace equality is not a semantic
 oracle for this GLM runtime. The historical canary establishes successful

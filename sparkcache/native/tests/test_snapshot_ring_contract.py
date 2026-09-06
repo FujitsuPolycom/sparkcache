@@ -33,7 +33,7 @@ def test_snapshot_ctypes_sizes_are_fixed() -> None:
     assert ctypes.sizeof(native.SnapshotAbiInfo) == 64
 
 
-def test_header_contract_is_fail_open_and_bounded() -> None:
+def test_header_contract_preserves_serving_and_is_bounded() -> None:
     text = HEADER.read_text(encoding="utf-8")
     assert "#define SPARK_CACHE_SNAPSHOT_ABI_VERSION 1u" in text
     assert "#define SPARK_CACHE_SNAPSHOT_MIN_SLOTS 2u" in text

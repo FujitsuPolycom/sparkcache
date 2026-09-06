@@ -1,0 +1,86 @@
+{
+  "schema": "sparkcache-page-tail-qualification/v1",
+  "runner": "live",
+  "identity": {
+    "publication_schema": "page-tail-cow-v1",
+    "storage_key": "93851754d9a7f6d1b2a861f9253d1267708a15b638a896bd7c67198d96e61c46",
+    "tp_degree": 4,
+    "dcp_degree": 4,
+    "dcp_shard_rank": 0,
+    "record_schema": ["target_ckv", "logical_positions"],
+    "chunk_tokens": 256
+  },
+  "fixture": {
+    "identity_salt": "live-glm53-520de24-four-track-tail-cow-v1",
+    "layout_sha256": "49922c57ea59fdecdeb125b100b1bde129c1029982b591f999efd00335f7a21f",
+    "tokens_per_page": 256
+  },
+  "base": {
+    "context_digest": "413301df0a66bde7530a3daf05eff57e1e1b8189e814eaf241001ee093da3630",
+    "manifest_digest": "7d1af76dc3901b86a01e178bc4a016e637646af2de95eda46bae7efe20404fa4",
+    "commit_ms": 454.4,
+    "snapshot_bytes": 201973922,
+    "committed_tokens": 98304
+  },
+  "deltas": [
+    {
+      "context_digest": "c3b026cb8c6a87198a8cd835910aed889f641e1babc3507b326804235f14dcf1",
+      "manifest_digest": "5cce5c66bedb96efb83c9e7c1f6f97bcb5eeae388a2539149891d18c8eec9587",
+      "manifest_schema": "sparkcache-page-delta-manifest/v2",
+      "compacted": false,
+      "commit_ms": 1508.2,
+      "restore_ms": 605.1,
+      "base_context_digest": "413301df0a66bde7530a3daf05eff57e1e1b8189e814eaf241001ee093da3630",
+      "base_committed_tokens": 98304,
+      "committed_tokens": 131072,
+      "base_snapshot_bytes": 201973922,
+      "delta_encoded_bytes": 100875798,
+      "delta_objects": 2,
+      "result_snapshot_bytes": 302849720,
+      "result_snapshot_sha256": "93e0817999e920e07c83608a74e58777b56d7256c0707e68b4e3729662f5d958"
+    }
+  ],
+  "result": {
+    "context_digest": "c3b026cb8c6a87198a8cd835910aed889f641e1babc3507b326804235f14dcf1",
+    "committed_tokens": 131072,
+    "expected_snapshot_sha256": "93e0817999e920e07c83608a74e58777b56d7256c0707e68b4e3729662f5d958",
+    "restart_restore_ms": 631.9
+  },
+  "unique_publication_bytes": 302854905,
+  "logical_snapshot_bytes": 302849720,
+  "corruption": {
+    "object": "cffcd7641cb445ec0c5a1239fed1b42050e66e4deb0fa040c5414b7b30a03e5f.spcc",
+    "byte_offset": 0,
+    "rejected": true,
+    "lookup_reason": "corrupt"
+  },
+  "validation": {
+    "byte_exact_restores": true,
+    "complete_snapshot_equal": true,
+    "corruption_rejected": true
+  },
+  "live": {
+    "image_id": "sha256:2797b5bb91769a0baac79c7aa32c4fe9a0e5cf94a6d821ec526535c744ae79a6",
+    "sparkcache_commit": "fe5f7f134f1af1f07f16187bd0ca549630c8d332",
+    "sparkring_commit": "afe26a8add9a3d9fe136820506303e97bd5e622e",
+    "target_checkpoint": "local-inference-lab/GLM-5.3-Flash-NVFP4@520de24eabf507659eaef7c70f14fd584527facc",
+    "draft_checkpoint": "incoai/GLM-5.3-Flash-DFlash2@dc77ff1c99eeb2df044ee3d4f0094eb033fee410",
+    "topology": "TP4/DCP4",
+    "base_bytes": [201973922, 201973922, 201973922, 201973922],
+    "delta_bytes": [100875798, 100875798, 100875798, 100875798],
+    "commit_ms_by_rank": {
+      "base": [454.4, 420.4, 430.0, 415.6],
+      "delta": [1661.0, 1615.9, 1548.7, 1675.2]
+    },
+    "restart_restore_ms_by_rank": [631.9, 657.2, 666.0, 685.0],
+    "post_repair_restore_ms_by_rank": [605.1, 671.7, 699.3, 735.1],
+    "base_semantic": "BASE",
+    "extension_semantic": "BLUE",
+    "restart_semantic": "BLUE",
+    "corruption_fallback_semantic": "BLUE",
+    "post_repair_semantic": "BLUE",
+    "corruption_fallback_tokens": 98304,
+    "corruption_fallback_elapsed_seconds": 15.299,
+    "post_repair_elapsed_seconds": 2.67
+  }
+}

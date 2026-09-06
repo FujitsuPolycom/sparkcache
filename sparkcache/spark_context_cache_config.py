@@ -4,7 +4,7 @@ Both the scheduler and worker connector roles share one parsing path.
 ``parse_connector_config`` reads all SparkCache settings from a
 ``VllmConfig``-like object — extra-config keys, environment variables,
 parallel degrees, model profile, and KV-cache group topology. It validates
-the fail-closed deployment contract and returns an immutable
+the verified-or-recompute deployment contract and returns an immutable
 :class:`ConnectorConfig` carrying every value the connector needs at
 construction.
 
@@ -18,12 +18,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
+import threading
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from sparkcache.spark_context_cache_profiles import (
     ProfileError,
@@ -41,9 +44,136 @@ from sparkcache.streaming.feature_gate import (
 )
 
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
-_NATIVE_ARENA_BYTES = frozenset(
+_CUDA_PLACEMENT_ARENA_BYTES = frozenset(
     {64 * 1024 * 1024, 128 * 1024 * 1024, 256 * 1024 * 1024}
 )
+_MISSING = object()
+_ACCESS_MODES = {
+    "read-write": (True, True),
+    "restore-only": (False, True),
+    "store-only": (True, False),
+    "disabled": (False, False),
+}
+_LEGACY_CUDA_RESTORE_WARNING_LOCK = threading.Lock()
+_LEGACY_CUDA_RESTORE_WARNING_EMITTED = False
+_ASYNC_PAGE_CAPTURE_CONFIG = "spark_cache_async_page_capture"
+_ASYNC_PAGE_CAPTURE_ENV = "SPARK_CONTEXT_CACHE_ASYNC_PAGE_CAPTURE"
+_DEFAULT_SHARED_PREFIX_LEASE_TTL_SECONDS = 15.0
+_MAX_SHARED_PREFIX_LEASE_TTL_SECONDS = 300.0
+
+
+def _warn_legacy_cuda_restore_config() -> None:
+    """Warn once when a process relies only on legacy configuration names."""
+
+    global _LEGACY_CUDA_RESTORE_WARNING_EMITTED
+    with _LEGACY_CUDA_RESTORE_WARNING_LOCK:
+        if _LEGACY_CUDA_RESTORE_WARNING_EMITTED:
+            return
+        _LEGACY_CUDA_RESTORE_WARNING_EMITTED = True
+    warnings.warn(
+        "legacy SparkCache CUDA configuration names are deprecated; use the"
+        " canonical SparkCache CUDA restore configuration names",
+        FutureWarning,
+        stacklevel=3,
+    )
+
+
+def _compat_config_value(
+    extra: Callable[[str, Any], Any],
+    *,
+    canonical_key: str,
+    legacy_key: str,
+    canonical_env: str,
+    legacy_env: str,
+    default: Any,
+    normalize: Callable[[Any], Any] = str,
+) -> Any:
+    """Resolve one canonical setting and its compatibility alias."""
+
+    canonical_extra = extra(canonical_key, _MISSING)
+    legacy_extra = extra(legacy_key, _MISSING)
+    canonical_value = (
+        canonical_extra
+        if canonical_extra is not _MISSING
+        else os.environ.get(canonical_env, _MISSING)
+    )
+    legacy_value = (
+        legacy_extra
+        if legacy_extra is not _MISSING
+        else os.environ.get(legacy_env, _MISSING)
+    )
+    if canonical_value is not _MISSING and legacy_value is not _MISSING:
+        try:
+            disagree = normalize(canonical_value) != normalize(legacy_value)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                "spark-context-cache: conflicting SparkCache CUDA restore"
+                f" settings {canonical_key} and legacy alias {legacy_key}"
+            ) from error
+        if disagree:
+            raise RuntimeError(
+                "spark-context-cache: conflicting SparkCache CUDA restore"
+                f" settings {canonical_key} and legacy alias {legacy_key}"
+            )
+        return canonical_value
+    if canonical_value is not _MISSING:
+        return canonical_value
+    if legacy_value is not _MISSING:
+        _warn_legacy_cuda_restore_config()
+        return legacy_value
+    return default
+
+
+def _config_bool(value: Any) -> bool:
+    if value in (1, "1", True, "true"):
+        return True
+    return False
+
+
+def _access_controls(
+    extra: Callable[[str, Any], Any],
+) -> tuple[str, bool, bool]:
+    """Resolve persistent-cache read and publication controls.
+
+    ``spark_cache_access_mode`` provides an operator-readable baseline. The
+    independent ``spark_cache_store`` and ``spark_cache_restore`` settings
+    remain supported and override their respective baseline values. This
+    preserves existing configurations while allowing a deployment to request
+    restore-only operation explicitly.
+    """
+
+    mode_raw = extra(
+        "spark_cache_access_mode",
+        os.environ.get("SPARK_CONTEXT_CACHE_ACCESS_MODE", "read-write"),
+    )
+    mode = str(mode_raw).strip().lower()
+    try:
+        default_store, default_restore = _ACCESS_MODES[mode]
+    except KeyError as error:
+        choices = ", ".join(sorted(_ACCESS_MODES))
+        raise RuntimeError(
+            "spark-context-cache: spark_cache_access_mode must be one of "
+            f"{choices}"
+        ) from error
+
+    store_raw = extra("spark_cache_store", _MISSING)
+    if store_raw is _MISSING:
+        store_raw = os.environ.get("SPARK_CONTEXT_CACHE_STORE", _MISSING)
+    restore_raw = extra("spark_cache_restore", _MISSING)
+    if restore_raw is _MISSING:
+        restore_raw = os.environ.get("SPARK_CONTEXT_CACHE_RESTORE", _MISSING)
+    store_enabled = (
+        default_store if store_raw is _MISSING else _config_bool(store_raw)
+    )
+    restore_enabled = (
+        default_restore if restore_raw is _MISSING else _config_bool(restore_raw)
+    )
+    effective_mode = next(
+        name
+        for name, controls in _ACCESS_MODES.items()
+        if controls == (store_enabled, restore_enabled)
+    )
+    return effective_mode, store_enabled, restore_enabled
 
 
 def _nonnegative_config_int(value: Any, label: str) -> int:
@@ -57,6 +187,35 @@ def _nonnegative_config_int(value: Any, label: str) -> int:
         ) from error
     if parsed < 0:
         raise RuntimeError(f"spark-context-cache: {label} must be non-negative")
+    return parsed
+
+
+def _bounded_positive_config_float(
+    value: Any,
+    label: str,
+    *,
+    minimum: float,
+    maximum: float,
+) -> float:
+    """Parse a finite positive duration with an explicit upper bound."""
+
+    try:
+        if isinstance(value, bool):
+            raise ValueError("Boolean values are not durations")
+        parsed = float(value)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"spark-context-cache: {label} must be a finite number"
+        ) from error
+    if not math.isfinite(parsed):
+        raise RuntimeError(
+            f"spark-context-cache: {label} must be a finite number"
+        )
+    if not minimum <= parsed <= maximum:
+        raise RuntimeError(
+            f"spark-context-cache: {label} must be at least {minimum:g} and at most"
+            f" {maximum:g} seconds"
+        )
     return parsed
 
 
@@ -163,19 +322,39 @@ def _recurrent_state_identity(
     return {field: next(iter(choices)) for field, choices in values.items()}
 
 
-def kv_group_topology(kv_cache_config: Any) -> tuple[dict[str, Any], ...]:
+def kv_group_topology(
+    kv_cache_config: Any,
+    *,
+    dcp_degree: int = 1,
+) -> tuple[dict[str, Any], ...]:
+    """Describe each manager group, including its DCP page ownership."""
+
+    if dcp_degree <= 0:
+        raise RuntimeError("spark-context-cache: DCP degree must be positive")
     groups = tuple(getattr(kv_cache_config, "kv_cache_groups", ()) or ())
     topology = []
     for group_index, group in enumerate(groups):
         spec = getattr(group, "kv_cache_spec", None)
         layers = tuple(sorted(getattr(group, "layer_names", ()) or ()))
         reuse_policy, reuse_window_tokens = _group_reuse_policy(spec, layers)
+        dcp_replicated = bool(
+            getattr(spec, "dcp_replicated", reuse_policy == "recurrent_align")
+        )
+        dcp_shard_count = 1 if dcp_replicated else dcp_degree
+        block_size = int(getattr(spec, "block_size", 0) or 0)
+        if block_size <= 0:
+            raise RuntimeError(
+                "spark-context-cache: KV-cache group block size must be positive"
+            )
         group_identity = {
             "group": group_index,
             "spec": type(spec).__name__,
-            "block_size": int(getattr(spec, "block_size", 0) or 0),
+            "block_size": block_size,
             "storage_block_size": int(getattr(spec, "storage_block_size", 0) or 0),
             "page_size_bytes": int(getattr(spec, "page_size_bytes", 0) or 0),
+            "dcp_replicated": dcp_replicated,
+            "dcp_shard_count": dcp_shard_count,
+            "logical_tokens_per_block": block_size * dcp_shard_count,
             "reuse_policy": reuse_policy,
             "reuse_window_tokens": reuse_window_tokens,
             "eagle": bool(getattr(group, "is_eagle_group", False)),
@@ -188,9 +367,9 @@ def kv_group_topology(kv_cache_config: Any) -> tuple[dict[str, Any], ...]:
     return tuple(topology)
 
 
-def kv_group_topology_digest(kv_cache_config: Any) -> str:
+def kv_group_topology_digest(kv_cache_config: Any, *, dcp_degree: int = 1) -> str:
     encoded = json.dumps(
-        kv_group_topology(kv_cache_config),
+        kv_group_topology(kv_cache_config, dcp_degree=dcp_degree),
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -203,7 +382,7 @@ class ConnectorConfig:
 
     Every core connector field is determined solely by the vLLM config,
     extra-config keys, environment variables, and model profile supplied at
-    construction. The optional streaming factory owns its native artifact,
+    construction. The optional streaming factory owns its C++/CUDA artifact,
     vLLM-root, lease-contract, and timing settings and validates them while the
     connector is still starting. Both scheduler and worker roles receive the
     same :class:`ConnectorConfig` for the same deployment, so cache-identity
@@ -212,6 +391,7 @@ class ConnectorConfig:
 
     tp_degree: int
     dcp_degree: int
+    cp_kv_cache_interleave_size: int
     block_size: int
     profile: Any
     storage_mode: str
@@ -223,18 +403,52 @@ class ConnectorConfig:
     capacity_policy: CapacityPolicy
     min_span: int
     max_span: int
+    access_mode: str
     store_enabled: bool
     restore_enabled: bool
     streaming_snapshots_enabled: bool
-    native_restore_enabled: bool
-    native_library_path: str
-    native_library_sha256: str
-    native_arena_bytes: int
-    native_io_workers: int
+    async_page_capture_enabled: bool
+    cuda_restore_enabled: bool
+    cuda_placement_library_path: str
+    cuda_placement_library_sha256: str
+    cuda_placement_arena_bytes: int
+    cuda_restore_io_workers: int
     scheduler_probe: str
     identity_base: Mapping[str, Any]
     load_thread_limit: int
     max_pending_restores: int
+    max_delayed_stores: int
+    shared_prefix_lease_ttl_seconds: float
+
+    @property
+    def native_restore_enabled(self) -> bool:
+        """Compatibility alias for :attr:`cuda_restore_enabled`."""
+
+        return self.cuda_restore_enabled
+
+    @property
+    def native_library_path(self) -> str:
+        """Compatibility alias for the CUDA placement library path."""
+
+        return self.cuda_placement_library_path
+
+    @property
+    def native_library_sha256(self) -> str:
+        """Compatibility alias for the CUDA placement library digest."""
+
+        return self.cuda_placement_library_sha256
+
+    @property
+    def native_arena_bytes(self) -> int:
+        """Compatibility alias for the CUDA placement arena size."""
+
+        return self.cuda_placement_arena_bytes
+
+    @property
+    def native_io_workers(self) -> int:
+        """Compatibility alias for the CUDA restore I/O worker count."""
+
+        return self.cuda_restore_io_workers
 
     def build_identity(self, shard_rank: int, tp_shard_rank: int) -> CacheIdentity:
         """Construct a :class:`CacheIdentity` for a DCP shard rank.
@@ -266,11 +480,32 @@ def parse_connector_config(
     parallel = vllm_config.parallel_config
     tp_degree = max(1, getattr(parallel, "tensor_parallel_size", 1))
     dcp_degree = max(1, getattr(parallel, "decode_context_parallel_size", 1))
+    cp_kv_cache_interleave_size = getattr(
+        parallel,
+        "cp_kv_cache_interleave_size",
+        getattr(parallel, "dcp_kv_cache_interleave_size", 1),
+    )
+    if (
+        type(cp_kv_cache_interleave_size) is not int
+        or cp_kv_cache_interleave_size <= 0
+    ):
+        raise RuntimeError(
+            "spark-context-cache: cp_kv_cache_interleave_size must be a"
+            " positive integer"
+        )
     if tp_degree % dcp_degree:
         raise RuntimeError(
             "spark-context-cache: decode context parallel size must divide"
             f" tensor parallel size (tp={tp_degree},"
             f" dcp={dcp_degree})"
+        )
+    if (
+        block_size < cp_kv_cache_interleave_size
+        or block_size % cp_kv_cache_interleave_size
+    ):
+        raise RuntimeError(
+            "spark-context-cache: cache block size must be at least and"
+            " divisible by cp_kv_cache_interleave_size"
         )
     pp_degree = max(1, getattr(parallel, "pipeline_parallel_size", 1))
     if pp_degree > 1:
@@ -281,12 +516,16 @@ def parse_connector_config(
             f" pipeline_parallel_size={pp_degree}"
         )
     extra = kv_transfer_config.get_from_extra_config
-    profile_name = str(
-        extra(
-            "spark_cache_model_profile",
-            os.environ.get("SPARK_CONTEXT_CACHE_MODEL_PROFILE", "glm52-nvfp4"),
-        )
+    profile_value = extra(
+        "spark_cache_model_profile",
+        os.environ.get("SPARK_CONTEXT_CACHE_MODEL_PROFILE"),
     )
+    if profile_value is None or not str(profile_value).strip():
+        raise RuntimeError(
+            "spark-context-cache: spark_cache_model_profile is required; "
+            "select a registered deployment profile explicitly"
+        )
+    profile_name = str(profile_value).strip()
     try:
         profile = resolve_profile(profile_name)
     except ProfileError as error:
@@ -301,22 +540,37 @@ def parse_connector_config(
             ),
         )
     )
-    if publication_schema_raw not in ("snapshot-v1", "tail-cow-v1"):
+    if publication_schema_raw not in (
+        "snapshot-v1",
+        "tail-cow-v1",
+        "tail-cow-v2",
+    ):
         raise RuntimeError(
             "spark-context-cache: spark_cache_publication_schema must be"
-            " 'snapshot-v1' or 'tail-cow-v1'"
+            " 'snapshot-v1', 'tail-cow-v1', or 'tail-cow-v2'"
         )
     publication_schema = ""
     if publication_schema_raw == "tail-cow-v1":
         publication_schema = (
             "page-tail-cow-v1" if storage_mode == "block_pages_v1" else "tail-cow-v1"
         )
-    group_topology = kv_group_topology(kv_cache_config)
+    elif publication_schema_raw == "tail-cow-v2":
+        if storage_mode != "block_pages_v1":
+            raise RuntimeError(
+                "spark-context-cache: tail-cow-v2 requires block-page storage"
+            )
+        publication_schema = "page-tail-cow-v2"
+    group_topology = kv_group_topology(kv_cache_config, dcp_degree=dcp_degree)
     if storage_mode == "block_pages_v1" and not group_topology:
         raise RuntimeError(
             "spark-context-cache: block-page storage requires KV-cache groups"
         )
     chunk_tokens = profile.chunk_tokens
+    if storage_mode == "per_token_rows" and cp_kv_cache_interleave_size != 1:
+        raise RuntimeError(
+            "spark-context-cache: per-token row storage supports only"
+            " cp_kv_cache_interleave_size=1"
+        )
     load_policy = str(
         getattr(kv_transfer_config, "kv_load_failure_policy", "recompute")
     )
@@ -395,16 +649,9 @@ def parse_connector_config(
             os.environ.get("SPARK_CONTEXT_CACHE_MAX_SPAN", default_max_span),
         )
     )
-    store_enabled = extra(
-        "spark_cache_store",
-        os.environ.get("SPARK_CONTEXT_CACHE_STORE", "1"),
-    ) in (1, "1", True, "true")
-    restore_enabled = extra(
-        "spark_cache_restore",
-        os.environ.get("SPARK_CONTEXT_CACHE_RESTORE", "1"),
-    ) in (1, "1", True, "true")
+    access_mode, store_enabled, restore_enabled = _access_controls(extra)
     try:
-        streaming_snapshots_enabled = _streaming_snapshots_enabled(
+        streaming_snapshots_requested = _streaming_snapshots_enabled(
             extra(
                 _STREAMING_SNAPSHOTS_CONFIG,
                 os.environ.get(_STREAMING_SNAPSHOTS_ENV, "0"),
@@ -412,6 +659,34 @@ def parse_connector_config(
         )
     except ValueError as error:
         raise RuntimeError(f"spark-context-cache: {error}") from error
+    streaming_snapshots_enabled = streaming_snapshots_requested and store_enabled
+    try:
+        async_page_capture_enabled = _streaming_snapshots_enabled(
+            extra(
+                _ASYNC_PAGE_CAPTURE_CONFIG,
+                os.environ.get(_ASYNC_PAGE_CAPTURE_ENV, "0"),
+            )
+        )
+    except ValueError as error:
+        raise RuntimeError(
+            "spark-context-cache: spark_cache_async_page_capture must be"
+            " 0/1 or false/true"
+        ) from error
+    if async_page_capture_enabled and storage_mode != "block_pages_v1":
+        raise RuntimeError(
+            "spark-context-cache: asynchronous manager-page capture requires"
+            " block-page storage"
+        )
+    if async_page_capture_enabled and not store_enabled:
+        raise RuntimeError(
+            "spark-context-cache: asynchronous manager-page capture requires"
+            " cache publication"
+        )
+    if async_page_capture_enabled and streaming_snapshots_enabled:
+        raise RuntimeError(
+            "spark-context-cache: asynchronous manager-page capture and"
+            " row streaming snapshots are mutually exclusive"
+        )
     if storage_mode == "block_pages_v1" and streaming_snapshots_enabled:
         raise RuntimeError(
             "spark-context-cache: block-page storage does not support"
@@ -422,68 +697,99 @@ def parse_connector_config(
             "spark-context-cache: tail-cow-v1 publication does not support"
             " streaming snapshots"
         )
-    native_restore_enabled = extra(
-        "spark_cache_native_restore",
-        os.environ.get("SPARK_CONTEXT_CACHE_NATIVE_RESTORE", "0"),
-    ) in (1, "1", True, "true")
-    native_library_path = str(
-        extra(
-            "spark_cache_native_library",
-            os.environ.get("SPARK_CONTEXT_CACHE_NATIVE_LIBRARY", ""),
+    cuda_restore_requested = _config_bool(
+        _compat_config_value(
+            extra,
+            canonical_key="spark_cache_cuda_restore",
+            legacy_key="spark_cache_native_restore",
+            canonical_env="SPARK_CONTEXT_CACHE_CUDA_RESTORE",
+            legacy_env="SPARK_CONTEXT_CACHE_NATIVE_RESTORE",
+            default="0",
+            normalize=_config_bool,
+        )
+    )
+    cuda_restore_enabled = cuda_restore_requested and restore_enabled
+    cuda_placement_library_path = str(
+        _compat_config_value(
+            extra,
+            canonical_key="spark_cache_cuda_placement_library",
+            legacy_key="spark_cache_native_library",
+            canonical_env="SPARK_CONTEXT_CACHE_CUDA_PLACEMENT_LIBRARY",
+            legacy_env="SPARK_CONTEXT_CACHE_NATIVE_LIBRARY",
+            default="",
         )
         or ""
     )
-    native_library_sha256 = str(
-        extra(
-            "spark_cache_native_library_sha256",
-            os.environ.get("SPARK_CONTEXT_CACHE_NATIVE_LIBRARY_SHA256", ""),
+    cuda_placement_library_sha256 = str(
+        _compat_config_value(
+            extra,
+            canonical_key="spark_cache_cuda_placement_library_sha256",
+            legacy_key="spark_cache_native_library_sha256",
+            canonical_env="SPARK_CONTEXT_CACHE_CUDA_PLACEMENT_LIBRARY_SHA256",
+            legacy_env="SPARK_CONTEXT_CACHE_NATIVE_LIBRARY_SHA256",
+            default="",
         )
         or ""
     )
-    native_arena_raw = str(
-        extra(
-            "spark_cache_native_arena_bytes",
-            os.environ.get("SPARK_CONTEXT_CACHE_NATIVE_ARENA_BYTES", ""),
+    cuda_placement_arena_raw = str(
+        _compat_config_value(
+            extra,
+            canonical_key="spark_cache_cuda_placement_arena_bytes",
+            legacy_key="spark_cache_native_arena_bytes",
+            canonical_env="SPARK_CONTEXT_CACHE_CUDA_PLACEMENT_ARENA_BYTES",
+            legacy_env="SPARK_CONTEXT_CACHE_NATIVE_ARENA_BYTES",
+            default="",
+            normalize=int,
         )
         or ""
     )
     try:
-        native_arena_bytes = int(native_arena_raw) if native_arena_raw else 0
+        cuda_placement_arena_bytes = (
+            int(cuda_placement_arena_raw) if cuda_placement_arena_raw else 0
+        )
     except ValueError as error:
-        if native_restore_enabled:
+        if cuda_restore_enabled:
             raise RuntimeError(
-                "spark-context-cache: native restore requires an integer arena size"
+                "spark-context-cache: SparkCache CUDA restore requires an integer"
+                " placement arena size"
             ) from error
-        native_arena_bytes = 0
-    native_workers_raw = extra(
-        "spark_cache_native_io_workers",
-        os.environ.get("SPARK_CONTEXT_CACHE_NATIVE_IO_WORKERS", "8"),
+        cuda_placement_arena_bytes = 0
+    cuda_restore_workers_raw = _compat_config_value(
+        extra,
+        canonical_key="spark_cache_cuda_restore_io_workers",
+        legacy_key="spark_cache_native_io_workers",
+        canonical_env="SPARK_CONTEXT_CACHE_CUDA_RESTORE_IO_WORKERS",
+        legacy_env="SPARK_CONTEXT_CACHE_NATIVE_IO_WORKERS",
+        default="8",
+        normalize=int,
     )
     try:
-        native_io_workers = int(native_workers_raw)
+        cuda_restore_io_workers = int(cuda_restore_workers_raw)
     except (TypeError, ValueError) as error:
-        if native_restore_enabled:
+        if cuda_restore_enabled:
             raise RuntimeError(
-                "spark-context-cache: native restore requires an integer"
+                "spark-context-cache: SparkCache CUDA restore requires an integer"
                 " IO worker count"
             ) from error
-        native_io_workers = 8
-    if native_restore_enabled:
-        library_path = Path(native_library_path)
+        cuda_restore_io_workers = 8
+    if cuda_restore_enabled:
+        library_path = Path(cuda_placement_library_path)
         if (
-            not native_library_path
+            not cuda_placement_library_path
             or not library_path.is_absolute()
-            or SHA256_RE.fullmatch(native_library_sha256) is None
-            or native_arena_bytes not in _NATIVE_ARENA_BYTES
+            or SHA256_RE.fullmatch(cuda_placement_library_sha256) is None
+            or cuda_placement_arena_bytes not in _CUDA_PLACEMENT_ARENA_BYTES
         ):
             raise RuntimeError(
-                "spark-context-cache: native restore requires an"
-                " absolute library path, a 64-character lowercase"
-                " SHA-256, and arena bytes equal to 64, 128, or 256 MiB"
+                "spark-context-cache: SparkCache CUDA restore requires an"
+                " absolute CUDA placement library path, a 64-character"
+                " lowercase SHA-256, and placement arena bytes equal to"
+                " 64, 128, or 256 MiB"
             )
-        if not 1 <= native_io_workers <= 32:
+        if not 1 <= cuda_restore_io_workers <= 32:
             raise RuntimeError(
-                "spark-context-cache: native restore IO workers must be in [1, 32]"
+                "spark-context-cache: SparkCache CUDA restore IO workers"
+                " must be in [1, 32]"
             )
     draft_policy = extra(
         "spark_cache_draft_policy",
@@ -534,7 +840,12 @@ def parse_connector_config(
         )
     quantization_layout = profile.quantization_layout
     if storage_mode == "block_pages_v1":
-        quantization_layout += ":" + kv_group_topology_digest(kv_cache_config)
+        # A cache-manager block ID names one complete physical page, including
+        # split kernel rows and opaque bytes beyond the logical tensor shape.
+        quantization_layout += ":manager-pages-v2:" + kv_group_topology_digest(
+            kv_cache_config,
+            dcp_degree=dcp_degree,
+        )
     record_schema = (
         ("target_ckv", "logical_positions") if storage_mode == "block_pages_v1" else ()
     )
@@ -545,6 +856,7 @@ def parse_connector_config(
         rope_layout=profile.rope_layout,
         tp_degree=tp_degree,
         dcp_degree=dcp_degree,
+        cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
         chunk_tokens=chunk_tokens,
         boundary_hidden_policy=profile.boundary_hidden_policy,
         draft_kv_policy=str(draft_policy),
@@ -558,7 +870,7 @@ def parse_connector_config(
             dcp_degree=dcp_degree,
             block_size=block_size,
             min_span_tokens=min_span,
-            native_restore=native_restore_enabled,
+            cuda_restore=cuda_restore_enabled,
         )
     except ProfileError as error:
         raise RuntimeError(f"spark-context-cache: {error}") from error
@@ -576,8 +888,11 @@ def parse_connector_config(
             "spark-context-cache: spark_cache_scheduler_probe must be"
             f" 'tp0' or 'none' (configured: {scheduler_probe!r})"
         )
+    # Page restores use one CUDA placement adapter and mapped arena per lane.
+    # Eight lanes bound concurrent placement memory while allowing one bounded
+    # request cohort to make progress without serializing every private delta.
     load_thread_limit = min(
-        2,
+        8,
         max(
             1,
             int(
@@ -588,7 +903,7 @@ def parse_connector_config(
             ),
         ),
     )
-    if native_restore_enabled and storage_mode != "block_pages_v1":
+    if cuda_restore_enabled and storage_mode != "block_pages_v1":
         load_thread_limit = 1
     max_pending_restores_raw = extra(
         "spark_cache_max_pending_restores",
@@ -606,9 +921,33 @@ def parse_connector_config(
         raise RuntimeError(
             "spark-context-cache: spark_cache_max_pending_restores must be at least 1"
         )
+    max_delayed_stores = _nonnegative_config_int(
+        extra(
+            "spark_cache_max_delayed_stores",
+            os.environ.get("SPARK_CONTEXT_CACHE_MAX_DELAYED_STORES", "16"),
+        ),
+        "spark_cache_max_delayed_stores",
+    )
+    if max_delayed_stores < 1:
+        raise RuntimeError(
+            "spark-context-cache: spark_cache_max_delayed_stores must be at least 1"
+        )
+    shared_prefix_lease_ttl_seconds = _bounded_positive_config_float(
+        extra(
+            "spark_cache_shared_prefix_lease_ttl_seconds",
+            os.environ.get(
+                "SPARK_CONTEXT_CACHE_SHARED_PREFIX_LEASE_TTL_SECONDS",
+                str(_DEFAULT_SHARED_PREFIX_LEASE_TTL_SECONDS),
+            ),
+        ),
+        "spark_cache_shared_prefix_lease_ttl_seconds",
+        minimum=1.0,
+        maximum=_MAX_SHARED_PREFIX_LEASE_TTL_SECONDS,
+    )
     return ConnectorConfig(
         tp_degree=tp_degree,
         dcp_degree=dcp_degree,
+        cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
         block_size=block_size,
         profile=profile,
         storage_mode=storage_mode,
@@ -620,16 +959,20 @@ def parse_connector_config(
         capacity_policy=capacity_policy,
         min_span=min_span,
         max_span=max_span,
+        access_mode=access_mode,
         store_enabled=store_enabled,
         restore_enabled=restore_enabled,
         streaming_snapshots_enabled=streaming_snapshots_enabled,
-        native_restore_enabled=native_restore_enabled,
-        native_library_path=native_library_path,
-        native_library_sha256=native_library_sha256,
-        native_arena_bytes=native_arena_bytes,
-        native_io_workers=native_io_workers,
+        async_page_capture_enabled=async_page_capture_enabled,
+        cuda_restore_enabled=cuda_restore_enabled,
+        cuda_placement_library_path=cuda_placement_library_path,
+        cuda_placement_library_sha256=cuda_placement_library_sha256,
+        cuda_placement_arena_bytes=cuda_placement_arena_bytes,
+        cuda_restore_io_workers=cuda_restore_io_workers,
         scheduler_probe=scheduler_probe,
         identity_base=_freeze_config_value(identity_base),
         load_thread_limit=load_thread_limit,
         max_pending_restores=max_pending_restores,
+        max_delayed_stores=max_delayed_stores,
+        shared_prefix_lease_ttl_seconds=shared_prefix_lease_ttl_seconds,
     )

@@ -200,7 +200,7 @@ def test_unknown_named_source_state_fails_closed(tmp_path: Path) -> None:
         verify_contract(root, contract)
 
 
-def test_mixed_named_source_states_fail_closed(tmp_path: Path) -> None:
+def test_mixed_named_source_states_are_rejected(tmp_path: Path) -> None:
     root, contract = write_contract(tmp_path, "vllm/base.py", b"source state")
     second = root / "vllm/scheduler.py"
     second.write_bytes(b"runtime state")

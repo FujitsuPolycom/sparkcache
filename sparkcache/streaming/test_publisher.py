@@ -21,6 +21,20 @@ from sparkcache.spark_context_cache_codec import (
     pack_record,
     unpack_positions,
 )
+from sparkcache.profile_adapters.glm52_streaming import (
+    GLM52_STREAMING_ADAPTER,
+    INDEXER_BYTES_PER_TOKEN as GLM52_INDEXER_BYTES_PER_TOKEN,
+    INDEXER_LAYERS as GLM52_INDEXER_LAYERS,
+    LAYER_ORDER as GLM52_LAYER_ORDER,
+    MACRO_PAYLOAD_BYTES as GLM52_MACRO_PAYLOAD_BYTES,
+    MACRO_ROWS as GLM52_MACRO_ROWS,
+    RING_DEPTH as GLM52_RING_DEPTH,
+    SLOT_BYTES as GLM52_SLOT_BYTES,
+    SOURCE_COUNT as GLM52_SOURCE_COUNT,
+    TARGET_BYTES_PER_TOKEN as GLM52_TARGET_BYTES_PER_TOKEN,
+    TARGET_LAYERS as GLM52_TARGET_LAYERS,
+    Glm52ReadyViewTranslator,
+)
 from sparkcache.streaming.block_lease import BlockLeaseRegistry, LeaseCapacity
 from sparkcache.streaming.native_ring import (
     NativeRingConfig,
@@ -35,17 +49,6 @@ from sparkcache.streaming.planner import (
     StreamingSnapshotCoordinator,
 )
 from sparkcache.streaming.publisher import (
-    GLM52_INDEXER_BYTES_PER_TOKEN,
-    GLM52_INDEXER_LAYERS,
-    GLM52_LAYER_ORDER,
-    GLM52_MACRO_PAYLOAD_BYTES,
-    GLM52_MACRO_ROWS,
-    GLM52_RING_DEPTH,
-    GLM52_SLOT_BYTES,
-    GLM52_SOURCE_COUNT,
-    GLM52_TARGET_BYTES_PER_TOKEN,
-    GLM52_TARGET_LAYERS,
-    Glm52ReadyViewTranslator,
     JournalState,
     ManifestSnapshotJournalWriter,
     SnapshotTranslationError,
@@ -61,7 +64,7 @@ from sparkcache.streaming.runtime import (
 
 
 class FakeGlmRingBackend:
-    """Immediately-ready, CPU-owned implementation of the native ABI."""
+    """Immediately-ready, CPU-owned implementation of the C++/CUDA ABI."""
 
     def __init__(self) -> None:
         self.config: NativeRingConfig | None = None
@@ -1060,15 +1063,7 @@ def test_writer_thread_start_failure_occurs_before_view_handoff(
     ring.shutdown()
 
 
-def test_wrong_identity_policy_is_rejected_before_writer_start(
-    tmp_path: Path,
-) -> None:
-    ring, _backend = _ring()
+def test_glm52_adapter_rejects_wrong_identity_policy() -> None:
     wrong = dataclasses.replace(_identity(), draft_kv_policy="separate")
-    with pytest.raises(ValueError, match="colocated MTP"):
-        ManifestSnapshotJournalWriter(
-            store=ManifestStore(tmp_path),
-            identity=wrong,
-            translator=Glm52ReadyViewTranslator.for_ring(ring, dcp_rank=0),
-        )
-    ring.shutdown()
+    with pytest.raises(RuntimeError, match="colocated draft state"):
+        GLM52_STREAMING_ADAPTER.validate_identity(wrong)

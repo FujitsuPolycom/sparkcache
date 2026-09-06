@@ -40,7 +40,7 @@ class BenchmarkConfig:
     scenario: str
     cache_state: str
     pretokenize: bool = False
-    prefix_header: str = "Native 128K restore test.\n"
+    prefix_header: str = "SparkCache CUDA 128K restore test.\n"
     prefix_repetitions: int = 131_072
     tail_repetitions: int = 32
     max_tokens: int = 1
@@ -271,7 +271,9 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--concurrency", type=int, choices=CONCURRENCY_LEVELS, required=True)
+    parser.add_argument(
+        "--concurrency", type=int, choices=CONCURRENCY_LEVELS, required=True
+    )
     parser.add_argument("--scenario", choices=SCENARIOS, required=True)
     parser.add_argument("--cache-state", choices=CACHE_STATES, required=True)
     parser.add_argument(
@@ -280,7 +282,9 @@ def _parser() -> argparse.ArgumentParser:
         help="tokenize each unique chat prompt before starting timed completions",
     )
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--prefix-header", default="Native 128K restore test.\n")
+    parser.add_argument(
+        "--prefix-header", default="SparkCache CUDA 128K restore test.\n"
+    )
     parser.add_argument("--prefix-repetitions", type=int, default=131_072)
     parser.add_argument("--tail-repetitions", type=int, default=32)
     parser.add_argument("--max-tokens", type=int, default=1)

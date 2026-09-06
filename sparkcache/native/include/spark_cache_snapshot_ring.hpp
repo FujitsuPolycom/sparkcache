@@ -18,7 +18,7 @@ struct Slot {
 };
 
 /*
- * Portable oracle for the native CUDA implementation. It contains no CUDA
+ * Portable oracle for the C++/CUDA implementation. It contains no CUDA
  * calls or allocation and is intentionally small enough for exhaustive tests.
  */
 class RingState {

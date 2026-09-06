@@ -16,7 +16,7 @@ assembly, H2D copy, and scatter on a background loader. The request is
 reported finished only after its writes have completed; unrelated requests
 remain schedulable while it restores.
 
-Fail-closed contract:
+Verified-or-recompute contract:
 - Storage uses content-addressed chunks with per-record SHA-256 and an
   identity pinning model/quant/TP/DCP/shard-rank/chunk geometry.
 - A failed asynchronous load publishes its invalid blocks and finished
@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import json
 import math
 
 import queue
@@ -48,11 +49,13 @@ import torch
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
+    KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
     KVConnectorRole,
     SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorPromMetrics,
     KVConnectorStats,
 )
 from vllm.logger import init_logger
@@ -60,6 +63,7 @@ from vllm.logger import init_logger
 from sparkcache.spark_context_cache_codec import (
     CHUNK_TOKENS,
     CodecError,
+    MultimodalFeatureIdentity,
     build_layer_plans,
     chunk_prefix_digests,
     chunk_count,
@@ -71,6 +75,7 @@ from sparkcache.spark_context_cache_codec import (
     pack_record,
     unpack_positions,
     unpack_record,
+    validate_multimodal_features,
 )
 from sparkcache.spark_context_cache_config import (
     SHA256_RE,
@@ -83,10 +88,17 @@ from sparkcache.spark_context_cache_hybrid import (
     PageLayout,
     decode_page_snapshot,
     encode_page_snapshot,
+    materialize_page_extension_capture,
     plan_page_snapshot,
     split_snapshot,
 )
 from sparkcache.spark_context_cache_restore_timing import RestoreTiming
+from sparkcache.page_base_read_flights import (
+    PageBaseReadEvidence,
+    PageBaseReadFlightKey,
+    PageBaseReadFlights,
+    PageBaseReadResult,
+)
 from sparkcache.spark_context_cache_store import (
     CacheIdentity,
     ContextChunk,
@@ -107,17 +119,30 @@ if TYPE_CHECKING:
 
 logger = init_logger("vllm.spark_context_cache")
 
+
+def _debug_log(message: str, *args: Any) -> None:
+    """Emit optional detail without requiring debug support from embedders."""
+
+    debug = getattr(logger, "debug", None)
+    if callable(debug):
+        debug(message, *args)
+
 _CAPACITY_RETRY_SECONDS = 5.0
 _CLEAR_ONCE_LOCK_TIMEOUT_SECONDS = 30.0
 _QUORUM_REPORT_BATCH_SIZE = 64
 _QUORUM_DELTA_HISTORY_SIZE = 64
+_STARTUP_HANDSHAKE_MAX_DIGESTS = 8 * _QUORUM_REPORT_BATCH_SIZE
 _QUORUM_PENDING_DELTA_LIMIT = 64
 _QUORUM_RETIRED_GENERATION_LIMIT = 64
 _QUORUM_DELTA_PROTOCOL = "sparkcache-quorum-delta-v1"
 _MAX_RESTORE_FLIGHT_FOLLOWERS = 16
 _MAX_SHARED_PREFIX_LEASES = 2
 _MAX_SHAREABLE_PREFIXES_PER_FLIGHT = 64
-_SHARED_PREFIX_LEASE_TTL_SECONDS = 15.0
+_MAX_PAGE_BASE_READ_FLIGHTS = 2
+_MAX_PAGE_BASE_READ_MEMBERS = 16
+_MAX_PAGE_BASE_BYTES_PER_FLIGHT = 1024**3
+_MAX_PAGE_BASE_BYTES_TOTAL = 2 * 1024**3
+_CONTEXT_DIGEST_NAMESPACE = "sparkcache-context-v2-multimodal"
 
 # The runtime is deliberately supplied by the embedding process instead of
 # importing or constructing the optional streaming-snapshot runtime here.
@@ -127,6 +152,9 @@ _SHARED_PREFIX_LEASE_TTL_SECONDS = 15.0
 _STREAMING_RUNTIME_FACTORIES: dict[
     KVConnectorRole, Callable[["SparkContextCacheConnector"], Any]
 ] = {}
+_ASYNC_PAGE_RUNTIME_FACTORY: Callable[
+    ["SparkContextCacheConnector"], Any
+] | None = None
 
 
 def configure_streaming_snapshot_runtime(
@@ -136,7 +164,7 @@ def configure_streaming_snapshot_runtime(
     """Install or remove the explicitly injected streaming runtime factory.
 
     This is a narrow integration seam for an attested embedding runtime.  It
-    does not create, import, or otherwise enable a native runtime by itself.
+    does not create, import, or otherwise enable a C++/CUDA runtime by itself.
     ``factory`` receives the connector after its basic vLLM configuration is
     available and must return a role-appropriate adapter.
     """
@@ -151,27 +179,41 @@ def configure_streaming_snapshot_runtime(
     _STREAMING_RUNTIME_FACTORIES[role] = factory
 
 
-def _load_native_components() -> SimpleNamespace:
-    """Lazy optional import: the Python restore path needs no native bundle."""
+def configure_async_page_capture_runtime(
+    factory: Callable[["SparkContextCacheConnector"], Any] | None,
+) -> None:
+    """Install a GPU-free test or attested manager-page runtime builder."""
 
-    placement = importlib.import_module(
-        "sparkcache.spark_context_cache_native_placement"
-    )
-    restore = importlib.import_module("sparkcache.spark_context_cache_native_restore")
+    global _ASYNC_PAGE_RUNTIME_FACTORY
+    if factory is not None and not callable(factory):
+        raise TypeError("manager-page capture runtime factory must be callable")
+    _ASYNC_PAGE_RUNTIME_FACTORY = factory
+
+
+def _load_cuda_components() -> SimpleNamespace:
+    """Load the optional SparkCache CUDA placement components lazily."""
+
+    placement = importlib.import_module("sparkcache.spark_context_cache_cuda_placement")
+    restore = importlib.import_module("sparkcache.spark_context_cache_cuda_restore")
     hybrid_restore = importlib.import_module(
-        "sparkcache.spark_context_cache_native_hybrid_restore"
+        "sparkcache.spark_context_cache_cuda_hybrid_restore"
     )
-    binding = importlib.import_module("sparkcache.spark_cache_native")
+    binding = importlib.import_module("sparkcache.spark_cache_cuda")
     return SimpleNamespace(
-        NativePlacementLibrary=placement.NativePlacementLibrary,
-        NativePlacementAdapter=placement.NativePlacementAdapter,
+        CudaPlacementLibrary=placement.CudaPlacementLibrary,
+        CudaPlacementAdapter=placement.CudaPlacementAdapter,
         ArenaMode=placement.ArenaMode,
         RecordKind=placement.RecordKind,
-        execute_native_restore=restore.execute_native_restore,
-        execute_native_hybrid_placement=(hybrid_restore.execute_native_hybrid_restore),
+        execute_cuda_restore=restore.execute_cuda_restore,
+        execute_cuda_hybrid_restore=hybrid_restore.execute_cuda_hybrid_restore,
+        execute_cuda_hybrid_placement=(hybrid_restore.execute_cuda_hybrid_placement),
         bind_page_reference=binding.bind_page_reference,
         hybrid_page_cuda_capability=binding.CAP_HYBRID_PAGE_CUDA,
     )
+
+
+# Private compatibility alias for embedders that imported the earlier helper.
+_load_native_components = _load_cuda_components
 
 
 @dataclass
@@ -191,10 +233,19 @@ class _ReqPlan:
     # stored prefix. Empty fields select ordinary full-snapshot publication.
     base_context_digest: str = ""
     base_span_tokens: int = 0
+    # vLLM may retain a recurrent replay-boundary page outside the request's
+    # arithmetic block-table slot after later forward work advances the live
+    # state. Each pair is an exact (group index, physical block id) override
+    # proven by vLLM for this plan's span_tokens boundary.
+    recurrent_boundary_blocks: tuple[tuple[int, int], ...] = ()
     # Authenticated row-prefix roots whose descriptors must match the leading
     # descriptors of this plan.  Workers validate these roots before the
     # leader's blocks may back a shorter shared-prefix lease.
     shared_segments: tuple[tuple[str, int], ...] = ()
+    # True when digest includes a media content identity. Token-only prefix
+    # alias and tail derivation cannot reproduce that identity and must not
+    # publish alternative keys for this plan.
+    has_multimodal_identity: bool = False
 
     @property
     def group_block_ids(self) -> tuple[tuple[int, ...], ...]:
@@ -243,6 +294,8 @@ class _RestoreFollower:
 class _QueuedLoad:
     plan: _ReqPlan
     timing: RestoreTiming
+    prior_cuda_event: Any | None = None
+    prior_cuda_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -307,7 +360,7 @@ class _HybridStoreSnapshot:
     rank: int
     identity: CacheIdentity
     positions: tuple[int, ...]
-    encoded_pages: bytes
+    encoded_pages: Any
     block_counts: tuple[int, ...]
 
 
@@ -426,6 +479,18 @@ class SparkCacheConnectorMetadata(KVConnectorMetadata):
 
 
 @dataclass
+class SparkCacheHandshakeMetadata(KVConnectorHandshakeMetadata):
+    """One worker's bounded startup manifest inventory.
+
+    Each report contains at most ``_QUORUM_REPORT_BATCH_SIZE`` manifest
+    digests. The engine transports this metadata once after every worker has
+    registered its KV caches and before it accepts requests.
+    """
+
+    reports: tuple[dict[str, Any], ...] = ()
+
+
+@dataclass
 class SparkCacheStats(KVConnectorStats):
     """Per-rank "digests I can serve" reports, merged across workers.
 
@@ -446,7 +511,14 @@ class SparkCacheStats(KVConnectorStats):
                 normalized = dict(report)
                 if isinstance(report.get("held"), list):
                     normalized["held"] = list(report["held"])
-                for field in ("delta", "checkpoint", "streaming", "capacity"):
+                for field in (
+                    "delta",
+                    "checkpoint",
+                    "streaming",
+                    "capacity",
+                    "async_capture",
+                    "publication",
+                ):
                     if isinstance(report.get(field), dict):
                         normalized[field] = dict(report[field])
                 merged[report["rank"]] = normalized
@@ -456,8 +528,8 @@ class SparkCacheStats(KVConnectorStats):
     def reduce(self) -> dict[str, int | float]:
         reports = self.data.get("reports", [])
         reduced: dict[str, int | float] = {
-            "spark_cache_ranks_reporting": len(reports),
-            "spark_cache_digests_held": sum(
+            "sparkcache_ranks": len(reports),
+            "sparkcache_entries": sum(
                 int(r.get("held_count", len(r.get("held", [])))) for r in reports
             ),
         }
@@ -467,71 +539,347 @@ class SparkCacheStats(KVConnectorStats):
             if isinstance(report.get("streaming"), dict)
         ]
         if streaming:
-            reduced.update(
-                spark_cache_streaming_ranks_reporting=len(streaming),
-                spark_cache_streaming_active_contexts=sum(
-                    int(status.get("active_contexts", 0)) for status in streaming
-                ),
-                spark_cache_streaming_active_leases=sum(
-                    int(status.get("active_leases", 0)) for status in streaming
-                ),
-                spark_cache_streaming_active_tickets=sum(
-                    int(status.get("active_tickets", 0)) for status in streaming
-                ),
+            active_contexts = sum(
+                int(status.get("active_contexts", 0)) for status in streaming
             )
+            active_leases = sum(
+                int(status.get("active_leases", 0)) for status in streaming
+            )
+            active_tickets = sum(
+                int(status.get("active_tickets", 0)) for status in streaming
+            )
+            if active_contexts:
+                reduced["sparkcache_streams"] = active_contexts
+            if active_leases:
+                reduced["sparkcache_leases"] = active_leases
+            if active_tickets:
+                reduced["sparkcache_tickets"] = active_tickets
         capacity = [
             report.get("capacity")
             for report in reports
             if isinstance(report.get("capacity"), dict)
         ]
         if capacity:
+            used_bytes = sum(int(status.get("bytes", 0)) for status in capacity)
+            maximum_bytes = sum(
+                int(status.get("max_bytes", 0)) for status in capacity
+            )
             reduced.update(
-                spark_cache_capacity_ranks_reporting=len(capacity),
-                spark_cache_capacity_bytes=sum(
-                    int(status.get("bytes", 0)) for status in capacity
-                ),
-                spark_cache_capacity_max_bytes=sum(
-                    int(status.get("max_bytes", 0)) for status in capacity
-                ),
-                spark_cache_capacity_manifests_evicted=sum(
-                    int(status.get("manifests_evicted", 0)) for status in capacity
-                ),
-                spark_cache_capacity_bytes_reclaimed=sum(
-                    int(status.get("bytes_reclaimed", 0)) for status in capacity
-                ),
-                spark_cache_capacity_pending_streaming_commits=sum(
-                    int(status.get("pending_streaming_commits", 0))
-                    for status in capacity
-                ),
-                spark_cache_streaming_store_evicted=sum(
-                    int(status.get("streaming_store_evicted", 0)) for status in capacity
-                ),
-                spark_cache_capacity_invalid_streaming_receipts=sum(
-                    int(status.get("invalid_streaming_receipts", 0))
-                    for status in capacity
-                ),
-                spark_cache_capacity_shutdown_dropped_streaming_commits=sum(
-                    int(status.get("shutdown_dropped_streaming_commits", 0))
-                    for status in capacity
-                ),
-                spark_cache_capacity_satisfied=int(
+                sparkcache_used_gib=round(used_bytes / 1024**3, 1),
+                sparkcache_limit_gib=round(maximum_bytes / 1024**3, 1),
+                sparkcache_healthy=int(
                     all(
                         bool(status.get("capacity_satisfied", False))
                         for status in capacity
                     )
                 ),
             )
+            alerts = {
+                "sparkcache_evicted": sum(
+                    int(status.get("manifests_evicted", 0)) for status in capacity
+                ),
+                "sparkcache_reclaimed_gib": round(
+                    sum(
+                        int(status.get("bytes_reclaimed", 0))
+                        for status in capacity
+                    )
+                    / 1024**3,
+                    1,
+                ),
+                "sparkcache_pending": sum(
+                    int(status.get("pending_streaming_commits", 0))
+                    for status in capacity
+                ),
+                "sparkcache_stream_evicted": sum(
+                    int(status.get("streaming_store_evicted", 0))
+                    for status in capacity
+                ),
+                "sparkcache_invalid_receipts": sum(
+                    int(status.get("invalid_streaming_receipts", 0))
+                    for status in capacity
+                ),
+                "sparkcache_dropped_commits": sum(
+                    int(status.get("shutdown_dropped_streaming_commits", 0))
+                    for status in capacity
+                ),
+            }
+            reduced.update({key: value for key, value in alerts.items() if value})
+        async_capture = [
+            report.get("async_capture")
+            for report in reports
+            if isinstance(report.get("async_capture"), dict)
+        ]
+        if async_capture:
+            delayed_rank_slots = sum(
+                int(status.get("delayed_requests", 0))
+                for status in async_capture
+            )
+            reduced.update(
+                sparkcache_capture_pending_rank_slots=sum(
+                    int(status.get("pending_requests", 0))
+                    for status in async_capture
+                ),
+                sparkcache_capture_completed_rank_slots=sum(
+                    int(status.get("completed_notifications", 0))
+                    for status in async_capture
+                ),
+                sparkcache_capture_delayed_requests=max(
+                    int(status.get("delayed_requests", 0))
+                    for status in async_capture
+                ),
+                sparkcache_capture_delayed_rank_slots=delayed_rank_slots,
+                sparkcache_capture_retained_pages=sum(
+                    int(status.get("retained_manager_pages", 0))
+                    for status in async_capture
+                ),
+                sparkcache_capture_oldest_delayed_ms=max(
+                    float(status.get("oldest_delayed_ms", 0.0))
+                    for status in async_capture
+                ),
+                sparkcache_capture_uncertain_ranks=sum(
+                    int(bool(status.get("ownership_uncertain", False)))
+                    for status in async_capture
+                ),
+                sparkcache_capture_busy_ranks=sum(
+                    int(bool(status.get("store_inflight", False)))
+                    for status in async_capture
+                ),
+            )
+        publication = [
+            report.get("publication")
+            for report in reports
+            if isinstance(report.get("publication"), dict)
+        ]
+        if publication:
+            fields = {
+                "committed_publications": "sparkcache_publications",
+                "logical_payload_bytes": "sparkcache_payload_bytes",
+                "committed_unique_object_bytes": (
+                    "sparkcache_unique_bytes"
+                ),
+                "staged_write_bytes": "sparkcache_staged_bytes",
+                "deduplicated_bytes": "sparkcache_dedup_bytes",
+                "aborted_staged_write_bytes": "sparkcache_aborted_bytes",
+                "failed_staged_write_bytes": "sparkcache_failed_bytes",
+            }
+            reduced.update(
+                {
+                    metric: sum(int(status.get(field, 0)) for status in publication)
+                    for field, metric in fields.items()
+                }
+            )
+            failures = {
+                "sparkcache_publication_aborted": sum(
+                    int(status.get("aborted_publications", 0))
+                    for status in publication
+                ),
+                "sparkcache_publication_failed": sum(
+                    int(status.get("failed_publications", 0))
+                    for status in publication
+                ),
+            }
+            reduced.update({key: value for key, value in failures.items() if value})
         return reduced
+
+    def format_log_lines(self) -> tuple[str, ...]:
+        """Return short human-readable summaries without dropping raw metrics."""
+
+        reduced = self.reduce()
+
+        def byte_count(name: str) -> str:
+            value = int(reduced.get(name, 0))
+            for suffix, unit in (("GiB", 1024**3), ("MiB", 1024**2)):
+                if value >= unit:
+                    return f"{value / unit:.1f}{suffix}"
+            return f"{value}B"
+
+        lines = [
+            "sparkcache: capacity"
+            f" ranks={int(reduced.get('sparkcache_ranks', 0))}"
+            f" entries={int(reduced.get('sparkcache_entries', 0))}"
+            f" used={float(reduced.get('sparkcache_used_gib', 0.0)):.1f}/"
+            f"{float(reduced.get('sparkcache_limit_gib', 0.0)):.1f}GiB"
+            " healthy="
+            + ("yes" if int(reduced.get("sparkcache_healthy", 0)) else "no"),
+            "sparkcache: publications"
+            f" count={int(reduced.get('sparkcache_publications', 0))}"
+            f" payload={byte_count('sparkcache_payload_bytes')}"
+            f" unique={byte_count('sparkcache_unique_bytes')}",
+            "sparkcache: writes"
+            f" staged={byte_count('sparkcache_staged_bytes')}"
+            f" dedup={byte_count('sparkcache_dedup_bytes')}"
+            f" aborted={byte_count('sparkcache_aborted_bytes')}"
+            f" failed={byte_count('sparkcache_failed_bytes')}",
+        ]
+        delayed_rank_slots = int(
+            reduced.get("sparkcache_capture_delayed_rank_slots", 0)
+        )
+        retained_pages = int(reduced.get("sparkcache_capture_retained_pages", 0))
+        uncertain_ranks = int(
+            reduced.get("sparkcache_capture_uncertain_ranks", 0)
+        )
+        if delayed_rank_slots or retained_pages or uncertain_ranks:
+            line = (
+                "sparkcache: capture"
+                " requests="
+                f"{int(reduced.get('sparkcache_capture_delayed_requests', 0))}"
+                f" rank_slots={delayed_rank_slots}"
+                f" pages={retained_pages}"
+                " oldest="
+                f"{float(reduced.get('sparkcache_capture_oldest_delayed_ms', 0.0)):.0f}ms"
+            )
+            if uncertain_ranks:
+                line += f" uncertain_ranks={uncertain_ranks}"
+            lines.append(line)
+        return tuple(lines)
 
     def is_empty(self) -> bool:
         return not self.data.get("reports")
 
 
+class SparkCachePromMetrics(KVConnectorPromMetrics):
+    """Prometheus gauges for asynchronous capture-page ownership."""
+
+    _GAUGES = {
+        "sparkcache_capture_delayed_requests": (
+            "vllm:sparkcache_capture_delayed_requests",
+            "Maximum delayed SparkCache capture requests on any physical rank.",
+            1.0,
+        ),
+        "sparkcache_capture_delayed_rank_slots": (
+            "vllm:sparkcache_capture_delayed_rank_slots",
+            "Sum of delayed SparkCache request ownership records across ranks.",
+            1.0,
+        ),
+        "sparkcache_capture_retained_pages": (
+            "vllm:sparkcache_capture_retained_manager_pages",
+            "Physical manager pages retained for asynchronous SparkCache capture.",
+            1.0,
+        ),
+        "sparkcache_capture_oldest_delayed_ms": (
+            "vllm:sparkcache_capture_oldest_delayed_seconds",
+            "Age in seconds of the oldest asynchronous SparkCache capture ownership.",
+            0.001,
+        ),
+        "sparkcache_capture_uncertain_ranks": (
+            "vllm:sparkcache_capture_ownership_uncertain_ranks",
+            "Physical ranks whose SparkCache capture-page ownership is uncertain.",
+            1.0,
+        ),
+    }
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[Any], type[Any]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> None:
+        super().__init__(
+            vllm_config,
+            metric_types,
+            labelnames,
+            per_engine_labelvalues,
+        )
+        self._capture_gauges: dict[str, dict[int, Any]] = {}
+        for key, (name, documentation, _scale) in self._GAUGES.items():
+            definition = self._gauge_cls(
+                name=name,
+                documentation=documentation,
+                labelnames=labelnames,
+            )
+            self._capture_gauges[key] = {
+                engine_idx: definition.labels(*labelvalues)
+                for engine_idx, labelvalues in per_engine_labelvalues.items()
+            }
+
+    def observe(
+        self,
+        transfer_stats_data: dict[str, Any],
+        engine_idx: int = 0,
+    ) -> None:
+        reduced = SparkCacheStats(data=transfer_stats_data).reduce()
+        for key, (_name, _documentation, scale) in self._GAUGES.items():
+            self._capture_gauges[key][engine_idx].set(
+                float(reduced.get(key, 0)) * scale
+            )
+
+
+def _multimodal_feature_identities(
+    request: object,
+    token_count: int,
+) -> tuple[MultimodalFeatureIdentity, ...] | None:
+    """Extract complete vLLM media identity, or None when it is unprovable.
+
+    Current vLLM request and scheduler-transfer objects retain each feature's
+    content identifier and placeholder range even when its tensor data is
+    stripped after a local prefix-cache hit. Older ``mm_hashes``-only objects
+    do not expose enough placeholder geometry for prefix-stable digests.
+    """
+
+    raw_features = getattr(request, "mm_features", None)
+    if raw_features is not None:
+        try:
+            raw_features = tuple(raw_features)
+        except TypeError:
+            return None
+    if raw_features:
+        try:
+            features = tuple(
+                MultimodalFeatureIdentity(
+                    modality=feature.modality,
+                    identifier=feature.identifier,
+                    offset=feature.mm_position.offset,
+                    length=feature.mm_position.length,
+                )
+                for feature in raw_features
+            )
+            return validate_multimodal_features(features, token_count)
+        except (AttributeError, CodecError, TypeError):
+            return None
+    if getattr(request, "mm_hashes", None):
+        return None
+    return ()
+
+
 class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     """Store/restore each rank's DCP shard on rank-local NVMe."""
 
+    # Exact-vLLM runtimes use this opt-in before pinning and exporting aligned
+    # recurrent replay-boundary blocks. Synchronous capture detaches them in
+    # wait_for_save. Explicit asynchronous page capture retains all groups until
+    # its completion event or preemption drain proves CUDA stopped reading.
+    supports_recurrent_boundary_blocks = True
+
+    @property
+    def recurrent_boundary_granularity(self) -> int:
+        """Token boundary used for connector-owned recurrent publication."""
+
+        return self._chunk_tokens
+
+    def get_recurrent_publication_boundaries(
+        self, request: "Request"
+    ) -> tuple[int, ...]:
+        """Propose the exact eligible store boundary without mutating state."""
+
+        if (
+            not self._cache_available
+            or not self._store_enabled
+            or self._streaming_snapshots_enabled
+            or not self._recurrent_group_indexes
+        ):
+            return ()
+        prompt_token_ids = getattr(request, "prompt_token_ids", None) or ()
+        span = self._aligned_span(len(prompt_token_ids))
+        if not self._min_span <= span <= self._max_span:
+            return ()
+        return (span,)
+
     configure_streaming_snapshot_runtime = staticmethod(
         configure_streaming_snapshot_runtime
+    )
+    configure_async_page_capture_runtime = staticmethod(
+        configure_async_page_capture_runtime
     )
 
     def __init__(
@@ -553,10 +901,16 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._block_size = config.block_size
         self._tp_degree = config.tp_degree
         self._dcp_degree = config.dcp_degree
+        self._cp_kv_cache_interleave_size = config.cp_kv_cache_interleave_size
         self._profile = config.profile
         self._storage_mode = config.storage_mode
         self._publication_schema = config.publication_schema
         self._group_topology = config.group_topology
+        self._recurrent_group_indexes = frozenset(
+            group_index
+            for group_index, topology in enumerate(self._group_topology)
+            if topology["reuse_policy"] == "recurrent_align"
+        )
         self._chunk_tokens = config.chunk_tokens
         self._root = config.root
         self._store = ManifestStore(self._root)
@@ -585,18 +939,30 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._capacity_policy = config.capacity_policy
         self._min_span = config.min_span
         self._max_span = config.max_span
+        self._access_mode = config.access_mode
         self._store_enabled = config.store_enabled and self._cache_available
         self._restore_enabled = config.restore_enabled and self._cache_available
         self._streaming_snapshots_enabled = (
             config.streaming_snapshots_enabled and self._cache_available
         )
+        if config.async_page_capture_enabled and not self._cache_available:
+            raise RuntimeError(
+                "spark-context-cache: asynchronous manager-page capture cannot"
+                " start while persistent cache initialization is unavailable"
+            )
+        self._async_page_capture_enabled = config.async_page_capture_enabled
+        self._async_page_capture_runtime: Any = None
+        self._async_page_capture_settings: Any = None
+        self._async_page_capture_eligible: set[str] = set()
+        self._max_delayed_stores = config.max_delayed_stores
+        self._async_page_capture_reservations: dict[str, int] = {}
         self._streaming_runtime: Any = None
         if self._streaming_snapshots_enabled:
             # An explicit opt-in never falls back to end-of-prefill snapshots.
             # Preserve an explicitly injected test/deployment adapter. When
             # none exists, import the builtin factory only on this opt-in
             # path; default-off scheduler and worker processes never import
-            # factory/native-ring modules.
+            # factory and C++/CUDA ring modules.
             if role not in _STREAMING_RUNTIME_FACTORIES:
                 from sparkcache.streaming.factory import (
                     make_model_serving_runtime_factory,
@@ -605,9 +971,18 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 _STREAMING_RUNTIME_FACTORIES[role] = make_model_serving_runtime_factory(
                     role.name
                 )
-            # Resolve the adapter before native import/allocation so a
-            # partially configured deployment fails closed at startup.
+            # Resolve the adapter before C++/CUDA import/allocation so a
+            # partially configured deployment is rejected at startup.
             self._install_streaming_runtime(role)
+        if self._async_page_capture_enabled:
+            from sparkcache.streaming.manager_page_factory import (
+                ManagerPageCaptureSettings,
+                verify_manager_page_lease_contract,
+            )
+
+            settings = ManagerPageCaptureSettings.from_connector(self)
+            verify_manager_page_lease_contract(settings)
+            self._async_page_capture_settings = settings
         self._native_restore_enabled = (
             config.native_restore_enabled and self._cache_available
         )
@@ -616,7 +991,14 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._native_arena_bytes = config.native_arena_bytes
         self._native_io_workers = config.native_io_workers
         self._identity_base = config.identity_base
-        self._context_digest_salt = config.build_identity(0, 0).storage_key
+        # The namespace change cleanly misses legacy token-only digests, which
+        # cannot reveal whether their KV bytes came from multimodal embeddings.
+        # Without this one-time rollover, a text request could still select an
+        # unsafe multimodal entry published before media identity was bound.
+        self._context_digest_salt = (
+            f"{_CONTEXT_DIGEST_NAMESPACE}:"
+            f"{config.build_identity(0, 0).storage_key}"
+        )
         self._scheduler_probe = config.scheduler_probe
         self._shard_rank = 0
         self._capacity_estimated_bytes = 0
@@ -673,8 +1055,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._load_threads: list[threading.Thread] = []
         self._load_thread_limit = config.load_thread_limit
         if self._native_restore_enabled and self._storage_mode != "block_pages_v1":
-            # One native adapter owns one transaction and two arenas. Keep
-            # row restores serialized; native page mode creates one adapter
+            # One SparkCache CUDA adapter owns one transaction and two arenas.
+            # Keep row restores serialized; CUDA page mode creates one adapter
             # per bounded load lane instead.
             self._load_thread_limit = 1
         self._inflight_load_reqs: set[str] = set()
@@ -683,8 +1065,17 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._native_adapter: Any = None
         self._native_adapters: list[Any] = []
         self._native_execute_restore: Any = None
-        self._native_execute_hybrid: Any = None
+        self._native_execute_hybrid_restore: Any = None
+        self._native_execute_hybrid_placement: Any = None
         self._native_required_record_mask = 0
+        self._page_base_reads = PageBaseReadFlights(
+            max_flights=_MAX_PAGE_BASE_READ_FLIGHTS,
+            max_members=_MAX_PAGE_BASE_READ_MEMBERS,
+            max_bytes_per_flight=_MAX_PAGE_BASE_BYTES_PER_FLIGHT,
+            max_bytes_total=_MAX_PAGE_BASE_BYTES_TOTAL,
+        )
+        self._page_base_plan_keys: dict[str, PageBaseReadFlightKey] = {}
+        self._deferred_page_base_loads: dict[str, _QueuedLoad] = {}
         # Scheduler state.
         self._need_load: dict[str, tuple[str, int]] = {}
         # Bound on concurrently promised async restores. Enforced at
@@ -692,11 +1083,14 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         # update_state_after_alloc / build_connector_meta and cleared by
         # request_finished, so the map cannot grow past in-flight requests.
         self._max_pending_restores = config.max_pending_restores
+        self._shared_prefix_lease_ttl_seconds = (
+            config.shared_prefix_lease_ttl_seconds
+        )
         # Coalesce requests selecting the same persistent digest around one
         # restore. Followers own no restore blocks: they remain ordinary
         # waiting requests until vLLM publishes the leader's verified blocks
         # into its local prefix cache. Unique flights are bounded by the same
-        # admission limit as native load lanes; excess unrelated work
+        # admission limit as SparkCache CUDA load lanes; excess unrelated work
         # recomputes immediately instead of joining a cache-side queue.
         self._restore_flights: dict[str, _RestoreFlight] = {}
         self._restore_flight_leaders: dict[str, str] = {}
@@ -734,11 +1128,24 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._worker_checkpoints: dict[int, dict[str, Any]] = {}
         self._worker_desynchronized: set[int] = set()
         self._worker_requires_checkpoint: set[int] = set()
+        # A vLLM request owns one immutable prompt-token object for its full
+        # lifetime. Cache the incremental digest chain by that object identity
+        # so repeated scheduler passes do not rescan an unadmittable prompt.
+        # request_finished removes the entry before vLLM may recycle state.
+        self._prefix_digest_candidates: dict[
+            str,
+            tuple[
+                tuple[int, int, int, tuple[MultimodalFeatureIdentity, ...]],
+                tuple[tuple[int, str], ...],
+            ],
+        ] = {}
         self._store_progress: dict[str, tuple[str, int, int, list[list[int]]]] = {}
         # Kept separate from the long-standing progress tuple so scheduler
         # checkpoint/test adapters that seed that tuple remain compatible.
         self._store_token_ids: dict[str, tuple[int, ...]] = {}
+        self._store_multimodal: set[str] = set()
         self._store_bases: dict[str, tuple[str, int]] = {}
+        self._store_recurrent_boundaries: dict[str, tuple[tuple[int, int], ...]] = {}
         self.counters: dict[str, int] = {
             "store_committed": 0,
             "store_failed": 0,
@@ -746,7 +1153,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             "store_skipped_busy": 0,
             "store_skipped_present": 0,
             "store_skipped_quorum": 0,
+            "store_skipped_delayed_limit": 0,
+            "multimodal_bypass": 0,
             "page_delta_compactions": 0,
+            "recurrent_boundary_metadata_rejected": 0,
             "prefix_alias_publication_attempted": 0,
             "prefix_alias_publication_failed": 0,
             "prefix_aliases_published": 0,
@@ -770,11 +1180,21 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             "restore_segment_flights_joined": 0,
             "restore_segment_roots_verified": 0,
             "restore_segment_roots_rejected": 0,
+            "page_base_flights_completed": 0,
+            "page_base_flights_recomputed": 0,
+            "page_base_flights_cancelled": 0,
+            "page_base_flight_participants": 0,
+            "page_base_physical_reads": 0,
+            "page_base_reads_avoided": 0,
+            "native_page_delta_load_verified": 0,
+            "native_page_delta_base_bytes_skipped": 0,
             "shared_prefix_leases_published": 0,
             "shared_prefix_leases_attached": 0,
             "shared_prefix_leases_expired": 0,
             "shared_prefix_leases_evicted": 0,
             "shared_prefix_lease_rejected": 0,
+            "prefix_digest_cache_hits": 0,
+            "prefix_digest_cache_misses": 0,
             "quorum_generation_resets": 0,
             "load_verified": 0,
             "load_failed": 0,
@@ -793,12 +1213,14 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             "streaming_capacity_shutdown_dropped": 0,
         }
         logger.info(
-            "spark-context-cache: role=%s root=%s dcp=%d store=%s restore=%s"
-            " native_restore=%s max_span=%d load_threads=%d max_bytes=%d"
-            " low_bytes=%d ttl_seconds=%d",
+            "sparkcache: config role=%s root=%s dcp=%d access_mode=%s"
+            " store=%s restore=%s"
+            " cuda_restore=%s max_span=%d load_threads=%d max_bytes=%d"
+            " low_bytes=%d ttl_seconds=%d shared_prefix_lease_ttl_seconds=%.3g",
             role.name,
             self._root,
             self._dcp_degree,
+            self._access_mode,
             self._store_enabled,
             self._restore_enabled,
             self._native_restore_enabled,
@@ -807,10 +1229,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self._capacity_policy.max_bytes,
             self._capacity_policy.low_watermark_bytes,
             self._capacity_policy.ttl_seconds,
+            self._shared_prefix_lease_ttl_seconds,
         )
 
     def _install_streaming_runtime(self, role: KVConnectorRole) -> None:
-        """Resolve the opt-in runtime without importing a native backend."""
+        """Resolve the opt-in runtime without importing a C++/CUDA backend."""
 
         factory = _STREAMING_RUNTIME_FACTORIES.get(role)
         if factory is None:
@@ -822,11 +1245,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             runtime = factory(self)
         except Exception as error:
             raise RuntimeError(
-                "spark-context-cache: streaming runtime installation failed closed"
+                "spark-context-cache: streaming runtime installation was rejected"
             ) from error
         if runtime is None:
             raise RuntimeError(
-                "spark-context-cache: streaming runtime installation failed closed"
+                "spark-context-cache: streaming runtime installation was rejected"
             )
         if role is KVConnectorRole.SCHEDULER:
             required = (
@@ -878,7 +1301,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             )
         return self._config.build_identity(shard_rank, tp_shard_rank)
 
-    def _digest(self, token_ids: list[int], span: int) -> str:
+    def _digest(
+        self,
+        token_ids: list[int],
+        span: int,
+        multimodal_features: Sequence[MultimodalFeatureIdentity] = (),
+    ) -> str:
         # The salt must be identical on every role and rank: it names the
         # shared context, not this process's shard. Pin both shard fields to
         # zero at construction rather than letting the worker role substitute
@@ -887,16 +1315,22 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             token_ids,
             self._context_digest_salt,
             token_count=span,
+            multimodal_features=multimodal_features,
         )
 
     def _publication_base(
         self,
         token_ids: Sequence[int],
         span_tokens: int,
+        multimodal_features: Sequence[MultimodalFeatureIdentity] = (),
     ) -> tuple[str, int]:
         """Select the longest all-rank prefix eligible for tail publication."""
 
         if not self._publication_schema:
+            return "", 0
+        if any(feature.offset < span_tokens for feature in multimodal_features):
+            # ManifestStore's extension proof derives token-only digests. An
+            # exact multimodal snapshot is safe; a derived key is not.
             return "", 0
         first = (
             (self._min_span + self._chunk_tokens - 1) // self._chunk_tokens
@@ -907,6 +1341,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             token_ids,
             self._context_digest_salt,
             boundaries=range(first, span_tokens, self._chunk_tokens),
+            multimodal_features=multimodal_features,
         )
         selected = next(
             (
@@ -978,7 +1413,23 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             return False
 
     def _aligned_span(self, prompt_len: int) -> int:
-        span = (prompt_len - 1) // self._block_size * self._block_size
+        alignment = self._block_size
+        if self._storage_mode == "block_pages_v1" and self._dcp_degree > 1:
+            try:
+                sharded_page_quanta = tuple(
+                    int(topology["logical_tokens_per_block"])
+                    for topology in self._group_topology
+                    if int(topology["dcp_shard_count"]) > 1
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise RuntimeError(
+                    "spark-context-cache: block-page DCP topology is incomplete"
+                ) from error
+            alignment = math.lcm(
+                self._chunk_tokens,
+                *(sharded_page_quanta or (self._block_size,)),
+            )
+        span = (prompt_len - 1) // alignment * alignment
         return span // self._chunk_tokens * self._chunk_tokens
 
     @staticmethod
@@ -998,44 +1449,76 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self,
         groups: tuple[tuple[int, ...], ...],
         span_tokens: int,
+        *,
+        recurrent_boundary_blocks: Sequence[tuple[int, int]] = (),
     ) -> tuple[tuple[int, ...], ...]:
         if len(groups) != len(self._group_topology):
             raise HybridCodecError("request block tables disagree with page groups")
+        overrides: dict[int, int] = {}
+        for entry in recurrent_boundary_blocks:
+            if (
+                not isinstance(entry, (list, tuple))
+                or len(entry) != 2
+                or any(type(value) is not int for value in entry)
+            ):
+                raise HybridCodecError("recurrent boundary override is malformed")
+            group_index, block_id = entry
+            if (
+                not 0 <= group_index < len(self._group_topology)
+                or group_index in overrides
+                or block_id <= 0
+                or self._group_topology[group_index]["reuse_policy"]
+                != "recurrent_align"
+            ):
+                raise HybridCodecError("recurrent boundary override is incompatible")
+            overrides[group_index] = block_id
         trimmed = []
-        for group, topology in zip(groups, self._group_topology):
-            block_size = int(topology["block_size"])
-            required = (span_tokens + block_size - 1) // block_size
-            if len(group) < required:
-                raise HybridCodecError(
-                    "request block table is shorter than the aligned cache span"
-                )
+        for group_index, (group, topology) in enumerate(
+            zip(groups, self._group_topology)
+        ):
+            logical_tokens_per_block = int(topology["logical_tokens_per_block"])
+            boundary_required = (
+                span_tokens + logical_tokens_per_block - 1
+            ) // logical_tokens_per_block
             policy = topology["reuse_policy"]
             window = topology["reuse_window_tokens"]
-            selected = required
+            selected = boundary_required
+            minimum_table_blocks = boundary_required
             if policy == "sliding":
                 if window is None:
                     raise HybridCodecError("sliding page group has no reuse window")
                 # The window includes the token about to be computed. Only its
                 # preceding window-1 KV positions must be resident.
                 selected = min(
-                    required,
-                    (int(window) - 1 + block_size - 1) // block_size,
+                    boundary_required,
+                    (int(window) - 1 + logical_tokens_per_block - 1)
+                    // logical_tokens_per_block,
                 )
             elif policy == "recurrent_align":
                 # Align mode retains a single recurrent checkpoint at the
                 # persistent boundary. Earlier position-indexed table entries
                 # are null after vLLM removes skipped state blocks.
                 selected = 1
+                minimum_table_blocks = 1
             elif policy != "full":
                 raise HybridCodecError(f"unsupported page reuse policy {policy!r}")
-            # The table can include a live tail beyond the persistent span.
-            # Sliding/recurrent groups can also contain recycled or null IDs
-            # before their semantic window. Select relative to the persistent
-            # boundary so neither class of unrelated page is copied. A
-            # SparkCache manifest names one exact full span; its constituent
-            # chunks are never matched as independent prefixes, so only the
-            # reuse window at that span's final boundary is required.
-            chosen = group[required - selected : required]
+            if len(group) < minimum_table_blocks:
+                raise HybridCodecError(
+                    "request block table is shorter than the aligned cache span"
+                )
+            # Full and sliding tables are position-indexed. Recurrent-align
+            # tables instead retain one live checkpoint in their final slot;
+            # earlier entries may be null padding or historical state. An
+            # explicit boundary hand-off names a pinned publication checkpoint
+            # and therefore takes precedence over the live tail.
+            if policy == "recurrent_align" and group_index in overrides:
+                chosen = (overrides[group_index],)
+            elif policy == "recurrent_align" and len(group) < boundary_required:
+                chosen = (group[-1],)
+            else:
+                chosen = group[
+                    boundary_required - selected : boundary_required
+                ]
             if any(block <= 0 for block in chosen):
                 raise HybridCodecError(
                     "selected page window contains vLLM's null block"
@@ -1052,8 +1535,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
 
         counts = []
         for topology in self._group_topology:
-            block_size = int(topology["block_size"])
-            required = (span_tokens + block_size - 1) // block_size
+            logical_tokens_per_block = int(topology["logical_tokens_per_block"])
+            required = (
+                span_tokens + logical_tokens_per_block - 1
+            ) // logical_tokens_per_block
             policy = topology["reuse_policy"]
             if policy == "sliding":
                 window = topology["reuse_window_tokens"]
@@ -1061,7 +1546,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     raise HybridCodecError("sliding page group has no reuse window")
                 required = min(
                     required,
-                    (int(window) - 1 + block_size - 1) // block_size,
+                    (int(window) - 1 + logical_tokens_per_block - 1)
+                    // logical_tokens_per_block,
                 )
             elif policy == "recurrent_align":
                 required = 1
@@ -1195,11 +1681,15 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 (
                     flight.segment_digest,
                     flight.segment_span_tokens,
-                    _SHARED_PREFIX_LEASE_TTL_SECONDS,
+                    self._shared_prefix_lease_ttl_seconds,
                 ),
             )
         return (
-            (flight.digest, flight.span_tokens, _SHARED_PREFIX_LEASE_TTL_SECONDS),
+            (
+                flight.digest,
+                flight.span_tokens,
+                self._shared_prefix_lease_ttl_seconds,
+            ),
         )
 
     def get_shared_prefix_lease_to_publish(
@@ -1227,8 +1717,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         if flight is None or not flight.workers_finished:
             return False
         candidates = {
-            key: span
-            for key, span, _ in self._lease_publication_candidates(flight)
+            key: span for key, span, _ in self._lease_publication_candidates(flight)
         }
         span = candidates.get(lease_key)
         if span is None:
@@ -1237,7 +1726,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         flight.lease_digest = lease_key
         flight.lease_span_tokens = span
         flight.lease_published_at = now
-        flight.lease_expires_at = now + _SHARED_PREFIX_LEASE_TTL_SECONDS
+        flight.lease_expires_at = now + self._shared_prefix_lease_ttl_seconds
         self.counters["shared_prefix_leases_published"] += 1
 
         published = sorted(
@@ -1273,7 +1762,15 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 return follower_digest.lease_digest, follower_digest.span_tokens
             return None
 
-        token_ids = list(request.prompt_token_ids or [])
+        prompt_token_ids = request.prompt_token_ids or ()
+        token_ids = list(prompt_token_ids)
+        multimodal_features = _multimodal_feature_identities(
+            request,
+            len(token_ids),
+        )
+        if multimodal_features is None:
+            self.counters["multimodal_bypass"] += 1
+            return None
         aligned_span = self._aligned_span(len(token_ids))
         span_ceiling = min(
             aligned_span,
@@ -1281,19 +1778,35 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         )
         if span_ceiling < self._min_span:
             return None
-        candidates = chunk_prefix_digests(
-            token_ids,
-            self._context_digest_salt,
-            boundaries=range(
-                (
-                    (self._min_span + self._chunk_tokens - 1)
-                    // self._chunk_tokens
-                    * self._chunk_tokens
-                ),
-                span_ceiling + 1,
-                self._chunk_tokens,
-            ),
+        signature = (
+            id(prompt_token_ids),
+            len(token_ids),
+            span_ceiling,
+            multimodal_features,
         )
+        cached = self._prefix_digest_candidates.get(request_id)
+        if cached is not None and cached[0] == signature:
+            candidates = cached[1]
+            self.counters["prefix_digest_cache_hits"] += 1
+        else:
+            candidates = tuple(
+                chunk_prefix_digests(
+                    token_ids,
+                    self._context_digest_salt,
+                    boundaries=range(
+                        (
+                            (self._min_span + self._chunk_tokens - 1)
+                            // self._chunk_tokens
+                            * self._chunk_tokens
+                        ),
+                        span_ceiling + 1,
+                        self._chunk_tokens,
+                    ),
+                    multimodal_features=multimodal_features,
+                )
+            )
+            self._prefix_digest_candidates[request_id] = (signature, candidates)
+            self.counters["prefix_digest_cache_misses"] += 1
         selected = next(
             (
                 (self._restore_flights.get(candidate_digest), candidate_digest)
@@ -1363,6 +1876,16 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> tuple[int | None, bool]:
         if not self._restore_enabled:
             return 0, False
+        token_ids = list(request.prompt_token_ids or [])
+        multimodal_features = _multimodal_feature_identities(
+            request,
+            len(token_ids),
+        )
+        if multimodal_features is None:
+            # Missing content identity or placeholder geometry cannot prove
+            # which media produced the KV state. Recompute without caching.
+            self.counters["multimodal_bypass"] += 1
+            return 0, False
         request_id = request.request_id
         follower_digest = self._restore_flight_followers.get(request_id)
         if follower_digest is not None:
@@ -1399,7 +1922,6 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     return flight.span_tokens - num_computed_tokens, True
                 self._need_load.pop(request_id, None)
                 self._retire_restore_flight(leader_digest, outcome="cancelled")
-        token_ids = list(request.prompt_token_ids or [])
         aligned_span = self._aligned_span(len(token_ids))
         span_ceiling = min(
             aligned_span,
@@ -1427,6 +1949,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 span_ceiling + 1,
                 self._chunk_tokens,
             ),
+            multimodal_features=multimodal_features,
         )
         selected = next(
             (
@@ -1496,14 +2019,14 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 return 0, False
             if is_alias:
                 self.counters["prefix_alias_scheduler_probe_hit"] += 1
-        # probe mode "none": quorum alone gates admission; every worker
+        # Probe mode "none": quorum alone determines admission; every worker
         # validated its own manifest at discovery or commit time, and any
         # rank's load failure still degrades to a clean recompute.
         self.counters["restore_hit"] += 1
         logger.info(
-            "spark-context-cache: scheduler hit digest=%s span=%d (async)",
-            digest[:12],
+            "sparkcache: hit tokens=%d digest=%s",
             span,
+            digest[:12],
         )
         self._restore_flights[digest] = _RestoreFlight(
             digest=digest,
@@ -1568,6 +2091,91 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             )
         )
 
+    def _validated_recurrent_boundary_blocks(
+        self,
+        scheduler_output: "SchedulerOutput",
+        request_id: str,
+        boundary_tokens: int,
+        *,
+        latched: tuple[tuple[int, int], ...] = (),
+    ) -> tuple[tuple[int, int], ...] | None:
+        """Validate vLLM's exact recurrent replay-boundary block hand-off.
+
+        vLLM may expose an earlier aligned checkpoint while the request is
+        still advancing toward this store boundary, followed by a partial-tail
+        CoW target on a later scheduler output. Valid older entries and absent
+        per-request metadata therefore preserve ``latched`` and keep the store
+        pending. None means supplied metadata is incomplete, malformed, ahead
+        of the plan, or conflicts with an earlier same-boundary latch, so this
+        publication attempt must be poisoned. SparkCache never derives a
+        replacement from another request-table entry because it can name
+        overwritten running or speculative state instead of vLLM's pinned CoW
+        target.
+        """
+
+        def reject(reason: str) -> None:
+            self.counters["recurrent_boundary_metadata_rejected"] += 1
+            logger.warning(
+                "spark-context-cache: recurrent boundary metadata rejected"
+                " request=%s boundary=%d: %s",
+                request_id,
+                boundary_tokens,
+                reason,
+            )
+            return None
+
+        required_groups = self._recurrent_group_indexes
+        if not required_groups:
+            return ()
+        raw = getattr(scheduler_output, "recurrent_boundary_blocks", None)
+        if raw is None:
+            return latched
+        if not isinstance(raw, Mapping):
+            return reject("top-level value is not a mapping")
+        entries = raw.get(request_id)
+        if entries is None:
+            return latched
+        if not isinstance(entries, (list, tuple)):
+            return reject("request value is not a sequence")
+        if not entries:
+            return reject("request has no recurrent boundary entries")
+
+        overrides: list[tuple[int, int]] = []
+        seen_target_groups: set[int] = set()
+        for entry in entries:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 3:
+                return reject("entry is not a group, block, boundary triple")
+            group_index, block_id, entry_boundary = entry
+            if any(type(value) is not int for value in entry):
+                return reject("entry values are not integers")
+            if not 0 <= group_index < len(self._group_topology):
+                return reject("group index is outside the registered topology")
+            topology = self._group_topology[group_index]
+            if topology["reuse_policy"] != "recurrent_align":
+                return reject("group is not an aligned recurrent cache")
+            if block_id <= 0:
+                return reject("physical block is vLLM's null block")
+            if entry_boundary < boundary_tokens:
+                continue
+            if entry_boundary > boundary_tokens:
+                return reject(
+                    "entry boundary is ahead of the store plan"
+                    f" observed={entry_boundary} target={boundary_tokens}"
+                    f" group={group_index} block={block_id}"
+                )
+            if group_index in seen_target_groups:
+                return reject("multiple blocks claim the same recurrent group")
+            seen_target_groups.add(group_index)
+            overrides.append((group_index, block_id))
+        if not overrides:
+            return latched
+        if seen_target_groups != required_groups:
+            return reject("entries do not cover every aligned recurrent group")
+        validated = tuple(sorted(overrides))
+        if latched and validated != latched:
+            return reject("entries conflict with the latched recurrent boundary")
+        return validated
+
     def build_connector_meta(
         self, scheduler_output: "SchedulerOutput"
     ) -> KVConnectorMetadata:
@@ -1576,6 +2184,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 sorted(getattr(scheduler_output, "preempted_req_ids", None) or ())
             )
         )
+        # vLLM releases request-lifetime recurrent boundary pins on preemption.
+        # Keep token/table accumulation for a possible resume, but require a
+        # fresh hash-proven hand-off before the resumed request may publish.
+        for request_id in meta.preempted_request_ids:
+            self._store_recurrent_boundaries.pop(request_id, None)
         for request_id, (
             digest,
             span,
@@ -1608,14 +2221,30 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             token_ids = list(new_req.prompt_token_ids or [])
             req_id = new_req.req_id
             self._need_load.pop(req_id, None)
+            multimodal_features = _multimodal_feature_identities(
+                new_req,
+                len(token_ids),
+            )
+            if multimodal_features is None:
+                # Publication without a complete media content/range identity
+                # would recreate the token-placeholder alias.
+                self.counters["multimodal_bypass"] += 1
+                continue
             scheduled = scheduler_output.num_scheduled_tokens.get(req_id, 0)
             group_blocks = self._normalize_group_blocks(new_req.block_ids)
             block_ids = group_blocks[0]
             span = self._aligned_span(len(token_ids))
             if self._store_enabled and self._min_span <= span <= self._max_span:
-                digest = self._digest(token_ids, span)
+                has_multimodal_identity = any(
+                    feature.offset < span for feature in multimodal_features
+                )
+                digest = self._digest(token_ids, span, multimodal_features)
                 exact_token_ids = tuple(token_ids[:span])
-                base_digest, base_span = self._publication_base(token_ids, span)
+                base_digest, base_span = self._publication_base(
+                    token_ids,
+                    span,
+                    multimodal_features,
+                )
                 admitted = self._admitted.get(req_id)
                 if admitted is not None and admitted[0] == digest:
                     # The restored entry already exists on every rank. A
@@ -1647,6 +2276,38 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                             [list(group) for group in group_blocks],
                         )
                         self._store_token_ids[req_id] = exact_token_ids
+                        if has_multimodal_identity:
+                            self._store_multimodal.add(req_id)
+                elif self._recurrent_group_indexes:
+                    recurrent_boundary_blocks = (
+                        self._validated_recurrent_boundary_blocks(
+                            scheduler_output,
+                            req_id,
+                            span,
+                        )
+                    )
+                    if recurrent_boundary_blocks is None:
+                        continue
+                    # Full-page proof and partial-tail CoW hand-offs can arrive
+                    # after the prefill which began this store. Retain the
+                    # complete request table and any early proof until a later
+                    # cached step has both finished the span and proven every
+                    # recurrent group.
+                    self._store_progress[req_id] = (
+                        digest,
+                        span,
+                        already,
+                        [list(group) for group in group_blocks],
+                    )
+                    self._store_token_ids[req_id] = exact_token_ids
+                    if has_multimodal_identity:
+                        self._store_multimodal.add(req_id)
+                    if recurrent_boundary_blocks:
+                        self._store_recurrent_boundaries[req_id] = (
+                            recurrent_boundary_blocks
+                        )
+                    if base_digest:
+                        self._store_bases[req_id] = (base_digest, base_span)
                 elif already >= span:
                     meta.plans.append(
                         _ReqPlan(
@@ -1659,6 +2320,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                             token_ids=exact_token_ids,
                             base_context_digest=base_digest,
                             base_span_tokens=base_span,
+                            has_multimodal_identity=has_multimodal_identity,
                         )
                     )
                 else:
@@ -1672,6 +2334,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         [list(group) for group in group_blocks],
                     )
                     self._store_token_ids[req_id] = exact_token_ids
+                    if has_multimodal_identity:
+                        self._store_multimodal.add(req_id)
                     if base_digest:
                         self._store_bases[req_id] = (base_digest, base_span)
         cached = scheduler_output.scheduled_cached_reqs
@@ -1680,31 +2344,56 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 continue
             digest, span, done, blocks_by_group = self._store_progress[req_id]
             exact_token_ids = self._store_token_ids.get(req_id, ())
+            has_multimodal_identity = req_id in self._store_multimodal
             base_digest, base_span = self._store_bases.get(req_id, ("", 0))
-            new_block_ids = cached.new_block_ids[index]
-            appended = (
-                [
-                    list(group)
-                    for group in self._normalize_group_blocks(
-                        new_block_ids,
-                        allow_empty_groups=True,
-                    )
-                ]
-                if new_block_ids is not None
-                else [[] for _ in blocks_by_group]
+            if self._has_full_quorum(digest):
+                del self._store_progress[req_id]
+                self._store_token_ids.pop(req_id, None)
+                self._store_multimodal.discard(req_id)
+                self._store_bases.pop(req_id, None)
+                self._store_recurrent_boundaries.pop(req_id, None)
+                self.counters["store_skipped_quorum"] += 1
+                continue
+            recurrent_boundary_blocks = self._validated_recurrent_boundary_blocks(
+                scheduler_output,
+                req_id,
+                span,
+                latched=self._store_recurrent_boundaries.get(req_id, ()),
             )
-            if len(appended) != len(blocks_by_group):
-                raise RuntimeError(
-                    "spark-context-cache: KV-cache group count changed while"
-                    " accumulating a store"
+            if recurrent_boundary_blocks is None:
+                del self._store_progress[req_id]
+                self._store_token_ids.pop(req_id, None)
+                self._store_multimodal.discard(req_id)
+                self._store_bases.pop(req_id, None)
+                self._store_recurrent_boundaries.pop(req_id, None)
+                continue
+            if recurrent_boundary_blocks:
+                self._store_recurrent_boundaries[req_id] = recurrent_boundary_blocks
+            if done < span or req_id in cached.resumed_req_ids:
+                new_block_ids = cached.new_block_ids[index]
+                appended = (
+                    [
+                        list(group)
+                        for group in self._normalize_group_blocks(
+                            new_block_ids,
+                            allow_empty_groups=True,
+                        )
+                    ]
+                    if new_block_ids is not None
+                    else [[] for _ in blocks_by_group]
                 )
-            if req_id in cached.resumed_req_ids:
-                blocks_by_group = appended
-            else:
-                blocks_by_group = [
-                    existing + added
-                    for existing, added in zip(blocks_by_group, appended)
-                ]
+                if len(appended) != len(blocks_by_group):
+                    raise RuntimeError(
+                        "spark-context-cache: KV-cache group count changed while"
+                        " accumulating a store"
+                    )
+                if req_id in cached.resumed_req_ids:
+                    blocks_by_group = appended
+                else:
+                    blocks_by_group = [
+                        existing + added
+                        for existing, added in zip(blocks_by_group, appended)
+                    ]
             blocks = blocks_by_group[0]
             done = cached.num_computed_tokens[index] + (
                 scheduler_output.num_scheduled_tokens.get(req_id, 0)
@@ -1713,7 +2402,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 if done >= span:
                     del self._store_progress[req_id]
                     self._store_token_ids.pop(req_id, None)
+                    self._store_multimodal.discard(req_id)
                     self._store_bases.pop(req_id, None)
+                    self._store_recurrent_boundaries.pop(req_id, None)
                     if self._has_full_quorum(digest):
                         self.counters["store_skipped_quorum"] += 1
                         continue
@@ -1733,12 +2424,29 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     block_ids=blocks,
                 )
             elif done >= span:
+                if self._recurrent_group_indexes and not recurrent_boundary_blocks:
+                    self._store_progress[req_id] = (
+                        digest,
+                        span,
+                        done,
+                        blocks_by_group,
+                    )
+                    continue
+                if exact_token_ids and not has_multimodal_identity:
+                    # A durable worker commit can finish while the scheduler is
+                    # idle. Its first quorum report then returns only after the
+                    # next request has begun prefill, which is too late for the
+                    # base choice made in scheduled_new_reqs above. Select from
+                    # the all-rank view observed at the publication step.
+                    base_digest, base_span = self._publication_base(
+                        exact_token_ids,
+                        span,
+                    )
                 del self._store_progress[req_id]
                 self._store_token_ids.pop(req_id, None)
+                self._store_multimodal.discard(req_id)
                 self._store_bases.pop(req_id, None)
-                if self._has_full_quorum(digest):
-                    self.counters["store_skipped_quorum"] += 1
-                    continue
+                self._store_recurrent_boundaries.pop(req_id, None)
                 normalized = tuple(tuple(group) for group in blocks_by_group)
                 meta.plans.append(
                     _ReqPlan(
@@ -1751,6 +2459,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         token_ids=exact_token_ids,
                         base_context_digest=base_digest,
                         base_span_tokens=base_span,
+                        recurrent_boundary_blocks=recurrent_boundary_blocks,
+                        has_multimodal_identity=has_multimodal_identity,
                     )
                 )
             else:
@@ -1766,7 +2476,46 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             # the exact offers sent to workers so it delays block reuse only
             # for requests whose final gather may still be in flight.
             runtime.observe_metadata(meta)
+        self._reserve_async_page_capture_plans(meta)
         return meta
+
+    def _reserve_async_page_capture_plans(
+        self,
+        meta: SparkCacheConnectorMetadata,
+    ) -> None:
+        """Bound request-block retention before worker capture can begin."""
+
+        if (
+            not self._async_page_capture_enabled
+            or self._role is not KVConnectorRole.SCHEDULER
+        ):
+            return
+        accepted: list[_ReqPlan] = []
+        for plan in meta.plans:
+            if not plan.is_store:
+                accepted.append(plan)
+                continue
+            if plan.request_id not in self._async_page_capture_reservations:
+                if (
+                    len(self._async_page_capture_reservations)
+                    >= self._max_delayed_stores
+                ):
+                    self.counters["store_skipped_delayed_limit"] += 1
+                    continue
+                self._async_page_capture_reservations[plan.request_id] = sum(
+                    len(group) for group in plan.group_block_ids
+                )
+            self._async_page_capture_eligible.add(plan.request_id)
+            accepted.append(plan)
+        meta.plans[:] = accepted
+
+    def _release_async_page_capture_reservations(
+        self,
+        request_ids: Sequence[str],
+    ) -> None:
+        for request_id in request_ids:
+            self._async_page_capture_reservations.pop(request_id, None)
+            self._async_page_capture_eligible.discard(request_id)
 
     # ------------------------------------------------------------------
     # worker side
@@ -1779,23 +2528,181 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             # This must remain synchronous: the runtime drains armed CUDA
             # fences or raises without releasing blocks of unknown status.
             runtime.handle_preemptions(kv_connector_metadata)
+        runtime = self._async_page_capture_runtime
+        if runtime is not None:
+            for request_id in getattr(
+                kv_connector_metadata, "preempted_request_ids", ()
+            ):
+                runtime.preempt(request_id)
+
+    def _manager_page_view(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        page_bytes: int,
+    ) -> torch.Tensor:
+        """Expose one complete physical manager page on dimension zero."""
+
+        manager_blocks = int(getattr(self._kv_cache_config, "num_blocks", 0) or 0)
+        if manager_blocks <= 0:
+            raise RuntimeError(
+                "spark-context-cache: block-page storage has no manager blocks"
+            )
+        if tensor.dim() < 2:
+            raise RuntimeError(
+                f"spark-context-cache: layer {name} has unexpected"
+                f" shape {tuple(tensor.shape)}"
+            )
+        kernel_rows = int(tensor.shape[0])
+        if kernel_rows % manager_blocks:
+            raise RuntimeError(
+                "spark-context-cache: layer "
+                f"{name} has {kernel_rows} kernel rows for {manager_blocks}"
+                " manager blocks"
+            )
+        kernel_rows_per_page = kernel_rows // manager_blocks
+        element_size = int(tensor.element_size())
+        logical_page_bytes = (
+            kernel_rows_per_page
+            * math.prod(int(size) for size in tensor.shape[1:])
+            * element_size
+        )
+        manager_page_stride = (
+            int(tensor.stride(0)) * element_size * kernel_rows_per_page
+        )
+        if manager_page_stride <= 0 or not (
+            logical_page_bytes <= page_bytes <= manager_page_stride
+        ):
+            raise RuntimeError(
+                "spark-context-cache: layer "
+                f"{name} page geometry is incompatible: logical={logical_page_bytes}"
+                f" physical={page_bytes} stride={manager_page_stride}"
+            )
+        try:
+            byte_view = tensor.view(torch.uint8)
+            storage_offset = int(byte_view.storage_offset())
+            required_storage_bytes = (
+                storage_offset + (manager_blocks - 1) * manager_page_stride + page_bytes
+            )
+            storage_bytes = int(byte_view.untyped_storage().nbytes())
+            if required_storage_bytes > storage_bytes:
+                raise RuntimeError(
+                    f"physical pages require {required_storage_bytes} bytes"
+                    f" from storage of {storage_bytes} bytes"
+                )
+            return torch.as_strided(
+                byte_view,
+                size=(manager_blocks, 1, page_bytes),
+                stride=(manager_page_stride, page_bytes, 1),
+                storage_offset=storage_offset,
+            )
+        except RuntimeError as error:
+            raise RuntimeError(
+                f"spark-context-cache: layer {name} physical page view is invalid"
+            ) from error
+
+    @staticmethod
+    def _layer_page_bytes(group_spec: Any, layer_name: str) -> int:
+        """Resolve one layer's physical page size from its manager group."""
+
+        layer_specs = getattr(group_spec, "kv_cache_specs", None)
+        if isinstance(layer_specs, Mapping):
+            layer_spec = layer_specs.get(layer_name)
+            if layer_spec is None:
+                raise RuntimeError(
+                    "spark-context-cache: group has no cache specification for"
+                    f" layer {layer_name}"
+                )
+        else:
+            layer_spec = group_spec
+        page_bytes = int(getattr(layer_spec, "page_size_bytes", 0) or 0)
+        if page_bytes <= 0:
+            raise RuntimeError(
+                f"spark-context-cache: layer {layer_name} has no physical page size"
+            )
+        return page_bytes
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        self._layer_tensors = dict(kv_caches)
+        registered_tensors = dict(kv_caches)
+        manager_page_summary: dict[str, int] | None = None
+        if self._storage_mode == "block_pages_v1":
+            groups = tuple(getattr(self._kv_cache_config, "kv_cache_groups", ()) or ())
+            manager_blocks = int(getattr(self._kv_cache_config, "num_blocks", 0) or 0)
+            page_bytes_by_layer: dict[str, int] = {}
+            for group in groups:
+                spec = getattr(group, "kv_cache_spec", None)
+                for name in getattr(group, "layer_names", ()) or ():
+                    if name in page_bytes_by_layer:
+                        raise RuntimeError(
+                            "spark-context-cache: layer belongs to multiple"
+                            f" KV-cache groups: {name}"
+                        )
+                    page_bytes_by_layer[name] = self._layer_page_bytes(spec, name)
+            unassigned = set(registered_tensors) - set(page_bytes_by_layer)
+            missing = set(page_bytes_by_layer) - set(registered_tensors)
+            if unassigned or missing:
+                raise RuntimeError(
+                    "spark-context-cache: registered layers disagree with KV-cache"
+                    f" groups: missing={sorted(missing)}, extra={sorted(unassigned)}"
+                )
+            split_kernel_layers = 0
+            physical_tail_layers = 0
+            physical_tail_bytes = 0
+            for name, tensor in registered_tensors.items():
+                if tensor.dim() < 2:
+                    continue
+                kernel_rows = int(tensor.shape[0])
+                if manager_blocks > 0 and kernel_rows % manager_blocks == 0:
+                    kernel_rows_per_page = kernel_rows // manager_blocks
+                    split_kernel_layers += int(kernel_rows_per_page > 1)
+                    logical_page_bytes = (
+                        kernel_rows_per_page
+                        * math.prod(int(size) for size in tensor.shape[1:])
+                        * int(tensor.element_size())
+                    )
+                    tail_bytes = page_bytes_by_layer[name] - logical_page_bytes
+                    if tail_bytes > 0:
+                        physical_tail_layers += 1
+                        physical_tail_bytes += tail_bytes
+            registered_tensors = {
+                name: self._manager_page_view(
+                    name,
+                    tensor,
+                    page_bytes_by_layer[name],
+                )
+                for name, tensor in registered_tensors.items()
+            }
+            manager_page_summary = {
+                "blocks": manager_blocks,
+                "layers": len(registered_tensors),
+                "split_kernel_layers": split_kernel_layers,
+                "physical_tail_layers": physical_tail_layers,
+                "physical_tail_bytes_per_page": physical_tail_bytes,
+            }
+            logger.info(
+                "sparkcache: manager_pages blocks=%d layers=%d"
+                " split_kernel_layers=%d tail_layers=%d"
+                " tail_bytes_per_page=%d",
+                manager_page_summary["blocks"],
+                manager_page_summary["layers"],
+                manager_page_summary["split_kernel_layers"],
+                manager_page_summary["physical_tail_layers"],
+                manager_page_summary["physical_tail_bytes_per_page"],
+            )
+        self._layer_tensors = registered_tensors
         if self._storage_mode == "block_pages_v1":
             page_groups = []
             assigned: set[str] = set()
-            groups = tuple(getattr(self._kv_cache_config, "kv_cache_groups", ()) or ())
             for group in groups:
                 spec = getattr(group, "kv_cache_spec", None)
                 layers = []
                 for name in sorted(getattr(group, "layer_names", ()) or ()):
-                    if name not in kv_caches:
+                    if name not in registered_tensors:
                         raise RuntimeError(
                             f"spark-context-cache: group layer {name} was not"
                             " registered"
                         )
-                    tensor = kv_caches[name]
+                    tensor = registered_tensors[name]
                     page_shape = tuple(int(size) for size in tensor.shape[1:])
                     layers.append(
                         PageLayer(
@@ -1820,7 +2727,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         ],
                     )
                 )
-            unassigned = set(kv_caches) - assigned
+            unassigned = set(registered_tensors) - assigned
             if unassigned:
                 raise RuntimeError(
                     "spark-context-cache: registered layers lack a KV-cache"
@@ -1828,7 +2735,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 )
             self._page_layout = PageLayout(tuple(page_groups))
         widths = {}
-        for name, tensor in sorted(kv_caches.items()):
+        for name, tensor in sorted(registered_tensors.items()):
             if tensor.dim() < 3:
                 raise RuntimeError(
                     f"spark-context-cache: layer {name} has unexpected"
@@ -1836,11 +2743,6 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 )
             row = tensor[0, 0]
             widths[name] = int(row.numel() * row.element_size())
-        logger.info(
-            "spark-context-cache: layer inventory (%d layers): %s",
-            len(widths),
-            {name: widths[name] for name in sorted(widths)},
-        )
         profile = self._profile
         draft_named = any(
             classify_layer(name, profile.classification_rules, profile.default_family)
@@ -1869,11 +2771,61 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         kinds: dict[str, int] = {}
         for plan in self._plans:
             kinds[plan.record_kind] = kinds.get(plan.record_kind, 0) + 1
+        item_bytes: dict[int, int] = {}
+        for width in widths.values():
+            item_bytes[width] = item_bytes.get(width, 0) + 1
+        layer_records = {plan.name: plan.record_kind for plan in self._plans}
+        self._startup_layer_inventory = {
+            "storage": self._storage_mode,
+            "draft_policy": self._identity_base.get("draft_kv_policy", "separate"),
+            "layer_count": len(self._plans),
+            "record_counts": dict(sorted(kinds.items())),
+            "item_byte_counts": {
+                str(width): count for width, count in sorted(item_bytes.items())
+            },
+            "manager_pages": manager_page_summary,
+            "layers": [
+                {
+                    "name": name,
+                    "item_bytes": widths[name],
+                    "record": layer_records[name],
+                }
+                for name in sorted(widths)
+            ],
+        }
+        self.counters["startup_layers_registered"] = len(self._plans)
+        self.counters["startup_record_kinds"] = len(kinds)
+        self.counters["startup_item_byte_widths"] = len(item_bytes)
+        if manager_page_summary is not None:
+            self.counters["startup_manager_blocks"] = manager_page_summary["blocks"]
+            self.counters["startup_split_kernel_layers"] = manager_page_summary[
+                "split_kernel_layers"
+            ]
+            self.counters["startup_physical_tail_layers"] = manager_page_summary[
+                "physical_tail_layers"
+            ]
+            self.counters["startup_physical_tail_bytes_per_page"] = (
+                manager_page_summary["physical_tail_bytes_per_page"]
+            )
         logger.info(
-            "spark-context-cache: registered %d layers %s policy=%s",
+            "sparkcache: layers total=%d storage=%s records=%s item_bytes=%s"
+            " draft_policy=%s",
             len(self._plans),
-            kinds,
+            self._storage_mode,
+            json.dumps(dict(sorted(kinds.items())), separators=(",", ":")),
+            json.dumps(
+                self._startup_layer_inventory["item_byte_counts"],
+                separators=(",", ":"),
+            ),
             self._identity_base.get("draft_kv_policy", "separate"),
+        )
+        logger.debug(
+            "sparkcache: layer_inventory %s",
+            json.dumps(
+                self._startup_layer_inventory,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
         )
         if self._native_restore_enabled and self._role is KVConnectorRole.WORKER:
             self._configure_native_restore()
@@ -1886,6 +2838,38 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             # The adapter closes over this connector. Bind only after the
             # complete tensor inventory and canonical layer plans exist.
             runtime.bind_kv_caches()
+        if self._async_page_capture_enabled and self._role is KVConnectorRole.WORKER:
+            factory = _ASYNC_PAGE_RUNTIME_FACTORY
+            if factory is None:
+                from sparkcache.streaming.manager_page_factory import (
+                    build_manager_page_runtime,
+                )
+
+                settings = self._async_page_capture_settings
+                if settings is None:
+                    raise RuntimeError(
+                        "spark-context-cache: manager-page capture settings vanished"
+                    )
+                runtime = build_manager_page_runtime(self, settings)
+            else:
+                runtime = factory(self)
+            required = (
+                "submit",
+                "preempt",
+                "finish_without_capture",
+                "take_finished",
+                "quiesce",
+                "shutdown",
+            )
+            missing = [
+                name for name in required if not callable(getattr(runtime, name, None))
+            ]
+            if missing:
+                raise RuntimeError(
+                    "spark-context-cache: manager-page capture runtime is incomplete: "
+                    + ", ".join(missing)
+                )
+            self._async_page_capture_runtime = runtime
         if (
             self._cache_available
             and self._capacity_policy.enabled
@@ -1901,23 +2885,26 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self.discover_manifests()
 
     def _configure_native_restore(self) -> None:
-        """Attest and bind native placement only after final CUDA inventory."""
+        """Attest SparkCache CUDA placement after final CUDA inventory."""
 
         if self._native_adapter is not None:
             raise RuntimeError(
-                "spark-context-cache: native placement is already configured"
+                "spark-context-cache: SparkCache CUDA placement is already configured"
             )
         if self._storage_mode == "block_pages_v1":
             self._configure_native_hybrid_restore()
             return
         assert self._plans is not None
         if not self._plans:
-            raise RuntimeError("spark-context-cache: native restore has no layer plans")
+            raise RuntimeError(
+                "spark-context-cache: SparkCache CUDA restore has no layer plans"
+            )
         first_tensor = self._layer_tensors[self._plans[0].name]
         device = first_tensor.device
         if device.type != "cuda":
             raise RuntimeError(
-                "spark-context-cache: native restore requires CUDA cache tensors"
+                "spark-context-cache: SparkCache CUDA restore requires CUDA"
+                " cache tensors"
             )
         device_ordinal = (
             int(device.index)
@@ -1946,7 +2933,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             # stores the full chunk on every rank); an arena that cannot
             # hold one encoded chunk would fail every restore plan later.
             raise RuntimeError(
-                "spark-context-cache: native arena"
+                "spark-context-cache: SparkCache CUDA placement arena"
                 f" ({self._native_arena_bytes} bytes) cannot hold one"
                 f" encoded chunk (floor {payload_floor} bytes) at"
                 f" dcp_degree={self._dcp_degree}"
@@ -1957,12 +2944,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         )
         adapter = None
         try:
-            components = _load_native_components()
-            library = components.NativePlacementLibrary.load(
+            components = _load_cuda_components()
+            library = components.CudaPlacementLibrary.load(
                 self._native_library_path,
                 expected_sha256=self._native_library_sha256,
             )
-            adapter = components.NativePlacementAdapter.create(
+            adapter = components.CudaPlacementAdapter.create(
                 library,
                 arena_mode=components.ArenaMode.MAPPED_HOST,
                 arena_bytes=self._native_arena_bytes,
@@ -1986,26 +2973,26 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 if ordinal is None:
                     raise RuntimeError(
                         f"spark-context-cache: record kind {kind} has no"
-                        " native placement ordinal"
+                        " SparkCache CUDA placement ordinal"
                     )
                 required |= 1 << int(ordinal)
-            native_execute = components.execute_native_restore
+            native_execute = components.execute_cuda_restore
             if not callable(native_execute):
-                raise TypeError("native restore orchestrator is not callable")
+                raise TypeError("SparkCache CUDA restore orchestrator is not callable")
         except Exception as error:
             if adapter is not None:
                 with contextlib.suppress(Exception):
                     adapter.close()
             raise RuntimeError(
-                f"spark-context-cache: native restore configuration"
-                f" failed closed: {error}"
+                f"spark-context-cache: SparkCache CUDA restore configuration"
+                f" was rejected: {error}"
             ) from error
         self._native_adapter = adapter
         self._native_execute_restore = native_execute
         self._native_required_record_mask = required
         self.counters["native_configured"] = 1
         logger.info(
-            "spark-context-cache: native restore configured library=%s"
+            "sparkcache: cuda_restore library=%s"
             " sha256=%s arena_mib=%d destinations=%d slots=%d"
             " max_chunks_per_slab=%d",
             self._native_library_path,
@@ -2019,12 +3006,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     def _configure_native_hybrid_restore(self) -> None:
         layout = self._page_layout
         if layout is None:
-            raise RuntimeError("native hybrid restore has no page layout")
+            raise RuntimeError("SparkCache CUDA restore has no page layout")
         first_layer = layout.groups[0].layers[0]
         first_tensor = self._layer_tensors[first_layer.name]
         device = first_tensor.device
         if device.type != "cuda":
-            raise RuntimeError("native hybrid restore requires CUDA page tensors")
+            raise RuntimeError("SparkCache CUDA restore requires CUDA page tensors")
         device_ordinal = (
             int(device.index)
             if device.index is not None
@@ -2038,13 +3025,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             }
             if len(capacities) != 1:
                 raise RuntimeError(
-                    "native hybrid page group layers disagree on capacity"
+                    "SparkCache CUDA page group layers disagree on capacity"
                 )
             max_slots += capacities.pop()
         adapters = []
         try:
-            components = _load_native_components()
-            library = components.NativePlacementLibrary.load(
+            components = _load_cuda_components()
+            library = components.CudaPlacementLibrary.load(
                 self._native_library_path,
                 expected_sha256=self._native_library_sha256,
             )
@@ -2054,9 +3041,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 & int(components.hybrid_page_cuda_capability)
                 == 0
             ):
-                raise RuntimeError("native library lacks hybrid page CUDA scatter")
+                raise RuntimeError(
+                    "SparkCache CUDA placement library lacks page scatter"
+                )
             for _lane in range(self._load_thread_limit):
-                adapter = components.NativePlacementAdapter.create(
+                adapter = components.CudaPlacementAdapter.create(
                     library,
                     arena_mode=components.ArenaMode.MAPPED_HOST,
                     arena_bytes=self._native_arena_bytes,
@@ -2067,22 +3056,29 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 )
                 adapters.append(adapter)
                 adapter.configure_pages(layout, self._layer_tensors)
-            execute = components.execute_native_hybrid_placement
-            if not callable(execute):
-                raise TypeError("native hybrid restore orchestrator is not callable")
+            execute_restore = components.execute_cuda_hybrid_restore
+            execute_placement = components.execute_cuda_hybrid_placement
+            if not callable(execute_restore):
+                raise TypeError("SparkCache CUDA restore orchestrator is not callable")
+            if not callable(execute_placement):
+                raise TypeError(
+                    "SparkCache CUDA page-placement orchestrator is not callable"
+                )
         except Exception as error:
             for adapter in adapters:
                 with contextlib.suppress(Exception):
                     adapter.close()
             raise RuntimeError(
-                f"spark-context-cache: native hybrid restore configuration failed: {error}"
+                "spark-context-cache: SparkCache CUDA restore configuration"
+                f" did not complete: {error}"
             ) from error
         self._native_adapters = adapters
         self._native_adapter = adapters[0]
-        self._native_execute_hybrid = execute
+        self._native_execute_hybrid_restore = execute_restore
+        self._native_execute_hybrid_placement = execute_placement
         self.counters["native_hybrid_configured"] = 1
         logger.info(
-            "spark-context-cache: native hybrid restore configured"
+            "sparkcache: cuda_restore"
             " destinations=%d max_slots=%d arena_mib=%d lanes=%d",
             destination_count,
             max_slots,
@@ -2285,7 +3281,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             return False
 
         # A failed or concurrently skipped pass cannot prove which manifests
-        # survived. Retain fail-closed readback only for that ambiguous path.
+        # survived. Retain verified survivor readback for that ambiguous path.
         return not self._store.lookup(
             identity,
             context_digest,
@@ -2399,7 +3395,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     digest,
                     receipt,
                 )
-            except Exception:  # noqa: BLE001 - cache metadata fails closed
+            except Exception:  # noqa: BLE001 - invalid metadata stays unadvertised
                 invalid_receipts += 1
                 continue
             staged.append((digest, receipt, allocated_bytes))
@@ -2489,7 +3485,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         verify_chunk_metadata=True,
                     ).is_hit
                 }
-            except Exception as error:  # noqa: BLE001 - fail closed/retry
+            except Exception as error:  # noqa: BLE001 - leave unverified and retry
                 self.counters["capacity_failed"] += 1
                 self._capacity_status.update(
                     bytes=self._capacity_estimated_bytes,
@@ -2729,7 +3725,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 payload_verified = False
                 if lookup.is_hit:
                     try:
-                        if lookup.root_kind == "page_delta":
+                        if lookup.root_kind in ("page_delta", "page_snapshot"):
                             if self._page_layout is None:
                                 raise RuntimeError(
                                     "block-page layout was not registered"
@@ -2738,7 +3734,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                             self._store.restore_page_snapshot(
                                 lookup,
                                 layout=self._page_layout,
-                                result_block_counts=manifest["result_block_counts"],
+                                result_block_counts=manifest.get(
+                                    "result_block_counts", ()
+                                ),
                                 result_boundary_tokens=manifest["committed_tokens"],
                             )
                             payload_verified = True
@@ -2836,10 +3834,19 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 return
             plan = queued.plan
             timing = queued.timing
-            started = time.perf_counter()
             with contextlib.suppress(Exception):
                 timing.start_service()
             try:
+                prerequisite_started = time.perf_counter_ns()
+                if queued.prior_cuda_error is not None:
+                    raise RuntimeError(queued.prior_cuda_error)
+                if queued.prior_cuda_event is not None:
+                    queued.prior_cuda_event.synchronize()
+                with contextlib.suppress(Exception):
+                    timing.observe(
+                        "prior_cuda_work",
+                        time.perf_counter_ns() - prerequisite_started,
+                    )
                 verified = self._load_one(
                     plan,
                     timing=timing,
@@ -2870,7 +3877,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self._load_cv.notify_all()
             try:
                 with contextlib.suppress(Exception):
-                    logger.info("%s", timing.render())
+                    _debug_log("%s", timing.render())
                 if verified:
                     with contextlib.suppress(Exception):
                         ttl_seconds = self._capacity_policy.ttl_seconds
@@ -2881,18 +3888,25 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                                 min(60, ttl_seconds // 2) if ttl_seconds else 60
                             ),
                         )
-                    logger.info(
-                        "spark-context-cache: restored %d tokens async in %.1f ms",
-                        plan.span_tokens,
-                        1e3 * (time.perf_counter() - started),
-                    )
+                    with contextlib.suppress(Exception):
+                        for message in timing.operator_lines():
+                            logger.info("%s", message)
             finally:
                 # Request completion may be published immediately after the
                 # verified placement edge, but connector quiescence includes
                 # every later filesystem/logging action owned by this work
                 # item. Tests and shutdown can therefore remove the cache root
                 # only after no loader can recreate or reopen its metadata.
+                page_base_key = self._page_base_plan_keys.get(plan.request_id)
+                self._page_base_reads.finish(plan.request_id)
+                if page_base_key is not None:
+                    self._release_page_base_deferred(
+                        page_base_key,
+                        promote_registered=True,
+                    )
+                self._emit_page_base_flight_summaries()
                 with self._load_cv:
+                    self._page_base_plan_keys.pop(plan.request_id, None)
                     self._inflight_load_reqs.discard(plan.request_id)
                     self._load_cv.notify_all()
 
@@ -2906,6 +3920,33 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self._load_stream = torch.cuda.Stream(device=device)
         return torch.cuda.stream(self._load_stream)
 
+    def _record_prior_cuda_work(self) -> tuple[Any | None, str | None]:
+        """Capture model-runner CUDA work that must precede cache placement.
+
+        vLLM calls ``start_load_kv`` on its model-runner thread after it has
+        enqueued cache-block zeroing and copy-on-write operations. SparkCache
+        performs restore writes on background threads and independent CUDA
+        streams. Recording an event on the caller's stream gives every queued
+        restore an explicit dependency on those earlier writes without making
+        the serving thread wait.
+        """
+
+        if not self._layer_tensors:
+            return None, None
+        device = next(iter(self._layer_tensors.values())).device
+        if getattr(device, "type", None) != "cuda":
+            return None, None
+        try:
+            event = torch.cuda.Event(blocking=False, interprocess=False)
+            event.record(torch.cuda.current_stream(device=device))
+        except Exception as error:  # noqa: BLE001
+            return (
+                None,
+                "prior model-runner CUDA work could not be ordered before"
+                f" cache placement: {type(error).__name__}: {error}",
+            )
+        return event, None
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, SparkCacheConnectorMetadata):
@@ -2913,21 +3954,199 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         load_plans = [plan for plan in metadata.plans if not plan.is_store]
         if not load_plans:
             return
+        prior_cuda_event, prior_cuda_error = self._record_prior_cuda_work()
+        runnable, deferred, page_base_keys = self._prepare_page_base_read_cohorts(
+            load_plans
+        )
         self._ensure_load_threads()
+        queued = {
+            plan.request_id: _QueuedLoad(
+                plan=plan,
+                timing=RestoreTiming(
+                    request_id=plan.request_id,
+                    digest=plan.digest,
+                    span_tokens=plan.span_tokens,
+                    storage_mode=self._storage_mode,
+                    enqueued_ns=time.perf_counter_ns(),
+                ),
+                prior_cuda_event=prior_cuda_event,
+                prior_cuda_error=prior_cuda_error,
+            )
+            for plan in (*runnable, *deferred)
+        }
         with self._load_lock:
-            self._inflight_load_reqs.update(plan.request_id for plan in load_plans)
+            self._inflight_load_reqs.update(queued)
+            self._page_base_plan_keys.update(page_base_keys)
+            self._deferred_page_base_loads.update(
+                (plan.request_id, queued[plan.request_id]) for plan in deferred
+            )
+        for plan in runnable:
+            self._load_queue.put(queued[plan.request_id])
+        for key in set(page_base_keys.values()):
+            self._release_page_base_deferred(
+                key,
+                promote_registered=False,
+            )
+
+    def _page_base_flight_key(
+        self,
+        evidence: PageBaseReadEvidence,
+    ) -> PageBaseReadFlightKey:
+        return PageBaseReadFlightKey(
+            worker_generation=self._stats_generation,
+            storage_mode=self._storage_mode,
+            evidence=evidence,
+        )
+
+    def _prepare_page_base_read_cohorts(
+        self,
+        load_plans: Sequence[_ReqPlan],
+    ) -> tuple[
+        list[_ReqPlan],
+        list[_ReqPlan],
+        dict[str, PageBaseReadFlightKey],
+    ]:
+        """Pre-register bases and defer followers until shared bytes are ready."""
+
+        if (
+            self._storage_mode != "block_pages_v1"
+            or self._page_layout is None
+        ):
+            return list(load_plans), [], {}
+        identity = self._identity(self._worker_rank())
+        grouped: dict[PageBaseReadFlightKey, list[_ReqPlan]] = {}
         for plan in load_plans:
-            self._load_queue.put(
-                _QueuedLoad(
-                    plan=plan,
-                    timing=RestoreTiming(
-                        request_id=plan.request_id,
-                        digest=plan.digest,
-                        span_tokens=plan.span_tokens,
-                        storage_mode=self._storage_mode,
-                        enqueued_ns=time.perf_counter_ns(),
-                    ),
+            try:
+                lookup, is_alias = self._lookup_reusable(
+                    identity,
+                    plan.digest,
+                    verify_chunks=False,
+                    verify_chunk_metadata=True,
                 )
+                if is_alias or lookup.root_kind != "page_delta":
+                    continue
+                groups = self._select_group_blocks_for_span(
+                    plan.group_block_ids,
+                    plan.span_tokens,
+                )
+                evidence = self._store.page_delta_base_read_evidence(
+                    lookup,
+                    layout=self._page_layout,
+                    result_block_counts=tuple(len(group) for group in groups),
+                    result_boundary_tokens=plan.span_tokens,
+                )
+                if (
+                    self._native_restore_enabled
+                    and evidence.base_root_kind != "page_snapshot"
+                ):
+                    # SparkCache CUDA object sharing publishes one verified
+                    # flat-base object set. Nested deltas keep their ordinary
+                    # independent direct path instead of waiting on a flight
+                    # whose representation they cannot consume.
+                    continue
+                key = self._page_base_flight_key(evidence)
+            except (KeyError, OSError, RuntimeError, ValueError):
+                continue
+            grouped.setdefault(key, []).append(plan)
+
+        registered: set[str] = set()
+        priority: list[_ReqPlan] = []
+        deferred: list[_ReqPlan] = []
+        page_base_keys: dict[str, PageBaseReadFlightKey] = {}
+        by_request = {plan.request_id: plan for plan in load_plans}
+        for key, plans in grouped.items():
+            registration = self._page_base_reads.register_cohort(
+                key,
+                (plan.request_id for plan in plans),
+            )
+            member_ids = set(registration.member_ids)
+            registered.update(member_ids)
+            page_base_keys.update((request_id, key) for request_id in member_ids)
+            leader_id = registration.leader_request_id
+            if registration.flight_state in {"ready", "error"}:
+                priority.extend(plan for plan in plans if plan.request_id in member_ids)
+                continue
+            if registration.flight_state == "registered" and leader_id in member_ids:
+                priority.append(by_request[leader_id])
+                member_ids.remove(leader_id)
+            deferred.extend(plan for plan in plans if plan.request_id in member_ids)
+        independent = [plan for plan in load_plans if plan.request_id not in registered]
+        return [*priority, *independent], deferred, page_base_keys
+
+    def _release_page_base_deferred(
+        self,
+        key: PageBaseReadFlightKey,
+        *,
+        promote_registered: bool,
+    ) -> None:
+        """Queue ready followers or one replacement reader without occupying a lane."""
+
+        state = self._page_base_reads.flight_state(key)
+        with self._load_lock:
+            matching = [
+                request_id
+                for request_id in self._deferred_page_base_loads
+                if self._page_base_plan_keys.get(request_id) == key
+            ]
+            if state in {"ready", "error"}:
+                selected = matching
+            elif state == "registered" and promote_registered and matching:
+                selected = matching[:1]
+            else:
+                selected = []
+            queued = [
+                self._deferred_page_base_loads.pop(request_id)
+                for request_id in selected
+            ]
+        for item in queued:
+            self._load_queue.put(item)
+
+    def _release_all_page_base_deferred(self) -> None:
+        """Queue shutdown-cancelled followers so loader ownership can drain."""
+
+        with self._load_lock:
+            queued = list(self._deferred_page_base_loads.values())
+            self._deferred_page_base_loads.clear()
+        for item in queued:
+            self._load_queue.put(item)
+
+    def _restore_page_base_for_request(
+        self,
+        request_id: str,
+        evidence: PageBaseReadEvidence,
+        reader: Callable[[], bytes | bytearray | PageBaseReadResult],
+    ) -> bytes | PageBaseReadResult:
+        key = self._page_base_flight_key(evidence)
+        try:
+            return self._page_base_reads.resolve(request_id, key, reader)
+        finally:
+            self._release_page_base_deferred(
+                key,
+                promote_registered=False,
+            )
+
+    def _emit_page_base_flight_summaries(self) -> None:
+        for summary in self._page_base_reads.take_summaries():
+            outcome = str(summary["outcome"])
+            counter = {
+                "verified": "page_base_flights_completed",
+                "recompute": "page_base_flights_recomputed",
+                "cancelled": "page_base_flights_cancelled",
+            }[outcome]
+            with self._load_lock:
+                self.counters[counter] += 1
+                self.counters["page_base_flight_participants"] += int(
+                    summary["participants"]
+                )
+                self.counters["page_base_physical_reads"] += int(
+                    summary["physical_base_reads"]
+                )
+                self.counters["page_base_reads_avoided"] += int(
+                    summary["avoided_base_reads"]
+                )
+            logger.info(
+                "spark-context-cache-page-base-flight:%s",
+                json.dumps(summary, sort_keys=True, separators=(",", ":")),
             )
 
     def _verify_shared_segment_roots(
@@ -2973,8 +4192,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     with self._load_lock:
                         self._held.discard(digest)
                 logger.warning(
-                    "spark-context-cache: shared trunk rejected digest=%s"
-                    " leader=%s",
+                    "spark-context-cache: shared trunk rejected digest=%s leader=%s",
                     digest[:12],
                     plan.digest[:12],
                 )
@@ -3054,7 +4272,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     or self._native_required_record_mask == 0
                 ):
                     raise RuntimeError(
-                        "native restore selected without a configured adapter"
+                        "SparkCache CUDA restore selected without a configured adapter"
                     )
                 positions = owned_positions(plan.span_tokens, self._dcp_degree, rank)
                 slots = local_slots_for_positions(
@@ -3078,12 +4296,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         io_workers=self._native_io_workers,
                     )
                 except Exception as error:  # noqa: BLE001
-                    # The native transaction may already have written some
+                    # The SparkCache CUDA transaction may already have written some
                     # private restore blocks. Never enter Python assembly or
                     # retry those blocks: retire the entry and publish all of
                     # this request's blocks as invalid for clean recompute.
                     logger.warning(
-                        "spark-context-cache: native load failed closed: %s",
+                        "spark-context-cache: SparkCache CUDA restore rejected;"
+                        " recomputing: %s",
                         error,
                     )
                     self._invalidate_after_failure(
@@ -3110,8 +4329,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self.counters["native_chunks_verified"] = self.counters.get(
                     "native_chunks_verified", 0
                 ) + int(result.verified_chunks)
-                logger.info(
-                    "spark-context-cache: native restored %d chunks"
+                _debug_log(
+                    "spark-context-cache: SparkCache CUDA restore verified %d chunks"
                     " (%d encoded bytes, %d slabs) read_hash=%.1f ms"
                     " parse_submit=%.1f ms finish=%.1f ms",
                     result.verified_chunks,
@@ -3219,15 +4438,17 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         )
         if len(groups) != len(layout.groups):
             raise HybridCodecError("request block tables disagree with page groups")
-        if self._native_restore_enabled and lookup.root_kind != "page_delta":
-            if not self._native_adapters or not callable(self._native_execute_hybrid):
+        if self._native_restore_enabled:
+            if not self._native_adapters or not callable(
+                self._native_execute_hybrid_restore
+            ):
                 raise RuntimeError(
-                    "native hybrid restore selected without a configured adapter"
+                    "SparkCache CUDA restore selected without a configured adapter"
                 )
             if not 0 <= native_lane < len(self._native_adapters):
-                raise RuntimeError("native hybrid restore lane is unavailable")
+                raise RuntimeError("SparkCache CUDA placement lane is unavailable")
             try:
-                result = self._native_execute_hybrid(
+                result = self._native_execute_hybrid_restore(
                     adapter=self._native_adapters[native_lane],
                     request_id=plan.request_id,
                     lookup=lookup,
@@ -3237,10 +4458,19 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     expected_span_tokens=plan.span_tokens,
                     arena_bytes=self._native_arena_bytes,
                     io_workers=self._native_io_workers,
+                    dcp_degree=self._dcp_degree,
+                    dcp_rank=self._worker_rank(),
+                    base_reader=lambda evidence, reader: (
+                        self._restore_page_base_for_request(
+                            plan.request_id,
+                            evidence,
+                            reader,
+                        )
+                    ),
                 )
             except Exception as error:  # noqa: BLE001
                 logger.warning(
-                    "spark-context-cache: native hybrid placement failed: %s",
+                    "spark-context-cache: SparkCache CUDA placement rejected: %s",
                     error,
                 )
                 self._invalidate_after_failure(plan.digest)
@@ -3263,23 +4493,49 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self.counters["native_hybrid_load_verified"] = (
                 self.counters.get("native_hybrid_load_verified", 0) + 1
             )
-            logger.info(
-                "spark-context-cache: native hybrid direct restored %d bytes"
-                " slabs=%d read_hash=%.1f ms submit=%.1f ms finish=%.1f ms",
+            if lookup.root_kind == "page_delta":
+                self.counters["native_page_delta_load_verified"] = (
+                    self.counters.get("native_page_delta_load_verified", 0) + 1
+                )
+                self.counters["native_page_delta_base_bytes_skipped"] = (
+                    self.counters.get(
+                        "native_page_delta_base_bytes_skipped",
+                        0,
+                    )
+                    + int(getattr(result, "skipped_base_object_bytes", 0))
+                )
+            _debug_log(
+                "spark-context-cache: SparkCache CUDA restore verified %d bytes"
+                " read_source_bytes=%d skipped_base_bytes=%d"
+                " slabs=%d read_hash=%.1f ms placement=%.1f ms"
+                " (arena_wait=%.1f ms host_copy=%.1f ms submit_call=%.1f ms)"
+                " finish=%.1f ms",
                 result.source_bytes,
+                int(getattr(result, "read_source_bytes", 0)),
+                int(getattr(result, "skipped_base_object_bytes", 0)),
                 result.slabs,
                 result.read_and_hash_ms,
                 result.copy_and_submit_ms,
+                result.arena_wait_ms,
+                result.host_copy_ms,
+                result.submit_call_ms,
                 result.finish_ms,
             )
             return True
         restore_started = time.perf_counter_ns()
-        if lookup.root_kind == "page_delta":
+        if lookup.root_kind in ("page_delta", "page_snapshot"):
             encoded_pages = self._store.restore_page_snapshot(
                 lookup,
                 layout=layout,
                 result_block_counts=tuple(len(group) for group in groups),
                 result_boundary_tokens=plan.span_tokens,
+                base_reader=lambda evidence, reader: (
+                    self._restore_page_base_for_request(
+                        plan.request_id,
+                        evidence,
+                        reader,
+                    )
+                ),
             )
             restored_chunk_count = chunk_count(plan.span_tokens, self._chunk_tokens)
         else:
@@ -3316,14 +4572,16 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 time.perf_counter_ns() - reassembly_started,
             )
         if self._native_restore_enabled:
-            if not self._native_adapters or not callable(self._native_execute_hybrid):
+            if not self._native_adapters or not callable(
+                self._native_execute_hybrid_placement
+            ):
                 raise RuntimeError(
-                    "native hybrid restore selected without a configured adapter"
+                    "SparkCache CUDA restore selected without a configured adapter"
                 )
             if not 0 <= native_lane < len(self._native_adapters):
-                raise RuntimeError("native hybrid restore lane is unavailable")
+                raise RuntimeError("SparkCache CUDA placement lane is unavailable")
             try:
-                result = self._native_execute_hybrid(
+                result = self._native_execute_hybrid_placement(
                     adapter=self._native_adapters[native_lane],
                     request_id=plan.request_id,
                     encoded_pages=encoded_pages,
@@ -3332,7 +4590,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 )
             except Exception as error:  # noqa: BLE001
                 logger.warning(
-                    "spark-context-cache: native hybrid placement failed: %s",
+                    "spark-context-cache: SparkCache CUDA placement rejected: %s",
                     error,
                 )
                 self._invalidate_after_failure(plan.digest)
@@ -3350,7 +4608,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self.counters.get("native_hybrid_load_verified", 0) + 1
             )
             logger.info(
-                "spark-context-cache: native hybrid restored %d bytes"
+                "spark-context-cache: SparkCache CUDA placement verified %d bytes"
                 " submit=%.1f ms finish=%.1f ms",
                 result.source_bytes,
                 result.copy_and_submit_ms,
@@ -3427,6 +4685,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         # state is dropped here. This is what keeps _need_load, _admitted,
         # and _store_progress bounded without evicting live entries.
         request_id = request.request_id
+        self._page_base_reads.cancel(request_id)
+        self._emit_page_base_flight_summaries()
         follower_digest = self._restore_flight_followers.get(request_id)
         if follower_digest is not None:
             self._remove_restore_follower(request_id)
@@ -3467,11 +4727,19 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 else:
                     self._retire_restore_flight(leader_digest, outcome="cancelled")
         self._need_load.pop(request_id, None)
+        # Test adapters and older connector shims may not initialize the
+        # optional scheduler-side digest cache. Request completion must remain
+        # idempotent for those callers.
+        getattr(self, "_prefix_digest_candidates", {}).pop(request_id, None)
         self._pending_async_loads.pop(request_id, None)
         self._admitted.pop(request_id, None)
         self._store_progress.pop(request_id, None)
         self._store_token_ids.pop(request_id, None)
+        store_multimodal = getattr(self, "_store_multimodal", None)
+        if store_multimodal is not None:
+            store_multimodal.discard(request_id)
         self._store_bases.pop(request_id, None)
+        self._store_recurrent_boundaries.pop(request_id, None)
         runtime = self._streaming_runtime
         if runtime is None:
             return False, None
@@ -3485,11 +4753,24 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> tuple[bool, dict[str, Any] | None]:
         """Release scheduler bookkeeping for a hybrid-memory-allocator request.
 
-        End-of-prefill stores do not retain request blocks after the CPU
-        snapshot, so the multi-group path has no delayed-free work. Streaming
-        snapshots require group-qualified leases and are refused until that
-        contract is implemented.
+        Synchronous stores do not retain request blocks after the CPU snapshot.
+        Explicit asynchronous manager-page capture delays all-group cleanup
+        until every worker reports its native read complete. Row-oriented
+        streaming snapshots do not support multiple KV-cache groups.
         """
+        if self._async_page_capture_enabled:
+            request_id = request.request_id
+            cleanup_delay, _ = self.request_finished(request, [])
+            if cleanup_delay:
+                raise RuntimeError(
+                    "spark-context-cache: manager-page cleanup encountered"
+                    " an incompatible row-streaming lease"
+                )
+            eligible = request_id in self._async_page_capture_eligible
+            if eligible:
+                self._async_page_capture_eligible.discard(request_id)
+                return True, None
+            return False, None
         if self._streaming_runtime is not None:
             raise RuntimeError(
                 "spark-context-cache: streaming snapshots do not support"
@@ -3504,27 +4785,48 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         runtime = self._streaming_runtime
         if runtime is not None:
             finished_sending.update(runtime.take_finished(finished_req_ids))
+        runtime = self._async_page_capture_runtime
+        if runtime is not None:
+            finished_sending.update(runtime.take_finished(finished_req_ids))
         with self._load_cv:
             finished_recving = set(self._finished_load_reqs)
             self._finished_load_reqs.clear()
         return finished_sending or None, finished_recving or None
+
+    def get_finished_count(self) -> int:
+        """Require terminal store acknowledgement from every physical rank.
+
+        A headless multi-node executor can report a local world size of one to
+        vLLM's completion aggregator even though every tensor-parallel rank
+        owns request pages. Releasing scheduler blocks after the first rank's
+        acknowledgement can strand later worker completions. SparkCache uses
+        the same physical-rank count here as its restore-admission quorum.
+        """
+
+        return self._tp_degree
 
     def wait_for_pending_loads(self, timeout: float | None = None) -> bool:
         with self._load_cv:
             return self._load_cv.wait_for(lambda: not self._inflight_load_reqs, timeout)
 
     def shutdown(self):
+        self._page_base_reads.close()
+        self._release_all_page_base_deferred()
+        self._emit_page_base_flight_summaries()
         runtime = self._streaming_runtime
         if runtime is not None:
-            # Drain/cancel snapshot leases before any native cache or staging
+            # Drain/cancel snapshot leases before any C++/CUDA cache or staging
             # resource can be destroyed. A failure remains fatal and prevents
             # unsafe teardown.
             runtime.shutdown()
             self._streaming_runtime = None
+        runtime = self._async_page_capture_runtime
+        if runtime is not None:
+            runtime.quiesce()
         capacity_thread = self._capacity_thread
         if capacity_thread is not None:
             # Give already handed-off durable commits one final background
-            # capacity pass. A persistent busy/failure remains fail closed:
+            # capacity pass. A persistent busy/failure remains unadvertised:
             # shutdown drops only the in-memory handoff, never advertises it.
             self._capacity_wakeup.set()
             self.wait_for_pending_capacity_commits(timeout=5.0)
@@ -3561,6 +4863,21 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 )
             else:
                 self._store_thread = None
+        runtime = self._async_page_capture_runtime
+        if runtime is not None:
+            if runtime.shutdown():
+                self._async_page_capture_runtime = None
+            else:
+                self.counters["async_page_capture_shutdown_ring_retained"] = (
+                    self.counters.get(
+                        "async_page_capture_shutdown_ring_retained", 0
+                    )
+                    + 1
+                )
+                logger.warning(
+                    "spark-context-cache: shutdown retained manager-page"
+                    " capture ring for a live durable writer"
+                )
         self.wait_for_pending_loads(timeout=5.0)
         for _ in self._load_threads:
             self._load_queue.put(None)
@@ -3569,7 +4886,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
         live_threads = sum(thread.is_alive() for thread in self._load_threads)
         if (self._native_adapters or self._native_adapter is not None) and live_threads:
-            # A native loader can still own the handle or mapped arenas.
+            # A SparkCache CUDA loader can still own the handle or mapped arenas.
             # Keep the adapter strongly reachable and let process teardown
             # reclaim it; destroying it here would be a use-after-close race.
             self.counters["native_shutdown_handle_leaked"] = (
@@ -3577,7 +4894,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             )
             logger.warning(
                 "spark-context-cache: shutdown left %d loader(s) alive;"
-                " retaining native placement handle until process exit",
+                " retaining SparkCache CUDA placement handle until process exit",
                 live_threads,
             )
             return None
@@ -3603,6 +4920,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         return
 
     def wait_for_save(self) -> None:
+        # Enforce the publication policy independently on every worker. The
+        # scheduler normally omits store plans when publication is disabled,
+        # but a stale or mismatched metadata object must not make a
+        # restore-only worker capture or publish model state.
+        if not self._store_enabled:
+            return
         metadata = self._get_connector_metadata()
         if self._streaming_snapshots_enabled:
             # Scheduler offers are promises for the step vLLM has just
@@ -3629,7 +4952,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 # every post-forward callback.
                 runtime.poll()
             # Never invoke the synchronous CPU snapshot/ManifestStore path under
-            # this flag: an incomplete injected runtime must fail closed, not
+            # this flag: an incomplete injected runtime must publish nothing, not
             # silently publish a synchronous end-of-prefill entry.
             return
         if not isinstance(metadata, SparkCacheConnectorMetadata):
@@ -3640,6 +4963,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             # Admission is atomic and precedes the multi-GB CPU snapshot.
             # At most one snapshot may be queued or committing per rank; a
             # busy store is a cache miss opportunity, never a serving stall.
+            skipped_before_submit = False
             with self._store_cv:
                 if plan.digest in self._held:
                     self.counters["store_skipped_present"] += 1
@@ -3648,15 +4972,53 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         " present digest=%s",
                         plan.digest[:12],
                     )
-                    continue
-                if not self._store_accepting or self._store_inflight:
+                    skipped_before_submit = True
+                elif not self._store_accepting or self._store_inflight:
                     self.counters["store_skipped_busy"] += 1
                     logger.warning(
                         "spark-context-cache: store skipped while saver busy digest=%s",
                         plan.digest[:12],
                     )
+                    skipped_before_submit = True
+                else:
+                    self._store_inflight = 1
+            if skipped_before_submit:
+                if self._async_page_capture_enabled:
+                    runtime = self._async_page_capture_runtime
+                    if runtime is None:
+                        raise RuntimeError(
+                            "manager-page capture runtime vanished before"
+                            " a skipped store completed"
+                        )
+                    runtime.finish_without_capture(
+                        plan.request_id,
+                        retained_manager_pages=sum(
+                            len(group) for group in plan.group_block_ids
+                        ),
+                    )
+                continue
+            if self._async_page_capture_enabled:
+                runtime = self._async_page_capture_runtime
+                if runtime is None:
+                    self._finish_store(
+                        plan.digest,
+                        committed=False,
+                        error=RuntimeError(
+                            "manager-page capture runtime is unavailable"
+                        ),
+                    )
                     continue
-                self._store_inflight = 1
+                producer_stream = int(torch.cuda.current_stream().cuda_stream)
+                try:
+                    runtime.submit(plan, producer_stream=producer_stream)
+                except Exception as error:  # noqa: BLE001 - serving continues
+                    runtime.preempt(plan.request_id)
+                    self._finish_store(
+                        plan.digest,
+                        committed=False,
+                        error=error,
+                    )
+                continue
             snapshot_started = time.perf_counter()
             try:
                 snapshot = self._snapshot_store(plan)
@@ -3678,7 +5040,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     plan.digest[:12],
                     1e3 * (time.perf_counter() - snapshot_started),
                 )
-            except Exception as error:  # noqa: BLE001 - enqueue must fail closed
+            except Exception as error:  # noqa: BLE001 - failed enqueue publishes nothing
                 self._finish_store(
                     plan.digest,
                     committed=False,
@@ -3728,7 +5090,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         if layout is None:
             raise RuntimeError("block-page layout was not registered")
         groups = self._select_group_blocks_for_span(
-            plan.group_block_ids, plan.span_tokens
+            plan.group_block_ids,
+            plan.span_tokens,
+            recurrent_boundary_blocks=plan.recurrent_boundary_blocks,
         )
         if len(groups) != len(layout.groups):
             raise HybridCodecError("request block tables disagree with page groups")
@@ -3756,6 +5120,120 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             block_counts=tuple(len(group) for group in groups),
         )
 
+    def _complete_async_page_capture(
+        self,
+        plan: _ReqPlan,
+        encoded_pages: Any,
+        block_counts: tuple[int, ...],
+    ) -> None:
+        """Validate completed native bytes and queue the existing commit path."""
+
+        layout = self._page_layout
+        if layout is None:
+            self._abort_async_page_capture(
+                plan.digest, "block-page layout is not registered"
+            )
+            return
+        try:
+            expected_groups = self._select_group_blocks_for_span(
+                plan.group_block_ids,
+                plan.span_tokens,
+                recurrent_boundary_blocks=plan.recurrent_boundary_blocks,
+            )
+            expected_counts = tuple(len(group) for group in expected_groups)
+            if block_counts != expected_counts:
+                raise HybridCodecError(
+                    "native capture block counts disagree with the store plan"
+                )
+            reused_pages = getattr(
+                encoded_pages, "reused_pages_by_group", None
+            )
+            if reused_pages is None:
+                header = getattr(encoded_pages, "header_bytes", encoded_pages)
+                total_bytes = getattr(encoded_pages, "total_bytes", None)
+                plan_page_snapshot(
+                    layout,
+                    header,
+                    block_counts,
+                    total_bytes=total_bytes,
+                )
+            else:
+                from sparkcache.streaming.manager_page_capture import (
+                    select_manager_page_extension_pages,
+                )
+
+                if not plan.base_context_digest or plan.base_span_tokens <= 0:
+                    raise HybridCodecError(
+                        "native page extension has no authenticated base"
+                    )
+                _, _, selected_counts, expected_reused = (
+                    select_manager_page_extension_pages(
+                        expected_groups,
+                        base_page_counts=self._group_block_counts_for_span(
+                            plan.base_span_tokens
+                        ),
+                        logical_tokens_per_page=tuple(
+                            int(group["logical_tokens_per_block"])
+                            for group in self._group_topology
+                        ),
+                        reuse_policies=tuple(
+                            str(group["reuse_policy"])
+                            for group in self._group_topology
+                        ),
+                        base_boundary_tokens=plan.base_span_tokens,
+                    )
+                )
+                if (
+                    tuple(reused_pages) != expected_reused
+                    or selected_counts != expected_counts
+                    or tuple(
+                        getattr(encoded_pages, "result_block_counts", ())
+                    )
+                    != expected_counts
+                ):
+                    raise HybridCodecError(
+                        "native page extension geometry disagrees with the store plan"
+                    )
+                expected_bytes = sum(
+                    (count - reused) * layer.bytes_per_page
+                    for group, count, reused in zip(
+                        layout.groups,
+                        expected_counts,
+                        expected_reused,
+                        strict=True,
+                    )
+                    for layer in group.layers
+                )
+                if getattr(encoded_pages, "total_bytes", None) != expected_bytes:
+                    raise HybridCodecError(
+                        "native page extension payload length differs"
+                    )
+            snapshot = _HybridStoreSnapshot(
+                plan=plan,
+                rank=self._worker_rank(),
+                identity=self._identity(self._worker_rank()),
+                positions=(),
+                encoded_pages=encoded_pages,
+                block_counts=block_counts,
+            )
+            self._ensure_store_thread()
+            self._store_queue.put(snapshot)
+        except Exception as error:  # noqa: BLE001 - serving continues
+            release = getattr(encoded_pages, "release", None)
+            if callable(release):
+                release()
+            self._finish_store(plan.digest, committed=False, error=error)
+
+    def _abort_async_page_capture(self, digest: str, reason: str) -> None:
+        self.counters["async_page_capture_aborted"] = (
+            self.counters.get("async_page_capture_aborted", 0) + 1
+        )
+        self._finish_store(
+            digest,
+            committed=False,
+            error=RuntimeError(reason),
+        )
+
     def _ensure_store_thread(self) -> None:
         with self._store_cv:
             if self._store_thread is not None:
@@ -3779,13 +5257,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 return
             commit_started = time.perf_counter()
             try:
-                chunks: Sequence[ContextChunk]
-                if isinstance(snapshot, _HybridStoreSnapshot):
-                    chunks = _HybridSnapshotChunks(snapshot, self._chunk_tokens)
-                else:
-                    chunks = _SnapshotChunks(
-                        snapshot, self._dcp_degree, self._chunk_tokens
-                    )
+                chunks = (
+                    None
+                    if isinstance(snapshot, _HybridStoreSnapshot)
+                    else _SnapshotChunks(snapshot, self._dcp_degree, self._chunk_tokens)
+                )
                 if snapshot.plan.base_context_digest and (
                     snapshot.plan.digest
                     != self._digest(
@@ -3803,6 +5279,40 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     layout = self._page_layout
                     if layout is None:
                         raise RuntimeError("block-page layout was not registered")
+                    result_snapshot = snapshot.encoded_pages
+                    verified_base_snapshot = None
+                    reused_pages = getattr(
+                        result_snapshot, "reused_pages_by_group", None
+                    )
+                    if reused_pages is not None:
+                        base = self._store.lookup(
+                            snapshot.identity,
+                            snapshot.plan.base_context_digest,
+                            verify_chunks=True,
+                        )
+                        if not base.is_hit:
+                            raise RuntimeError(
+                                f"page extension base is unavailable: {base.reason}"
+                            )
+                        base_counts = self._group_block_counts_for_span(
+                            snapshot.plan.base_span_tokens
+                        )
+                        base_snapshot = self._store.restore_page_snapshot(
+                            base,
+                            layout=layout,
+                            result_block_counts=base_counts,
+                            result_boundary_tokens=snapshot.plan.base_span_tokens,
+                        )
+                        if self._publication_schema != "page-tail-cow-v2":
+                            result_snapshot = materialize_page_extension_capture(
+                                layout,
+                                base_snapshot,
+                                result_snapshot,
+                                base_block_counts=base_counts,
+                                result_block_counts=snapshot.block_counts,
+                                reused_pages_by_group=reused_pages,
+                            )
+                        verified_base_snapshot = base_snapshot
                     try:
                         receipt = self._store.commit_page_extension(
                             identity=snapshot.identity,
@@ -3816,17 +5326,19 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                             result_block_counts=snapshot.block_counts,
                             base_boundary_tokens=snapshot.plan.base_span_tokens,
                             result_boundary_tokens=snapshot.plan.span_tokens,
-                            result_snapshot=snapshot.encoded_pages,
+                            result_snapshot=result_snapshot,
+                            verified_base_snapshot=verified_base_snapshot,
                         )
                     except PageDeltaDepthExceeded:
-                        receipt = self._store.commit(
+                        receipt = self._store.commit_page_snapshot(
                             identity=snapshot.identity,
                             context_digest=snapshot.plan.digest,
-                            chunks=chunks,
                             span_tokens=snapshot.plan.span_tokens,
+                            snapshot=snapshot.encoded_pages,
                         )
                         self.counters["page_delta_compactions"] += 1
                 elif snapshot.plan.base_context_digest:
+                    assert chunks is not None
                     receipt = self._store.commit_extension(
                         identity=snapshot.identity,
                         base_context_digest=snapshot.plan.base_context_digest,
@@ -3834,7 +5346,15 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         identity_salt=self._context_digest_salt,
                         tail_chunks=chunks,
                     )
+                elif isinstance(snapshot, _HybridStoreSnapshot):
+                    receipt = self._store.commit_page_snapshot(
+                        identity=snapshot.identity,
+                        context_digest=snapshot.plan.digest,
+                        span_tokens=snapshot.plan.span_tokens,
+                        snapshot=snapshot.encoded_pages,
+                    )
                 else:
+                    assert chunks is not None
                     receipt = self._store.commit(
                         identity=snapshot.identity,
                         context_digest=snapshot.plan.digest,
@@ -3860,6 +5380,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         receipt.manifest_digest[:12],
                         1e3 * (time.perf_counter() - commit_started),
                     )
+                    if receipt.publication is not None:
+                        logger.info(receipt.publication.format_compact())
                     self._finish_store(
                         snapshot.plan.digest,
                         committed=not evicted,
@@ -3880,6 +5402,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     error=error,
                 )
                 continue
+            finally:
+                encoded_pages = getattr(snapshot, "encoded_pages", None)
+                release = getattr(encoded_pages, "release", None)
+                if callable(release):
+                    release()
 
     def _publish_row_prefix_aliases(
         self,
@@ -3897,6 +5424,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self._storage_mode != "per_token_rows"
             or self._streaming_snapshots_enabled
             or not plan.token_ids
+            or plan.has_multimodal_identity
         ):
             return set()
         self.counters["prefix_alias_publication_attempted"] += 1
@@ -3994,11 +5522,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         """Compatibility helper for offline callers; not the request path."""
 
         snapshot = self._snapshot_store(plan)
-        chunks: Sequence[ContextChunk]
-        if isinstance(snapshot, _HybridStoreSnapshot):
-            chunks = _HybridSnapshotChunks(snapshot, self._chunk_tokens)
-        else:
-            chunks = _SnapshotChunks(snapshot, self._dcp_degree, self._chunk_tokens)
+        chunks = (
+            None
+            if isinstance(snapshot, _HybridStoreSnapshot)
+            else _SnapshotChunks(snapshot, self._dcp_degree, self._chunk_tokens)
+        )
         if plan.base_context_digest and (
             plan.digest != self._digest(list(plan.token_ids), plan.span_tokens)
         ):
@@ -4023,14 +5551,15 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     result_snapshot=snapshot.encoded_pages,
                 )
             except PageDeltaDepthExceeded:
-                receipt = self._store.commit(
+                receipt = self._store.commit_page_snapshot(
                     identity=snapshot.identity,
                     context_digest=plan.digest,
-                    chunks=chunks,
                     span_tokens=plan.span_tokens,
+                    snapshot=snapshot.encoded_pages,
                 )
                 self.counters["page_delta_compactions"] += 1
         elif plan.base_context_digest:
+            assert chunks is not None
             receipt = self._store.commit_extension(
                 identity=snapshot.identity,
                 base_context_digest=plan.base_context_digest,
@@ -4038,7 +5567,15 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 identity_salt=self._context_digest_salt,
                 tail_chunks=chunks,
             )
+        elif isinstance(snapshot, _HybridStoreSnapshot):
+            receipt = self._store.commit_page_snapshot(
+                identity=snapshot.identity,
+                context_digest=plan.digest,
+                span_tokens=plan.span_tokens,
+                snapshot=snapshot.encoded_pages,
+            )
         else:
+            assert chunks is not None
             receipt = self._store.commit(
                 identity=snapshot.identity,
                 context_digest=plan.digest,
@@ -4381,6 +5918,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
 
     def update_connector_output(self, connector_output: Any) -> None:
         self._absorb_quorum(connector_output)
+        self._release_async_page_capture_reservations(
+            tuple(getattr(connector_output, "finished_sending", None) or ())
+        )
         invalid = getattr(connector_output, "invalid_block_ids", None)
         invalid_blocks = set(invalid or ())
         # Async failure output reaches this callback before the parked
@@ -4454,6 +5994,21 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     @classmethod
     def build_kv_connector_stats(cls, data=None):
         return SparkCacheStats(data=data if data is not None else {})
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[Any], type[Any]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> KVConnectorPromMetrics:
+        return SparkCachePromMetrics(
+            vllm_config,
+            metric_types,
+            labelnames,
+            per_engine_labelvalues,
+        )
 
     def _build_quorum_report_locked(self) -> dict[str, Any]:
         held = set(self._held)
@@ -4570,7 +6125,93 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 maintenance_retries=self.counters["capacity_retries"],
             )
             report["capacity"] = capacity
+        runtime = self._async_page_capture_runtime
+        status = getattr(runtime, "status", None)
+        if self._async_page_capture_enabled and callable(status):
+            async_capture = dict(status())
+            with self._store_cv:
+                async_capture["store_inflight"] = bool(self._store_inflight)
+            report["async_capture"] = async_capture
+        report["publication"] = self._store.publication_telemetry_snapshot().as_dict()
         return SparkCacheStats(data={"reports": [report]})
+
+    def get_handshake_metadata(self) -> SparkCacheHandshakeMetadata | None:
+        """Return a bounded manifest inventory at engine startup.
+
+        vLLM collects connector handshake metadata after worker KV-cache
+        registration and before the engine becomes ready. SparkCache uses that
+        existing exchange to establish the same physical-rank quorum otherwise
+        learned from post-request worker statistics. The handshake carries at
+        most ``_STARTUP_HANDSHAKE_MAX_DIGESTS`` entries so cache size cannot
+        make API readiness unbounded. Later bounded statistics report entries
+        outside that startup subset.
+        """
+
+        if self._role is not KVConnectorRole.WORKER or not self._restore_enabled:
+            return None
+        with self._load_lock:
+            held = tuple(sorted(self._held))[:_STARTUP_HANDSHAKE_MAX_DIGESTS]
+            state_sequence = self._stats_sequence + int(
+                self._held != self._stats_observed_held
+            )
+            checkpoint_count = max(
+                1,
+                math.ceil(len(held) / _QUORUM_REPORT_BATCH_SIZE),
+            )
+            reports = []
+            for index in range(checkpoint_count):
+                start = index * _QUORUM_REPORT_BATCH_SIZE
+                checkpoint_held = list(
+                    held[start : start + _QUORUM_REPORT_BATCH_SIZE]
+                )
+                reports.append(
+                    {
+                        "rank": self._physical_rank(),
+                        "protocol": _QUORUM_DELTA_PROTOCOL,
+                        "generation": self._stats_generation,
+                        "generation_epoch": self._stats_generation_epoch,
+                        "held_count": len(held),
+                        "held": [],
+                        "checkpoint": {
+                            "state_sequence": state_sequence,
+                            "cycle": self._stats_checkpoint_cycle,
+                            "index": index,
+                            "count": checkpoint_count,
+                            "held_count": len(held),
+                            "held": checkpoint_held,
+                        },
+                    }
+                )
+        return SparkCacheHandshakeMetadata(reports=tuple(reports))
+
+    def set_xfer_handshake_metadata(
+        self, metadata: dict[int, KVConnectorHandshakeMetadata]
+    ) -> None:
+        """Establish scheduler quorum from worker startup inventories.
+
+        The transport rank must agree with each report's physical rank. A
+        missing, malformed, or mismatched worker report contributes no quorum;
+        requests continue with ordinary prompt computation until later bounded
+        worker statistics establish unanimity.
+        """
+
+        if self._role is not KVConnectorRole.SCHEDULER:
+            return
+        for transport_rank, handshake in sorted(metadata.items()):
+            if type(transport_rank) is not int or not isinstance(
+                handshake, SparkCacheHandshakeMetadata
+            ):
+                continue
+            for report in handshake.reports:
+                if not isinstance(report, dict) or report.get("rank") != transport_rank:
+                    continue
+                self._absorb_quorum(
+                    SimpleNamespace(
+                        kv_connector_stats=SparkCacheStats(
+                            data={"reports": [dict(report)]}
+                        )
+                    )
+                )
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         with self._load_lock:

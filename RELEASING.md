@@ -1,34 +1,27 @@
 # Releasing SparkCache
 
-SparkCache releases are built from version tags and published to PyPI by
-`.github/workflows/publish.yml`. The workflow uses PyPI trusted publishing;
-the repository does not store a PyPI token.
+Version tags start `.github/workflows/publish.yml`. The workflow builds the
+Python distributions and publishes them through PyPI trusted publishing. The
+repository stores no PyPI token.
 
-## One-time repository setup
+## Repository setup
 
-1. Create a PyPI project named `sparkcache`, or reserve that name during the
-   first trusted publication.
-2. In the PyPI project publishing settings, add a trusted publisher for this
-   GitHub repository. Set the workflow filename to `publish.yml` and the
-   environment name to `pypi`.
-3. Create a GitHub Actions environment named `pypi` with a required reviewer.
-   The environment gate must hold the publish job until that reviewer has
-   reviewed the exact workflow artifact and the release's declared evidence
-   class. A single-maintainer repository must allow the configured reviewer to
-   approve their own deployment.
+1. Create or reserve the PyPI project named `sparkcache`.
+2. Add this repository as a trusted publisher. Use workflow `publish.yml` and
+   environment `pypi`.
+3. Create the GitHub Actions environment `pypi` with a required reviewer.
 
-The trusted-publisher owner and repository values must match the public GitHub
-location exactly. No password, API token, or signing key is required by the
-workflow.
+The owner and repository names must match the public GitHub location. A
+single-maintainer repository must allow that maintainer to approve the waiting
+deployment.
 
-## Release procedure
+## Publish a version
 
-1. Set `project.version` in `pyproject.toml` to the version being released.
-   Use a PEP 440 version such as `0.1.0` or `0.1.0rc1`.
-2. Replace development-version wording in canonical documentation with the
-   resulting supported behavior. Record qualified hardware evidence separately
-   from GPU-free package validation.
-3. Run the local release checks:
+1. Set `project.version` in `pyproject.toml` to a PEP 440 version such as
+   `0.1.0` or `0.1.0rc1`.
+2. Update canonical documentation to describe the resulting package behavior.
+   Keep live hardware results in their profile or evidence records.
+3. Run the local checks:
 
    ```bash
    python -m ruff check .
@@ -40,10 +33,9 @@ workflow.
    python tools/verify_distribution.py dist/*.whl dist/*.tar.gz --version "$version"
    ```
 
-4. Commit the version and documentation changes. The commit message must state
-   resulting behavior, technical reason, compatibility impact, and validation.
-5. Create and push an annotated tag whose name is `v` followed by the exact
-   `project.version` value:
+4. Commit the version and documentation changes. Describe the resulting
+   behavior, reason, compatibility impact, and validation.
+5. Create and push an annotated tag:
 
    ```bash
    version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
@@ -51,10 +43,8 @@ workflow.
    git push origin "v${version}"
    ```
 
-6. Wait for the tag workflow's `build` job to finish. Its `python-distributions`
-   artifact contains the wheel and source distribution. Its
-   `release-artifact-identity` artifact contains their SHA-256 values. Download
-   both artifacts from the same workflow run and verify them before testing:
+6. Download both artifacts from the tag workflow's `build` job and verify that
+   their checksums match:
 
    ```bash
    gh run download <workflow-run-id> --name python-distributions --dir dist
@@ -64,41 +54,32 @@ workflow.
      ../release-artifact-identity/release-artifact-sha256.txt)
    ```
 
-7. Assign the release an evidence class from the changed behavior:
+7. Match the test depth to the changed behavior:
 
-   - documentation, metadata, packaging, and qualification-harness-only
-     changes require the GPU-free suite, archive verification, and isolated
-     installation;
-   - model-neutral connector control-plane changes require the GPU-free TP/DCP
-     matrix and one representative four-rank live gate before that artifact is
-     described as qualified;
-   - model-profile changes require live gates for the affected profiles;
-   - cache-identity, on-disk format, restore-placement, CUDA-ownership, or vLLM
-     runtime-patch changes require the complete qualified profile matrix.
+   - Documentation, metadata, packaging, and test-tool changes need the
+     GPU-free suite, archive verification, and isolated installation.
+   - Connector control-plane changes need the GPU-free TP/DCP matrix and one
+     representative four-rank live check.
+   - Model-profile changes need live checks for the affected profiles.
+   - Storage formats, identity, CUDA ownership, placement, or vLLM patches need
+     live checks for every affected profile.
 
-   A pre-release may be published with **implemented** status after its
-   offline and package gates pass when live systems are unavailable. Its
-   README and release notes must state that live qualification is absent, and
-   it must not inherit a qualification claim from another artifact.
+A prerelease may use **implemented** status after offline and package checks.
+Its README and release notes must say which live checks were not run.
 
-8. Approve the waiting `pypi` environment deployment only after the gates for
-   the declared publication status pass. The approval comment must identify
-   the artifact hashes, evidence class, resulting status, and any omitted live
-   gates. The publish job downloads the same two workflow artifacts and
-   verifies their SHA-256 values immediately before uploading the distributions
-   to PyPI.
+8. Approve the waiting `pypi` deployment after reviewing the artifact hashes,
+   resulting status, completed checks, and omitted checks.
 
-The publish workflow rejects a tag that does not match `project.version`. A
-qualification claim must name the exact published artifact hash evaluated by
-its required gates. Never transfer a qualification result between artifacts,
-even when their source trees are equivalent.
+The publish job verifies the same artifacts immediately before uploading them.
+It rejects a tag that does not match `project.version`.
 
-## Verification
+Live evidence belongs to the exact published artifact tested. Do not copy a
+result from a different artifact, even when the source trees appear equivalent.
 
-After publication, install from PyPI in a clean virtual environment and verify
-the installed package rather than the checkout. The isolated-mode probe omits
-the checkout and user site from Python's import path, so source files or stale
-local package metadata cannot satisfy the check:
+## Verify the published package
+
+Install from PyPI in a clean virtual environment. The isolated Python probe
+excludes the checkout and user site, so local files cannot satisfy the import.
 
 ```bash
 python -m venv sparkcache-release-check
@@ -108,5 +89,4 @@ sparkcache-release-check/bin/python -m pip install "sparkcache==${version}"
 sparkcache-release-check/bin/python -I -c "import sparkcache; print(sparkcache.__version__, sparkcache.__file__)"
 ```
 
-On Windows, replace `sparkcache-release-check/bin/python` with
-`sparkcache-release-check\Scripts\python.exe`.
+On Windows, use `sparkcache-release-check\Scripts\python.exe`.

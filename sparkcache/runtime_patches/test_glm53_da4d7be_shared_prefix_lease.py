@@ -364,7 +364,7 @@ def test_null_partial_page_refuses_lease_and_pressure_drops_only_pin() -> None:
 
     manager, coordinator, _, _ = _manager()
     assert manager.publish_shared_prefix_lease(
-        "pressure", "leader", 1024, 15.0, now=10.0
+        "pressure", "leader", 1024, 300.0, now=10.0
     )
     _fence_pending_copies(coordinator)
     assert manager.mark_shared_prefix_lease_ready("pressure", now=10.5)

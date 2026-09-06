@@ -14,6 +14,7 @@ import json
 import os
 import types
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -30,6 +31,7 @@ def _make_vllm_config(
     dcp: int = 4,
     pp: int = 1,
     block_size: int = 64,
+    cp_kv_cache_interleave_size: int = 1,
     max_model_len: int = 0,
     kv_cache_config: object | None = None,
 ) -> tuple[types.SimpleNamespace, types.SimpleNamespace]:
@@ -37,6 +39,7 @@ def _make_vllm_config(
 
     values = {
         "spark_cache_root": "/cache/test",
+        "spark_cache_model_profile": "glm52-nvfp4",
         "spark_cache_target_checkpoint_sha256": "1" * 64,
         "spark_cache_draft_checkpoint_sha256": "2" * 64,
         "spark_cache_draft_policy": "separate",
@@ -52,6 +55,7 @@ def _make_vllm_config(
         parallel_config=types.SimpleNamespace(
             tensor_parallel_size=tp,
             decode_context_parallel_size=dcp,
+            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
             pipeline_parallel_size=pp,
         ),
         model_config=types.SimpleNamespace(max_model_len=max_model_len),
@@ -82,7 +86,96 @@ class ParseConnectorConfigTests(unittest.TestCase):
         config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
         self.assertTrue(config.store_enabled)
         self.assertTrue(config.restore_enabled)
+        self.assertEqual(config.access_mode, "read-write")
         self.assertEqual(config.clear_once_token, "")
+
+    def test_restore_only_mode_reads_without_publishing(self) -> None:
+        vllm, _ = _make_vllm_config(
+            {"spark_cache_access_mode": "restore-only"}
+        )
+
+        config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+
+        self.assertFalse(config.store_enabled)
+        self.assertTrue(config.restore_enabled)
+        self.assertEqual(config.access_mode, "restore-only")
+
+    def test_access_mode_does_not_change_cache_identity(self) -> None:
+        read_write_vllm, _ = _make_vllm_config()
+        restore_only_vllm, _ = _make_vllm_config(
+            {"spark_cache_access_mode": "restore-only"}
+        )
+
+        read_write = cfg.parse_connector_config(
+            read_write_vllm,
+            read_write_vllm.kv_transfer_config,
+            None,
+        )
+        restore_only = cfg.parse_connector_config(
+            restore_only_vllm,
+            restore_only_vllm.kv_transfer_config,
+            None,
+        )
+
+        self.assertEqual(
+            read_write.build_identity(0, 0).storage_key,
+            restore_only.build_identity(0, 0).storage_key,
+        )
+
+    def test_independent_controls_override_access_mode(self) -> None:
+        vllm, _ = _make_vllm_config(
+            {
+                "spark_cache_access_mode": "restore-only",
+                "spark_cache_store": "1",
+                "spark_cache_restore": "0",
+            }
+        )
+
+        config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+
+        self.assertTrue(config.store_enabled)
+        self.assertFalse(config.restore_enabled)
+        self.assertEqual(config.access_mode, "store-only")
+
+    def test_unknown_access_mode_is_rejected(self) -> None:
+        vllm, _ = _make_vllm_config(
+            {"spark_cache_access_mode": "sometimes"}
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "spark_cache_access_mode"):
+            cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+
+    def test_restore_only_mode_disables_publication_accelerators(self) -> None:
+        vllm, _ = _make_vllm_config(
+            {
+                "spark_cache_access_mode": "restore-only",
+                "spark_cache_streaming_snapshots": "1",
+            }
+        )
+
+        config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+
+        self.assertFalse(config.streaming_snapshots_enabled)
+
+    def test_store_only_mode_disables_restore_accelerators(self) -> None:
+        vllm, _ = _make_vllm_config(
+            {
+                "spark_cache_access_mode": "store-only",
+                "spark_cache_cuda_restore": "1",
+            }
+        )
+
+        config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+
+        self.assertFalse(config.cuda_restore_enabled)
+
+    def test_per_token_rows_reject_nontrivial_dcp_interleave(self) -> None:
+        vllm, _ = _make_vllm_config(cp_kv_cache_interleave_size=4)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "per-token row storage supports only cp_kv_cache_interleave_size=1",
+        ):
+            cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
 
     def test_clear_once_accepts_operator_token_and_absolute_rank_root(self) -> None:
         root = (Path.cwd() / "cache" / "rank-0").resolve()
@@ -113,7 +206,7 @@ class ParseConnectorConfigTests(unittest.TestCase):
         self.assertFalse(config.store_enabled)
         self.assertFalse(config.restore_enabled)
 
-    def test_default_root_and_profile(self) -> None:
+    def test_root_and_explicit_profile_from_environment(self) -> None:
         vllm, _ = _make_vllm_config({"spark_cache_root": None})
         vllm.kv_transfer_config.get_from_extra_config = lambda key, default=None: (
             default
@@ -122,6 +215,7 @@ class ParseConnectorConfigTests(unittest.TestCase):
             os.environ,
             {
                 "SPARK_CONTEXT_CACHE_ROOT": "/env/root",
+                "SPARK_CONTEXT_CACHE_MODEL_PROFILE": "glm52-nvfp4",
                 "SPARK_CONTEXT_CACHE_TARGET_CHECKPOINT_SHA256": "1" * 64,
                 "SPARK_CONTEXT_CACHE_DRAFT_CHECKPOINT_SHA256": "2" * 64,
                 "SPARK_CONTEXT_CACHE_DRAFT_POLICY": "separate",
@@ -141,6 +235,7 @@ class ParseConnectorConfigTests(unittest.TestCase):
                 "SPARK_CONTEXT_CACHE_MAX_BYTES": "1000000",
                 "SPARK_CONTEXT_CACHE_LOW_WATERMARK_BYTES": "900000",
                 "SPARK_CONTEXT_CACHE_TTL_SECONDS": "3600",
+                "SPARK_CONTEXT_CACHE_MODEL_PROFILE": "glm52-nvfp4",
                 "SPARK_CONTEXT_CACHE_TARGET_CHECKPOINT_SHA256": "1" * 64,
                 "SPARK_CONTEXT_CACHE_DRAFT_CHECKPOINT_SHA256": "2" * 64,
                 "SPARK_CONTEXT_CACHE_DRAFT_POLICY": "separate",
@@ -151,29 +246,168 @@ class ParseConnectorConfigTests(unittest.TestCase):
         self.assertEqual(config.capacity_policy.low_watermark_bytes, 900000)
         self.assertEqual(config.capacity_policy.ttl_seconds, 3600)
 
-    def test_load_thread_limit_clamped_to_2(self) -> None:
+    def test_missing_model_profile_is_rejected_explicitly(self) -> None:
+        vllm, _ = _make_vllm_config()
+        vllm.kv_transfer_config.get_from_extra_config = lambda key, default=None: (
+            default
+        )
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            self.assertRaisesRegex(RuntimeError, "model_profile is required"),
+        ):
+            cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+
+    def test_load_thread_limit_accepts_8_for_page_restores(self) -> None:
         vllm, _ = _make_vllm_config({"spark_cache_load_threads": "8"})
         config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
-        self.assertEqual(config.load_thread_limit, 2)
+        self.assertEqual(config.load_thread_limit, 8)
+
+    def test_load_thread_limit_clamped_to_8(self) -> None:
+        vllm, _ = _make_vllm_config({"spark_cache_load_threads": "16"})
+        config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+        self.assertEqual(config.load_thread_limit, 8)
 
     def test_load_thread_limit_native_restore_forces_one(self) -> None:
         vllm, _ = _make_vllm_config(
             {
                 "spark_cache_load_threads": "4",
+                "spark_cache_cuda_restore": "1",
+                "spark_cache_cuda_placement_library": _ABS_LIB,
+                "spark_cache_cuda_placement_library_sha256": _SHA,
+                "spark_cache_cuda_placement_arena_bytes": "67108864",
+            }
+        )
+        config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+        self.assertTrue(config.cuda_restore_enabled)
+        self.assertEqual(config.load_thread_limit, 1)
+
+    def test_legacy_cuda_restore_config_is_accepted_with_one_warning(self) -> None:
+        vllm, _ = _make_vllm_config(
+            {
                 "spark_cache_native_restore": "1",
                 "spark_cache_native_library": _ABS_LIB,
                 "spark_cache_native_library_sha256": _SHA,
                 "spark_cache_native_arena_bytes": "67108864",
+                "spark_cache_native_io_workers": "2",
             }
         )
-        config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+        with (
+            mock.patch.object(cfg, "_LEGACY_CUDA_RESTORE_WARNING_EMITTED", False),
+            self.assertWarnsRegex(
+                FutureWarning, "legacy SparkCache CUDA configuration names"
+            ),
+        ):
+            config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+        self.assertTrue(config.cuda_restore_enabled)
         self.assertTrue(config.native_restore_enabled)
-        self.assertEqual(config.load_thread_limit, 1)
+        self.assertEqual(config.cuda_placement_library_path, _ABS_LIB)
+        self.assertEqual(config.cuda_restore_io_workers, 2)
+
+    def test_conflicting_cuda_restore_aliases_are_rejected(self) -> None:
+        cases = (
+            ("spark_cache_cuda_restore", "1", "spark_cache_native_restore", "0"),
+            (
+                "spark_cache_cuda_placement_library",
+                _ABS_LIB,
+                "spark_cache_native_library",
+                str((Path.cwd() / "other.so").resolve()),
+            ),
+            (
+                "spark_cache_cuda_placement_arena_bytes",
+                "67108864",
+                "spark_cache_native_arena_bytes",
+                "134217728",
+            ),
+        )
+        for canonical, canonical_value, legacy, legacy_value in cases:
+            with self.subTest(canonical=canonical):
+                vllm, _ = _make_vllm_config(
+                    {canonical: canonical_value, legacy: legacy_value}
+                )
+                with self.assertRaisesRegex(RuntimeError, "conflicting"):
+                    cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+
+    def test_conflicting_cuda_restore_environment_aliases_are_rejected(self) -> None:
+        vllm, _ = _make_vllm_config()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "SPARK_CONTEXT_CACHE_CUDA_RESTORE": "1",
+                    "SPARK_CONTEXT_CACHE_NATIVE_RESTORE": "0",
+                },
+            ),
+            self.assertRaisesRegex(RuntimeError, "conflicting"),
+        ):
+            cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+
+    def test_legacy_cuda_restore_environment_is_accepted(self) -> None:
+        vllm, _ = _make_vllm_config()
+        environment = {
+            "SPARK_CONTEXT_CACHE_NATIVE_RESTORE": "1",
+            "SPARK_CONTEXT_CACHE_NATIVE_LIBRARY": _ABS_LIB,
+            "SPARK_CONTEXT_CACHE_NATIVE_LIBRARY_SHA256": _SHA,
+            "SPARK_CONTEXT_CACHE_NATIVE_ARENA_BYTES": "67108864",
+            "SPARK_CONTEXT_CACHE_NATIVE_IO_WORKERS": "3",
+        }
+        with (
+            mock.patch.object(cfg, "_LEGACY_CUDA_RESTORE_WARNING_EMITTED", False),
+            mock.patch.dict(os.environ, environment),
+            self.assertWarnsRegex(
+                FutureWarning, "legacy SparkCache CUDA configuration names"
+            ),
+        ):
+            config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+        self.assertTrue(config.cuda_restore_enabled)
+        self.assertEqual(config.cuda_restore_io_workers, 3)
 
     def test_max_pending_restores_default_64(self) -> None:
         vllm, _ = _make_vllm_config()
         config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
         self.assertEqual(config.max_pending_restores, 64)
+
+    def test_shared_prefix_lease_ttl_defaults_to_15_seconds(self) -> None:
+        vllm, _ = _make_vllm_config()
+
+        config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+
+        self.assertEqual(config.shared_prefix_lease_ttl_seconds, 15.0)
+
+    def test_shared_prefix_lease_ttl_accepts_bounded_override(self) -> None:
+        vllm, _ = _make_vllm_config(
+            {"spark_cache_shared_prefix_lease_ttl_seconds": "300"}
+        )
+
+        config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+
+        self.assertEqual(config.shared_prefix_lease_ttl_seconds, 300.0)
+
+    def test_shared_prefix_lease_ttl_accepts_one_second_minimum(self) -> None:
+        vllm, _ = _make_vllm_config(
+            {"spark_cache_shared_prefix_lease_ttl_seconds": "1"}
+        )
+
+        config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
+
+        self.assertEqual(config.shared_prefix_lease_ttl_seconds, 1.0)
+
+    def test_shared_prefix_lease_ttl_does_not_change_cache_identity(self) -> None:
+        default_vllm, _ = _make_vllm_config()
+        retained_vllm, _ = _make_vllm_config(
+            {"spark_cache_shared_prefix_lease_ttl_seconds": "300"}
+        )
+
+        default = cfg.parse_connector_config(
+            default_vllm, default_vllm.kv_transfer_config, None
+        )
+        retained = cfg.parse_connector_config(
+            retained_vllm, retained_vllm.kv_transfer_config, None
+        )
+
+        self.assertEqual(
+            default.build_identity(0, 0).storage_key,
+            retained.build_identity(0, 0).storage_key,
+        )
 
     def test_scheduler_probe_default_tp0(self) -> None:
         vllm, _ = _make_vllm_config()
@@ -184,6 +418,7 @@ class ParseConnectorConfigTests(unittest.TestCase):
         vllm, _ = _make_vllm_config()
         config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
         self.assertFalse(config.streaming_snapshots_enabled)
+        self.assertFalse(config.async_page_capture_enabled)
 
     def test_tail_publication_is_opt_in_and_namespace_bound(self) -> None:
         default_vllm, _ = _make_vllm_config()
@@ -253,6 +488,42 @@ class IdentityBaseTests(unittest.TestCase):
             "page-tail-cow-v1",
         )
 
+    def test_flat_page_tail_publication_uses_a_distinct_namespace(self) -> None:
+        class FullAttentionSpec:
+            block_size = 512
+            storage_block_size = 512
+            page_size_bytes = 528
+
+        kv_cache_config = types.SimpleNamespace(
+            kv_cache_groups=(
+                types.SimpleNamespace(
+                    kv_cache_spec=FullAttentionSpec(),
+                    is_eagle_group=False,
+                    layer_names=("full",),
+                ),
+            )
+        )
+        vllm, _ = _make_vllm_config(
+            {
+                "spark_cache_model_profile": "deepseek-v4-fp8-hma",
+                "spark_cache_publication_schema": "tail-cow-v2",
+            },
+            tp=1,
+            dcp=1,
+        )
+
+        config = cfg.parse_connector_config(
+            vllm,
+            vllm.kv_transfer_config,
+            kv_cache_config,
+        )
+
+        self.assertEqual(config.publication_schema, "page-tail-cow-v2")
+        self.assertEqual(
+            config.build_identity(0, 0).publication_schema,
+            "page-tail-cow-v2",
+        )
+
     def test_identity_base_contains_required_fields(self) -> None:
         vllm, _ = _make_vllm_config()
         config = cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
@@ -305,6 +576,7 @@ class IdentityBaseTests(unittest.TestCase):
             "rope_layout": config.identity_base["rope_layout"],
             "tp_degree": 4,
             "dcp_degree": 4,
+            "cp_kv_cache_interleave_size": 1,
             "chunk_tokens": config.identity_base["chunk_tokens"],
             "dcp_shard_rank": 0,
             "tp_shard_rank": 0,
@@ -358,7 +630,7 @@ class IdentityBaseTests(unittest.TestCase):
 
 
 class ErrorPathTests(unittest.TestCase):
-    """Representative fail-closed startup validation paths."""
+    """Representative startup paths that reject unverified configuration."""
 
     def test_dcp_must_divide_tp(self) -> None:
         vllm, _ = _make_vllm_config(tp=4, dcp=3)
@@ -472,6 +744,29 @@ class ErrorPathTests(unittest.TestCase):
             cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
         self.assertIn("must be an integer", str(ctx.exception))
 
+    def test_shared_prefix_lease_ttl_rejects_invalid_values(self) -> None:
+        invalid = {
+            "malformed": "not-a-duration",
+            "negative": "-1",
+            "zero": "0",
+            "below-minimum": "0.5",
+            "excessive": "300.001",
+            "infinite": "inf",
+            "boolean": True,
+        }
+        for label, value in invalid.items():
+            with self.subTest(label=label):
+                vllm, _ = _make_vllm_config(
+                    {"spark_cache_shared_prefix_lease_ttl_seconds": value}
+                )
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "spark_cache_shared_prefix_lease_ttl_seconds",
+                ):
+                    cfg.parse_connector_config(
+                        vllm, vllm.kv_transfer_config, None
+                    )
+
     def test_nnegative_config_int_rejects_float(self) -> None:
         with self.assertRaises(RuntimeError) as ctx:
             cfg._nonnegative_config_int(1.5, "test_label")
@@ -485,26 +780,26 @@ class ErrorPathTests(unittest.TestCase):
     def test_native_restore_requires_absolute_path(self) -> None:
         vllm, _ = _make_vllm_config(
             {
-                "spark_cache_native_restore": "1",
-                "spark_cache_native_library": "relative/path.so",
-                "spark_cache_native_library_sha256": _SHA,
-                "spark_cache_native_arena_bytes": "67108864",
+                "spark_cache_cuda_restore": "1",
+                "spark_cache_cuda_placement_library": "relative/path.so",
+                "spark_cache_cuda_placement_library_sha256": _SHA,
+                "spark_cache_cuda_placement_arena_bytes": "67108864",
             }
         )
         with self.assertRaises(RuntimeError) as ctx:
             cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
         self.assertIn(
-            "absolute library path, a 64-character lowercase SHA-256",
+            "absolute CUDA placement library path, a 64-character lowercase SHA-256",
             str(ctx.exception),
         )
 
     def test_native_restore_requires_valid_sha256(self) -> None:
         vllm, _ = _make_vllm_config(
             {
-                "spark_cache_native_restore": "1",
-                "spark_cache_native_library": _ABS_LIB,
-                "spark_cache_native_library_sha256": "short",
-                "spark_cache_native_arena_bytes": "67108864",
+                "spark_cache_cuda_restore": "1",
+                "spark_cache_cuda_placement_library": _ABS_LIB,
+                "spark_cache_cuda_placement_library_sha256": "short",
+                "spark_cache_cuda_placement_arena_bytes": "67108864",
             }
         )
         with self.assertRaises(RuntimeError) as ctx:
@@ -514,10 +809,10 @@ class ErrorPathTests(unittest.TestCase):
     def test_native_restore_requires_valid_arena(self) -> None:
         vllm, _ = _make_vllm_config(
             {
-                "spark_cache_native_restore": "1",
-                "spark_cache_native_library": _ABS_LIB,
-                "spark_cache_native_library_sha256": _SHA,
-                "spark_cache_native_arena_bytes": "12345",
+                "spark_cache_cuda_restore": "1",
+                "spark_cache_cuda_placement_library": _ABS_LIB,
+                "spark_cache_cuda_placement_library_sha256": _SHA,
+                "spark_cache_cuda_placement_arena_bytes": "12345",
             }
         )
         with self.assertRaises(RuntimeError) as ctx:
@@ -527,11 +822,11 @@ class ErrorPathTests(unittest.TestCase):
     def test_native_restore_requires_valid_io_workers(self) -> None:
         vllm, _ = _make_vllm_config(
             {
-                "spark_cache_native_restore": "1",
-                "spark_cache_native_library": _ABS_LIB,
-                "spark_cache_native_library_sha256": _SHA,
-                "spark_cache_native_arena_bytes": "67108864",
-                "spark_cache_native_io_workers": "50",
+                "spark_cache_cuda_restore": "1",
+                "spark_cache_cuda_placement_library": _ABS_LIB,
+                "spark_cache_cuda_placement_library_sha256": _SHA,
+                "spark_cache_cuda_placement_arena_bytes": "67108864",
+                "spark_cache_cuda_restore_io_workers": "50",
             }
         )
         with self.assertRaises(RuntimeError) as ctx:
@@ -566,6 +861,70 @@ class ErrorPathTests(unittest.TestCase):
             str(ctx.exception),
         )
 
+    def test_async_page_capture_is_explicit_and_block_page_only(self) -> None:
+        class FullAttentionSpec:
+            block_size = 512
+            storage_block_size = 512
+            page_size_bytes = 528
+
+        kv_cache_config = types.SimpleNamespace(
+            num_blocks=8,
+            kv_cache_groups=(
+                types.SimpleNamespace(
+                    kv_cache_spec=FullAttentionSpec(),
+                    is_eagle_group=False,
+                    layer_names=("full",),
+                ),
+            ),
+        )
+        block_pages, _ = _make_vllm_config(
+            {
+                "spark_cache_model_profile": "deepseek-v4-fp8-hma",
+                "spark_cache_async_page_capture": "1",
+            }
+        )
+        parsed = cfg.parse_connector_config(
+            block_pages,
+            block_pages.kv_transfer_config,
+            kv_cache_config,
+        )
+        self.assertTrue(parsed.async_page_capture_enabled)
+
+        rows, _ = _make_vllm_config(
+            {"spark_cache_async_page_capture": "1"}
+        )
+        with self.assertRaisesRegex(RuntimeError, "requires block-page storage"):
+            cfg.parse_connector_config(rows, rows.kv_transfer_config, None)
+
+        no_store, _ = _make_vllm_config(
+            {
+                "spark_cache_model_profile": "deepseek-v4-fp8-hma",
+                "spark_cache_async_page_capture": "1",
+                "spark_cache_store": "0",
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "requires cache publication"):
+            cfg.parse_connector_config(
+                no_store,
+                no_store.kv_transfer_config,
+                kv_cache_config,
+            )
+
+        tail_store, _ = _make_vllm_config(
+            {
+                "spark_cache_model_profile": "deepseek-v4-fp8-hma",
+                "spark_cache_async_page_capture": "1",
+                "spark_cache_publication_schema": "tail-cow-v1",
+            }
+        )
+        tail = cfg.parse_connector_config(
+            tail_store,
+            tail_store.kv_transfer_config,
+            kv_cache_config,
+        )
+        self.assertTrue(tail.async_page_capture_enabled)
+        self.assertEqual(tail.publication_schema, "page-tail-cow-v1")
+
 
 class KvGroupTopologyTests(unittest.TestCase):
     """Tests for the topology extraction and digest helpers."""
@@ -597,6 +956,7 @@ class KvGroupTopologyTests(unittest.TestCase):
 
     def test_sliding_window_policy(self) -> None:
         class SlidingWindowSpec:
+            block_size = 64
             sliding_window = 512
 
         kv_cache_config = types.SimpleNamespace(
@@ -615,8 +975,8 @@ class KvGroupTopologyTests(unittest.TestCase):
 
     def test_mamba_align_policy_records_recurrent_identity(self) -> None:
         class MambaSpec:
-            block_size = 256
-            storage_block_size = 256
+            block_size = 512
+            storage_block_size = 512
             page_size_bytes = 4096
             mamba_cache_mode = "align"
             tokens_per_state = 256
@@ -632,9 +992,12 @@ class KvGroupTopologyTests(unittest.TestCase):
                 ),
             )
         )
-        topology = cfg.kv_group_topology(kv_cache_config)
+        topology = cfg.kv_group_topology(kv_cache_config, dcp_degree=2)
         self.assertEqual(topology[0]["reuse_policy"], "recurrent_align")
         self.assertIsNone(topology[0]["reuse_window_tokens"])
+        self.assertTrue(topology[0]["dcp_replicated"])
+        self.assertEqual(topology[0]["dcp_shard_count"], 1)
+        self.assertEqual(topology[0]["logical_tokens_per_block"], 512)
         self.assertEqual(
             topology[0]["recurrent_state"],
             {
@@ -658,6 +1021,101 @@ class KvGroupTopologyTests(unittest.TestCase):
             connector_config.group_topology[0]["recurrent_state"][
                 "tokens_per_state"
             ] = 512
+
+    def test_block_page_identity_separates_complete_manager_pages(self) -> None:
+        class FullAttentionSpec:
+            block_size = 2304
+            storage_block_size = 2304
+            page_size_bytes = 4096
+
+        kv_cache_config = types.SimpleNamespace(
+            num_blocks=8,
+            kv_cache_groups=(
+                types.SimpleNamespace(
+                    kv_cache_spec=FullAttentionSpec(),
+                    is_eagle_group=False,
+                    layer_names=("attention",),
+                ),
+            ),
+        )
+        vllm, _ = _make_vllm_config(
+            {"spark_cache_model_profile": "glm53-flash-hybrid"},
+            dcp=1,
+            tp=1,
+            block_size=2304,
+        )
+        connector_config = cfg.parse_connector_config(
+            vllm, vllm.kv_transfer_config, kv_cache_config
+        )
+        identity = connector_config.build_identity(0, 0)
+
+        self.assertIn(":manager-pages-v2:", identity.quantization_layout)
+        row_indexed_identity = replace(
+            identity,
+            quantization_layout=identity.quantization_layout.replace(
+                ":manager-pages-v2:", ":", 1
+            ),
+        )
+        self.assertNotEqual(identity.storage_key, row_indexed_identity.storage_key)
+
+    def test_glm53_manager_pages_accept_tp4_dcp2_and_dcp4(self) -> None:
+        """Opaque manager pages retain the configured DCP degree in identity."""
+
+        class FullAttentionSpec:
+            block_size = 2304
+            storage_block_size = 2304
+            page_size_bytes = 4096
+
+        kv_cache_config = types.SimpleNamespace(
+            num_blocks=8,
+            kv_cache_groups=(
+                types.SimpleNamespace(
+                    kv_cache_spec=FullAttentionSpec(),
+                    is_eagle_group=False,
+                    layer_names=("attention",),
+                ),
+            ),
+        )
+        for dcp_degree in (2, 4):
+            with self.subTest(dcp_degree=dcp_degree):
+                vllm, _ = _make_vllm_config(
+                    {"spark_cache_model_profile": "glm53-flash-hybrid"},
+                    dcp=dcp_degree,
+                    tp=4,
+                    block_size=2304,
+                    cp_kv_cache_interleave_size=4,
+                )
+                connector_config = cfg.parse_connector_config(
+                    vllm,
+                    vllm.kv_transfer_config,
+                    kv_cache_config,
+                )
+                self.assertEqual(connector_config.dcp_degree, dcp_degree)
+                self.assertEqual(connector_config.cp_kv_cache_interleave_size, 4)
+                self.assertFalse(
+                    connector_config.group_topology[0]["dcp_replicated"]
+                )
+                self.assertEqual(
+                    connector_config.group_topology[0]["dcp_shard_count"],
+                    dcp_degree,
+                )
+                self.assertEqual(
+                    connector_config.group_topology[0][
+                        "logical_tokens_per_block"
+                    ],
+                    2304 * dcp_degree,
+                )
+                self.assertEqual(
+                    connector_config.build_identity(0, 0).dcp_degree,
+                    dcp_degree,
+                )
+                self.assertEqual(
+                    connector_config.build_identity(
+                        0,
+                        0,
+                    ).cp_kv_cache_interleave_size,
+                    4,
+                )
 
     def test_mamba_non_align_policy_fails_closed(self) -> None:
         class MambaSpec:

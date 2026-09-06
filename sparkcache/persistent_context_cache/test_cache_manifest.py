@@ -23,7 +23,6 @@ from sparkcache.persistent_context_cache.cache_manifest import (
     ContextChunk,
     IncompleteEntry,
     ManifestStore,
-    PageDeltaDepthExceeded,
     StateRecord,
 )
 
@@ -44,6 +43,15 @@ def _tail_identity(**changes: Any) -> CacheIdentity:
     return dataclasses.replace(
         _identity(),
         publication_schema="tail-cow-v1",
+        **changes,
+    )
+
+
+def _page_identity(**changes: Any) -> CacheIdentity:
+    return dataclasses.replace(
+        _identity(),
+        record_schema=("target_ckv", "logical_positions"),
+        publication_schema="page-tail-cow-v1",
         **changes,
     )
 
@@ -98,6 +106,388 @@ def _clear_once_in_subprocess(
 
 
 class ManifestStoreTests(unittest.TestCase):
+    def test_page_snapshot_scatter_is_consumed_in_bounded_ranges(self) -> None:
+        from sparkcache.spark_context_cache_hybrid import (
+            PageGroup,
+            PageLayer,
+            PageLayout,
+            encode_page_snapshot,
+            encode_page_snapshot_header,
+        )
+
+        identity = dataclasses.replace(_page_identity(), publication_schema="")
+        layout = PageLayout((PageGroup(256, (PageLayer("page", "u8", (32,), 32),)),))
+        snapshot = encode_page_snapshot(
+            layout,
+            (16,),
+            {"page": hashlib.shake_256(b"scatter-page-bytes").digest(512)},
+        )
+        header = encode_page_snapshot_header(layout, (16,))
+
+        class Scatter:
+            total_bytes = len(snapshot)
+            calls: list[tuple[int, int]] = []
+
+            @staticmethod
+            def read_range(start: int, end: int) -> bytes:
+                Scatter.calls.append((start, end))
+                if end <= len(header):
+                    return header[start:end]
+                if start >= len(header):
+                    return snapshot[start:end]
+                return header[start:] + snapshot[len(header) : end]
+
+        digest = hashlib.sha256(b"scatter-page-snapshot").hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            store = ManifestStore(directory)
+            with mock.patch.object(cache_manifest, "_PAGE_SNAPSHOT_OBJECT_BYTES", 64):
+                store.commit_page_snapshot(
+                    identity=identity,
+                    context_digest=digest,
+                    span_tokens=128 * identity.chunk_tokens,
+                    snapshot=Scatter(),
+                )
+            lookup = store.lookup(identity, digest, verify_chunks=True)
+            restored = store.restore_page_snapshot(
+                lookup,
+                layout=layout,
+                result_block_counts=(16,),
+                result_boundary_tokens=128 * identity.chunk_tokens,
+            )
+        self.assertEqual(restored, snapshot)
+        self.assertGreater(len(Scatter.calls), 1)
+        self.assertTrue(all(end - start <= 64 for start, end in Scatter.calls))
+
+    def test_flat_page_snapshot_uses_bounded_macro_objects_and_restores_exactly(
+        self,
+    ) -> None:
+        from sparkcache.spark_context_cache_hybrid import (
+            PageGroup,
+            PageLayer,
+            PageLayout,
+            encode_page_snapshot,
+        )
+
+        identity = _page_identity()
+        layout = PageLayout((PageGroup(256, (PageLayer("page", "u8", (32,), 32),)),))
+        snapshot = encode_page_snapshot(
+            layout,
+            (16,),
+            {"page": hashlib.shake_256(b"unique-page-bytes").digest(512)},
+        )
+        digest = hashlib.sha256(b"flat-page-macro").hexdigest()
+        publish_batches: list[int] = []
+        read_batches: list[int] = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ManifestStore(root)
+            original_publish = cache_manifest._publish_immutable_batch
+            original_read = cache_manifest._read_page_snapshot_object_batch
+
+            def record_publish(objects: Any) -> None:
+                publish_batches.append(len(objects))
+                self.assertLessEqual(len(objects), 2)
+                self.assertTrue(all(len(payload) <= 64 for _path, payload in objects))
+                original_publish(objects)
+
+            def record_read(object_root: Path, descriptors: Any) -> tuple[bytes, ...]:
+                read_batches.append(len(descriptors))
+                self.assertLessEqual(len(descriptors), 4)
+                return original_read(object_root, descriptors)
+
+            with (
+                mock.patch.object(cache_manifest, "_PAGE_SNAPSHOT_OBJECT_BYTES", 64),
+                mock.patch.object(
+                    cache_manifest,
+                    "_publish_immutable_batch",
+                    side_effect=record_publish,
+                ),
+                mock.patch.object(
+                    cache_manifest,
+                    "_read_page_snapshot_object_batch",
+                    side_effect=record_read,
+                ),
+                mock.patch.object(
+                    cache_manifest,
+                    "_encode_chunk",
+                    side_effect=AssertionError(
+                        "flat macro publication must not encode logical chunks"
+                    ),
+                ),
+            ):
+                receipt = store.commit_page_snapshot(
+                    identity=identity,
+                    context_digest=digest,
+                    span_tokens=128 * identity.chunk_tokens,
+                    snapshot=snapshot,
+                )
+                lookup = store.lookup(identity, digest, verify_chunks=False)
+                restored = store.restore_page_snapshot(
+                    lookup,
+                    layout=layout,
+                    result_block_counts=(16,),
+                    result_boundary_tokens=128 * identity.chunk_tokens,
+                )
+
+            manifest = lookup._manifest
+            assert manifest is not None
+            self.assertEqual(manifest["schema"], "sparkcache-page-snapshot-manifest/v2")
+            self.assertEqual(manifest["logical_chunk_tokens"], 256)
+            self.assertEqual(manifest["logical_chunk_count"], 128)
+            self.assertEqual(lookup.root_kind, "page_snapshot")
+            self.assertEqual(restored, snapshot)
+            physical_files = tuple((root / "chunks").glob("*.spcc"))
+            self.assertEqual(
+                len(physical_files),
+                (len(snapshot) + 63) // 64,
+            )
+            self.assertLess(len(physical_files), manifest["logical_chunk_count"])
+            self.assertEqual(publish_batches, [2, 2, 2, 2, 2, 1])
+            self.assertEqual(read_batches, [4, 4, 3])
+            self.assertEqual(receipt.committed_tokens, 128 * 256)
+
+    def test_flat_page_snapshot_corruption_becomes_a_miss_and_repairs(self) -> None:
+        identity = _page_identity()
+        digest = hashlib.sha256(b"flat-page-corruption").hexdigest()
+        snapshot = b"opaque-page-snapshot" * 32
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ManifestStore(root)
+            with mock.patch.object(cache_manifest, "_PAGE_SNAPSHOT_OBJECT_BYTES", 64):
+                store.commit_page_snapshot(
+                    identity=identity,
+                    context_digest=digest,
+                    span_tokens=512,
+                    snapshot=snapshot,
+                )
+            probe = store.lookup(identity, digest, verify_chunks=False)
+            self.assertTrue(probe.is_hit, probe.reason)
+            manifest = probe._manifest
+            assert manifest is not None
+            damaged = (
+                root / "chunks" / f"{manifest['snapshot_objects'][1]['sha256']}.spcc"
+            )
+            payload = bytearray(damaged.read_bytes())
+            payload[len(payload) // 2] ^= 0xFF
+            damaged.write_bytes(payload)
+
+            verified = store.lookup(identity, digest)
+            self.assertFalse(verified.is_hit)
+            self.assertEqual(verified.reason, "corrupt")
+            with self.assertRaisesRegex(
+                cache_manifest.CacheFormatError,
+                "page snapshot object checksum mismatch",
+            ):
+                store.restore_page_snapshot(
+                    probe,
+                    layout=object(),
+                    result_block_counts=(),
+                    result_boundary_tokens=512,
+                )
+            self.assertTrue(store.invalidate(identity, digest))
+            self.assertFalse(damaged.exists())
+            self.assertFalse(store.lookup(identity, digest).is_hit)
+
+    def test_unknown_page_snapshot_schema_is_a_clean_miss(self) -> None:
+        identity = _page_identity()
+        digest = hashlib.sha256(b"unknown-page-root").hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ManifestStore(root)
+            store.commit_page_snapshot(
+                identity=identity,
+                context_digest=digest,
+                span_tokens=256,
+                snapshot=b"opaque-page-root",
+            )
+            manifest_path = root / "manifests" / identity.storage_key / f"{digest}.json"
+            manifest = json.loads(manifest_path.read_bytes())
+            manifest["schema"] = "sparkcache-page-snapshot-manifest/unknown"
+            manifest.pop("metadata_sha256")
+            manifest["metadata_sha256"] = hashlib.sha256(
+                cache_manifest._canonical_json(manifest)
+            ).hexdigest()
+            manifest_path.write_bytes(cache_manifest._canonical_json(manifest))
+
+            lookup = store.lookup(identity, digest)
+
+            self.assertFalse(lookup.is_hit)
+            self.assertEqual(lookup.reason, "corrupt")
+
+    def test_page_delta_keeps_shared_flat_macro_base_alive_during_gc(self) -> None:
+        from sparkcache.spark_context_cache_codec import context_prefix_digest
+        from sparkcache.spark_context_cache_hybrid import (
+            PageGroup,
+            PageLayer,
+            PageLayout,
+            encode_page_snapshot,
+        )
+
+        identity = _page_identity()
+        layout = PageLayout((PageGroup(128, (PageLayer("page", "u8", (64,), 64),)),))
+        base_snapshot = encode_page_snapshot(
+            layout,
+            (2,),
+            {"page": b"A" * 128},
+        )
+        result_snapshot = encode_page_snapshot(
+            layout,
+            (3,),
+            {"page": b"A" * 128 + b"B" * 64},
+        )
+        tokens = tuple(range(512))
+        salt = "flat-macro-shared-base"
+        base_digest = context_prefix_digest(tokens, salt, token_count=256)
+        result_digest = context_prefix_digest(tokens, salt, token_count=512)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ManifestStore(root)
+            with mock.patch.object(cache_manifest, "_PAGE_SNAPSHOT_OBJECT_BYTES", 64):
+                store.commit_page_snapshot(
+                    identity=identity,
+                    context_digest=base_digest,
+                    span_tokens=256,
+                    snapshot=base_snapshot,
+                )
+            base_manifest_path = (
+                root / "manifests" / identity.storage_key / f"{base_digest}.json"
+            )
+            base_manifest = json.loads(base_manifest_path.read_bytes())
+            base_objects = tuple(
+                root / "chunks" / f"{item['sha256']}.spcc"
+                for item in base_manifest["snapshot_objects"]
+            )
+            store.commit_page_extension(
+                identity=identity,
+                base_context_digest=base_digest,
+                token_ids=tokens,
+                identity_salt=salt,
+                layout=layout,
+                base_block_counts=(2,),
+                result_block_counts=(3,),
+                base_boundary_tokens=256,
+                result_boundary_tokens=512,
+                result_snapshot=result_snapshot,
+            )
+            base_manifest_path.unlink()
+
+            report = store.maintain(
+                CapacityPolicy(max_bytes=10**9, low_watermark_bytes=10**9)
+            )
+
+            self.assertEqual(report.orphan_chunks_deleted, 0)
+            self.assertTrue(all(path.exists() for path in base_objects))
+            lookup = store.lookup(identity, result_digest)
+            self.assertTrue(lookup.is_hit, lookup.reason)
+            self.assertEqual(
+                store.restore_page_snapshot(
+                    lookup,
+                    layout=layout,
+                    result_block_counts=(3,),
+                    result_boundary_tokens=512,
+                ),
+                result_snapshot,
+            )
+
+    def test_legacy_flat_page_manifest_remains_byte_exact_and_row_mode_unchanged(
+        self,
+    ) -> None:
+        from sparkcache.spark_context_cache_codec import pack_positions
+        from sparkcache.spark_context_cache_hybrid import split_snapshot
+
+        identity = _page_identity()
+        digest = hashlib.sha256(b"legacy-flat-page").hexdigest()
+        snapshot = b"legacy-flat-page-bytes" * 31
+        parts = split_snapshot(snapshot, 2)
+        chunks = tuple(
+            ContextChunk(
+                index * 256,
+                (index + 1) * 256,
+                {
+                    StateRecord.TARGET_CKV: payload,
+                    StateRecord.LOGICAL_POSITIONS: pack_positions(
+                        range(index * 256, (index + 1) * 256)
+                    ),
+                },
+            )
+            for index, payload in enumerate(parts)
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ManifestStore(root)
+            store.commit(
+                identity=identity,
+                context_digest=digest,
+                chunks=chunks,
+                span_tokens=512,
+            )
+            lookup = store.lookup(identity, digest)
+            self.assertEqual(lookup.root_kind, "manifest")
+            self.assertEqual(
+                store.restore_page_snapshot(
+                    lookup,
+                    layout=object(),
+                    result_block_counts=(),
+                    result_boundary_tokens=512,
+                ),
+                snapshot,
+            )
+            manifest = json.loads(
+                next((root / "manifests").rglob("*.json")).read_bytes()
+            )
+            self.assertNotIn("schema", manifest)
+            self.assertEqual(len(manifest["chunks"]), 2)
+
+            row_digest = hashlib.sha256(b"row-format-unchanged").hexdigest()
+            store.commit(
+                identity=_identity(),
+                context_digest=row_digest,
+                chunks=(_chunk(),),
+                span_tokens=256,
+            )
+            row_manifest = json.loads(
+                (
+                    root / "manifests" / _identity().storage_key / f"{row_digest}.json"
+                ).read_bytes()
+            )
+            self.assertNotIn("schema", row_manifest)
+            self.assertEqual(
+                store.restore(store.lookup(_identity(), row_digest)), (_chunk(),)
+            )
+
+    def test_page_delta_chunk_reads_overlap_and_preserve_descriptor_order(
+        self,
+    ) -> None:
+        identity = _identity()
+        chunks = (_chunk(0, 256), _chunk(256, 512))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ManifestStore(root)
+            digest = hashlib.sha256(b"parallel-page-delta-reads").hexdigest()
+            store.commit(
+                identity=identity,
+                context_digest=digest,
+                chunks=chunks,
+                span_tokens=512,
+            )
+            manifest_path = root / "manifests" / identity.storage_key / f"{digest}.json"
+            descriptors = json.loads(manifest_path.read_bytes())["chunks"]
+            overlap = threading.Barrier(len(descriptors), timeout=2.0)
+            original_read_bytes = Path.read_bytes
+
+            def read_with_overlap(path: Path) -> bytes:
+                if path.suffix == ".spcc":
+                    overlap.wait()
+                return original_read_bytes(path)
+
+            with mock.patch.object(Path, "read_bytes", read_with_overlap):
+                restored = store._read_context_chunks(
+                    descriptors,
+                    identity.required_records,
+                )
+
+            self.assertEqual(restored, chunks)
+
     def test_page_extension_materializes_full_snapshot_after_base_root_removal(
         self,
     ) -> None:
@@ -116,7 +506,7 @@ class ManifestStoreTests(unittest.TestCase):
         identity = dataclasses.replace(
             _identity(),
             record_schema=("target_ckv", "logical_positions"),
-            publication_schema="page-tail-cow-v1",
+            publication_schema="page-tail-cow-v2",
         )
         layout = PageLayout(
             (PageGroup(256, (PageLayer("page", "u8", (1024,), 1024),)),)
@@ -126,6 +516,7 @@ class ManifestStoreTests(unittest.TestCase):
         base_digest = context_prefix_digest(tokens, salt, token_count=256)
         result_digest = context_prefix_digest(tokens, salt, token_count=512)
         third_digest = context_prefix_digest(tokens, salt, token_count=768)
+        fourth_digest = context_prefix_digest(tokens, salt, token_count=1024)
         base_snapshot = encode_page_snapshot(layout, (1,), {"page": b"A" * 1024})
         result_snapshot = encode_page_snapshot(
             layout,
@@ -185,7 +576,7 @@ class ManifestStoreTests(unittest.TestCase):
                 page_root_path,
                 *(
                     root / "chunks" / f"{item['sha256']}.spcc"
-                    for item in page_root["delta_chunks"]
+                    for item in page_root["delta_stages"][-1]["delta_objects"]
                 ),
             ]
             self.assertGreaterEqual(
@@ -215,7 +606,7 @@ class ManifestStoreTests(unittest.TestCase):
                 chained_root_path,
                 *(
                     root / "chunks" / f"{item['sha256']}.spcc"
-                    for item in chained_root["delta_chunks"]
+                    for item in chained_root["delta_stages"][-1]["delta_objects"]
                 ),
             ]
             self.assertGreaterEqual(
@@ -225,7 +616,18 @@ class ManifestStoreTests(unittest.TestCase):
                     for path in chained_objects
                 ),
             )
-            with self.assertRaises(PageDeltaDepthExceeded):
+            third_lookup = store.lookup(identity, third_digest)
+            prepared_base = store.restore_page_snapshot(
+                third_lookup,
+                layout=layout,
+                result_block_counts=(3,),
+                result_boundary_tokens=768,
+            )
+            with mock.patch.object(
+                store,
+                "restore_page_snapshot",
+                side_effect=AssertionError("prepared base was read again"),
+            ):
                 store.commit_page_extension(
                     identity=identity,
                     base_context_digest=third_digest,
@@ -237,7 +639,45 @@ class ManifestStoreTests(unittest.TestCase):
                     base_boundary_tokens=768,
                     result_boundary_tokens=1024,
                     result_snapshot=fourth_snapshot,
+                    verified_base_snapshot=prepared_base,
                 )
+            flattened = store.lookup(identity, fourth_digest)
+            self.assertTrue(flattened.is_hit, flattened.reason)
+            self.assertEqual(flattened.root_kind, "page_delta")
+            self.assertEqual(
+                flattened._manifest["schema"],  # type: ignore[index]
+                "sparkcache-page-delta-manifest/v3",
+            )
+            self.assertEqual(
+                len(flattened._manifest["delta_stages"]),  # type: ignore[index]
+                3,
+            )
+            self.assertEqual(
+                flattened._manifest["base_context_digest"],  # type: ignore[index]
+                base_digest,
+            )
+            self.assertEqual(
+                store.restore_page_snapshot(
+                    flattened,
+                    layout=layout,
+                    result_block_counts=(4,),
+                    result_boundary_tokens=1024,
+                ),
+                fourth_snapshot,
+            )
+            corrupted_descriptor = flattened._manifest["delta_stages"][1][  # type: ignore[index]
+                "delta_objects"
+            ][0]
+            corrupted_path = (
+                root / "chunks" / f"{corrupted_descriptor['sha256']}.spcc"
+            )
+            original = corrupted_path.read_bytes()
+            corrupted_path.write_bytes(bytes((original[0] ^ 0xFF,)) + original[1:])
+            rejected = store.lookup(identity, fourth_digest)
+            self.assertFalse(rejected.is_hit)
+            self.assertEqual(rejected.reason, "corrupt")
+            corrupted_path.write_bytes(original)
+            self.assertTrue(store.lookup(identity, fourth_digest).is_hit)
             (root / "manifests" / identity.storage_key / f"{base_digest}.json").unlink()
             (
                 root / "manifests" / identity.storage_key / f"{result_digest}.json"

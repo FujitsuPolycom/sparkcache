@@ -1,4 +1,4 @@
-"""Optional, fail-open timing trace for the final streaming snapshot batch."""
+"""Optional timing trace whose failures do not interrupt serving."""
 
 from __future__ import annotations
 

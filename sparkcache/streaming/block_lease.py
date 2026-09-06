@@ -101,8 +101,8 @@ class LeaseHandle:
 
         The registry serializes preemption against the callback. The callback
         must enqueue the gather, record its completion event, and return the
-        event. Any callback exception is treated as unknown submission state:
-        the lease remains held and the worker must fail closed.
+        event. Any callback exception leaves submission ownership unknown, so
+        the lease remains held and cache publication must stop.
         """
 
         self._registry._submit(self._lease_id, submitter)
@@ -132,7 +132,7 @@ class BlockLeaseRegistry:
 
         Duplicate block IDs and invalid identifiers are programmer errors.
         Capacity pressure or overlap with an active lease is an expected
-        fail-open cache miss and returns ``None``.
+        cache-publication skip and returns ``None`` without interrupting serving.
         """
 
         blocks = tuple(block_ids)

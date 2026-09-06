@@ -46,6 +46,7 @@ def _make_connector_pn(
 ) -> SparkContextCacheConnector:
     values = {
         "spark_cache_root": str(root),
+        "spark_cache_model_profile": "glm52-nvfp4",
         "spark_cache_min_span_tokens": "256",
         "spark_cache_target_checkpoint_sha256": "1" * 64,
         "spark_cache_draft_checkpoint_sha256": "2" * 64,
@@ -90,6 +91,7 @@ class ProfileRegistryTests(unittest.TestCase):
                 "rope_layout": "glm52-rope-v1",
                 "tp_degree": 4,
                 "dcp_degree": 4,
+                "cp_kv_cache_interleave_size": 1,
                 "chunk_tokens": 256,
                 "boundary_hidden_policy": "live_forward",
                 "draft_kv_policy": "separate",
@@ -111,7 +113,7 @@ class ProfileRegistryTests(unittest.TestCase):
                 dcp_degree=1,
                 block_size=64,
                 min_span_tokens=profile.chunk_tokens,
-                native_restore=profile.storage_mode == "per_token_rows",
+                cuda_restore=profile.storage_mode == "per_token_rows",
             )
 
     def test_resolve_profile_error_lists_known_names(self) -> None:
@@ -124,12 +126,12 @@ class ProfileRegistryTests(unittest.TestCase):
         self.assertEqual(profile.required_families, frozenset({"target_ckv"}))
         self.assertEqual(profile.classification_rules, ())
         self.assertIn("block-pages-v1", profile.quantization_layout)
-        with self.assertRaisesRegex(ProfileError, "native restore"):
+        with self.assertRaisesRegex(ProfileError, "SparkCache CUDA restore"):
             profile.validate_for_deployment(
                 dcp_degree=1,
                 block_size=64,
                 min_span_tokens=256,
-                native_restore=True,
+                cuda_restore=True,
             )
 
     def test_glm53_profile_is_distinct_hybrid_namespace(self) -> None:
@@ -148,7 +150,7 @@ class ProfileRegistryTests(unittest.TestCase):
             dcp_degree=1,
             block_size=2304,
             min_span_tokens=4096,
-            native_restore=False,
+            cuda_restore=False,
         )
 
     def test_glm53_profile_rejects_incommensurate_scheduler_block_size(self) -> None:
@@ -158,7 +160,7 @@ class ProfileRegistryTests(unittest.TestCase):
                 dcp_degree=1,
                 block_size=384,
                 min_span_tokens=4096,
-                native_restore=False,
+                cuda_restore=False,
             )
 
 
@@ -367,19 +369,34 @@ class SchedulerProbeNoneTests(unittest.TestCase):
 
 
 class ClassificationRuleTests(unittest.TestCase):
-    def test_default_rules_match_reference_layer_names(self) -> None:
+    def test_glm52_profile_rules_match_registered_layer_names(self) -> None:
+        profile = resolve_profile("glm52-nvfp4")
         self.assertEqual(
-            codec.classify_layer("model.layers.0.self_attn.indexer_cache"),
+            codec.classify_layer(
+                "model.layers.0.self_attn.indexer_cache",
+                profile.classification_rules,
+            ),
             "sparse_indexer",
         )
         self.assertEqual(
-            codec.classify_layer("draft.layers.0.self_attn.attn"),
+            codec.classify_layer(
+                "draft.layers.0.self_attn.attn",
+                profile.classification_rules,
+            ),
             "mtp_draft_kv",
         )
         self.assertEqual(
             codec.classify_layer("model.layers.0.self_attn.attn"),
             "target_ckv",
         )
+
+    def test_generic_defaults_do_not_infer_a_model_layout(self) -> None:
+        self.assertEqual(
+            codec.classify_layer("model.layers.0.self_attn.indexer_cache"),
+            "target_ckv",
+        )
+        plans = codec.build_layer_plans({"opaque.cache": 8})
+        self.assertEqual(plans[0].record_kind, "target_ckv")
 
     def test_custom_rules_first_match_wins_and_default_applies(self) -> None:
         rules = (("indexer", "sparse_indexer"),)

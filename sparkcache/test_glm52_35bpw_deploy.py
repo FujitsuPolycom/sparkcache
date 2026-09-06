@@ -18,6 +18,7 @@ from deploy.glm52_35bpw.profile import (
     ProfileTransformError,
     transform_inspection,
 )
+import deploy.glm52_35bpw.profile as glm_profile
 from deploy.glm52_35bpw import prepare_vllm_overlays
 from deploy.glm52_35bpw.semantic_gate import run_hit_after_quorum
 from deploy.glm52_35bpw import launch as glm_launch
@@ -122,8 +123,7 @@ def _source_inspection() -> dict:
                 "fabb73eb513ec64f3a365da396b38de8d55b3930edfb11baeecbf34ecafa6126",
                 "SPARKRING_ATTEST_MODEL_INDEX_SHA256="
                 "9fd852f69ed64442e31dce1cbc5fe7acd0a76bfb848e945d272fe98d00d0c9cd",
-                "SPARKRING_MODEL_REVISION="
-                "46537e0e16fcd156627800139b41b9c497fc7ee2",
+                "SPARKRING_MODEL_REVISION=46537e0e16fcd156627800139b41b9c497fc7ee2",
                 "SPARKRING_MODEL_CONFIG_SHA256="
                 "ffd30e72ab8bb7e8ad560f2aaab03cc595f3106f0acf793ef96eedaf90f66d69",
                 "KV_FP8_ROPE=1",
@@ -226,9 +226,7 @@ def _environment(inspection: dict) -> dict[str, str]:
 
 
 def test_deployment_alias_reuses_the_frozen_glm_cache_layout() -> None:
-    assert resolve_profile("glm52-exl3-r7-3.5bpw") is resolve_profile(
-        "glm52-nvfp4"
-    )
+    assert resolve_profile("glm52-exl3-r7-3.5bpw") is resolve_profile("glm52-nvfp4")
     assert resolve_profile("glm52-exl3-r7-3.5bpw").name == "glm52-nvfp4"
 
 
@@ -294,29 +292,32 @@ def test_glm_cli_passes_required_rank_local_cache_bind(
         lambda receipt, scheduler, config: "a" * 64,
     )
 
-    assert launch_main(
-        [
-            "--inspect",
-            str(path),
-            "--image",
-            _source_inspection()["Image"],
-            "--name",
-            "glm52-r0",
-            "--checkpoint-sha256",
-            DEFAULT_CHECKPOINT_SHA256,
-            "--cache-host-path",
-            "/host-cache/glm52-r0",
-            "--sparkcache-source-host-path",
-            "/host-code/sparkcache",
-            "--scheduler-overlay-host-path",
-            "/host-overlays/scheduler.py",
-            "--vllm-config-overlay-host-path",
-            "/host-overlays/vllm.py",
-            "--vllm-overlay-receipt-host-path",
-            "/host-overlays/receipt.json",
-            "--create-only",
-        ]
-    ) == 0
+    assert (
+        launch_main(
+            [
+                "--inspect",
+                str(path),
+                "--image",
+                _source_inspection()["Image"],
+                "--name",
+                "glm52-r0",
+                "--checkpoint-sha256",
+                DEFAULT_CHECKPOINT_SHA256,
+                "--cache-host-path",
+                "/host-cache/glm52-r0",
+                "--sparkcache-source-host-path",
+                "/host-code/sparkcache",
+                "--scheduler-overlay-host-path",
+                "/host-overlays/scheduler.py",
+                "--vllm-config-overlay-host-path",
+                "/host-overlays/vllm.py",
+                "--vllm-overlay-receipt-host-path",
+                "/host-overlays/receipt.json",
+                "--create-only",
+            ]
+        )
+        == 0
+    )
 
     assert observed[0][1]["extra_binds"] == (
         ("/host-cache/glm52-r0", "/cache/sparkcache-glm52-r7", False),
@@ -390,9 +391,7 @@ def test_overlay_receipt_and_files_must_match(monkeypatch, tmp_path: Path) -> No
         encoding="utf-8",
     )
 
-    assert glm_launch._validate_overlay_inputs(receipt, scheduler, config) == (
-        "c" * 64
-    )
+    assert glm_launch._validate_overlay_inputs(receipt, scheduler, config) == ("c" * 64)
     config.write_bytes(b"changed")
     with pytest.raises(ProfileTransformError, match="hash differs"):
         glm_launch._validate_overlay_inputs(receipt, scheduler, config)
@@ -451,9 +450,7 @@ def test_profile_matches_the_public_r7_contract() -> None:
     assert PROFILE["sparkcache"]["source_sha256"] == (
         prepare_vllm_overlays.source_tree_sha256(repository / "sparkcache")
     )
-    assert PROFILE["model"]["revision"] == (
-        "9ab9579774cc432df91567a36f6e9e863e0d4c9f"
-    )
+    assert PROFILE["model"]["revision"] == ("9ab9579774cc432df91567a36f6e9e863e0d4c9f")
     assert PROFILE["serving"] == {
         "served_model_name": "glm-5.2-exl3-r7-3.5bpw",
         "tensor_parallel_size": 4,
@@ -514,7 +511,7 @@ def test_transform_replaces_only_cache_wiring_and_removes_lmcache() -> None:
         "spark_cache_restore": True,
         "spark_cache_scheduler_probe": "none",
         "spark_cache_streaming_snapshots": False,
-        "spark_cache_native_restore": False,
+        "spark_cache_cuda_restore": False,
         "spark_cache_max_bytes": 200 * 1024**3,
         "spark_cache_low_watermark_bytes": 180 * 1024**3,
         "spark_cache_ttl_seconds": 0,
@@ -538,9 +535,7 @@ def test_transform_replaces_only_cache_wiring_and_removes_lmcache() -> None:
     )
     assert "LMCACHE_CONFIG_FILE" in environment["SPARKRING_EXPLICITLY_UNSET"]
     assert "LEGACY_CONNECTOR_PATH" in environment["SPARKRING_EXPLICITLY_UNSET"]
-    assert "SPARK_CONTEXT_CACHE_ENABLE" in environment[
-        "SPARKRING_EXPLICITLY_UNSET"
-    ]
+    assert "SPARK_CONTEXT_CACHE_ENABLE" in environment["SPARKRING_EXPLICITLY_UNSET"]
     assert transformed["Config"]["Labels"] == {
         "org.sparkring.r7": "accepted-source",
         "org.sparkcache.deployment-profile": "glm52-exl3-r7-3.5bpw",
@@ -565,35 +560,35 @@ def test_transform_rejects_the_unsupported_q35_q40_state_variant() -> None:
 
 
 @pytest.mark.parametrize(
-    ("streaming", "native_restore"),
+    ("streaming", "cuda_restore"),
     [(False, False), (True, False), (False, True), (True, True)],
 )
-def test_streaming_and_native_restore_are_independent(
-    streaming: bool, native_restore: bool
+def test_streaming_and_cuda_restore_are_independent(
+    streaming: bool, cuda_restore: bool
 ) -> None:
     kwargs: dict[str, object] = {
         "streaming_snapshots": streaming,
-        "native_restore": native_restore,
+        "cuda_restore": cuda_restore,
     }
     if streaming:
         kwargs.update(
             streaming_native_library="/opt/sparkcache/lib/libsnapshot.so",
             streaming_native_library_sha256="a" * 64,
         )
-    if native_restore:
+    if cuda_restore:
         kwargs.update(
-            native_restore_library="/opt/sparkcache/lib/libplacement.so",
-            native_restore_library_sha256="b" * 64,
+            cuda_placement_library="/opt/sparkcache/lib/libplacement.so",
+            cuda_placement_library_sha256="b" * 64,
         )
     transformed = transform_inspection(_source_inspection(), **kwargs)
     extra = _connector_extra(transformed)
 
     assert extra["spark_cache_streaming_snapshots"] is streaming
-    assert extra["spark_cache_native_restore"] is native_restore
+    assert extra["spark_cache_cuda_restore"] is cuda_restore
     assert extra["spark_cache_max_bytes"] == 200 * 1024**3
     assert extra["spark_cache_low_watermark_bytes"] == 180 * 1024**3
     assert ("spark_cache_streaming_native_library" in extra) is streaming
-    assert ("spark_cache_native_library" in extra) is native_restore
+    assert ("spark_cache_cuda_placement_library" in extra) is cuda_restore
     if streaming:
         assert extra["spark_cache_streaming_timing"] == 0
 
@@ -613,16 +608,41 @@ def test_streaming_timing_uses_the_runtime_zero_or_one_contract() -> None:
     "kwargs",
     [
         {"streaming_snapshots": True},
-        {"native_restore": True},
+        {"cuda_restore": True},
         {
             "streaming_native_library": "/opt/libsnapshot.so",
             "streaming_native_library_sha256": "a" * 64,
         },
     ],
 )
-def test_native_feature_configuration_fails_closed(kwargs: dict) -> None:
+def test_cuda_feature_configuration_is_rejected(kwargs: dict) -> None:
     with pytest.raises(ProfileTransformError):
         transform_inspection(_source_inspection(), **kwargs)
+
+
+def test_legacy_profile_names_warn_and_emit_canonical_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(glm_profile, "_LEGACY_CUDA_RESTORE_WARNING_EMITTED", False)
+    with pytest.warns(FutureWarning, match="legacy SparkCache CUDA profile names"):
+        transformed = transform_inspection(
+            _source_inspection(),
+            native_restore=True,
+            native_restore_library="/opt/sparkcache/lib/libplacement.so",
+            native_restore_library_sha256="b" * 64,
+        )
+    extra = _connector_extra(transformed)
+    assert extra["spark_cache_cuda_restore"] is True
+    assert "spark_cache_native_restore" not in extra
+
+
+def test_conflicting_profile_aliases_are_rejected() -> None:
+    with pytest.raises(ProfileTransformError, match="conflicting"):
+        transform_inspection(
+            _source_inspection(),
+            cuda_restore=True,
+            native_restore=False,
+        )
 
 
 def test_instance_ports_are_overridden_together_and_cannot_collide() -> None:
@@ -657,8 +677,9 @@ def test_direct_and_underscore_wrapped_r7_commands_transform_identically() -> No
         "_",
         *direct["Config"]["Cmd"],
     ]
-    assert transform_inspection(wrapped)["Config"]["Cmd"] == (
-        transform_inspection(direct)["Config"]["Cmd"]
+    assert (
+        transform_inspection(wrapped)["Config"]["Cmd"]
+        == (transform_inspection(direct)["Config"]["Cmd"])
     )
 
 
@@ -726,7 +747,7 @@ def test_prefix_cache_flags_preserve_native_default_or_explicit_enable() -> None
 
     disabled_source = _source_inspection()
     disabled_source["Config"]["Cmd"].append("--disable-prefix-caching")
-    with pytest.raises(ProfileTransformError, match="native prefix-cache default"):
+    with pytest.raises(ProfileTransformError, match="vLLM prefix-cache default"):
         transform_inspection(disabled_source)
 
 
@@ -746,8 +767,7 @@ def test_explicit_block_size_is_preserved_and_other_values_are_rejected() -> Non
 
 def test_containerfile_inherits_r7_entrypoint_and_applies_only_glm_patches() -> None:
     containerfile = (
-        Path(__file__).resolve().parents[1]
-        / "deploy/glm52_35bpw/Containerfile"
+        Path(__file__).resolve().parents[1] / "deploy/glm52_35bpw/Containerfile"
     ).read_text(encoding="utf-8")
     instructions = [
         line.strip().split(maxsplit=1)[0].upper()
@@ -806,9 +826,7 @@ def test_prepare_vllm_overlays_patches_exact_preimages(
 
     assert receipt["schema"] == "sparkcache-glm52-r7-vllm-overlays/v1"
     assert [record["disposition"] for record in receipt["files"]] == ["patched"]
-    assert {
-        path.name for path in output.iterdir()
-    } == {"example.py", "receipt.json"}
+    assert {path.name for path in output.iterdir()} == {"example.py", "receipt.json"}
     assert (output / "example.py").read_bytes() == b"new\n"
     with pytest.raises(RuntimeError, match="refusing to overwrite"):
         prepare_vllm_overlays.prepare(

@@ -1,14 +1,16 @@
 """GPU-free tests for the SparkRing persistent context-cache connector.
 
 Simulates a four-rank DCP4 store -> pool wipe -> restore cycle with real
-byte comparisons on CPU torch tensors, plus the fail-closed sabotage paths.
+byte comparisons on CPU torch tensors, plus verified-or-recompute sabotage paths.
 vLLM is stubbed the same way as the sibling backend suites.
 """
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import dataclasses
 import hashlib
+import inspect
 import json
 import os
 import struct
@@ -24,10 +26,12 @@ from unittest import mock
 import torch
 
 import sparkcache.spark_context_cache_codec as codec
+from sparkcache.spark_context_cache_profiles import resolve_profile
 from sparkcache.spark_context_cache_restore_timing import (
     RESTORE_TIMING_PREFIX,
     RestoreTiming,
 )
+from sparkcache.page_base_read_flights import PageBaseReadEvidence
 
 
 def _install_vllm_stubs() -> None:
@@ -43,6 +47,9 @@ def _install_vllm_stubs() -> None:
     logger_mod = types.ModuleType("vllm.logger")
 
     class _Logger:
+        def debug(self, *args, **kwargs):
+            pass
+
         def info(self, *args, **kwargs):
             pass
 
@@ -86,6 +93,20 @@ def _install_vllm_stubs() -> None:
 
     metrics.KVConnectorStats = KVConnectorStats
 
+    class KVConnectorPromMetrics:
+        def __init__(
+            self,
+            _vllm_config,
+            metric_types,
+            labelnames,
+            per_engine_labelvalues,
+        ):
+            self._gauge_cls = next(iter(metric_types.values()))
+            self._labelnames = labelnames
+            self.per_engine_labelvalues = per_engine_labelvalues
+
+    metrics.KVConnectorPromMetrics = KVConnectorPromMetrics
+
     import enum
 
     class KVConnectorRole(enum.Enum):
@@ -93,6 +114,9 @@ def _install_vllm_stubs() -> None:
         WORKER = 1
 
     class KVConnectorMetadata:
+        pass
+
+    class KVConnectorHandshakeMetadata:
         pass
 
     class SupportsHMA:
@@ -115,6 +139,7 @@ def _install_vllm_stubs() -> None:
             return self._metadata
 
     base.KVConnectorBase_V1 = KVConnectorBase_V1
+    base.KVConnectorHandshakeMetadata = KVConnectorHandshakeMetadata
     base.KVConnectorMetadata = KVConnectorMetadata
     base.KVConnectorRole = KVConnectorRole
     base.SupportsHMA = SupportsHMA
@@ -140,7 +165,6 @@ from sparkcache.spark_context_cache_connector import (  # noqa: E402
     SparkContextCacheConnector,
     _ReqPlan,
 )
-from sparkcache.spark_context_cache_hybrid import decode_page_snapshot  # noqa: E402
 from sparkcache.spark_context_cache_store import (  # noqa: E402
     CapacityPolicy,
     EntryKey,
@@ -151,6 +175,19 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # noqa: E402
     KVConnectorRole,
     SupportsHMA,
 )
+
+
+class CudaHybridDispatchTests(unittest.TestCase):
+    def test_loader_exposes_distinct_direct_and_materialized_page_paths(self) -> None:
+        components = connector_module._load_cuda_components()
+        direct = components.execute_cuda_hybrid_restore
+        materialized = components.execute_cuda_hybrid_placement
+
+        self.assertIsNot(direct, materialized)
+        self.assertIn("lookup", inspect.signature(direct).parameters)
+        self.assertNotIn("encoded_pages", inspect.signature(direct).parameters)
+        self.assertIn("encoded_pages", inspect.signature(materialized).parameters)
+        self.assertNotIn("lookup", inspect.signature(materialized).parameters)
 
 
 class CodecTests(unittest.TestCase):
@@ -172,7 +209,12 @@ class CodecTests(unittest.TestCase):
             codec.local_slots_for_positions((33,), (7, 2), 4, 4)
 
     def test_record_round_trip_and_trailing_rejection(self) -> None:
-        plans = codec.build_layer_plans({"a.attn": 8, "b.indexer": 4, "c.draft": 2})
+        profile = resolve_profile("glm52-nvfp4")
+        plans = codec.build_layer_plans(
+            {"a.attn": 8, "b.indexer": 4, "c.draft": 2},
+            required_families=profile.required_families,
+            classification_rules=profile.classification_rules,
+        )
         rows = 3
         payload = codec.pack_record(
             plans, "target_ckv", {"a.attn": bytes(range(24))}, rows
@@ -183,8 +225,13 @@ class CodecTests(unittest.TestCase):
             codec.unpack_record(plans, "target_ckv", payload + b"x", rows)
 
     def test_layer_plans_require_all_kinds(self) -> None:
+        profile = resolve_profile("glm52-nvfp4")
         with self.assertRaises(codec.CodecError):
-            codec.build_layer_plans({"a.attn": 8, "b.indexer": 4})
+            codec.build_layer_plans(
+                {"a.attn": 8, "b.indexer": 4},
+                required_families=profile.required_families,
+                classification_rules=profile.classification_rules,
+            )
 
     def test_digest_binds_identity_salt(self) -> None:
         tokens = list(range(64))
@@ -252,6 +299,71 @@ class CodecTests(unittest.TestCase):
                     boundaries=boundaries,
                 )
 
+    def test_multimodal_prefix_digests_bind_content_and_range(self) -> None:
+        tokens = list(range(1024))
+        red = codec.MultimodalFeatureIdentity("image", "red", 300, 200)
+        blue = codec.MultimodalFeatureIdentity("image", "blue", 300, 200)
+        moved_red = codec.MultimodalFeatureIdentity("image", "red", 301, 200)
+        boundaries = (256, 512, 1024)
+        produced = codec.chunk_prefix_digests(
+            tokens,
+            "identity",
+            boundaries=boundaries,
+            multimodal_features=(red,),
+        )
+
+        self.assertEqual(
+            produced,
+            tuple(
+                (
+                    boundary,
+                    codec.context_prefix_digest(
+                        tokens,
+                        "identity",
+                        token_count=boundary,
+                        multimodal_features=(red,),
+                    ),
+                )
+                for boundary in boundaries
+            ),
+        )
+        self.assertEqual(
+            produced[0][1],
+            codec.context_prefix_digest(tokens, "identity", token_count=256),
+        )
+        for feature in (blue, moved_red):
+            self.assertNotEqual(
+                produced[-1][1],
+                codec.context_prefix_digest(
+                    tokens,
+                    "identity",
+                    token_count=1024,
+                    multimodal_features=(feature,),
+                ),
+            )
+
+    def test_multimodal_feature_geometry_is_strict(self) -> None:
+        tokens = list(range(1024))
+        invalid_features = (
+            (codec.MultimodalFeatureIdentity("", "red", 10, 20),),
+            (codec.MultimodalFeatureIdentity("image", "", 10, 20),),
+            (codec.MultimodalFeatureIdentity("image", "red", -1, 20),),
+            (codec.MultimodalFeatureIdentity("image", "red", 10, 0),),
+            (codec.MultimodalFeatureIdentity("image", "red", 1000, 25),),
+            (
+                codec.MultimodalFeatureIdentity("image", "red", 100, 100),
+                codec.MultimodalFeatureIdentity("image", "blue", 150, 100),
+            ),
+        )
+        for features in invalid_features:
+            with self.subTest(features=features), self.assertRaises(codec.CodecError):
+                codec.context_prefix_digest(
+                    tokens,
+                    "identity",
+                    token_count=1024,
+                    multimodal_features=features,
+                )
+
     def test_vectorized_integer_codec_matches_v1_wire_bytes(self) -> None:
         tokens = [0, 1, 255, 65535, 2**32 - 1]
         v1_reference_bytes = b"".join(
@@ -281,7 +393,11 @@ class CodecTests(unittest.TestCase):
 class HybridAllocatorContractTests(unittest.TestCase):
     def test_connector_advertises_hybrid_memory_allocator_support(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            connector = _make_connector(Path(directory), 0)
+            connector = _make_connector(
+                Path(directory),
+                0,
+                extra_config={"spark_cache_load_threads": "2"},
+            )
         self.assertIsInstance(connector, SupportsHMA)
 
     def test_all_group_finish_clears_scheduler_tracking(self) -> None:
@@ -307,7 +423,211 @@ class HybridAllocatorContractTests(unittest.TestCase):
         self.assertEqual(connector._store_progress, {})
 
 
+class StartupInventoryLogTests(unittest.TestCase):
+    @staticmethod
+    def _render_log_calls(calls: list[mock._Call]) -> list[str]:
+        return [call.args[0] % call.args[1:] for call in calls]
+
+    @staticmethod
+    def _page_config() -> types.SimpleNamespace:
+        class FullAttentionSpec:
+            block_size = 256
+            storage_block_size = 256
+            page_size_bytes = 20
+
+        spec = FullAttentionSpec()
+        return types.SimpleNamespace(
+            num_blocks=2,
+            kv_cache_groups=(
+                types.SimpleNamespace(
+                    kv_cache_spec=spec,
+                    is_eagle_group=False,
+                    layer_names=("model.layers.0.attn",),
+                ),
+            ),
+        )
+
+    def test_info_inventory_is_compact_and_preserves_geometry_totals(self) -> None:
+        storage = torch.zeros(48, dtype=torch.uint8)
+        split_page_tensor = torch.as_strided(
+            storage,
+            size=(4, 1, 8),
+            stride=(12, 8, 1),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                extra_config={
+                    "spark_cache_model_profile": "glm53-flash-hybrid",
+                },
+                tp=1,
+                dcp=1,
+                kv_cache_config=self._page_config(),
+            )
+            test_logger = mock.Mock()
+            with mock.patch.object(connector_module, "logger", test_logger):
+                connector.register_kv_caches(
+                    {"model.layers.0.attn": split_page_tensor}
+                )
+
+        info_lines = self._render_log_calls(test_logger.info.call_args_list)
+        self.assertEqual(
+            info_lines,
+            [
+                "sparkcache: manager_pages blocks=2 layers=1"
+                " split_kernel_layers=1 tail_layers=1 tail_bytes_per_page=4",
+                "sparkcache: layers total=1 storage=block_pages_v1"
+                ' records={"target_ckv":1} item_bytes={"20":1}'
+                " draft_policy=separate",
+            ],
+        )
+        self.assertNotIn("model.layers.0.attn", "\n".join(info_lines))
+        self.assertEqual(connector.counters["startup_layers_registered"], 1)
+        self.assertEqual(connector.counters["startup_record_kinds"], 1)
+        self.assertEqual(connector.counters["startup_item_byte_widths"], 1)
+        self.assertEqual(connector.counters["startup_manager_blocks"], 2)
+        self.assertEqual(connector.counters["startup_split_kernel_layers"], 1)
+        self.assertEqual(connector.counters["startup_physical_tail_layers"], 1)
+        self.assertEqual(
+            connector.counters["startup_physical_tail_bytes_per_page"],
+            4,
+        )
+
+    def test_debug_inventory_retains_layer_names_widths_and_records(self) -> None:
+        storage = torch.zeros(48, dtype=torch.uint8)
+        split_page_tensor = torch.as_strided(
+            storage,
+            size=(4, 1, 8),
+            stride=(12, 8, 1),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                extra_config={
+                    "spark_cache_model_profile": "glm53-flash-hybrid",
+                },
+                tp=1,
+                dcp=1,
+                kv_cache_config=self._page_config(),
+            )
+            test_logger = mock.Mock()
+            with mock.patch.object(connector_module, "logger", test_logger):
+                connector.register_kv_caches(
+                    {"model.layers.0.attn": split_page_tensor}
+                )
+
+        debug_lines = self._render_log_calls(test_logger.debug.call_args_list)
+        self.assertEqual(len(debug_lines), 1)
+        prefix = "sparkcache: layer_inventory "
+        self.assertTrue(debug_lines[0].startswith(prefix))
+        inventory = json.loads(debug_lines[0][len(prefix) :])
+        self.assertEqual(inventory, connector._startup_layer_inventory)
+        self.assertEqual(
+            inventory["layers"],
+            [
+                {
+                    "name": "model.layers.0.attn",
+                    "item_bytes": 20,
+                    "record": "target_ckv",
+                }
+            ],
+        )
+        self.assertEqual(
+            inventory["manager_pages"],
+            {
+                "blocks": 2,
+                "layers": 1,
+                "split_kernel_layers": 1,
+                "physical_tail_layers": 1,
+                "physical_tail_bytes_per_page": 4,
+            },
+        )
+
 class HybridPageRoundTripTests(unittest.TestCase):
+    def test_dcp_recurrent_align_uses_replicated_position_width(
+        self,
+    ) -> None:
+        """A replicated recurrent table uses its unsharded position width."""
+
+        connector = object.__new__(SparkContextCacheConnector)
+        connector._dcp_degree = 2
+        connector._group_topology = (
+            {
+                "logical_tokens_per_block": 512,
+                "reuse_policy": "recurrent_align",
+                "reuse_window_tokens": None,
+            },
+        )
+        group = tuple([0] * 17 + [34, 13, 12, 11, 10, 9, 8, 7])
+
+        self.assertEqual(len(group), 25)
+        self.assertEqual(group[17], 34)
+        self.assertEqual(
+            connector._select_group_blocks_for_span((group,), 9216),
+            ((34,),),
+        )
+        self.assertEqual(
+            connector._select_group_blocks_for_span(
+                (group,),
+                9216,
+                recurrent_boundary_blocks=((0, 42),),
+            ),
+            ((42,),),
+        )
+
+    def test_dcp_manager_page_boundary_uses_complete_local_pages(self) -> None:
+        """Opaque snapshots stop at a complete DCP-local manager page."""
+
+        connector = object.__new__(SparkContextCacheConnector)
+        connector._block_size = 2304
+        connector._chunk_tokens = 256
+        connector._dcp_degree = 2
+        connector._storage_mode = "block_pages_v1"
+        connector._group_topology = (
+            {"dcp_shard_count": 2, "logical_tokens_per_block": 4608},
+            {"dcp_shard_count": 1, "logical_tokens_per_block": 2304},
+        )
+
+        self.assertEqual(connector._aligned_span(8193), 4608)
+
+    def test_dcp_manager_page_selection_uses_global_tokens_per_local_block(
+        self,
+    ) -> None:
+        """A local DCP page covers ``block_size * dcp_degree`` global tokens."""
+
+        connector = object.__new__(SparkContextCacheConnector)
+        connector._dcp_degree = 2
+        connector._group_topology = (
+            {
+                "block_size": 256,
+                "dcp_replicated": False,
+                "dcp_shard_count": 2,
+                "logical_tokens_per_block": 512,
+                "reuse_policy": "full",
+                "reuse_window_tokens": None,
+            },
+            {
+                "block_size": 256,
+                "dcp_replicated": True,
+                "dcp_shard_count": 1,
+                "logical_tokens_per_block": 256,
+                "reuse_policy": "recurrent_align",
+                "reuse_window_tokens": None,
+            },
+        )
+        groups = ((3, 5), (7,))
+
+        self.assertEqual(
+            connector._select_group_blocks_for_span(groups, 1024),
+            ((3, 5), (7,)),
+        )
+        self.assertEqual(
+            connector._group_block_counts_for_span(1024),
+            (2, 1),
+        )
+
     def test_page_tail_uses_geometry_when_historical_recurrent_slot_is_null(
         self,
     ) -> None:
@@ -326,6 +646,7 @@ class HybridPageRoundTripTests(unittest.TestCase):
             num_prefill_checkpoint_blocks = 1
 
         config = types.SimpleNamespace(
+            num_blocks=10,
             kv_cache_groups=(
                 types.SimpleNamespace(
                     kv_cache_spec=FullAttentionSpec(),
@@ -337,7 +658,7 @@ class HybridPageRoundTripTests(unittest.TestCase):
                     is_eagle_group=False,
                     layer_names=("state",),
                 ),
-            )
+            ),
         )
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(
@@ -454,7 +775,12 @@ class HybridPageRoundTripTests(unittest.TestCase):
                     / f"{plan.digest}.json"
                 ).read_bytes()
             )
-            self.assertNotIn("schema", root_manifest)
+            self.assertEqual(
+                root_manifest["schema"],
+                "sparkcache-page-snapshot-manifest/v2",
+            )
+            self.assertEqual(root_manifest["logical_chunk_count"], 4)
+            self.assertEqual(len(root_manifest["snapshot_objects"]), 1)
             self.assertEqual(connector.counters["page_delta_compactions"], 1)
             with self.assertRaisesRegex(RuntimeError, "digest differs"):
                 connector._store_one(
@@ -546,39 +872,54 @@ class HybridPageRoundTripTests(unittest.TestCase):
             self.assertTrue(torch.equal(compressed[[6, 7]], expected_compressed))
             self.assertTrue(torch.equal(state[[9]], expected_state))
 
-            materialized = []
+            direct_restores = []
 
-            def native_placement(**kwargs):
-                materialized.append(kwargs["encoded_pages"])
+            def native_restore(**kwargs):
+                direct_restores.append(kwargs["lookup"])
                 return types.SimpleNamespace(
-                    source_bytes=len(kwargs["encoded_pages"]),
+                    source_bytes=1234,
+                    read_and_hash_ms=1.0,
                     copy_and_submit_ms=1.0,
                     finish_ms=1.0,
+                    slabs=2,
+                    arena_wait_ms=0.1,
+                    host_copy_ms=0.8,
+                    submit_call_ms=0.1,
                 )
 
             connector._native_restore_enabled = True
             connector._native_adapters = [object()]
-            connector._native_execute_hybrid = native_placement
-            self.assertTrue(
-                connector._load_one(
-                    _ReqPlan(
-                        "page-native-load",
-                        result_digest,
-                        1024,
-                        destination[0],
-                        False,
-                        block_ids_by_group=destination,
-                    )
+            connector._native_execute_hybrid_restore = native_restore
+            connector._native_execute_hybrid_placement = mock.Mock(
+                side_effect=AssertionError(
+                    "page-delta SparkCache CUDA restore must not receive materialized bytes"
                 )
             )
-            self.assertEqual(len(materialized), 1)
+            with mock.patch.object(
+                connector._store,
+                "restore_page_snapshot",
+                side_effect=AssertionError(
+                    "page-delta SparkCache CUDA restore must not materialize a snapshot"
+                ),
+            ):
+                self.assertTrue(
+                    connector._load_one(
+                        _ReqPlan(
+                            "page-native-load",
+                            result_digest,
+                            1024,
+                            destination[0],
+                            False,
+                            block_ids_by_group=destination,
+                        )
+                    )
+                )
+            self.assertEqual(len(direct_restores), 1)
+            self.assertEqual(direct_restores[0].root_kind, "page_delta")
+            connector._native_execute_hybrid_placement.assert_not_called()
             self.assertEqual(
-                decode_page_snapshot(
-                    connector._page_layout,
-                    materialized[0],
-                    (2, 1),
-                )["state"],
-                expected_state.view(torch.uint8).numpy().tobytes(),
+                connector.counters["native_page_delta_load_verified"],
+                1,
             )
             sweep = connector.sweep_integrity()
             self.assertEqual(sweep["invalidated"], 0)
@@ -592,7 +933,7 @@ class HybridPageRoundTripTests(unittest.TestCase):
                 ).read_bytes()
             )
             delta_path = (
-                root / "chunks" / f"{manifest['delta_chunks'][0]['sha256']}.spcc"
+                root / "chunks" / f"{manifest['delta_objects'][0]['sha256']}.spcc"
             )
             damaged = bytearray(delta_path.read_bytes())
             damaged[-1] ^= 1
@@ -725,6 +1066,7 @@ def _make_connector(
 ) -> SparkContextCacheConnector:
     values = {
         "spark_cache_root": str(root),
+        "spark_cache_model_profile": "glm52-nvfp4",
         "spark_cache_min_span_tokens": "256",
         "spark_cache_target_checkpoint_sha256": "1" * 64,
         "spark_cache_draft_checkpoint_sha256": "2" * 64,
@@ -757,18 +1099,30 @@ def _hybrid_kv_cache_config() -> types.SimpleNamespace:
     class FullAttentionSpec:
         block_size = 512
         storage_block_size = 512
-        page_size_bytes = 528
+
+        def __init__(self, page_size_bytes: int = 528) -> None:
+            self.page_size_bytes = page_size_bytes
 
     class SlidingWindowSpec:
         sliding_window = 512
+        page_size_bytes = 256
 
     class SlidingWindowMLASpec(SlidingWindowSpec):
         pass
 
     return types.SimpleNamespace(
+        num_blocks=10,
         kv_cache_groups=(
             types.SimpleNamespace(
-                kv_cache_spec=FullAttentionSpec(),
+                kv_cache_spec=types.SimpleNamespace(
+                    block_size=512,
+                    storage_block_size=512,
+                    page_size_bytes=528,
+                    kv_cache_specs={
+                        "compressed": FullAttentionSpec(16),
+                        "full": FullAttentionSpec(512),
+                    },
+                ),
                 is_eagle_group=False,
                 layer_names=("compressed", "full"),
             ),
@@ -782,7 +1136,7 @@ def _hybrid_kv_cache_config() -> types.SimpleNamespace:
                 is_eagle_group=False,
                 layer_names=("state",),
             ),
-        )
+        ),
     )
 
 
@@ -790,11 +1144,12 @@ def _deepseek_tp4_hma_config() -> types.SimpleNamespace:
     class FullAttentionSpec:
         block_size = 256
         storage_block_size = 256
-        page_size_bytes = 2
+        page_size_bytes = 4
 
     class SlidingWindowSpec:
         def __init__(self, window: int):
             self.sliding_window = window
+            self.page_size_bytes = 4
 
     counts = (83, 23, 23, 21, 20)
     block_sizes = (256, 64, 64, 4, 8)
@@ -813,7 +1168,7 @@ def _deepseek_tp4_hma_config() -> types.SimpleNamespace:
             spec = types.SimpleNamespace(
                 block_size=block_size,
                 storage_block_size=block_size,
-                page_size_bytes=2,
+                page_size_bytes=4 * count,
                 kv_cache_specs={name: SlidingWindowSpec(window) for name in names},
             )
         groups.append(
@@ -823,7 +1178,7 @@ def _deepseek_tp4_hma_config() -> types.SimpleNamespace:
                 layer_names=names,
             )
         )
-    return types.SimpleNamespace(kv_cache_groups=tuple(groups))
+    return types.SimpleNamespace(num_blocks=1024, kv_cache_groups=tuple(groups))
 
 
 def _deepseek_tp4_hma_pools(
@@ -849,7 +1204,7 @@ def _deepseek_tp4_group_tables(
 
 
 class CheckpointIdentityTests(unittest.TestCase):
-    def test_prompt_digest_reuses_identity_salt_without_slicing_tokens(self) -> None:
+    def test_prompt_digest_reuses_namespaced_salt_without_slicing_tokens(self) -> None:
         class UnsliceableTokens(list[int]):
             def __getitem__(self, index):
                 if isinstance(index, slice):
@@ -858,12 +1213,14 @@ class CheckpointIdentityTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(Path(directory), 0)
-            salt = connector._identity(0, tp_shard_rank=0).storage_key
             tokens = UnsliceableTokens(range(1100))
-            expected = codec.context_digest(range(1024), salt)
+            expected = codec.context_digest(
+                range(1024),
+                connector._context_digest_salt,
+            )
             connector._identity = mock.Mock(
                 side_effect=AssertionError(
-                    "prompt digest must reuse its immutable identity salt"
+                    "prompt digest must reuse its immutable namespaced salt"
                 )
             )
 
@@ -1017,7 +1374,7 @@ _LAYERS = {
 }
 
 
-class NativeRestoreSelectionTests(unittest.TestCase):
+class CudaRestoreSelectionTests(unittest.TestCase):
     def test_streaming_snapshot_feature_is_disabled_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(Path(directory), 0)
@@ -1025,10 +1382,12 @@ class NativeRestoreSelectionTests(unittest.TestCase):
         self.assertFalse(connector._streaming_snapshots_enabled)
         self.assertIsNone(connector._streaming_runtime)
 
-    def test_streaming_snapshot_opt_in_fails_before_native_side_effects(self) -> None:
+    def test_streaming_snapshot_opt_in_is_rejected_before_cuda_side_effects(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(
-                RuntimeError, "runtime installation failed closed"
+                RuntimeError, "runtime installation was rejected"
             ):
                 _make_connector(
                     Path(directory),
@@ -1036,7 +1395,7 @@ class NativeRestoreSelectionTests(unittest.TestCase):
                     extra_config={"spark_cache_streaming_snapshots": "1"},
                 )
 
-    def test_native_restore_is_disabled_by_default(self) -> None:
+    def test_cuda_restore_is_disabled_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(Path(directory), 0)
 
@@ -1044,17 +1403,17 @@ class NativeRestoreSelectionTests(unittest.TestCase):
         self.assertIsNone(connector._native_adapter)
         self.assertEqual(connector._load_thread_limit, 1)
 
-    def test_disabled_native_mode_ignores_stale_native_settings(self) -> None:
+    def test_disabled_cuda_mode_ignores_invalid_cuda_settings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(
                 Path(directory),
                 0,
                 extra_config={
-                    "spark_cache_native_restore": "0",
-                    "spark_cache_native_library": "not-absolute",
-                    "spark_cache_native_library_sha256": "UPPERCASE",
-                    "spark_cache_native_arena_bytes": "not-an-integer",
-                    "spark_cache_native_io_workers": "also-invalid",
+                    "spark_cache_cuda_restore": "0",
+                    "spark_cache_cuda_placement_library": "not-absolute",
+                    "spark_cache_cuda_placement_library_sha256": "UPPERCASE",
+                    "spark_cache_cuda_placement_arena_bytes": "not-an-integer",
+                    "spark_cache_cuda_restore_io_workers": "also-invalid",
                 },
             )
             connector.register_kv_caches(_make_pools(8, 64))
@@ -1062,28 +1421,28 @@ class NativeRestoreSelectionTests(unittest.TestCase):
         self.assertFalse(connector._native_restore_enabled)
         self.assertIsNone(connector._native_adapter)
 
-    def test_native_restore_requires_all_three_attested_settings(self) -> None:
+    def test_cuda_restore_requires_all_three_attested_settings(self) -> None:
         cases = (
             {},
-            {"spark_cache_native_library": "/tmp/placement.so"},
+            {"spark_cache_cuda_placement_library": "/tmp/placement.so"},
             {
-                "spark_cache_native_library": "/tmp/placement.so",
-                "spark_cache_native_library_sha256": "0" * 64,
+                "spark_cache_cuda_placement_library": "/tmp/placement.so",
+                "spark_cache_cuda_placement_library_sha256": "0" * 64,
             },
         )
         for missing in cases:
             with self.subTest(missing=missing):
                 with tempfile.TemporaryDirectory() as directory:
                     settings = {
-                        "spark_cache_native_restore": "1",
+                        "spark_cache_cuda_restore": "1",
                         **missing,
                     }
                     with self.assertRaisesRegex(
-                        RuntimeError, "native restore requires"
+                        RuntimeError, "SparkCache CUDA restore requires"
                     ):
                         _make_connector(Path(directory), 0, extra_config=settings)
 
-    def test_native_library_hash_failure_stops_registration(self) -> None:
+    def test_cuda_library_hash_rejection_stops_registration(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             artifact = Path(directory) / "placement.so"
             artifact.write_bytes(b"not-the-pinned-library")
@@ -1091,26 +1450,29 @@ class NativeRestoreSelectionTests(unittest.TestCase):
                 Path(directory),
                 0,
                 extra_config={
-                    "spark_cache_native_restore": "1",
-                    "spark_cache_native_library": str(artifact),
-                    "spark_cache_native_library_sha256": "0" * 64,
-                    "spark_cache_native_arena_bytes": str(64 * 1024 * 1024),
+                    "spark_cache_cuda_restore": "1",
+                    "spark_cache_cuda_placement_library": str(artifact),
+                    "spark_cache_cuda_placement_library_sha256": "0" * 64,
+                    "spark_cache_cuda_placement_arena_bytes": str(64 * 1024 * 1024),
                     "spark_cache_load_threads": "2",
                 },
             )
 
-            with self.assertRaisesRegex(RuntimeError, "SHA-256 mismatch"):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "SparkCache CUDA restore configuration was rejected:.*SHA-256 mismatch",
+            ):
                 connector.register_kv_caches(_fake_cuda_pools())
 
             self.assertIsNone(connector._native_adapter)
             self.assertEqual(
                 connector._load_thread_limit,
                 1,
-                "native restores must be serialized regardless of requested"
+                "SparkCache CUDA restores must be serialized regardless of requested"
                 " Python load-thread count",
             )
 
-    def test_attested_native_adapter_is_configured_after_cache_registration(
+    def test_attested_cuda_adapter_is_configured_after_cache_registration(
         self,
     ) -> None:
         calls = []
@@ -1134,15 +1496,15 @@ class NativeRestoreSelectionTests(unittest.TestCase):
                 return adapter
 
         components = types.SimpleNamespace(
-            NativePlacementLibrary=FakeLibrary,
-            NativePlacementAdapter=FakeAdapter,
+            CudaPlacementLibrary=FakeLibrary,
+            CudaPlacementAdapter=FakeAdapter,
             ArenaMode=types.SimpleNamespace(MAPPED_HOST=1),
             RecordKind=types.SimpleNamespace(
                 TARGET_CKV=0,
                 SPARSE_INDEXER=1,
                 MTP_DRAFT_KV=2,
             ),
-            execute_native_restore=lambda **_kwargs: None,
+            execute_cuda_restore=lambda **_kwargs: None,
         )
 
         with tempfile.TemporaryDirectory() as directory:
@@ -1152,15 +1514,15 @@ class NativeRestoreSelectionTests(unittest.TestCase):
                 Path(directory),
                 0,
                 extra_config={
-                    "spark_cache_native_restore": "true",
-                    "spark_cache_native_library": str(artifact),
-                    "spark_cache_native_library_sha256": "a" * 64,
-                    "spark_cache_native_arena_bytes": str(128 * 1024 * 1024),
+                    "spark_cache_cuda_restore": "true",
+                    "spark_cache_cuda_placement_library": str(artifact),
+                    "spark_cache_cuda_placement_library_sha256": "a" * 64,
+                    "spark_cache_cuda_placement_arena_bytes": str(128 * 1024 * 1024),
                 },
             )
             with mock.patch.object(
                 connector_module,
-                "_load_native_components",
+                "_load_cuda_components",
                 return_value=components,
             ):
                 connector.register_kv_caches(_fake_cuda_pools())
@@ -1174,7 +1536,7 @@ class NativeRestoreSelectionTests(unittest.TestCase):
         self.assertEqual(create["device_ordinal"], 0)
         self.assertIs(connector._native_adapter, adapter)
 
-    def test_scheduler_role_never_creates_a_native_adapter(self) -> None:
+    def test_scheduler_role_never_creates_a_cuda_adapter(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             artifact = Path(directory) / "placement.so"
             artifact.write_bytes(b"scheduler-does-not-load-this")
@@ -1182,32 +1544,32 @@ class NativeRestoreSelectionTests(unittest.TestCase):
                 Path(directory),
                 0,
                 extra_config={
-                    "spark_cache_native_restore": "1",
-                    "spark_cache_native_library": str(artifact),
-                    "spark_cache_native_library_sha256": "b" * 64,
-                    "spark_cache_native_arena_bytes": str(64 * 1024 * 1024),
+                    "spark_cache_cuda_restore": "1",
+                    "spark_cache_cuda_placement_library": str(artifact),
+                    "spark_cache_cuda_placement_library_sha256": "b" * 64,
+                    "spark_cache_cuda_placement_arena_bytes": str(64 * 1024 * 1024),
                 },
                 role=KVConnectorRole.SCHEDULER,
             )
             with mock.patch.object(
                 connector_module,
-                "_load_native_components",
+                "_load_cuda_components",
                 side_effect=AssertionError(
-                    "scheduler role must not load native placement"
+                    "scheduler role must not load SparkCache CUDA placement"
                 ),
             ):
                 connector.register_kv_caches(_fake_cuda_pools())
 
         self.assertIsNone(connector._native_adapter)
 
-    def test_enabled_native_load_never_falls_back_to_python_assembly(
+    def test_enabled_cuda_load_never_falls_back_to_python_assembly(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(Path(directory), 0, 64)
             connector.register_kv_caches(_make_pools(8, 64))
             plan = _ReqPlan(
-                "native-restore",
+                "cuda-restore",
                 "9" * 64,
                 1024,
                 (3, 0, 5, 1),
@@ -1245,13 +1607,13 @@ class NativeRestoreSelectionTests(unittest.TestCase):
             connector._native_execute_restore = execute
             connector._store.restore = mock.Mock(
                 side_effect=AssertionError(
-                    "native selection must not enter Python assembly"
+                    "SparkCache CUDA restore must not enter Python assembly"
                 )
             )
 
             self.assertTrue(connector._load_one(plan))
 
-        self.assertEqual(observed["request_id"], "native-restore")
+        self.assertEqual(observed["request_id"], "cuda-restore")
         self.assertEqual(observed["lookup"], lookup)
         self.assertEqual(
             observed["slots"],
@@ -1266,14 +1628,14 @@ class NativeRestoreSelectionTests(unittest.TestCase):
         )
         self.assertEqual(connector.counters["native_load_verified"], 1)
 
-    def test_native_failure_invalidates_entry_without_python_fallback(
+    def test_cuda_rejection_invalidates_entry_without_python_fallback(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(Path(directory), 0, 64)
             connector.register_kv_caches(_make_pools(8, 64))
             plan = _ReqPlan(
-                "native-failure",
+                "cuda-rejection",
                 "8" * 64,
                 1024,
                 (3, 0, 5, 1),
@@ -1297,7 +1659,7 @@ class NativeRestoreSelectionTests(unittest.TestCase):
             )
             connector._store.restore = mock.Mock(
                 side_effect=AssertionError(
-                    "partial native failure must never fall back"
+                    "rejected SparkCache CUDA restore must not fall back"
                 )
             )
 
@@ -1381,6 +1743,679 @@ def _drain_store(
 
 class IntegratedPublicationAndSharingTests(unittest.TestCase):
     """Exercise publication graphs together with restore-flight sharing."""
+
+    @staticmethod
+    def _page_base_queue_fixture(
+        root: Path,
+    ) -> tuple[
+        SparkContextCacheConnector,
+        PageBaseReadEvidence,
+        list[_ReqPlan],
+    ]:
+        connector = _make_connector(
+            root,
+            0,
+            extra_config={"spark_cache_load_threads": "2"},
+        )
+        connector._storage_mode = "block_pages_v1"
+        connector._page_layout = types.SimpleNamespace(digest="layout")
+        connector._select_group_blocks_for_span = mock.Mock(return_value=((1,), (2,)))
+        evidence = PageBaseReadEvidence(
+            identity_storage_key="identity",
+            base_context_digest="a" * 64,
+            base_root_sha256="b" * 64,
+            base_root_kind="page_snapshot",
+            layout_sha256="layout",
+            base_block_counts=(1, 1),
+            base_boundary_tokens=512,
+            base_encoded_bytes=18,
+        )
+        connector._store.page_delta_base_read_evidence = mock.Mock(
+            return_value=evidence
+        )
+        connector._lookup_reusable = mock.Mock(
+            return_value=(
+                LookupResult(True, "hit", root_kind="page_delta"),
+                False,
+            )
+        )
+        plans = [
+            _ReqPlan(
+                f"shared-{index}",
+                f"{index + 1:064x}",
+                1024,
+                (1,),
+                False,
+                block_ids_by_group=((1,), (2,)),
+            )
+            for index in range(16)
+        ]
+        return connector, evidence, plans
+
+    def test_native_page_delta_restore_registers_object_base_flights(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector, evidence, plans = self._page_base_queue_fixture(
+                Path(directory)
+            )
+            connector._native_restore_enabled = True
+
+            runnable, deferred, keys = connector._prepare_page_base_read_cohorts(
+                plans
+            )
+
+            self.assertEqual(runnable, plans[:1])
+            self.assertEqual(deferred, plans[1:])
+            expected_key = connector._page_base_flight_key(evidence)
+            self.assertEqual(
+                keys,
+                {plan.request_id: expected_key for plan in plans},
+            )
+            connector._store.page_delta_base_read_evidence.assert_called()
+            for plan in plans:
+                connector._page_base_reads.finish(plan.request_id)
+
+    def test_start_load_kv_c16_reads_one_pre_registered_page_base(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector, evidence, plans = self._page_base_queue_fixture(Path(directory))
+            started = threading.Event()
+            release = threading.Event()
+            reads = 0
+            read_lock = threading.Lock()
+
+            def read_base() -> bytes:
+                nonlocal reads
+                with read_lock:
+                    reads += 1
+                started.set()
+                self.assertTrue(release.wait(timeout=5))
+                return b"authenticated-base"
+
+            def load_one(plan: _ReqPlan, **_kwargs: object) -> bool:
+                return (
+                    connector._restore_page_base_for_request(
+                        plan.request_id,
+                        evidence,
+                        read_base,
+                    )
+                    == b"authenticated-base"
+                )
+
+            connector._load_one = mock.Mock(side_effect=load_one)
+            with mock.patch.object(connector_module.logger, "info") as log_info:
+                connector.bind_connector_metadata(
+                    SparkCacheConnectorMetadata(plans=plans)
+                )
+                connector.start_load_kv(None)
+                self.assertTrue(started.wait(timeout=5))
+                self.assertEqual(connector._load_thread_limit, 2)
+                self.assertEqual(
+                    connector._page_base_reads.snapshot().registered_members,
+                    16,
+                )
+                release.set()
+                self.assertEqual(
+                    _drain(connector), set(plan.request_id for plan in plans)
+                )
+
+            self.assertEqual(reads, 1)
+            self.assertEqual(connector.counters["load_verified"], 16)
+            self.assertEqual(connector.counters["page_base_flight_participants"], 16)
+            self.assertEqual(connector.counters["page_base_physical_reads"], 1)
+            self.assertEqual(connector.counters["page_base_reads_avoided"], 15)
+            self.assertEqual(connector._page_base_reads.snapshot().active_flights, 0)
+            summaries = [
+                json.loads(call.args[1])
+                for call in log_info.call_args_list
+                if call.args
+                and call.args[0] == "spark-context-cache-page-base-flight:%s"
+            ]
+            self.assertEqual(len(summaries), 1)
+            self.assertEqual(
+                summaries[0]["schema"],
+                "sparkcache-page-base-restore-flight/v1",
+            )
+            self.assertEqual(summaries[0]["participants"], 16)
+            connector.shutdown()
+
+    def test_start_load_kv_joins_eight_seven_and_singleton_batches(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector, evidence, plans = self._page_base_queue_fixture(Path(directory))
+            started = threading.Event()
+            release = threading.Event()
+            reads = 0
+
+            def read_base() -> bytes:
+                nonlocal reads
+                reads += 1
+                started.set()
+                self.assertTrue(release.wait(timeout=5))
+                return b"authenticated-base"
+
+            connector._load_one = mock.Mock(
+                side_effect=lambda plan, **_kwargs: (
+                    connector._restore_page_base_for_request(
+                        plan.request_id,
+                        evidence,
+                        read_base,
+                    )
+                    == b"authenticated-base"
+                )
+            )
+            with mock.patch.object(connector_module.logger, "info") as log_info:
+                for batch_index, batch in enumerate(
+                    (plans[:8], plans[8:15], plans[15:])
+                ):
+                    connector.bind_connector_metadata(
+                        SparkCacheConnectorMetadata(plans=batch)
+                    )
+                    connector.start_load_kv(None)
+                    if batch_index == 0:
+                        self.assertTrue(started.wait(timeout=5))
+                self.assertEqual(
+                    connector._page_base_reads.snapshot().registered_members,
+                    16,
+                )
+                release.set()
+                self.assertEqual(
+                    _drain(connector), set(plan.request_id for plan in plans)
+                )
+
+            self.assertEqual(reads, 1)
+            self.assertEqual(connector.counters["page_base_flight_participants"], 16)
+            self.assertEqual(connector.counters["page_base_reads_avoided"], 15)
+            summaries = [
+                json.loads(call.args[1])
+                for call in log_info.call_args_list
+                if call.args
+                and call.args[0] == "spark-context-cache-page-base-flight:%s"
+            ]
+            self.assertEqual(len(summaries), 1)
+            connector.shutdown()
+
+    def test_singleton_batch_reader_accepts_fifteen_late_members_without_blocking_unrelated_work(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector, evidence, plans = self._page_base_queue_fixture(Path(directory))
+            unrelated = _ReqPlan(
+                "unrelated-after-singleton",
+                "f" * 64,
+                1024,
+                (3,),
+                False,
+                block_ids_by_group=((3,), (4,)),
+            )
+
+            def lookup(_identity, digest, **_kwargs):
+                if digest == unrelated.digest:
+                    return LookupResult(False, "miss"), False
+                return LookupResult(True, "hit", root_kind="page_delta"), False
+
+            connector._lookup_reusable = mock.Mock(side_effect=lookup)
+            read_started = threading.Event()
+            release_read = threading.Event()
+            unrelated_finished = threading.Event()
+            reads = 0
+
+            def read_base() -> bytes:
+                nonlocal reads
+                reads += 1
+                read_started.set()
+                self.assertTrue(release_read.wait(timeout=5))
+                return b"authenticated-base"
+
+            def load_one(plan: _ReqPlan, **_kwargs: object) -> bool:
+                if plan.request_id == unrelated.request_id:
+                    unrelated_finished.set()
+                    return True
+                return (
+                    connector._restore_page_base_for_request(
+                        plan.request_id,
+                        evidence,
+                        read_base,
+                    )
+                    == b"authenticated-base"
+                )
+
+            connector._load_one = mock.Mock(side_effect=load_one)
+            with mock.patch.object(connector_module.logger, "info") as log_info:
+                connector.bind_connector_metadata(
+                    SparkCacheConnectorMetadata(plans=plans[:1])
+                )
+                connector.start_load_kv(None)
+                self.assertTrue(read_started.wait(timeout=5))
+                self.assertEqual(
+                    connector._page_base_reads.snapshot().registered_members,
+                    1,
+                )
+
+                connector.bind_connector_metadata(
+                    SparkCacheConnectorMetadata(plans=plans[1:])
+                )
+                connector.start_load_kv(None)
+                self.assertEqual(
+                    connector._page_base_reads.snapshot().registered_members,
+                    16,
+                )
+
+                connector.bind_connector_metadata(
+                    SparkCacheConnectorMetadata(plans=[unrelated])
+                )
+                connector.start_load_kv(None)
+                self.assertTrue(unrelated_finished.wait(timeout=5))
+                release_read.set()
+                self.assertEqual(
+                    _drain(connector),
+                    {*(plan.request_id for plan in plans), unrelated.request_id},
+                )
+
+            self.assertEqual(reads, 1)
+            self.assertEqual(connector.counters["page_base_flight_participants"], 16)
+            self.assertEqual(connector.counters["page_base_physical_reads"], 1)
+            self.assertEqual(connector.counters["page_base_reads_avoided"], 15)
+            summaries = [
+                json.loads(call.args[1])
+                for call in log_info.call_args_list
+                if call.args
+                and call.args[0] == "spark-context-cache-page-base-flight:%s"
+            ]
+            self.assertEqual(len(summaries), 1)
+            self.assertEqual(summaries[0]["participants"], 16)
+            self.assertEqual(summaries[0]["physical_base_reads"], 1)
+            self.assertEqual(summaries[0]["avoided_base_reads"], 15)
+            self.assertEqual(connector._page_base_reads.snapshot().active_flights, 0)
+            connector.shutdown()
+
+    def test_later_unrelated_restore_finishes_while_c16_base_read_is_pending(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector, evidence, plans = self._page_base_queue_fixture(Path(directory))
+            unrelated = _ReqPlan(
+                "unrelated",
+                "f" * 64,
+                1024,
+                (3,),
+                False,
+                block_ids_by_group=((3,), (4,)),
+            )
+
+            def lookup(_identity, digest, **_kwargs):
+                if digest == unrelated.digest:
+                    return LookupResult(False, "miss"), False
+                return LookupResult(True, "hit", root_kind="page_delta"), False
+
+            connector._lookup_reusable = mock.Mock(side_effect=lookup)
+            base_started = threading.Event()
+            release_base = threading.Event()
+            unrelated_finished = threading.Event()
+            started_requests: list[str] = []
+            started_lock = threading.Lock()
+
+            def read_base() -> bytes:
+                base_started.set()
+                self.assertTrue(release_base.wait(timeout=5))
+                return b"authenticated-base"
+
+            def load_one(plan: _ReqPlan, **_kwargs: object) -> bool:
+                with started_lock:
+                    started_requests.append(plan.request_id)
+                if plan.request_id == unrelated.request_id:
+                    unrelated_finished.set()
+                    return True
+                return (
+                    connector._restore_page_base_for_request(
+                        plan.request_id,
+                        evidence,
+                        read_base,
+                    )
+                    == b"authenticated-base"
+                )
+
+            connector._load_one = mock.Mock(side_effect=load_one)
+            connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=plans))
+            connector.start_load_kv(None)
+            self.assertTrue(base_started.wait(timeout=5))
+            connector.bind_connector_metadata(
+                SparkCacheConnectorMetadata(plans=[unrelated])
+            )
+            connector.start_load_kv(None)
+
+            self.assertTrue(unrelated_finished.wait(timeout=5))
+            with started_lock:
+                self.assertEqual(started_requests, ["shared-0", "unrelated"])
+            release_base.set()
+            self.assertEqual(
+                _drain(connector),
+                {*(plan.request_id for plan in plans), "unrelated"},
+            )
+            self.assertEqual(connector.counters["page_base_physical_reads"], 1)
+            connector.shutdown()
+
+    def test_cancelled_designated_reader_promotes_one_registered_follower(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector, evidence, plans = self._page_base_queue_fixture(Path(directory))
+            leader_entered = threading.Event()
+            allow_leader_resolve = threading.Event()
+            base_read = threading.Event()
+            reads = 0
+
+            def read_base() -> bytes:
+                nonlocal reads
+                reads += 1
+                base_read.set()
+                return b"authenticated-base"
+
+            def load_one(plan: _ReqPlan, **_kwargs: object) -> bool:
+                if plan.request_id == "shared-0":
+                    leader_entered.set()
+                    self.assertTrue(allow_leader_resolve.wait(timeout=5))
+                return (
+                    connector._restore_page_base_for_request(
+                        plan.request_id,
+                        evidence,
+                        read_base,
+                    )
+                    == b"authenticated-base"
+                )
+
+            connector._load_one = mock.Mock(side_effect=load_one)
+            connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=plans))
+            connector.start_load_kv(None)
+            self.assertTrue(leader_entered.wait(timeout=5))
+            connector.request_finished(
+                types.SimpleNamespace(request_id="shared-0"),
+                [],
+            )
+            allow_leader_resolve.set()
+            self.assertTrue(base_read.wait(timeout=5))
+            self.assertEqual(_drain(connector), set(plan.request_id for plan in plans))
+
+            self.assertEqual(reads, 1)
+            self.assertEqual(connector.counters["load_failed"], 1)
+            self.assertEqual(connector.counters["load_verified"], 15)
+            self.assertEqual(connector.counters["page_base_flight_participants"], 16)
+            self.assertEqual(connector.counters["page_base_physical_reads"], 1)
+            self.assertEqual(connector.counters["page_base_reads_avoided"], 14)
+            self.assertEqual(connector._page_base_reads.snapshot().active_flights, 0)
+            connector.shutdown()
+
+    def test_two_completed_base_flights_keep_summary_counters_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector, evidence, _plans = self._page_base_queue_fixture(Path(directory))
+            evidences = (
+                evidence,
+                dataclasses.replace(
+                    evidence,
+                    base_context_digest="c" * 64,
+                    base_root_sha256="d" * 64,
+                ),
+            )
+
+            def complete(index: int) -> None:
+                selected = evidences[index]
+                key = connector._page_base_flight_key(selected)
+                request_ids = (f"leader-{index}", f"follower-{index}")
+                connector._page_base_reads.register_cohort(key, request_ids)
+                self.assertEqual(
+                    connector._restore_page_base_for_request(
+                        request_ids[0],
+                        selected,
+                        lambda: b"authenticated-base",
+                    ),
+                    b"authenticated-base",
+                )
+                self.assertEqual(
+                    connector._restore_page_base_for_request(
+                        request_ids[1],
+                        selected,
+                        lambda: b"wrong",
+                    ),
+                    b"authenticated-base",
+                )
+                connector._emit_page_base_flight_summaries()
+
+            with (
+                mock.patch.object(connector_module.logger, "info") as log_info,
+                ThreadPoolExecutor(max_workers=2) as executor,
+            ):
+                tuple(executor.map(complete, range(2)))
+
+            self.assertEqual(connector.counters["page_base_flights_completed"], 2)
+            self.assertEqual(connector.counters["page_base_flight_participants"], 4)
+            self.assertEqual(connector.counters["page_base_physical_reads"], 2)
+            self.assertEqual(connector.counters["page_base_reads_avoided"], 2)
+            summaries = [
+                call
+                for call in log_info.call_args_list
+                if call.args
+                and call.args[0] == "spark-context-cache-page-base-flight:%s"
+            ]
+            self.assertEqual(len(summaries), 2)
+
+    def test_shutdown_releases_pending_c16_base_cohort(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector, evidence, plans = self._page_base_queue_fixture(Path(directory))
+            read_started = threading.Event()
+            release_read = threading.Event()
+
+            def read_base() -> bytes:
+                read_started.set()
+                self.assertTrue(release_read.wait(timeout=5))
+                return b"authenticated-base"
+
+            connector._load_one = mock.Mock(
+                side_effect=lambda plan, **_kwargs: (
+                    connector._restore_page_base_for_request(
+                        plan.request_id,
+                        evidence,
+                        read_base,
+                    )
+                    == b"authenticated-base"
+                )
+            )
+            connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=plans))
+            connector.start_load_kv(None)
+            self.assertTrue(read_started.wait(timeout=5))
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                shutdown = executor.submit(connector.shutdown)
+                deadline = time.monotonic() + 5
+                while (
+                    connector._page_base_reads.snapshot().active_flights
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.001)
+                self.assertEqual(
+                    connector._page_base_reads.snapshot().active_flights,
+                    0,
+                )
+                self.assertEqual(
+                    connector._page_base_reads.snapshot().retained_bytes,
+                    0,
+                )
+                release_read.set()
+                shutdown.result(timeout=5)
+
+            self.assertTrue(connector.wait_for_pending_loads(timeout=1))
+            self.assertEqual(connector._deferred_page_base_loads, {})
+            self.assertEqual(connector._page_base_plan_keys, {})
+            self.assertEqual(connector.counters["page_base_flights_cancelled"], 1)
+            self.assertEqual(connector.counters["page_base_flight_participants"], 16)
+
+    def test_page_base_cohort_precedes_followers_with_two_load_lanes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                extra_config={"spark_cache_load_threads": "2"},
+            )
+            connector._storage_mode = "block_pages_v1"
+            connector._page_layout = types.SimpleNamespace(digest="layout")
+            connector._select_group_blocks_for_span = mock.Mock(
+                return_value=((1,), (2,))
+            )
+            evidence = PageBaseReadEvidence(
+                identity_storage_key="identity",
+                base_context_digest="a" * 64,
+                base_root_sha256="b" * 64,
+                base_root_kind="page_snapshot",
+                layout_sha256="layout",
+                base_block_counts=(1, 1),
+                base_boundary_tokens=512,
+                base_encoded_bytes=1024,
+            )
+            connector._store.page_delta_base_read_evidence = mock.Mock(
+                return_value=evidence
+            )
+            shared = [
+                _ReqPlan(
+                    f"shared-{index}",
+                    f"{index + 1:064x}",
+                    1024,
+                    (1,),
+                    False,
+                    block_ids_by_group=((1,), (2,)),
+                )
+                for index in range(16)
+            ]
+            unrelated = _ReqPlan(
+                "unrelated",
+                "f" * 64,
+                1024,
+                (3,),
+                False,
+                block_ids_by_group=((3,), (4,)),
+            )
+
+            def lookup(_identity, digest, **_kwargs):
+                if digest == unrelated.digest:
+                    return LookupResult(False, "miss"), False
+                return LookupResult(True, "hit", root_kind="page_delta"), False
+
+            connector._lookup_reusable = mock.Mock(side_effect=lookup)
+
+            runnable, deferred, page_base_keys = (
+                connector._prepare_page_base_read_cohorts([*shared, unrelated])
+            )
+
+            self.assertEqual(runnable[0].request_id, "shared-0")
+            self.assertEqual(runnable[1].request_id, "unrelated")
+            self.assertEqual(
+                [plan.request_id for plan in deferred],
+                [plan.request_id for plan in shared[1:]],
+            )
+            self.assertEqual(set(page_base_keys), {plan.request_id for plan in shared})
+            self.assertEqual(connector._load_thread_limit, 2)
+            self.assertEqual(
+                connector._page_base_reads.snapshot().registered_members, 16
+            )
+
+    def test_singleton_scheduler_batch_joins_reading_page_base(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(Path(directory), 0)
+            connector._storage_mode = "block_pages_v1"
+            connector._page_layout = types.SimpleNamespace(digest="layout")
+            connector._select_group_blocks_for_span = mock.Mock(
+                return_value=((1,), (2,))
+            )
+            evidence = PageBaseReadEvidence(
+                identity_storage_key="identity",
+                base_context_digest="a" * 64,
+                base_root_sha256="b" * 64,
+                base_root_kind="page_snapshot",
+                layout_sha256="layout",
+                base_block_counts=(1, 1),
+                base_boundary_tokens=512,
+                base_encoded_bytes=4,
+            )
+            connector._store.page_delta_base_read_evidence = mock.Mock(
+                return_value=evidence
+            )
+            connector._lookup_reusable = mock.Mock(
+                return_value=(
+                    LookupResult(True, "hit", root_kind="page_delta"),
+                    False,
+                )
+            )
+            first = [
+                _ReqPlan(
+                    f"first-{index}",
+                    f"{index + 1:064x}",
+                    1024,
+                    (1,),
+                    False,
+                    block_ids_by_group=((1,), (2,)),
+                )
+                for index in range(8)
+            ]
+            connector._prepare_page_base_read_cohorts(first)
+            started = threading.Event()
+            release = threading.Event()
+
+            def read_base() -> bytes:
+                started.set()
+                self.assertTrue(release.wait(timeout=5))
+                return b"base"
+
+            key = connector._page_base_flight_key(evidence)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                leader = executor.submit(
+                    connector._restore_page_base_for_request,
+                    "first-0",
+                    evidence,
+                    read_base,
+                )
+                self.assertTrue(started.wait(timeout=5))
+                singleton = _ReqPlan(
+                    "singleton",
+                    "e" * 64,
+                    1024,
+                    (1,),
+                    False,
+                    block_ids_by_group=((1,), (2,)),
+                )
+                runnable, deferred, keys = connector._prepare_page_base_read_cohorts(
+                    [singleton]
+                )
+                self.assertEqual(runnable, [])
+                self.assertEqual(deferred, [singleton])
+                self.assertEqual(set(keys), {"singleton"})
+                self.assertEqual(
+                    connector._page_base_reads.registered_key("singleton"),
+                    key,
+                )
+                release.set()
+                self.assertEqual(leader.result(timeout=5), b"base")
+
+            for request_id in (
+                *(plan.request_id for plan in first[1:]),
+                "singleton",
+            ):
+                self.assertEqual(
+                    connector._restore_page_base_for_request(
+                        request_id,
+                        evidence,
+                        lambda: b"wrong",
+                    ),
+                    b"base",
+                )
+            with mock.patch.object(connector_module.logger, "info") as log_info:
+                connector._emit_page_base_flight_summaries()
+            self.assertEqual(connector.counters["page_base_physical_reads"], 1)
+            self.assertEqual(connector.counters["page_base_reads_avoided"], 8)
+            summaries = [
+                call.args[1]
+                for call in log_info.call_args_list
+                if call.args
+                and call.args[0] == "spark-context-cache-page-base-flight:%s"
+            ]
+            self.assertEqual(len(summaries), 1)
+            self.assertEqual(json.loads(summaries[0])["participants"], 9)
 
     @staticmethod
     def _publish_divergent_row_extensions(root: Path):
@@ -1540,14 +2575,14 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                 kv_cache_config=_hybrid_kv_cache_config(),
             )
             pools = {
-                "full": torch.arange(20 * 64 * 8, dtype=torch.int64)
-                .reshape(20, 64, 8)
+                "full": torch.arange(10 * 64 * 8, dtype=torch.int64)
+                .reshape(10, 64, 8)
                 .to(torch.uint8),
-                "compressed": torch.arange(20 * 2 * 8, dtype=torch.int64)
-                .reshape(20, 2, 8)
+                "compressed": torch.arange(10 * 2 * 8, dtype=torch.int64)
+                .reshape(10, 2, 8)
                 .to(torch.uint8),
-                "state": torch.arange(20 * 4 * 16, dtype=torch.float32).reshape(
-                    20, 4, 16
+                "state": torch.arange(10 * 4 * 16, dtype=torch.float32).reshape(
+                    10, 4, 16
                 ),
             }
             connector.register_kv_caches(pools)
@@ -1603,9 +2638,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                 connector.get_num_new_matched_tokens(divergent, 0), (1024, True)
             )
             self.assertEqual(len(connector._restore_flights), 2)
-            self.assertNotIn(
-                divergent.request_id, connector._restore_flight_followers
-            )
+            self.assertNotIn(divergent.request_id, connector._restore_flight_followers)
             self.assertTrue(
                 connector._store.lookup(connector._identity(0), digest_a).is_hit
             )
@@ -1746,6 +2779,48 @@ class ConnectorRoundTripTests(unittest.TestCase):
 
 
 class SchedulerChunkedPrefillTests(unittest.TestCase):
+    def test_restore_only_miss_recomputes_without_creating_a_store_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                block_size=64,
+                extra_config={"spark_cache_access_mode": "restore-only"},
+                role=KVConnectorRole.SCHEDULER,
+            )
+            token_ids = list(range(1100))
+            request = types.SimpleNamespace(
+                request_id="uncached-request",
+                prompt_token_ids=token_ids,
+            )
+
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(request, 0),
+                (0, False),
+            )
+            output = types.SimpleNamespace(
+                scheduled_new_reqs=[
+                    types.SimpleNamespace(
+                        req_id=request.request_id,
+                        prompt_token_ids=token_ids,
+                        num_computed_tokens=0,
+                        block_ids=([10, 11, 12, 13],),
+                    )
+                ],
+                num_scheduled_tokens={request.request_id: 1024},
+                scheduled_cached_reqs=types.SimpleNamespace(
+                    req_ids=[],
+                    resumed_req_ids=set(),
+                    num_computed_tokens=[],
+                    new_block_ids=[],
+                ),
+            )
+
+            metadata = connector.build_connector_meta(output)
+
+            self.assertEqual(metadata.plans, [])
+            self.assertEqual(connector._store_progress, {})
+
     def test_tail_store_plan_selects_longest_all_rank_base(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(
@@ -2472,10 +3547,14 @@ class CapacityPolicyConnectorTests(unittest.TestCase):
         self.assertEqual(connector._held, {survivor})
         self.assertEqual(connector.counters["capacity_manifests_evicted"], 1)
         stats = connector.get_kv_connector_stats()
+        capacity = stats.data["reports"][0]["capacity"]
         reduced = stats.reduce()
-        self.assertEqual(reduced["spark_cache_capacity_bytes"], 800)
-        self.assertEqual(reduced["spark_cache_capacity_max_bytes"], 1000)
-        self.assertEqual(reduced["spark_cache_capacity_satisfied"], 1)
+        self.assertEqual(capacity["bytes"], 800)
+        self.assertEqual(capacity["max_bytes"], 1000)
+        self.assertEqual(reduced["sparkcache_used_gib"], 0.0)
+        self.assertEqual(reduced["sparkcache_limit_gib"], 0.0)
+        self.assertEqual(reduced["sparkcache_healthy"], 1)
+        self.assertEqual(reduced["sparkcache_evicted"], 1)
 
     def test_maintenance_failure_is_nonfatal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2980,12 +4059,9 @@ class StreamingCapacityHandoffTests(unittest.TestCase):
             self.assertEqual(capacity["pending_streaming_commits"], 0)
             self.assertEqual(capacity["streaming_store_committed"], 1)
             self.assertEqual(capacity["streaming_store_evicted"], 0)
-            self.assertEqual(
-                reduced["spark_cache_capacity_pending_streaming_commits"],
-                0,
-            )
-            self.assertEqual(reduced["spark_cache_streaming_store_evicted"], 0)
-            self.assertEqual(reduced["spark_cache_capacity_satisfied"], 1)
+            self.assertNotIn("sparkcache_pending", reduced)
+            self.assertNotIn("sparkcache_stream_evicted", reduced)
+            self.assertEqual(reduced["sparkcache_healthy"], 1)
             connector.shutdown()
 
 
@@ -3016,6 +4092,98 @@ class SweepTests(unittest.TestCase):
 
 
 class AsyncStoreTests(unittest.TestCase):
+    def test_restore_only_worker_rejects_store_metadata_before_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                64,
+                extra_config={"spark_cache_access_mode": "restore-only"},
+            )
+            connector.register_kv_caches(_make_pools(8, 64))
+            plan = _ReqPlan(
+                "must-not-publish",
+                "6" * 64,
+                1024,
+                (3, 0, 5, 1),
+                True,
+            )
+            connector.bind_connector_metadata(
+                SparkCacheConnectorMetadata(plans=[plan])
+            )
+
+            with mock.patch.object(
+                connector,
+                "_snapshot_store",
+                wraps=connector._snapshot_store,
+            ) as snapshot:
+                connector.wait_for_save()
+
+            snapshot.assert_not_called()
+            self.assertIsNone(connector._store_thread)
+            self.assertFalse(
+                connector._store.lookup(connector._identity(0), plan.digest).is_hit
+            )
+
+    def test_restore_only_worker_restores_a_preexisting_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            writer = _make_connector(root, 0, 64)
+            source = _make_pools(8, 64)
+            expected = {name: tensor.clone() for name, tensor in source.items()}
+            writer.register_kv_caches(source)
+            plan = _ReqPlan(
+                "published-before-restore-only-start",
+                "5" * 64,
+                1024,
+                (3, 0, 5, 1),
+                True,
+            )
+            writer.bind_connector_metadata(
+                SparkCacheConnectorMetadata(plans=[plan])
+            )
+            writer.wait_for_save()
+            self.assertTrue(writer.wait_for_pending_stores(timeout=5))
+
+            reader = _make_connector(
+                root,
+                0,
+                64,
+                extra_config={"spark_cache_access_mode": "restore-only"},
+            )
+            destination = _make_pools(8, 64)
+            for tensor in destination.values():
+                tensor.zero_()
+            reader.register_kv_caches(destination)
+            reader.bind_connector_metadata(
+                SparkCacheConnectorMetadata(
+                    plans=[dataclasses.replace(plan, is_store=False)]
+                )
+            )
+
+            reader.start_load_kv(None)
+
+            self.assertEqual(
+                _drain(reader),
+                {"published-before-restore-only-start"},
+            )
+            slots = codec.local_slots_for_positions(
+                codec.owned_positions(1024, 4, 0),
+                plan.block_ids,
+                64,
+                4,
+            )
+            slot_tensor = torch.tensor(slots, dtype=torch.long)
+            for name in _LAYERS:
+                actual_rows = destination[name].reshape(-1, _LAYERS[name])
+                expected_rows = expected[name].reshape(-1, _LAYERS[name])
+                torch.testing.assert_close(
+                    actual_rows[slot_tensor],
+                    expected_rows[slot_tensor],
+                    rtol=0,
+                    atol=0,
+                )
+
     def test_tail_publication_snapshots_only_rows_after_verified_base(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -4062,12 +5230,23 @@ class AsyncRestoreTests(unittest.TestCase):
         table = list(block_ids or self.BLOCKS)
         return types.SimpleNamespace(get_block_ids=lambda: (table,))
 
-    def _cohort_connector(self, root: Path, *, max_pending: int = 2):
+    def _cohort_connector(
+        self,
+        root: Path,
+        *,
+        max_pending: int = 2,
+        lease_ttl_seconds: float = 15.0,
+    ):
         connector = _make_connector(
             root,
             0,
             64,
-            extra_config={"spark_cache_max_pending_restores": str(max_pending)},
+            extra_config={
+                "spark_cache_max_pending_restores": str(max_pending),
+                "spark_cache_shared_prefix_lease_ttl_seconds": str(
+                    lease_ttl_seconds
+                ),
+            },
         )
         connector._scheduler_probe = "none"
         return connector
@@ -4077,6 +5256,189 @@ class AsyncRestoreTests(unittest.TestCase):
         digest = connector._digest(tokens, 1024)
         connector._quorum[digest] = {0, 1, 2, 3}
         return digest
+
+    def test_async_restore_waits_for_prior_cuda_work_before_gpu_write(self) -> None:
+        """Placement starts only after earlier model-runner CUDA work completes."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(Path(directory), 0, 64)
+            connector.register_kv_caches(_make_pools(8, 64))
+            connector._layer_tensors = {
+                "cuda-page": types.SimpleNamespace(
+                    device=types.SimpleNamespace(type="cuda", index=0)
+                )
+            }
+            connector.bind_connector_metadata(
+                SparkCacheConnectorMetadata(
+                    plans=[
+                        _ReqPlan(
+                            "ordered-restore",
+                            "8" * 64,
+                            self.SPAN,
+                            self.BLOCKS,
+                            False,
+                        )
+                    ]
+                )
+            )
+
+            recorded = threading.Event()
+            wait_started = threading.Event()
+            permit_restore = threading.Event()
+            restore_started = threading.Event()
+            model_runner_stream = object()
+            test_case = self
+
+            class PriorCudaWork:
+                def record(self, stream) -> None:
+                    test_case.assertIs(stream, model_runner_stream)
+                    recorded.set()
+
+                def synchronize(self) -> None:
+                    wait_started.set()
+                    test_case.assertTrue(permit_restore.wait(timeout=30))
+
+            prerequisite = PriorCudaWork()
+
+            def restored(*_args, **_kwargs) -> bool:
+                restore_started.set()
+                return True
+
+            connector._load_one = restored
+            try:
+                with (
+                    mock.patch.object(
+                        torch.cuda,
+                        "Event",
+                        return_value=prerequisite,
+                    ),
+                    mock.patch.object(
+                        torch.cuda,
+                        "current_stream",
+                        return_value=model_runner_stream,
+                    ),
+                ):
+                    connector.start_load_kv(None)
+                    self.assertTrue(recorded.wait(timeout=1))
+                    self.assertTrue(wait_started.wait(timeout=1))
+                    self.assertFalse(restore_started.is_set())
+                    permit_restore.set()
+                    self.assertEqual(_drain(connector), {"ordered-restore"})
+                self.assertTrue(restore_started.is_set())
+                self.assertEqual(connector.counters["load_verified"], 1)
+            finally:
+                permit_restore.set()
+                connector.shutdown()
+
+    def test_cuda_prerequisite_record_failure_recomputes_without_placement(
+        self,
+    ) -> None:
+        """An unprovable stream dependency never permits a cache write."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(Path(directory), 0, 64)
+            connector.register_kv_caches(_make_pools(8, 64))
+            connector._layer_tensors = {
+                "cuda-page": types.SimpleNamespace(
+                    device=types.SimpleNamespace(type="cuda", index=0)
+                )
+            }
+            connector.bind_connector_metadata(
+                SparkCacheConnectorMetadata(
+                    plans=[
+                        _ReqPlan(
+                            "unordered-restore",
+                            "9" * 64,
+                            self.SPAN,
+                            self.BLOCKS,
+                            False,
+                        )
+                    ]
+                )
+            )
+            connector._load_one = mock.Mock(return_value=True)
+            try:
+                with mock.patch.object(
+                    torch.cuda,
+                    "Event",
+                    side_effect=RuntimeError("event allocation rejected"),
+                ):
+                    connector.start_load_kv(None)
+                    self.assertEqual(_drain(connector), {"unordered-restore"})
+                connector._load_one.assert_not_called()
+                self.assertEqual(connector.counters["load_failed"], 1)
+                self.assertEqual(
+                    connector.get_block_ids_with_load_errors(),
+                    set(self.BLOCKS),
+                )
+            finally:
+                connector.shutdown()
+
+    def test_pre_forward_shares_one_cuda_prerequisite_across_queued_loads(
+        self,
+    ) -> None:
+        """One model-runner stream event orders every restore in the callback."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _make_connector(
+                Path(directory),
+                0,
+                64,
+                extra_config={"spark_cache_load_threads": "2"},
+            )
+            connector.register_kv_caches(_make_pools(8, 64))
+            connector._layer_tensors = {
+                "cuda-page": types.SimpleNamespace(
+                    device=types.SimpleNamespace(type="cuda", index=0)
+                )
+            }
+            connector.bind_connector_metadata(
+                SparkCacheConnectorMetadata(
+                    plans=[
+                        _ReqPlan(
+                            "ordered-a",
+                            "a" * 64,
+                            self.SPAN,
+                            self.BLOCKS,
+                            False,
+                        ),
+                        _ReqPlan(
+                            "ordered-b",
+                            "b" * 64,
+                            self.SPAN,
+                            (2, 4, 6, 7),
+                            False,
+                        ),
+                    ]
+                )
+            )
+            prerequisite = mock.Mock()
+            connector._ensure_load_threads = mock.Mock()
+            try:
+                with (
+                    mock.patch.object(
+                        torch.cuda,
+                        "Event",
+                        return_value=prerequisite,
+                    ) as event_factory,
+                    mock.patch.object(
+                        torch.cuda,
+                        "current_stream",
+                        return_value=object(),
+                    ),
+                ):
+                    connector.start_load_kv(None)
+                first = connector._load_queue.get_nowait()
+                second = connector._load_queue.get_nowait()
+                self.assertIs(first.prior_cuda_event, prerequisite)
+                self.assertIs(second.prior_cuda_event, prerequisite)
+                event_factory.assert_called_once_with(
+                    blocking=False,
+                    interprocess=False,
+                )
+                prerequisite.record.assert_called_once()
+            finally:
+                connector.shutdown()
 
     def test_identical_requests_share_one_restore_plan(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -4127,6 +5489,33 @@ class AsyncRestoreTests(unittest.TestCase):
                 connector.get_num_new_matched_tokens(follower, self.SPAN),
                 (0, False),
             )
+
+    def test_waiting_request_reuses_its_prefix_digest_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            request = types.SimpleNamespace(
+                request_id="capacity-waiter",
+                prompt_token_ids=list(range(1100)),
+            )
+
+            with mock.patch(
+                "sparkcache.spark_context_cache_connector.chunk_prefix_digests",
+                wraps=codec.chunk_prefix_digests,
+            ) as digest_chain:
+                self.assertIsNone(
+                    connector.get_shared_prefix_lease_candidate(request)
+                )
+                self.assertIsNone(
+                    connector.get_shared_prefix_lease_candidate(request)
+                )
+                digest_chain.assert_called_once()
+
+                connector.request_finished(request, [])
+                self.assertNotIn(request.request_id, connector._prefix_digest_candidates)
+                self.assertIsNone(
+                    connector.get_shared_prefix_lease_candidate(request)
+                )
+                self.assertEqual(digest_chain.call_count, 2)
 
     def test_partially_computed_request_does_not_wait_for_zero_token_lease(
         self,
@@ -4217,6 +5606,71 @@ class AsyncRestoreTests(unittest.TestCase):
             connector.shared_prefix_lease_attached(late.request_id, digest)
             self.assertEqual(connector.counters["shared_prefix_leases_attached"], 2)
 
+    def test_configured_shared_prefix_lease_ttl_controls_publication_and_expiry(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(
+                Path(directory), lease_ttl_seconds=300.0
+            )
+            tokens = list(range(1100))
+            digest = self._offer(connector, tokens)
+            leader = types.SimpleNamespace(
+                request_id="retained-leader", prompt_token_ids=tokens
+            )
+            connector.get_num_new_matched_tokens(leader, 0)
+            connector.update_state_after_alloc(
+                leader, self._blocks_stub(), self.SPAN
+            )
+            connector.build_connector_meta(_empty_scheduler_output())
+            connector.update_connector_output(
+                types.SimpleNamespace(
+                    invalid_block_ids=set(), finished_recving={leader.request_id}
+                )
+            )
+
+            self.assertEqual(
+                connector.get_shared_prefix_lease_to_publish(leader),
+                (digest, self.SPAN, 300.0),
+            )
+            with mock.patch(
+                "sparkcache.spark_context_cache_connector.time.monotonic",
+                return_value=10.0,
+            ):
+                self.assertTrue(
+                    connector.shared_prefix_lease_published(
+                        leader.request_id, digest
+                    )
+                )
+
+            attached = types.SimpleNamespace(
+                request_id="retained-follower", prompt_token_ids=tokens
+            )
+            with mock.patch(
+                "sparkcache.spark_context_cache_connector.time.monotonic",
+                return_value=309.999,
+            ):
+                self.assertEqual(
+                    connector.get_shared_prefix_lease_candidate(attached),
+                    (digest, self.SPAN),
+                )
+            connector.shared_prefix_lease_attached(attached.request_id, digest)
+
+            late = types.SimpleNamespace(
+                request_id="expired-follower", prompt_token_ids=tokens
+            )
+            with mock.patch(
+                "sparkcache.spark_context_cache_connector.time.monotonic",
+                return_value=310.001,
+            ):
+                self.assertIsNone(
+                    connector.get_shared_prefix_lease_candidate(late)
+                )
+            self.assertNotIn(digest, connector._restore_flights)
+            self.assertEqual(
+                connector.counters["shared_prefix_leases_expired"], 1
+            )
+
     def test_c16_distinct_roots_share_one_authenticated_trunk_restore(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = self._cohort_connector(Path(directory))
@@ -4251,14 +5705,10 @@ class AsyncRestoreTests(unittest.TestCase):
                     (None, False),
                 )
 
-            connector.update_state_after_alloc(
-                leader, self._blocks_stub(), self.SPAN
-            )
+            connector.update_state_after_alloc(leader, self._blocks_stub(), self.SPAN)
             metadata = connector.build_connector_meta(_empty_scheduler_output())
             self.assertEqual(len(metadata.plans), 1)
-            self.assertEqual(
-                metadata.plans[0].shared_segments, ((trunk_digest, 768),)
-            )
+            self.assertEqual(metadata.plans[0].shared_segments, ((trunk_digest, 768),))
             connector.update_connector_output(
                 types.SimpleNamespace(
                     invalid_block_ids=set(), finished_recving={leader.request_id}
@@ -4318,9 +5768,7 @@ class AsyncRestoreTests(unittest.TestCase):
                 (trunk_digest, 768),
             )
 
-            connector.update_state_after_alloc(
-                leader, self._blocks_stub(), self.SPAN
-            )
+            connector.update_state_after_alloc(leader, self._blocks_stub(), self.SPAN)
             connector.build_connector_meta(_empty_scheduler_output())
             connector.update_connector_output(
                 types.SimpleNamespace(
@@ -4496,7 +5944,9 @@ class AsyncRestoreTests(unittest.TestCase):
 
         self.assertEqual(results, [True, True, False, True])
 
-    def test_segment_verification_failure_releases_distinct_root_followers(self) -> None:
+    def test_segment_verification_failure_releases_distinct_root_followers(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = self._cohort_connector(Path(directory))
             common = list(range(768))
@@ -4516,9 +5966,7 @@ class AsyncRestoreTests(unittest.TestCase):
             )
             connector.get_num_new_matched_tokens(leader, 0)
             connector.get_num_new_matched_tokens(follower, 0)
-            connector.update_state_after_alloc(
-                leader, self._blocks_stub(), self.SPAN
-            )
+            connector.update_state_after_alloc(leader, self._blocks_stub(), self.SPAN)
             connector.build_connector_meta(_empty_scheduler_output())
 
             connector.update_connector_output(
@@ -4967,13 +6415,16 @@ class AsyncRestoreTests(unittest.TestCase):
                 )
             )
 
-            with mock.patch.object(connector_module.logger, "info") as log_info:
+            with (
+                mock.patch.object(connector_module, "_debug_log") as log_debug,
+                mock.patch.object(connector_module.logger, "info") as log_info,
+            ):
                 connector.start_load_kv(None)
                 self.assertEqual(_drain(connector), {"timed-restore"})
 
             rendered = next(
                 call.args[1]
-                for call in log_info.call_args_list
+                for call in log_debug.call_args_list
                 if len(call.args) == 2
                 and isinstance(call.args[1], str)
                 and call.args[1].startswith(RESTORE_TIMING_PREFIX)
@@ -4987,6 +6438,14 @@ class AsyncRestoreTests(unittest.TestCase):
             self.assertGreater(record["phase_ms"]["restore_read"], 0)
             self.assertGreater(record["phase_ms"]["reassembly_decode"], 0)
             self.assertGreater(record["phase_ms"]["h2d_submit"], 0)
+            operator_lines = [
+                call.args[1]
+                for call in log_info.call_args_list
+                if len(call.args) == 2 and call.args[0] == "%s"
+            ]
+            self.assertTrue(operator_lines[0].startswith("sparkcache: restore tokens="))
+            self.assertIn(" tok/s", operator_lines[0])
+            self.assertTrue(operator_lines[1].startswith("sparkcache: phases read="))
 
     def test_timing_failure_does_not_prevent_restore_completion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -5215,6 +6674,96 @@ class AsyncRestoreTests(unittest.TestCase):
             self.assertEqual(connector.build_connector_meta(step).plans, [])
 
 
+class StartupInventoryHandshakeTests(unittest.TestCase):
+    def test_worker_handshake_carries_every_bounded_checkpoint_chunk(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            worker = _make_connector(Path(directory), 2, 64)
+            worker._held = {f"{value:064x}" for value in range(130)}
+
+            metadata = worker.get_handshake_metadata()
+
+            self.assertIsNotNone(metadata)
+            assert metadata is not None
+            self.assertEqual(len(metadata.reports), 3)
+            self.assertEqual(
+                [report["checkpoint"]["index"] for report in metadata.reports],
+                [0, 1, 2],
+            )
+            self.assertTrue(
+                all(
+                    len(report["checkpoint"]["held"])
+                    <= connector_module._QUORUM_REPORT_BATCH_SIZE
+                    for report in metadata.reports
+                )
+            )
+            self.assertTrue(all(report["rank"] == 2 for report in metadata.reports))
+
+    def test_worker_handshake_limits_inventory_before_api_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            worker = _make_connector(Path(directory), 2, 64)
+            worker._held = {f"{value:064x}" for value in range(700)}
+
+            metadata = worker.get_handshake_metadata()
+
+            self.assertIsNotNone(metadata)
+            assert metadata is not None
+            self.assertEqual(len(metadata.reports), 8)
+            checkpoint = [report["checkpoint"] for report in metadata.reports]
+            self.assertEqual([item["index"] for item in checkpoint], list(range(8)))
+            self.assertTrue(all(item["count"] == 8 for item in checkpoint))
+            self.assertTrue(all(item["held_count"] == 512 for item in checkpoint))
+            self.assertEqual(sum(len(item["held"]) for item in checkpoint), 512)
+
+    def test_scheduler_handshake_establishes_full_physical_rank_quorum(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            digest = "a" * 64
+            metadata = {}
+            for rank in range(4):
+                worker = _make_connector(root / f"worker-{rank}", rank, 64)
+                worker._held = {digest}
+                metadata[rank] = worker.get_handshake_metadata()
+            scheduler = _make_connector(
+                root / "scheduler",
+                0,
+                64,
+                role=KVConnectorRole.SCHEDULER,
+            )
+
+            scheduler.set_xfer_handshake_metadata(metadata)
+
+            self.assertTrue(scheduler._has_full_quorum(digest))
+
+    def test_transport_rank_mismatch_cannot_contribute_to_quorum(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            digest = "b" * 64
+            worker = _make_connector(root / "worker", 0, 64)
+            worker._held = {digest}
+            report = worker.get_handshake_metadata()
+            scheduler = _make_connector(
+                root / "scheduler",
+                0,
+                64,
+                role=KVConnectorRole.SCHEDULER,
+            )
+
+            scheduler.set_xfer_handshake_metadata({0: report, 1: report})
+
+            self.assertEqual(scheduler._quorum[digest], {0})
+            self.assertFalse(scheduler._has_full_quorum(digest))
+
+    def test_scheduler_does_not_emit_worker_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            scheduler = _make_connector(
+                Path(directory),
+                0,
+                64,
+                role=KVConnectorRole.SCHEDULER,
+            )
+            self.assertIsNone(scheduler.get_handshake_metadata())
+
+
 class QuorumStatsAggregationTests(unittest.TestCase):
     """The executor merges every worker's stats object before the scheduler
     sees it, so aggregate() must be concrete and must union the reports."""
@@ -5229,7 +6778,157 @@ class QuorumStatsAggregationTests(unittest.TestCase):
         ranks = {r["rank"] for r in acc.data["reports"]}
         self.assertEqual(ranks, {0, 1, 2, 3})
         self.assertFalse(acc.is_empty())
-        self.assertEqual(acc.reduce()["spark_cache_ranks_reporting"], 4)
+        reduced = acc.reduce()
+        self.assertEqual(reduced["sparkcache_ranks"], 4)
+        self.assertEqual(reduced["sparkcache_entries"], 4)
+
+    def test_publication_byte_counters_reduce_across_ranks(self) -> None:
+        cls = connector_module.SparkCacheStats
+        reports = []
+        for rank in range(2):
+            reports.append(
+                {
+                    "rank": rank,
+                    "held": [],
+                    "publication": {
+                        "committed_publications": rank + 1,
+                        "logical_payload_bytes": 100 * (rank + 1),
+                        "committed_unique_object_bytes": 80 * (rank + 1),
+                        "staged_write_bytes": 120 * (rank + 1),
+                        "deduplicated_bytes": 20 * (rank + 1),
+                        "aborted_staged_write_bytes": 10 * rank,
+                        "failed_staged_write_bytes": 5 * rank,
+                        "aborted_publications": rank,
+                        "failed_publications": 0,
+                    },
+                }
+            )
+        stats = cls(data={"reports": reports})
+
+        reduced = stats.reduce()
+
+        self.assertEqual(reduced["sparkcache_publications"], 3)
+        self.assertEqual(reduced["sparkcache_payload_bytes"], 300)
+        self.assertEqual(reduced["sparkcache_unique_bytes"], 240)
+        self.assertEqual(reduced["sparkcache_staged_bytes"], 360)
+        self.assertEqual(reduced["sparkcache_dedup_bytes"], 60)
+        self.assertEqual(reduced["sparkcache_aborted_bytes"], 10)
+        self.assertEqual(reduced["sparkcache_failed_bytes"], 5)
+        self.assertEqual(reduced["sparkcache_publication_aborted"], 1)
+        self.assertNotIn("sparkcache_publication_failed", reduced)
+
+    def test_prometheus_metrics_expose_capture_ownership(self) -> None:
+        class GaugeValue:
+            def __init__(self) -> None:
+                self.value = None
+
+            def set(self, value) -> None:
+                self.value = value
+
+        class GaugeDefinition:
+            definitions: dict[str, "GaugeDefinition"] = {}
+
+            def __init__(self, *, name, documentation, labelnames) -> None:
+                self.name = name
+                self.documentation = documentation
+                self.labelnames = labelnames
+                self.children: dict[tuple[object, ...], GaugeValue] = {}
+                self.definitions[name] = self
+
+            def labels(self, *values):
+                return self.children.setdefault(tuple(values), GaugeValue())
+
+        metrics = connector_module.SparkCachePromMetrics(
+            types.SimpleNamespace(),
+            {object: GaugeDefinition},
+            ["engine"],
+            {0: ["0"]},
+        )
+        metrics.observe(
+            {
+                "reports": [
+                    {
+                        "rank": rank,
+                        "held": [],
+                        "async_capture": {
+                            "pending_requests": 0,
+                            "completed_notifications": 1,
+                            "delayed_requests": 1,
+                            "retained_manager_pages": 3,
+                            "oldest_delayed_ms": 125.0,
+                            "ownership_uncertain": rank == 3,
+                            "store_inflight": False,
+                        },
+                    }
+                    for rank in range(4)
+                ]
+            }
+        )
+
+        def value(name: str):
+            return GaugeDefinition.definitions[name].children[("0",)].value
+
+        self.assertEqual(value("vllm:sparkcache_capture_delayed_requests"), 1)
+        self.assertEqual(value("vllm:sparkcache_capture_delayed_rank_slots"), 4)
+        self.assertEqual(value("vllm:sparkcache_capture_retained_manager_pages"), 12)
+        self.assertEqual(value("vllm:sparkcache_capture_oldest_delayed_seconds"), 0.125)
+        self.assertEqual(value("vllm:sparkcache_capture_ownership_uncertain_ranks"), 1)
+
+    def test_aggregate_log_summary_is_split_by_operator_concern(self) -> None:
+        cls = connector_module.SparkCacheStats
+        stats = cls(
+            data={
+                "reports": [
+                    {
+                        "rank": rank,
+                        "held_count": 3,
+                        "capacity": {
+                            "bytes": 300 * 1024**2,
+                            "max_bytes": 40 * 1024**3,
+                            "capacity_satisfied": True,
+                        },
+                        "async_capture": {
+                            "pending_requests": 0,
+                            "completed_notifications": 1,
+                            "delayed_requests": 1,
+                            "retained_manager_pages": 3,
+                            "oldest_delayed_ms": 125.0,
+                            "ownership_uncertain": False,
+                            "store_inflight": False,
+                        },
+                        "publication": {
+                            "committed_publications": 3,
+                            "logical_payload_bytes": 300 * 1024**2,
+                            "committed_unique_object_bytes": 300 * 1024**2,
+                            "staged_write_bytes": 300 * 1024**2,
+                            "deduplicated_bytes": 0,
+                            "aborted_staged_write_bytes": 0,
+                            "failed_staged_write_bytes": 0,
+                        },
+                    }
+                    for rank in range(4)
+                ]
+            }
+        )
+
+        self.assertEqual(
+            stats.format_log_lines(),
+            (
+                "sparkcache: capacity ranks=4 entries=12 "
+                "used=1.2/160.0GiB healthy=yes",
+                "sparkcache: publications count=12 payload=1.2GiB "
+                "unique=1.2GiB",
+                "sparkcache: writes staged=1.2GiB dedup=0B "
+                "aborted=0B failed=0B",
+                "sparkcache: capture requests=1 rank_slots=4 "
+                "pages=12 oldest=125ms",
+            ),
+        )
+        reduced = stats.reduce()
+        self.assertEqual(reduced["sparkcache_capture_delayed_requests"], 1)
+        self.assertEqual(reduced["sparkcache_capture_delayed_rank_slots"], 4)
+        self.assertEqual(reduced["sparkcache_capture_retained_pages"], 12)
+        self.assertEqual(reduced["sparkcache_capture_oldest_delayed_ms"], 125.0)
 
     def test_later_report_replaces_same_rank(self) -> None:
         cls = connector_module.SparkCacheStats
@@ -5488,18 +7187,18 @@ class StreamingLifecycleScaffoldingTests(unittest.TestCase):
         self.assertEqual(runtime.finished_filter, {"stream-done"})
         self.assertEqual(connector.get_finished(set()), (None, None))
 
-    def test_shutdown_drains_streaming_before_native_close(self) -> None:
+    def test_shutdown_drains_streaming_before_cuda_close(self) -> None:
         events: list[str] = []
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(Path(directory), 0)
             connector._streaming_runtime = _FakeStreamingRuntime(events=events)
-            native = mock.Mock()
-            native.close.side_effect = lambda: events.append("native-close")
-            connector._native_adapter = native
+            cuda = mock.Mock()
+            cuda.close.side_effect = lambda: events.append("cuda-close")
+            connector._native_adapter = cuda
 
             connector.shutdown()
 
-        self.assertEqual(events, ["streaming-shutdown", "native-close"])
+        self.assertEqual(events, ["streaming-shutdown", "cuda-close"])
         self.assertIsNone(connector._streaming_runtime)
         self.assertIsNone(connector._native_adapter)
 
@@ -5734,7 +7433,7 @@ class StreamingSnapshotConnectorSeamTests(unittest.TestCase):
                 settings=types.SimpleNamespace(),
             )
             # Finish reporting itself is GPU-free.  Keep the real adapter and
-            # lease registry, while replacing unrelated native-ring progress.
+            # lease registry, while replacing unrelated C++/CUDA-ring progress.
             worker_adapter._bound = True
             worker_adapter._runtime = object()
             worker_adapter._leases = BlockLeaseRegistry(
@@ -5977,6 +7676,7 @@ class DCP2RoundTripTests(unittest.TestCase):
             # A distinct DCP degree must produce a distinct cache identity.
             dcp2_values = {
                 "spark_cache_root": str(Path(directory) / "dcp2"),
+                "spark_cache_model_profile": "glm52-nvfp4",
                 "spark_cache_min_span_tokens": "256",
                 "spark_cache_target_checkpoint_sha256": "a" * 64,
                 "spark_cache_draft_checkpoint_sha256": "b" * 64,
@@ -6033,6 +7733,7 @@ class DCP2RoundTripTests(unittest.TestCase):
         root = Path(directory) / f"rank{tp_rank}"
         values = {
             "spark_cache_root": str(root),
+            "spark_cache_model_profile": "glm52-nvfp4",
             "spark_cache_min_span_tokens": "256",
             "spark_cache_target_checkpoint_sha256": "1" * 64,
             "spark_cache_draft_checkpoint_sha256": "2" * 64,
@@ -6298,6 +7999,7 @@ class DCP2RoundTripTests(unittest.TestCase):
         """Build a scheduler-side connector for DCP2 quorum tests."""
         sched_values = {
             "spark_cache_root": str(Path(directory) / "sched"),
+            "spark_cache_model_profile": "glm52-nvfp4",
             "spark_cache_min_span_tokens": "256",
             "spark_cache_target_checkpoint_sha256": "3" * 64,
             "spark_cache_draft_checkpoint_sha256": "4" * 64,
@@ -6347,6 +8049,7 @@ class DCP2RoundTripTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             values = {
                 "spark_cache_root": str(Path(directory)),
+                "spark_cache_model_profile": "glm52-nvfp4",
                 "spark_cache_min_span_tokens": "256",
                 "spark_cache_target_checkpoint_sha256": "5" * 64,
                 "spark_cache_draft_checkpoint_sha256": "6" * 64,
@@ -6483,7 +8186,7 @@ class DCP4CompatibilityTests(unittest.TestCase):
         """An identity dictionary without ``tp_shard_rank`` hashes to a
         different storage key than an identity with a concrete physical rank.
 
-        The fail-closed condition depends on the wire key set, not merely on
+        The verified-or-miss condition depends on the wire key set, not merely on
         the value assigned to ``tp_shard_rank``.
         """
         import hashlib
@@ -6528,7 +8231,7 @@ class DCP4CompatibilityTests(unittest.TestCase):
                 incomplete_storage_key,
                 canonical_identity.storage_key,
                 "Identities without tp_shard_rank must have a different "
-                "storage_key and fail closed.",
+                "storage_key and be rejected.",
             )
 
 

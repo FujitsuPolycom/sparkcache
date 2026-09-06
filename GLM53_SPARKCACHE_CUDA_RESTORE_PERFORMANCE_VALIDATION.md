@@ -1,10 +1,14 @@
-# GLM-5.3 native restore and shared-prefix validation
+# GLM-5.3 SparkCache CUDA restore and shared-prefix validation
+
+The repository path retains its compatibility filename so existing evidence
+links remain valid. In this record, SparkCache CUDA restore and SparkCache CUDA
+placement are the canonical capability and data-movement terms.
 
 Date: 2026-08-29
 
 ## Status
 
-Native direct restore, verified multi-group recovery, bounded shared GPU-prefix
+SparkCache direct CUDA restore, verified multi-group recovery, bounded shared GPU-prefix
 reuse, C2/C8/C16 completion, shared-trunk C16 completion, and continued
 generation are **qualified** for the exact GLM-5.3 Flash TP4/DCP1 runtime
 identified below.
@@ -31,12 +35,12 @@ qualification requires a receipt produced by the equality validator in
 | vLLM source revision | `local-inference-lab/vllm@da4d7be6c97434f6942292ed8abbf4b32dc44355` |
 | Serving topology | GLM-5.3 Flash, TP4/DCP1, one rank on each of `spark-r0` through `spark-r3` |
 | Scheduler capacity | `--max-num-seqs 32` |
-| Restore concurrency | Two host restore workers and two native placement lanes per rank |
-| Native staging | Two 256 MiB mapped-host arenas per rank |
+| Restore concurrency | Two host restore workers and two SparkCache CUDA placement lanes per rank |
+| SparkCache CUDA staging | Two 256 MiB mapped-host arenas per rank |
 | Persistent prefix | 131,072 tokens and 813,068,464 encoded bytes per rank |
 | Runtime receipt | `evidence/glm53-flash-dflash7-bf16/hotlease-2b86fb9-runtime.json` |
 
-The runtime receipt records one immutable image ID per rank, native library
+The runtime receipt records one immutable image ID per rank, SparkCache CUDA library
 SHA-256 `683cb9e0420da9c68e3263093077fdbcaa400913ff0fb1d18639771213220605`,
 scheduler SHA-256
 `4f8793c4ac4bf356a89c829b6e75b189e6bc4a74c97135208952d0bad1678f15`,
@@ -48,7 +52,7 @@ The direct page-placement implementation is identified by these commits:
 | Responsibility | Revision |
 |---|---|
 | Restore phase timing | `175f9401984a03744d7fe1a985d7c2ef6035f949` |
-| Native hybrid-page placement | `71f367be07788d611698a251fe866d678b0034ae` |
+| SparkCache CUDA page placement | `71f367be07788d611698a251fe866d678b0034ae` |
 | Multi-slab restore and exact-prefix discovery | `8e7f5fc62fd4fffdd661aca9ea634cf130c45d1a` |
 | Direct pipelined slab restore | `94c44930a13df5c668d777e0270e7d8203069d7c` |
 | Authenticated span-table bound | `9dbf73c0caab89b24346567e2769752ac746e114` |
@@ -60,16 +64,56 @@ and parent/runtime image
 The shared-prefix qualification used source revision `2b86fb9d...` and
 source-tree SHA-256 `b3e84d...` identified in the table above.
 
+### Qualified flat-v2 snapshot artifact
+
+The following artifact qualifies only C1 publication, restart, all-rank
+restore, and exact-codeword validation for one 131,072-token flat snapshot.
+
+| Attribute | Value |
+|---|---|
+| SparkCache source revision | `a1511d26a1fe2b17b24561bc52e376bf7f54b06a` |
+| SparkCache source tree | `4d5b8eb8c5c13793ee7a1e67b2b34bd38fcf4ddb` |
+| SparkCache source-tree SHA-256 | `6651f2823c816fac93779cbca54a8f19c0ed262830953149f3a87d189d1f833b` |
+| Flat-v2 header-accounting implementation origin | `229d7d6158261e9510ab99d7e82d532abb9ade01` |
+| Local image ID | `sha256:35b58a7bf414059c65b8f74e4e4b17ee6a81b7008e1bffbc9bd298b5e08c739e` |
+| Parent image ID | `sha256:cc2c0e2f812f4b78d5b91f863aaf46fd8e8e505844245aa50911af1fb8e061c0` |
+| Publication identity | `snapshot-v1` |
+| Root schema | `sparkcache-page-snapshot-manifest/v2` |
+| Persistent prefix | 131,072 tokens and 813,068,464 encoded bytes per rank |
+| Physical objects | 13 authenticated objects per rank, each at most 64 MiB |
+| Serving topology | GLM-5.3 Flash DFlash7, TP4/DCP1, one rank per DGX Spark |
+
+All-rank SparkCache CUDA restore took 1.55--1.70 seconds. Sequential
+macro-object reads and hashing consumed 1.35--1.50 seconds. The exact codeword
+matched before restart and after restoration. This result does not qualify a
+registry artifact, page-delta roots, or concurrent restored roots.
+
+### Rejected four-reader flat-v2 artifact
+
+SparkCache `eabe7fd0c878db7384ef87fe80a1e96b9bedcf67` implements bounded
+four-reader prefetch for flat-v2 objects. ARM64 image
+`sha256:df4e09a32cdbf1c0e69cc7c4c9e95d890d6c7a1e3eaac84f969912a16fd27dd3`
+structurally verified 813,068,464 bytes in 13 objects on every rank. Read and
+authentication took 484.1--528.8 ms, placement took 323.7--330.9 ms, and cache
+service took 1,231.7--1,331.2 ms.
+
+The restored response was `spark`; the deterministic oracle required `red`.
+A one-token-changed prompt of the same length recomputed `red`. Structural
+validation therefore did not establish semantic correctness. The image is
+rejected for deployment and does not replace the qualified single-reader
+artifact. The exact evidence is retained in
+[`flat-v2-four-reader-semantic-rejection-eabe7fd.json`](evidence/glm53-flash-dflash7-bf16/flat-v2-four-reader-semantic-rejection-eabe7fd.json).
+
 ## Implemented restore path
 
-Native restore reads immutable `.spcc` objects directly into alternating
+SparkCache CUDA restore reads immutable `.spcc` objects directly into alternating
 mapped-host arenas with `pread`, hashes every complete file in place, validates
 its authenticated extent table, and submits only validated spans to the CUDA
 page-placement kernel. Read work and CUDA submission overlap across slabs.
 
 This path avoids Python `ContextChunk` reconstruction and an 813 MiB
 intermediate join/copy. The adapter accepts at most 4,096 authenticated spans,
-matching the validated native ABI. These changes do not alter `CacheIdentity`,
+matching the validated SparkCache C++/CUDA ABI. These changes do not alter `CacheIdentity`,
 digest values, 256-token logical geometry, or the on-disk exact-manifest and
 chunk formats.
 
@@ -79,7 +123,7 @@ chunk formats.
 
 Each rank restored 813,068,464 bytes through four slabs:
 
-| Rank | Cache service | Read and hash | Native submit | CUDA finish |
+| Rank | Cache service | Read and hash | SparkCache CUDA submit | CUDA finish |
 |---:|---:|---:|---:|---:|
 | 0 | 141.9 ms | 77.9 ms | 25.4 ms | 3.4 ms |
 | 1 | 131.3 ms | 84.6 ms | 13.4 ms | 3.4 ms |
@@ -87,7 +131,7 @@ Each rank restored 813,068,464 bytes through four slabs:
 | 3 | 250.1 ms | 140.7 ms | 20.1 ms | 3.4 ms |
 
 The Python reconstruction pipeline measured 1.29--1.46 seconds per rank for
-the same stored prefix. Native cache service therefore reduced the slowest-rank
+the same stored prefix. SparkCache CUDA restore therefore reduced the slowest-rank
 time to 250.1 ms. End-to-end client latency was 0.907 seconds, including
 scheduler work, live-token execution, and DFlash generation. A separate
 historical canary found the expected marker suffix, and HTTP health remained
@@ -96,7 +140,7 @@ historical canary found the expected marker suffix, and HTTP health remained
 ### Eight concurrent 16K prefixes
 
 The Python/Torch placement path produced 1.54--1.57 second submission spikes;
-eight clients completed in 9.45--10.64 seconds. Native placement submitted in
+eight clients completed in 9.45--10.64 seconds. SparkCache CUDA placement submitted in
 6--15 ms, and two restore lanes completed eight clients in approximately
 1.2--2.1 seconds. This diagnostic isolates page placement as the dominant
 serialized cost in that workload; it is not a separate deployment

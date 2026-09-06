@@ -52,7 +52,7 @@ print(json.dumps({
             "SPARKCACHE_MAX_SPAN_TOKENS", "524288"
         )),
         "spark_cache_streaming_snapshots": False,
-        "spark_cache_native_restore": False,
+        "spark_cache_cuda_restore": False,
     },
 }, separators=(",", ":")))
 PY

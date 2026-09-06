@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import unittest
 
 from sparkcache.spark_context_cache_hybrid import (
@@ -10,7 +11,9 @@ from sparkcache.spark_context_cache_hybrid import (
     decode_page_snapshot,
     apply_page_delta,
     encode_page_delta,
+    encode_page_delta_from_capture,
     encode_page_snapshot,
+    plan_page_delta,
     plan_page_snapshot,
     split_snapshot,
 )
@@ -35,6 +38,204 @@ def _layout() -> PageLayout:
 
 
 class HybridPageCodecTests(unittest.TestCase):
+    def test_sparse_capture_encodes_the_same_authenticated_page_delta(self) -> None:
+        layout = PageLayout(
+            (
+                PageGroup(
+                    2,
+                    (
+                        PageLayer("attention", "u8", (4,), 4),
+                        PageLayer("value", "u8", (2,), 2),
+                    ),
+                ),
+                PageGroup(
+                    2,
+                    (PageLayer("state", "u8", (3,), 3),),
+                    reuse_policy="recurrent_align",
+                ),
+            )
+        )
+        base = encode_page_snapshot(
+            layout,
+            (2, 2),
+            {
+                "attention": b"A" * 8,
+                "value": b"B" * 4,
+                "state": b"C" * 6,
+            },
+        )
+        result = encode_page_snapshot(
+            layout,
+            (4, 3),
+            {
+                "attention": b"A" * 8 + b"D" * 8,
+                "value": b"B" * 4 + b"E" * 4,
+                "state": b"F" * 6 + b"G" * 3,
+            },
+        )
+        captured = b"D" * 8 + b"E" * 4 + b"F" * 6 + b"G" * 3
+
+        direct = encode_page_delta_from_capture(
+            layout,
+            base,
+            captured,
+            base_block_counts=(2, 2),
+            result_block_counts=(4, 3),
+            reused_pages_by_group=(2, 0),
+            base_boundary_tokens=4,
+            result_boundary_tokens=8,
+        )
+
+        self.assertEqual(
+            direct,
+            encode_page_delta(
+                layout,
+                base,
+                result,
+                base_block_counts=(2, 2),
+                result_block_counts=(4, 3),
+                base_boundary_tokens=4,
+                result_boundary_tokens=8,
+            ),
+        )
+        self.assertEqual(
+            apply_page_delta(
+                layout,
+                base,
+                direct,
+                base_block_counts=(2, 2),
+                result_block_counts=(4, 3),
+                base_boundary_tokens=4,
+                result_boundary_tokens=8,
+            ),
+            result,
+        )
+
+    def test_sparse_capture_accepts_a_bounded_range_reader(self) -> None:
+        layout = PageLayout(
+            (
+                PageGroup(2, (PageLayer("attention", "u8", (4,), 4),)),
+                PageGroup(2, (PageLayer("state", "u8", (3,), 3),)),
+            )
+        )
+        base = encode_page_snapshot(
+            layout,
+            (2, 2),
+            {"attention": b"A" * 8, "state": b"B" * 6},
+        )
+        result = encode_page_snapshot(
+            layout,
+            (3, 3),
+            {"attention": b"A" * 8 + b"C" * 4, "state": b"B" * 6 + b"D" * 3},
+        )
+
+        class CapturedPages:
+            def __init__(self) -> None:
+                self.payload = b"C" * 4 + b"D" * 3
+                self.total_bytes = len(self.payload)
+                self.reads: list[tuple[int, int]] = []
+
+            def read_range(self, start: int, end: int) -> bytes:
+                self.reads.append((start, end))
+                return self.payload[start:end]
+
+        capture = CapturedPages()
+
+        delta = encode_page_delta_from_capture(
+            layout,
+            base,
+            capture,
+            base_block_counts=(2, 2),
+            result_block_counts=(3, 3),
+            reused_pages_by_group=(2, 2),
+            base_boundary_tokens=4,
+            result_boundary_tokens=6,
+        )
+
+        self.assertEqual(capture.reads, [(0, 4), (4, 7)])
+        self.assertEqual(
+            apply_page_delta(
+                layout,
+                base,
+                delta,
+                base_block_counts=(2, 2),
+                result_block_counts=(3, 3),
+                base_boundary_tokens=4,
+                result_boundary_tokens=6,
+            ),
+            result,
+        )
+
+    def test_page_delta_plan_describes_tail_sources_without_reading_the_base(
+        self,
+    ) -> None:
+        layout = PageLayout(
+            (
+                PageGroup(
+                    2,
+                    (
+                        PageLayer("a", "u8", (4,), 4),
+                        PageLayer("b", "u8", (2,), 2),
+                    ),
+                ),
+            )
+        )
+        base = encode_page_snapshot(
+            layout,
+            (2,),
+            {"a": b"A" * 8, "b": b"B" * 4},
+        )
+        result = encode_page_snapshot(
+            layout,
+            (4,),
+            {
+                "a": b"A" * 8 + b"C" * 8,
+                "b": b"B" * 4 + b"D" * 4,
+            },
+        )
+        delta = encode_page_delta(
+            layout,
+            base,
+            result,
+            base_block_counts=(2,),
+            result_block_counts=(4,),
+            base_boundary_tokens=4,
+            result_boundary_tokens=8,
+        )
+
+        plan = plan_page_delta(
+            layout,
+            delta,
+            base_block_counts=(2,),
+            result_block_counts=(4,),
+            base_boundary_tokens=4,
+            result_boundary_tokens=8,
+            total_bytes=len(delta),
+        )
+
+        self.assertEqual(
+            plan.base_snapshot_sha256,
+            hashlib.sha256(base).hexdigest(),
+        )
+        self.assertEqual(
+            plan.result_snapshot_sha256,
+            hashlib.sha256(result).hexdigest(),
+        )
+        self.assertEqual(plan.reused_pages_by_group, (2,))
+        self.assertEqual(
+            [
+                (
+                    tail.layer_name,
+                    tail.group_index,
+                    tail.destination_byte_offset,
+                    tail.source_end - tail.source_start,
+                )
+                for tail in plan.tails
+            ],
+            [("a", 0, 8, 8), ("b", 0, 4, 4)],
+        )
+        self.assertEqual(plan.total_bytes, len(delta))
+
     def test_page_delta_reuses_byte_identical_pages_and_round_trips(self) -> None:
         layout = PageLayout(
             (
@@ -140,14 +341,14 @@ class HybridPageCodecTests(unittest.TestCase):
                 base_boundary_tokens=256,
                 result_boundary_tokens=512,
             )
-        with self.assertRaisesRegex(HybridCodecError, "group geometry"):
+        with self.assertRaisesRegex(HybridCodecError, "boundaries are invalid"):
             encode_page_delta(
                 layout,
                 base,
                 result,
                 base_block_counts=(1, 1),
                 result_block_counts=(2, 2),
-                base_boundary_tokens=257,
+                base_boundary_tokens=512,
                 result_boundary_tokens=512,
             )
 

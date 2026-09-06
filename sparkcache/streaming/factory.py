@@ -1,9 +1,9 @@
-"""Fail-closed model-serving assembly for SparkCache streaming snapshots.
+"""Verified model-serving assembly for SparkCache streaming snapshots.
 
 Importing this module does not import the ctypes binding, allocate CUDA
 memory, inspect cache tensors, or start a writer thread.  The worker adapter
 performs those actions exactly once, after vLLM has registered its final KV
-cache inventory.  The scheduler adapter never imports the native binding.
+cache inventory. The scheduler adapter never imports the C++/CUDA binding.
 """
 
 from __future__ import annotations
@@ -19,9 +19,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Mapping, Sequence
-
-from .native_ring import SnapshotSourceSpec
+from typing import Any, Callable, Sequence
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _LOGGER = logging.getLogger("vllm.spark_context_cache.streaming")
@@ -46,13 +44,6 @@ LEASE_CONTRACT_ENVIRONMENT_KEY = (
 TIMING_CONFIG_KEY = "spark_cache_streaming_timing"
 TIMING_ENVIRONMENT_KEY = "SPARK_CONTEXT_CACHE_STREAMING_TIMING"
 
-MAPPED_HOST_ARENA_MODE = 1
-RING_DEPTH = 2
-SLOT_BYTES = 64 * 1024 * 1024
-MAX_SOURCES = 101
-MAX_ROWS = 1024
-CHUNKS_PER_BATCH = 16
-MAX_SESSIONS = 8
 BACKGROUND_PROGRESS_POLL_SECONDS = 0.005
 
 
@@ -69,11 +60,11 @@ def _deployment_path_is_absolute(path: Path) -> bool:
 
 
 def _set_background_cuda_device(device_ordinal: int) -> None:
-    """Establish CUDA's thread-local device before native event polling."""
+    """Establish CUDA's thread-local device before C++/CUDA event polling."""
 
     import torch
 
-    # CPU-only test environments cannot own a native CUDA ring; injected fake
+    # CPU-only test environments cannot own a C++/CUDA ring; injected fake
     # rings still exercise the thread/lifecycle contract. A CUDA-enabled
     # serving environment exposes this binding, and set_device failures remain
     # sticky/fatal below.
@@ -106,7 +97,7 @@ class ModelServingStreamingSettings:
             or _SHA256_RE.fullmatch(self.native_library_sha256) is None
         ):
             raise RuntimeError(
-                "streaming snapshots require an absolute native library path "
+                "streaming snapshots require an absolute C++/CUDA library path "
                 "and a 64-character lowercase SHA-256"
             )
         for name in ("vllm_root", "lease_contract_path"):
@@ -168,8 +159,8 @@ class SchedulerStreamingSnapshotAdapter:
         self.counters: Counter[str] = Counter()
 
     def observe_metadata(self, metadata: Any) -> None:
-        # A resumed request may be present in both fields. Retire the old
-        # ownership first, then let the current offer establish eligibility.
+        # A resumed request may be present in both fields. Clear ownership from
+        # the completed attempt before the active offer establishes eligibility.
         for request_id in getattr(
             metadata,
             "preempted_request_ids",
@@ -222,147 +213,6 @@ class SchedulerStreamingSnapshotAdapter:
         }
 
 
-@dataclass(frozen=True, slots=True)
-class Glm52SourceInventory:
-    """Exact native descriptors plus row views retained for ring lifetime."""
-
-    sources: tuple[SnapshotSourceSpec, ...]
-    retained_row_views: tuple[Any, ...]
-    device_ordinal: int
-
-
-def _is_contiguous(value: Any) -> bool:
-    check = getattr(value, "is_contiguous", None)
-    return bool(callable(check) and check())
-
-
-def build_glm52_source_inventory(connector: Any) -> Glm52SourceInventory:
-    """Attest the registered GLM layout without allowing reshape copies."""
-
-    plans = tuple(connector._plans or ())
-    tensors: Mapping[str, Any] = connector._layer_tensors
-    if len(plans) != MAX_SOURCES or set(tensors) != {
-        plan.name for plan in plans
-    }:
-        raise RuntimeError(
-            "streaming snapshots require exactly 101 registered GLM cache layers"
-        )
-    grouped = {
-        "target_ckv": tuple(
-            sorted(
-                (plan for plan in plans if plan.record_kind == "target_ckv"),
-                key=lambda plan: plan.name,
-            )
-        ),
-        "sparse_indexer": tuple(
-            sorted(
-                (
-                    plan
-                    for plan in plans
-                    if plan.record_kind == "sparse_indexer"
-                ),
-                key=lambda plan: plan.name,
-            )
-        ),
-    }
-    if any(plan.record_kind not in grouped for plan in plans):
-        raise RuntimeError(
-            "streaming snapshots require colocated MTP with no separate "
-            "draft cache record"
-        )
-    if (
-        len(grouped["target_ckv"]) != 79
-        or {plan.bytes_per_token for plan in grouped["target_ckv"]} != {368}
-        or len(grouped["sparse_indexer"]) != 22
-        or {
-            plan.bytes_per_token
-            for plan in grouped["sparse_indexer"]
-        }
-        != {132}
-    ):
-        raise RuntimeError(
-            "streaming snapshots require 79x368-byte target and "
-            "22x132-byte indexer GLM sources"
-        )
-
-    sources: list[SnapshotSourceSpec] = []
-    retained: list[Any] = []
-    device_ordinal: int | None = None
-    for record_kind, kind_name in enumerate(
-        ("target_ckv", "sparse_indexer")
-    ):
-        for ordinal, plan in enumerate(grouped[kind_name]):
-            tensor = tensors[plan.name]
-            rows = connector._rows_view(tensor)
-            tensor_device = getattr(tensor, "device", None)
-            rows_device = getattr(rows, "device", None)
-            shape = tuple(getattr(rows, "shape", ()))
-            element_size_call = getattr(rows, "element_size", None)
-            stride_call = getattr(rows, "stride", None)
-            tensor_pointer_call = getattr(tensor, "data_ptr", None)
-            rows_pointer_call = getattr(rows, "data_ptr", None)
-            if (
-                getattr(tensor_device, "type", None) != "cuda"
-                or getattr(rows_device, "type", None) != "cuda"
-                or getattr(tensor_device, "index", None)
-                != getattr(rows_device, "index", None)
-                or not _is_contiguous(tensor)
-                or not _is_contiguous(rows)
-                or len(shape) != 2
-                or shape[0] < MAX_ROWS
-                or not callable(element_size_call)
-                or not callable(stride_call)
-                or not callable(tensor_pointer_call)
-                or not callable(rows_pointer_call)
-            ):
-                raise RuntimeError(
-                    f"layer {plan.name} is not a contiguous aliasing row view"
-                )
-            element_size = int(element_size_call())
-            row_width = int(shape[1]) * element_size
-            stride_bytes = int(stride_call(0)) * element_size
-            tensor_pointer = int(tensor_pointer_call())
-            rows_pointer = int(rows_pointer_call())
-            if (
-                element_size <= 0
-                or row_width != plan.bytes_per_token
-                or stride_bytes != row_width
-                or rows_pointer != tensor_pointer
-                or rows_pointer <= 0
-            ):
-                raise RuntimeError(
-                    f"layer {plan.name} is not a contiguous aliasing row view"
-                )
-            index = getattr(rows_device, "index", None)
-            current_device = 0 if index is None else int(index)
-            if device_ordinal is None:
-                device_ordinal = current_device
-            elif current_device != device_ordinal:
-                raise RuntimeError(
-                    "streaming snapshot sources span multiple CUDA devices"
-                )
-            sources.append(
-                SnapshotSourceSpec(
-                    source_base=rows_pointer,
-                    source_rows=int(shape[0]),
-                    source_row_stride_bytes=stride_bytes,
-                    bytes_per_token=plan.bytes_per_token,
-                    record_kind=record_kind,
-                    source_layer_ordinal=ordinal,
-                )
-            )
-            # Retain the actual alias passed to native code. A later Python
-            # collection of a copy-producing reshape must never invalidate
-            # the descriptor behind the ring.
-            retained.append(rows)
-    assert device_ordinal is not None
-    return Glm52SourceInventory(
-        sources=tuple(sources),
-        retained_row_views=tuple(retained),
-        device_ordinal=device_ordinal,
-    )
-
-
 class WorkerStreamingSnapshotAdapter:
     """Connector-facing, lazily bound owner of the live worker pipeline."""
 
@@ -378,6 +228,14 @@ class WorkerStreamingSnapshotAdapter:
         if progress_poll_seconds <= 0:
             raise ValueError("progress_poll_seconds must be positive")
         self._connector = connector
+        from sparkcache.profile_adapters import resolve_streaming_profile_adapter
+
+        profile_name = str(getattr(getattr(connector, "_profile", None), "name", ""))
+        if not profile_name:
+            raise RuntimeError(
+                "streaming snapshots require an explicit model profile"
+            )
+        self._profile_adapter = resolve_streaming_profile_adapter(profile_name)
         self.settings = settings
         self._ring_builder = ring_builder
         self._progress_poll_seconds = float(progress_poll_seconds)
@@ -429,18 +287,8 @@ class WorkerStreamingSnapshotAdapter:
             raise RuntimeError("streaming snapshot adapter is closed")
         if self._bound:
             return
-        if (
-            getattr(self._connector, "_dcp_degree", None) != 4
-            or getattr(self._connector, "_block_size", 0) <= 0
-            or getattr(self._connector, "_identity_base", {}).get(
-                "draft_kv_policy"
-            )
-            != "colocated_target"
-        ):
-            raise RuntimeError(
-                "model-serving streaming snapshots require DCP4 and "
-                "colocated_target MTP state"
-            )
+        adapter = self._profile_adapter
+        adapter.validate_connector(self._connector)
 
         # All imports below are worker-only and occur after vLLM has supplied
         # the final tensor inventory. NativeSnapshotRing.from_attested is the
@@ -448,27 +296,16 @@ class WorkerStreamingSnapshotAdapter:
         from .block_lease import BlockLeaseRegistry, LeaseCapacity
         from .native_ring import NativeRingConfig, NativeSnapshotRing
         from .planner import StreamingSnapshotCoordinator
-        from .publisher import (
-            Glm52ReadyViewTranslator,
-            ManifestSnapshotJournalWriter,
-        )
+        from .publisher import ManifestSnapshotJournalWriter
         from .runtime import (
             StreamingSnapshotRuntime,
             StreamingSnapshotRuntimeConfig,
         )
 
-        inventory = build_glm52_source_inventory(self._connector)
+        inventory = adapter.build_source_inventory(self._connector)
         rank = int(self._connector._worker_rank())
-        if not 0 <= rank < 4:
-            raise RuntimeError("streaming snapshot DCP rank is outside [0, 4)")
-        config = NativeRingConfig(
-            arena_mode=MAPPED_HOST_ARENA_MODE,
-            slot_bytes=SLOT_BYTES,
-            slot_count=RING_DEPTH,
-            max_sources=MAX_SOURCES,
-            max_rows=MAX_ROWS,
-            device_ordinal=inventory.device_ordinal,
-        )
+        adapter.validate_rank(rank)
+        config = adapter.build_ring_config(inventory.device_ordinal)
         builder = self._ring_builder
         if builder is None:
             def build_attested_ring(
@@ -526,7 +363,7 @@ class WorkerStreamingSnapshotAdapter:
                 raise RuntimeError(
                     "connector storage ABI exports are incomplete"
                 )
-            translator = Glm52ReadyViewTranslator.for_ring(
+            translator = adapter.build_translator(
                 ring,
                 dcp_rank=rank,
                 context_chunk_factory=context_chunk_factory,
@@ -540,26 +377,28 @@ class WorkerStreamingSnapshotAdapter:
                     enabled=True,
                     sink=_LOGGER.info,
                 )
+            identity = self._connector._identity(rank)
+            adapter.validate_identity(identity)
             writer = ManifestSnapshotJournalWriter(
                 store=self._connector._store,
-                identity=self._connector._identity(rank),
+                identity=identity,
                 translator=translator,
-                max_pending_batches=RING_DEPTH,
+                max_pending_batches=adapter.ring_depth,
                 timing_trace=timing_trace,
             )
             planner = StreamingSnapshotCoordinator(
                 chunk_tokens=256,
-                chunks_per_batch=CHUNKS_PER_BATCH,
-                max_inflight_batches=RING_DEPTH,
-                max_sessions=MAX_SESSIONS,
+                chunks_per_batch=adapter.chunks_per_batch,
+                max_inflight_batches=adapter.ring_depth,
+                max_sessions=adapter.max_sessions,
             )
             leases = BlockLeaseRegistry(
                 LeaseCapacity(
-                    max_active_leases=RING_DEPTH,
-                    max_leased_blocks=RING_DEPTH
+                    max_active_leases=adapter.ring_depth,
+                    max_leased_blocks=adapter.ring_depth
                     * (
                         (
-                            MAX_ROWS
+                            adapter.max_rows
                             + int(self._connector._block_size)
                             - 1
                         )
@@ -571,7 +410,7 @@ class WorkerStreamingSnapshotAdapter:
                 StreamingSnapshotRuntimeConfig(
                     enabled=True,
                     block_size=int(self._connector._block_size),
-                    dcp_degree=4,
+                    dcp_degree=adapter.dcp_degree,
                     dcp_rank=rank,
                 ),
                 planner=planner,
@@ -600,16 +439,7 @@ class WorkerStreamingSnapshotAdapter:
         self._bound = True
         self._start_background_progress_locked()
         self.counters["bound"] += 1
-        self._emit_status(
-            "bound",
-            dcp_rank=rank,
-            target_sources=79,
-            target_bytes_per_token=368,
-            indexer_sources=22,
-            indexer_bytes_per_token=132,
-            record_mask=0b011,
-            max_rows=MAX_ROWS,
-        )
+        self._emit_status("bound", dcp_rank=rank, **adapter.bound_status())
 
     def offer_completed(
         self,
@@ -769,7 +599,7 @@ class WorkerStreamingSnapshotAdapter:
         ):
             # An abort may retain a claimed writer-owned ring view after its
             # one terminal edge. Emit the later observable ownership boundary
-            # so log-based gates do not mistake a stale abort snapshot for a
+            # so log-based checks do not mistake a stale abort snapshot for a
             # leak after the writer really drains.
             self._emit_status("drained", completed_batches=completed)
         return completed
@@ -1024,7 +854,7 @@ class WorkerStreamingSnapshotAdapter:
             )
             fields.update(
                 visible_after_abort=False,
-                # `leases_after_abort` remains the stable gate field, but its
+                # `leases_after_abort` remains the stable compatibility field, but its
                 # contract is request-scoped. Other concurrently caching
                 # requests may legitimately retain leases.
                 leases_after_abort=request_leases,
@@ -1104,9 +934,9 @@ class WorkerStreamingSnapshotAdapter:
                 and self._progress_thread.is_alive()
             ),
             "background_progress_error": self._background_progress_error,
-            "arena_mode": "mapped_host",
-            "ring_depth": RING_DEPTH,
-            "slot_bytes": SLOT_BYTES,
+            "arena_mode": self._profile_adapter.arena_mode_name,
+            "ring_depth": self._profile_adapter.ring_depth,
+            "slot_bytes": self._profile_adapter.slot_bytes,
             "native_library_sha256": self.settings.native_library_sha256,
             "timing_enabled": self.settings.timing_enabled,
             "active_contexts": (

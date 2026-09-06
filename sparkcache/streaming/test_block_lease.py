@@ -57,7 +57,7 @@ def test_completed_fence_releases_blocks_and_finished_request() -> None:
     assert leases.leased_blocks == 0
 
 
-def test_admission_is_fail_open_at_both_capacity_limits() -> None:
+def test_admission_skips_without_blocking_at_both_capacity_limits() -> None:
     leases = registry(leases=1, blocks=2)
     assert leases.try_reserve("first", [1, 2]) is not None
     assert leases.try_reserve("lease-full", [3]) is None

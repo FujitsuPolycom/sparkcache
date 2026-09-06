@@ -32,7 +32,7 @@ store, full-restart restore, and mixed-request concurrency. The qualification
 does not transfer to a rebuilt image or a changed checkpoint, cache identity,
 parallel topology, or runtime source contract; those artifacts require the
 the checkpoint, topology, runtime-source, store/restart/hit, semantic, and
-concurrency gates against their own immutable identifiers.
+concurrency checks against their own immutable identifiers.
 
 `MULTI_MODEL_LIVE_VALIDATION.md` records the 2026-08-21 qualification of the
 exact EXL3 R7 3.5-bpw profile with SparkCache source tree

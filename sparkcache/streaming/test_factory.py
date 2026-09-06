@@ -18,11 +18,14 @@ from sparkcache.persistent_context_cache.cache_manifest import (
     StateRecord,
 )
 from sparkcache.spark_context_cache_codec import LayerPlan, pack_positions
+from sparkcache.spark_context_cache_profiles import resolve_profile
+from sparkcache.profile_adapters.glm52_streaming import (
+    build_source_inventory as build_glm52_source_inventory,
+)
 from sparkcache.streaming.factory import (
     ModelServingStreamingSettings,
     SchedulerStreamingSnapshotAdapter,
     WorkerStreamingSnapshotAdapter,
-    build_glm52_source_inventory,
     verify_model_serving_lease_contract,
 )
 from sparkcache.streaming.block_lease import BlockLeaseRegistry, LeaseCapacity
@@ -36,6 +39,11 @@ from sparkcache.streaming.timing import (
 # module, exactly as the model-serving adapter resolves the flat connector's
 # canonical storage ABI exports.
 CONNECTOR_ABI_EXPORTS = (ContextChunk, StateRecord, pack_positions)
+_GLM52_PROFILE = resolve_profile("glm52-nvfp4")
+
+
+def _profiled_namespace(**values: object) -> types.SimpleNamespace:
+    return types.SimpleNamespace(_profile=_GLM52_PROFILE, **values)
 
 
 def _commit_receipt(committed_tokens: int = 32768) -> CommitReceipt:
@@ -75,7 +83,7 @@ def test_worker_settings_require_attested_absolute_snapshot_library(
 
     with pytest.raises(
         RuntimeError,
-        match="absolute native library path.*lowercase SHA-256",
+        match=r"absolute C\+\+/CUDA library path.*lowercase SHA-256",
     ):
         ModelServingStreamingSettings.from_connector(_connector())
 
@@ -120,7 +128,7 @@ def test_worker_adapter_construction_is_cuda_and_native_inert(
     touched: list[object] = []
 
     adapter = WorkerStreamingSnapshotAdapter(
-        types.SimpleNamespace(),
+        _profiled_namespace(),
         settings=settings,
         ring_builder=lambda *_args, **_kwargs: touched.append("native"),
     )
@@ -198,6 +206,7 @@ def _glm_inventory_connector(*, noncontiguous: str | None = None):
         tensors[name] = _FakeTensor(rows)
         pointer += 0x10000
     connector = _FakeConnector()
+    connector._profile = _GLM52_PROFILE
     connector._plans = tuple(sorted(plans, key=lambda plan: plan.name))
     connector._layer_tensors = tensors
     connector._rows_view = lambda tensor: tensor.rows
@@ -613,7 +622,7 @@ def test_worker_poll_emits_registered_final_timing_once() -> None:
         def take_committed(self) -> dict[str, CommitReceipt]:
             return {digest: _commit_receipt()}
 
-    connector = types.SimpleNamespace(
+    connector = _profiled_namespace(
         _load_lock=threading.Lock(),
         _held=set(),
         counters={},
@@ -780,7 +789,7 @@ def test_worker_preemption_retires_old_finished_sending_ownership() -> None:
             return {}
 
     adapter = WorkerStreamingSnapshotAdapter(
-        types.SimpleNamespace(),
+        _profiled_namespace(),
         settings=ModelServingStreamingSettings(
             native_library_path=Path("/opt/spark/lib/libspcc_snapshot.so"),
             native_library_sha256="d" * 64,
@@ -861,9 +870,9 @@ class _AbortOnceRuntime:
         return True
 
 
-def test_worker_ignores_later_watermarks_after_fail_open_abort() -> None:
+def test_worker_ignores_later_watermarks_after_publication_abort() -> None:
     adapter = WorkerStreamingSnapshotAdapter(
-        types.SimpleNamespace(),
+        _profiled_namespace(),
         settings=ModelServingStreamingSettings(
             native_library_path=Path("/opt/spark/lib/libspcc_snapshot.so"),
             native_library_sha256="d" * 64,
@@ -890,7 +899,7 @@ def test_worker_ignores_later_watermarks_after_fail_open_abort() -> None:
 
 def test_worker_reports_only_seen_finished_requests_without_active_leases() -> None:
     adapter = WorkerStreamingSnapshotAdapter(
-        types.SimpleNamespace(),
+        _profiled_namespace(),
         settings=ModelServingStreamingSettings(
             native_library_path=Path("/opt/spark/lib/libspcc_snapshot.so"),
             native_library_sha256="d" * 64,
@@ -923,7 +932,7 @@ def test_worker_retains_seen_finished_request_until_lease_completes() -> None:
             self.done = True
 
     adapter = WorkerStreamingSnapshotAdapter(
-        types.SimpleNamespace(),
+        _profiled_namespace(),
         settings=ModelServingStreamingSettings(
             native_library_path=Path("/opt/spark/lib/libspcc_snapshot.so"),
             native_library_sha256="d" * 64,
@@ -988,7 +997,7 @@ def test_four_rank_finished_sending_requires_every_worker_once() -> None:
     fences: list[_Fence | None] = [None]
     for rank in range(4):
         adapter = WorkerStreamingSnapshotAdapter(
-            types.SimpleNamespace(),
+            _profiled_namespace(),
             settings=ModelServingStreamingSettings(
                 native_library_path=Path("/opt/spark/lib/libspcc_snapshot.so"),
                 native_library_sha256="d" * 64,
@@ -1034,7 +1043,7 @@ def test_four_rank_finished_sending_requires_every_worker_once() -> None:
 
 def test_worker_cancels_changed_offer_identity_without_new_submission() -> None:
     adapter = WorkerStreamingSnapshotAdapter(
-        types.SimpleNamespace(),
+        _profiled_namespace(),
         settings=ModelServingStreamingSettings(
             native_library_path=Path("/opt/spark/lib/libspcc_snapshot.so"),
             native_library_sha256="d" * 64,
@@ -1110,7 +1119,7 @@ class _DrainingAbortRuntime:
 def test_worker_emits_drained_after_aborted_writer_releases_final_ticket(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    connector = types.SimpleNamespace(
+    connector = _profiled_namespace(
         _load_lock=threading.Lock(),
         _held=set(),
         counters={},
@@ -1172,7 +1181,7 @@ def test_worker_emits_drained_after_aborted_writer_releases_final_ticket(
 def test_worker_abort_reports_request_leases_separately_from_global_leases(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    connector = types.SimpleNamespace(
+    connector = _profiled_namespace(
         _load_lock=threading.Lock(),
         _held=set(),
         counters={},
@@ -1214,7 +1223,7 @@ def test_worker_abort_reports_request_leases_separately_from_global_leases(
 
 def test_worker_advertises_only_post_manifest_committed_digests() -> None:
     handed_off: dict[str, CommitReceipt] = {}
-    connector = types.SimpleNamespace(
+    connector = _profiled_namespace(
         _load_lock=threading.Lock(),
         _held=set(),
         counters={},
@@ -1262,7 +1271,7 @@ def test_finished_scheduler_generation_retains_context_until_late_commit(
     runtime = _TerminalRuntime()
     runtime._committed = {}
     runtime._aborted = {}
-    connector = types.SimpleNamespace(
+    connector = _profiled_namespace(
         _load_lock=threading.Lock(),
         _held=set(),
         counters={},

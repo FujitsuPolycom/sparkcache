@@ -20,7 +20,7 @@ from sparkcache.streaming.native_ring import (
 
 
 class FakeBackend:
-    """GPU-free ABI double with the native ring's ownership states."""
+    """GPU-free ABI double with the C++/CUDA ring's ownership states."""
 
     def __init__(self) -> None:
         self.calls: list[tuple] = []
@@ -234,7 +234,7 @@ def test_fake_construction_does_not_import_or_load_ctypes_binding(
     monkeypatch.setattr(
         native_ring.importlib,
         "import_module",
-        lambda _name: pytest.fail("native binding imported"),
+        lambda _name: pytest.fail("C++/CUDA binding imported"),
     )
     backend = FakeBackend()
     ring = NativeSnapshotRing(config(), backend=backend)
@@ -515,7 +515,7 @@ def test_unexpected_native_drop_of_active_ticket_is_generation_failure() -> None
     ring.shutdown()
 
 
-def test_every_unexpected_native_status_is_fail_closed() -> None:
+def test_every_unexpected_cpp_cuda_status_stops_the_ring() -> None:
     ring, backend = configured_ring()
     ticket = ring.submit(
         context_sequence=10,

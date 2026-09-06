@@ -27,14 +27,14 @@ whole-file preimage and postimage SHA-256; the contract verifier accepts
 only the recorded states and rejects any other hash.
 
 Deployment notes for this build, established by source analysis and
-recorded here because they gate any live use:
+recorded here because they determine whether live use is supported:
 
 - `kv_load_failure_policy` defaults to `fail` in this build; the connector
   requires `recompute` and refuses to start otherwise.
 - DeepSeek-V4 models with `compress_ratios` use the
   `deepseek-v4-fp8-hma` profile. It persists opaque pages from all five HMA
   block tables, including compressor state, under a topology-hashed cache
-  identity. This profile is qualified for TP2/DCP1 and TP4/DCP1; native
+  identity. This profile is qualified for TP2/DCP1 and TP4/DCP1; SparkCache CUDA
   restore and streaming snapshots remain unsupported for block-page storage.
 - With speculative decoding configured, this build defers connector
   finalization until after the draft model runs. The synchronous store

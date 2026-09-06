@@ -1,23 +1,20 @@
-# Local issue tracker
+# Issue tracker
 
-SparkCache uses local Markdown files for implementation plans, product
-requirements, and issue records because this checkout has no configured Git
-remote.
+SparkCache uses [GitHub
+Issues](https://github.com/FujitsuPolycom/sparkcache/issues) for public defects,
+feature requests, questions, and documentation work.
 
-Store each work item under `.scratch/<feature-slug>/`. Use descriptive slugs
-that identify the affected behavior, such as
-`.scratch/bounded-nvme-eviction/`. A work-item directory may contain:
+An issue should identify the affected behavior, exact revision or artifact,
+reproduction conditions, expected result, observed result, and acceptance
+conditions.
 
-- `README.md` for the issue statement, scope, acceptance conditions, and
-  status;
-- `PRD.md` for product requirements;
-- `plan.md` for an implementation plan;
-- supporting evidence whose purpose and provenance are stated in the file.
+Do not publish credentials, private prompts, sensitive KV-derived data, or a
+security vulnerability in an issue. Follow [`../../SECURITY.md`](../../SECURITY.md)
+for private vulnerability reporting.
 
-Repository prose rules in `AGENTS.md` and `CLAUDE.md` apply to every work-item
-file. Records must describe the desired or resulting behavior directly and
-must not depend on conversation history.
+Temporary local investigation notes may live under an ignored `.scratch/`
+directory. They are not the public issue tracker and should not be referenced
+by repository documentation or pull requests.
 
-If a Git remote and hosted issue tracker are configured, update this document
-before creating hosted issues. Local Markdown remains authoritative until the
-repository documents a different tracker.
+Repository prose rules in `AGENTS.md` and `CLAUDE.md` apply to issue and pull
+request text.

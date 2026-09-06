@@ -1,6 +1,6 @@
-"""Strict ctypes binding for the native SparkCache placement ABI.
+"""Strict ctypes binding for the SparkCache CUDA placement ABI.
 
-This module is intentionally dependency-free. The full-artifact gate may use
+This module is intentionally dependency-free. The full-artifact check may use
 ``arena_memoryview`` with ``os.preadv`` to fill cudaHostAllocMapped memory
 without creating an intermediate Python ``bytes`` object.
 """
@@ -436,6 +436,9 @@ def pread_exact(fd: int, target: memoryview, offset: int = 0) -> None:
         consumed += count
 
 
+CudaPlacementError = NativePlacementError
+
+
 __all__ = [
     "ABI_VERSION",
     "ARENA_COUNT",
@@ -446,6 +449,7 @@ __all__ = [
     "AbiInfo",
     "ArenaView",
     "ChunkDescriptor",
+    "CudaPlacementError",
     "DestinationDescriptor",
     "NativePlacementError",
     "PlacementConfig",

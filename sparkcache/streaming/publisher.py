@@ -1,6 +1,6 @@
 """Bounded READY-view translation and manifest-last publication.
 
-This module is intentionally not wired into the connector feature gate. The
+This module is intentionally not wired into the connector opt-in check. The
 runtime exclusively owns ring tickets and lends each claimed, immutable view
 to this writer. Canonical chunk bytes are copied one chunk at a time, durable
 append completes, and the returned completion then permits the runtime to
@@ -12,9 +12,8 @@ from __future__ import annotations
 
 import concurrent.futures
 import threading
-from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Iterator, Protocol, Sequence
+from typing import Any, Callable, Iterator, Protocol
 
 from sparkcache.persistent_context_cache.cache_manifest import (
     CacheIdentity,
@@ -22,62 +21,11 @@ from sparkcache.persistent_context_cache.cache_manifest import (
     ContextChunk,
     ManifestStore,
     ManifestTransaction,
-    StateRecord,
 )
-from sparkcache.spark_context_cache_codec import CHUNK_TOKENS, pack_positions
+from sparkcache.spark_context_cache_codec import CHUNK_TOKENS
 
-from .native_ring import NativeSnapshotRing, SnapshotSourceSpec, SnapshotView
+from .native_ring import SnapshotView
 from .planner import SnapshotBatch
-
-
-GLM52_ARENA_MODE_MAPPED_HOST = 1
-GLM52_RING_DEPTH = 2
-GLM52_SLOT_BYTES = 64 * 1024 * 1024
-GLM52_MACRO_ROWS = 1024
-GLM52_DCP_DEGREE = 4
-GLM52_ROWS_PER_CHUNK = CHUNK_TOKENS // GLM52_DCP_DEGREE
-GLM52_TARGET_LAYERS = 79
-GLM52_TARGET_BYTES_PER_TOKEN = 368
-GLM52_INDEXER_LAYERS = 22
-GLM52_INDEXER_BYTES_PER_TOKEN = 132
-GLM52_SOURCE_COUNT = GLM52_TARGET_LAYERS + GLM52_INDEXER_LAYERS
-GLM52_MACRO_PAYLOAD_BYTES = GLM52_MACRO_ROWS * (
-    GLM52_TARGET_LAYERS * GLM52_TARGET_BYTES_PER_TOKEN
-    + GLM52_INDEXER_LAYERS * GLM52_INDEXER_BYTES_PER_TOKEN
-)
-
-_TARGET_KIND = 0
-_INDEXER_KIND = 1
-
-
-@dataclass(frozen=True, slots=True)
-class Glm52LayerOrder:
-    name: str
-    record_kind: int
-    source_ordinal: int
-    bytes_per_token: int
-
-
-# Frozen native and canonical order. The 79 target sources include colocated
-# MTP state; there is deliberately no separate native or persisted MTP record.
-GLM52_LAYER_ORDER = tuple(
-    Glm52LayerOrder(
-        name=f"model.layers.{ordinal:02d}.mla",
-        record_kind=_TARGET_KIND,
-        source_ordinal=ordinal,
-        bytes_per_token=GLM52_TARGET_BYTES_PER_TOKEN,
-    )
-    for ordinal in range(GLM52_TARGET_LAYERS)
-) + tuple(
-    Glm52LayerOrder(
-        name=f"model.layers.{ordinal:02d}.indexer",
-        record_kind=_INDEXER_KIND,
-        source_ordinal=ordinal,
-        bytes_per_token=GLM52_INDEXER_BYTES_PER_TOKEN,
-    )
-    for ordinal in range(GLM52_INDEXER_LAYERS)
-)
-
 
 class SnapshotTranslationError(ValueError):
     """A claimed READY view cannot represent canonical SparkCache chunks."""
@@ -100,174 +48,6 @@ class ReadyViewTranslator(Protocol):
     def batch_logical_tokens(self, view: SnapshotView) -> int: ...
 
     def iter_chunks(self, view: SnapshotView) -> Iterator[ContextChunk]: ...
-
-
-class Glm52ReadyViewTranslator:
-    """Translate the proven DCP4 GLM-5.2 ring layout one chunk at a time."""
-
-    def __init__(
-        self,
-        sources: Sequence[SnapshotSourceSpec],
-        *,
-        dcp_rank: int,
-        context_chunk_factory: Callable[..., ContextChunk] = ContextChunk,
-        state_record_type: type[StateRecord] = StateRecord,
-        pack_positions_function: Callable[[Sequence[int]], bytes] = pack_positions,
-    ) -> None:
-        if not 0 <= dcp_rank < GLM52_DCP_DEGREE:
-            raise ValueError("dcp_rank must be in [0, 4)")
-        self.dcp_degree = GLM52_DCP_DEGREE
-        self.dcp_rank = dcp_rank
-        self._sources = tuple(sources)
-        self._context_chunk_factory = context_chunk_factory
-        self._state_record_type = state_record_type
-        self._pack_positions = pack_positions_function
-        self._validate_source_order()
-
-    @classmethod
-    def for_ring(
-        cls,
-        ring: NativeSnapshotRing,
-        *,
-        dcp_rank: int,
-        context_chunk_factory: Callable[..., ContextChunk] = ContextChunk,
-        state_record_type: type[StateRecord] = StateRecord,
-        pack_positions_function: Callable[[Sequence[int]], bytes] = pack_positions,
-    ) -> "Glm52ReadyViewTranslator":
-        config = ring.config
-        if (
-            config.arena_mode != GLM52_ARENA_MODE_MAPPED_HOST
-            or config.slot_count != GLM52_RING_DEPTH
-            or config.slot_bytes != GLM52_SLOT_BYTES
-            or config.max_sources < GLM52_SOURCE_COUNT
-            or config.max_rows < GLM52_MACRO_ROWS
-        ):
-            raise SnapshotTranslationError(
-                "ring config is not the proven mapped/depth-2/64-MiB GLM profile"
-            )
-        sources = ring.configured_sources
-        if sources is None:
-            raise SnapshotTranslationError(
-                "ring source inventory must be configured before translation"
-            )
-        return cls(
-            sources,
-            dcp_rank=dcp_rank,
-            context_chunk_factory=context_chunk_factory,
-            state_record_type=state_record_type,
-            pack_positions_function=pack_positions_function,
-        )
-
-    def batch_logical_tokens(self, view: SnapshotView) -> int:
-        rows = view.ticket.row_count
-        if rows <= 0 or rows % GLM52_ROWS_PER_CHUNK:
-            raise SnapshotTranslationError(
-                "READY row count must cover complete 256-token chunks"
-            )
-        return rows * self.dcp_degree
-
-    def iter_chunks(self, view: SnapshotView) -> Iterator[ContextChunk]:
-        logical_tokens = self.batch_logical_tokens(view)
-        logical_start = view.ticket.logical_start
-        if logical_start % CHUNK_TOKENS:
-            raise SnapshotTranslationError(
-                "READY logical_start must be 256-token aligned"
-            )
-        logical_end = logical_start + logical_tokens
-        if logical_end > 0x100000000:
-            raise SnapshotTranslationError(
-                "logical positions exceed the uint32 storage ABI"
-            )
-
-        rows = view.ticket.row_count
-        expected_target = rows * GLM52_TARGET_LAYERS * GLM52_TARGET_BYTES_PER_TOKEN
-        expected_indexer = rows * GLM52_INDEXER_LAYERS * GLM52_INDEXER_BYTES_PER_TOKEN
-        if (
-            view.record_mask != 0b011
-            or view.record_lengths[_TARGET_KIND] != expected_target
-            or view.record_lengths[_INDEXER_KIND] != expected_indexer
-            or view.record_lengths[2:] != (0, 0)
-        ):
-            raise SnapshotTranslationError(
-                "READY records do not match the colocated-MTP GLM layout"
-            )
-
-        for batch_row_start in range(0, rows, GLM52_ROWS_PER_CHUNK):
-            chunk_start = logical_start + batch_row_start * self.dcp_degree
-            chunk_end = chunk_start + CHUNK_TOKENS
-            positions = tuple(
-                range(
-                    chunk_start + self.dcp_rank,
-                    chunk_end,
-                    self.dcp_degree,
-                )
-            )
-            state_record = self._state_record_type
-            records = {
-                state_record.LOGICAL_POSITIONS: self._pack_positions(positions),
-                state_record.TARGET_CKV: self._copy_chunk_record(
-                    view,
-                    record_kind=_TARGET_KIND,
-                    layer_count=GLM52_TARGET_LAYERS,
-                    width=GLM52_TARGET_BYTES_PER_TOKEN,
-                    batch_rows=rows,
-                    batch_row_start=batch_row_start,
-                ),
-                state_record.SPARSE_INDEXER: self._copy_chunk_record(
-                    view,
-                    record_kind=_INDEXER_KIND,
-                    layer_count=GLM52_INDEXER_LAYERS,
-                    width=GLM52_INDEXER_BYTES_PER_TOKEN,
-                    batch_rows=rows,
-                    batch_row_start=batch_row_start,
-                ),
-            }
-            yield self._context_chunk_factory(
-                logical_start=chunk_start,
-                logical_end=chunk_end,
-                records=records,
-            )
-
-    def _validate_source_order(self) -> None:
-        if len(self._sources) != len(GLM52_LAYER_ORDER):
-            raise SnapshotTranslationError(
-                "GLM source inventory must contain 79 target and 22 indexer layers"
-            )
-        for source, expected in zip(self._sources, GLM52_LAYER_ORDER, strict=True):
-            if (
-                source.record_kind != expected.record_kind
-                or source.source_layer_ordinal != expected.source_ordinal
-                or source.bytes_per_token != expected.bytes_per_token
-            ):
-                raise SnapshotTranslationError(
-                    f"source inventory disagrees at {expected.name}"
-                )
-
-    @staticmethod
-    def _copy_chunk_record(
-        view: SnapshotView,
-        *,
-        record_kind: int,
-        layer_count: int,
-        width: int,
-        batch_rows: int,
-        batch_row_start: int,
-    ) -> bytes:
-        record = view.record(record_kind)
-        layer_bytes = batch_rows * width
-        chunk_layer_bytes = GLM52_ROWS_PER_CHUNK * width
-        parts: list[memoryview] = []
-        try:
-            for layer in range(layer_count):
-                start = layer * layer_bytes + batch_row_start * width
-                parts.append(record[start : start + chunk_layer_bytes])
-            # This is the one required ownership transition: ContextChunk's
-            # immutable bytes are copied while the ring ticket is WRITING.
-            return b"".join(parts)
-        finally:
-            for part in parts:
-                part.release()
-            record.release()
 
 
 class ManifestWriterCompletion:
@@ -327,21 +107,17 @@ class ManifestSnapshotJournalWriter:
         store: ManifestStore,
         identity: CacheIdentity,
         translator: ReadyViewTranslator,
-        max_pending_batches: int = GLM52_RING_DEPTH,
+        max_pending_batches: int = 2,
         timing_trace: Any | None = None,
     ) -> None:
-        if not 1 <= max_pending_batches <= GLM52_RING_DEPTH:
-            raise ValueError("max_pending_batches must be one or two")
+        if max_pending_batches <= 0:
+            raise ValueError("max_pending_batches must be positive")
         if (
             identity.chunk_tokens != CHUNK_TOKENS
-            or identity.dcp_degree != GLM52_DCP_DEGREE
             or not 0 <= identity.dcp_shard_rank < identity.dcp_degree
-            or identity.boundary_hidden_policy != "live_forward"
-            or identity.draft_kv_policy != "colocated_target"
         ):
             raise ValueError(
-                "writer requires DCP4, 256-token chunks, live boundary "
-                "state, and colocated MTP"
+                "writer requires 256-token chunks and a valid DCP shard rank"
             )
         if (
             translator.dcp_degree != identity.dcp_degree

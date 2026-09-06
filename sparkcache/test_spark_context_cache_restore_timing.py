@@ -20,6 +20,7 @@ class RestoreTimingTests(unittest.TestCase):
         )
         timing.start_service(2_000_000)
         timing.add("manifest_lookup", 3_000_000)
+        timing.add("prior_cuda_work", 2_000_000)
         timing.add("restore_read", 4_000_000)
         timing.add("reassembly_decode", 5_000_000)
         timing.add("h2d_submit", 6_000_000)
@@ -44,11 +45,21 @@ class RestoreTimingTests(unittest.TestCase):
             set(record["phase_ms"]),
             {
                 "manifest_lookup",
+                "prior_cuda_work",
                 "restore_read",
                 "reassembly_decode",
                 "h2d_submit",
                 "cuda_sync",
             },
+        )
+        self.assertEqual(
+            timing.operator_lines(),
+            (
+                "sparkcache: restore tokens=16384 total=29.0ms"
+                " rate=565K tok/s bytes=0.1MiB",
+                "sparkcache: phases read=4.0ms place=6.0ms"
+                " sync=7.0ms queue=1.0ms",
+            ),
         )
 
     def test_unknown_or_duplicate_phase_is_rejected(self) -> None:

@@ -1,4 +1,4 @@
-"""Copy one SparkCache entry and prove chunk corruption fails closed."""
+"""Copy one SparkCache entry and prove chunk corruption is rejected."""
 
 from __future__ import annotations
 
@@ -81,7 +81,7 @@ def run(source_root: Path, test_root: Path) -> dict[str, Any]:
 
     corrupted = store.lookup(identity, context_digest, verify_chunks=True)
     if corrupted.is_hit or corrupted.reason != "corrupt":
-        raise RuntimeError("damaged entry did not fail closed as corrupt")
+        raise RuntimeError("damaged entry was not rejected as corrupt")
     invalidated = store.invalidate(
         identity,
         context_digest,

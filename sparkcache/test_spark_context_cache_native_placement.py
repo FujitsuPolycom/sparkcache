@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from sparkcache.spark_context_cache_codec import LayerPlan
+from sparkcache.spark_context_cache_hybrid import PageGroup, PageLayer, PageLayout
 from sparkcache.spark_context_cache_native_placement import (
     ArenaMode,
     NativePlacementAdapter,
@@ -16,6 +17,7 @@ from sparkcache.spark_context_cache_native_placement import (
     NativePlacementLibrary,
     RestoreState,
     build_destination_descriptors,
+    build_page_destination_descriptors,
 )
 import sparkcache.spark_cache_native as native
 
@@ -82,7 +84,7 @@ class MockLibrary:
 
     @staticmethod
     def _copy_error(_placement, output, capacity):
-        message = b"mock native failure\0"
+        message = b"mock C++/CUDA failure\0"
         ctypes.memmove(output, message, min(len(message), capacity))
         return 0
 
@@ -120,7 +122,7 @@ class FakeTensor:
 
 def _attested_mock(tmp_path: Path, mock: MockLibrary | None = None):
     artifact = tmp_path / "libspark_cache_placement.so"
-    artifact.write_bytes(b"native-test-artifact")
+    artifact.write_bytes(b"cuda-test-artifact")
     digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
     loaded = mock or MockLibrary()
     library = NativePlacementLibrary.load(
@@ -173,7 +175,7 @@ def test_hash_mismatch_refuses_to_load_before_cdll(tmp_path):
 
 def test_canonical_binding_rejection_fails_closed(tmp_path):
     artifact = tmp_path / "placement.so"
-    artifact.write_bytes(b"native-test-artifact")
+    artifact.write_bytes(b"cuda-test-artifact")
     digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
 
     def reject(_path):
@@ -251,6 +253,43 @@ def test_destination_descriptor_requires_exact_registered_tensor_set():
         )
 
 
+def test_page_destination_uses_grouped_manager_page_geometry():
+    layout = PageLayout(
+        (
+            PageGroup(
+                block_size=2304,
+                layers=(
+                    PageLayer(
+                        name="full",
+                        dtype="torch.uint8",
+                        page_shape=(9, 1, 4),
+                        bytes_per_page=36,
+                    ),
+                ),
+                reuse_policy="full",
+            ),
+        )
+    )
+    descriptors = build_page_destination_descriptors(
+        layout,
+        {
+            "full": FakeTensor(
+                pointer=0x4000,
+                shape=(8, 9, 1, 4),
+                strides=(36, 4, 4, 1),
+                element_size=1,
+            )
+        },
+    )
+
+    assert len(descriptors) == 1
+    descriptor = descriptors[0]
+    assert descriptor.destination_base == 0x4000
+    assert descriptor.destination_pages == 8
+    assert descriptor.destination_page_stride_bytes == 36
+    assert descriptor.bytes_per_page == 36
+
+
 def test_request_stays_parked_until_native_finish_succeeds(tmp_path):
     adapter, mock = _configured_adapter(tmp_path)
 
@@ -278,7 +317,10 @@ def test_native_finish_failure_aborts_and_never_releases_parked_request(tmp_path
     adapter, loaded = _configured_adapter(tmp_path, mock)
     restore = adapter.begin_parked_restore("request-8", (2, 4))
 
-    with pytest.raises(NativePlacementCallError, match="finish restore"):
+    with pytest.raises(
+        NativePlacementCallError,
+        match="SparkCache CUDA placement did not complete finish restore",
+    ):
         restore.finish()
 
     assert restore.state is RestoreState.ABORTED

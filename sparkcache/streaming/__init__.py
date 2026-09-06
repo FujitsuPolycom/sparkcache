@@ -28,7 +28,6 @@ from .native_ring import (
     SnapshotView,
 )
 from .publisher import (
-    Glm52ReadyViewTranslator,
     JournalState,
     ManifestSnapshotJournalTransaction,
     ManifestSnapshotJournalWriter,
@@ -59,7 +58,6 @@ __all__ = [
     "SnapshotSourceSpec",
     "SnapshotTicket",
     "SnapshotView",
-    "Glm52ReadyViewTranslator",
     "JournalState",
     "ManifestSnapshotJournalTransaction",
     "ManifestSnapshotJournalWriter",
