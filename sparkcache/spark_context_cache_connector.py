@@ -3350,6 +3350,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         """Keep scans and survivor reconciliation within the maintenance activity gauge."""
         try:
             with self._store_cv:
+                held_snapshot = (self._held, self._held.revision, set(self._held))
                 protected = tuple(
                     key
                     for result_digest, base in getattr(self, "_publication_base_pins", {}).items()
@@ -3413,53 +3414,17 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self.counters["prefix_alias_segments_deleted"] += int(
             getattr(report, "segments_deleted", 0)
         )
-        if report.evicted_entries:
+        if report.surviving_entries is None:
+            # A report without an inventory cannot authorize withdrawals.
+            self._reconcile_held_capacity()
+        elif held_snapshot[2]:
             identity = self._identity(self._worker_rank())
-            withdrawn = set()
-            candidates: dict[str, set[str]] = {}
-            for entry in report.evicted_entries:
-                if entry.storage_key != identity.storage_key:
-                    continue
-                candidates.setdefault(entry.context_digest, set()).add(
-                    getattr(entry, "root_kind", "manifest")
-                )
-            for digest, evicted_roots in candidates.items():
-                exact_exists = (
-                    "manifest" not in evicted_roots
-                    and (
-                        Path(self._root)
-                        / "manifests"
-                        / identity.storage_key
-                        / f"{digest}.json"
-                    ).exists()
-                )
-                alias_exists = (
-                    self._storage_mode == "per_token_rows"
-                    and "prefix_alias" not in evicted_roots
-                    and (
-                        Path(self._root)
-                        / "prefix-aliases"
-                        / identity.storage_key
-                        / f"{digest}.json"
-                    ).exists()
-                )
-                if not exact_exists and not alias_exists:
-                    withdrawn.add(digest)
-                    continue
-                lookup, _is_alias = self._lookup_reusable(
-                    identity,
-                    digest,
-                    verify_chunks=False,
-                    verify_chunk_metadata=True,
-                )
-                if not lookup.is_hit:
-                    withdrawn.add(digest)
-            with self._store_cv:
-                self._held.difference_update(withdrawn)
-        # One digest can name both an exact manifest and its source-boundary
-        # alias. The targeted checks above retain the offer when either root
-        # remains; this complete pass also catches entries removed as debris.
-        self._reconcile_held_capacity()
+            surviving = {
+                entry.context_digest for entry in report.surviving_entries
+                if entry.storage_key == identity.storage_key
+                and (entry.root_kind == "manifest" or self._storage_mode == "per_token_rows")
+            }
+            self._apply_held_capacity_survivors(held_snapshot, surviving)
         if (not report.capacity_satisfied or report.work_pending) and wake_worker_on_unsatisfied:
             self._capacity_wakeup.set()
         if force or report.bytes_reclaimed:
@@ -3772,15 +3737,32 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self.counters["streaming_store_evicted"] += len(evicted)
             return True
 
+    def _apply_held_capacity_survivors(
+        self,
+        snapshot: tuple[HeldInventory, int, set[str]],
+        surviving: set[str],
+    ) -> None:
+        inventory, revision, held = snapshot
+        with self._store_cv:
+            if self._held is not inventory or self._held.revision != revision:
+                # A digest can be withdrawn and republished during a probe.
+                # An earlier inventory cannot revoke that publication; a
+                # stable pass reconciles it, and restores still verify bytes.
+                self.counters["capacity_stale_inventory_snapshots"] = (
+                    self.counters.get("capacity_stale_inventory_snapshots", 0) + 1
+                )
+                return
+            self._held.difference_update(held - surviving)
+
     def _reconcile_held_capacity(self) -> None:
-        if not self._held:
+        with self._store_cv:
+            snapshot = (self._held, self._held.revision, set(self._held))
+        if not snapshot[2]:
             return
         rank = self._worker_rank()
         identity = self._identity(rank)
-        with self._store_cv:
-            held = set(self._held)
         surviving = set()
-        for digest in held:
+        for digest in snapshot[2]:
             lookup, _is_alias = self._lookup_reusable(
                 identity,
                 digest,
@@ -3789,8 +3771,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             )
             if lookup.is_hit:
                 surviving.add(digest)
-        with self._store_cv:
-            self._held.intersection_update(surviving)
+        self._apply_held_capacity_survivors(snapshot, surviving)
 
     def _ensure_capacity_thread(self) -> None:
         if self._capacity_thread is not None:
@@ -6551,6 +6532,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 ],
                 maintenance_retries=self.counters["capacity_retries"],
                 maintenance_deletion_attempts=self.counters.get("capacity_deletion_attempts", 0),
+                maintenance_stale_inventory_snapshots=self.counters.get("capacity_stale_inventory_snapshots", 0),
                 maintenance_budget_exhausted=self.counters.get("capacity_budget_exhausted", 0),
                 maintenance_skipped_cooldown=self.counters.get("capacity_skipped_cooldown", 0),
             )

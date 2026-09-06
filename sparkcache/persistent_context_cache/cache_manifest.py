@@ -482,6 +482,9 @@ class MaintenanceReport:
     aliases_evicted: int = 0
     segments_deleted: int = 0
     orphan_segments_deleted: int = 0
+    # Metadata-qualified offers at the end of the exclusive inventory pass.
+    # None means no authoritative inventory was completed, not an empty cache.
+    surviving_entries: tuple[EntryKey, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -2508,14 +2511,17 @@ class ManifestStore:
                 else ()
             )
             chunk_sizes: dict[Path, int] = {}
+            chunk_logical_sizes: dict[str, int] = {}
             canonical_chunks: dict[str, Path] = {}
             for path in chunk_paths:
                 try:
-                    chunk_sizes[path] = _allocated_bytes(path.stat())
+                    metadata = path.stat()
+                    chunk_sizes[path] = _allocated_bytes(metadata)
                 except FileNotFoundError:
                     continue
                 if path.suffix == ".spcc" and _DIGEST.fullmatch(path.stem):
                     canonical_chunks[path.stem] = path
+                    chunk_logical_sizes[path.stem] = metadata.st_size
 
             references: Counter[str] = Counter()
             segment_references: Counter[tuple[str, str]] = Counter()
@@ -2746,6 +2752,21 @@ class ManifestStore:
             aliases_removed = sum(
                 entry.key.root_kind == "prefix_alias" for entry in removed
             )
+            remaining_entries = [entry for entry in entries if entry.path not in removed_paths]
+            # Exact roots shadow aliases even when corrupt or when an unlink
+            # failed. Match lookup's exact-first policy without re-reading roots.
+            exact_keys = {
+                (entry.key.storage_key, entry.key.context_digest)
+                for entry in remaining_entries if entry.key.root_kind == "manifest"
+            }
+            surviving_entries = tuple(
+                entry.key for entry in remaining_entries
+                if entry.valid
+                and (entry.key.root_kind == "manifest"
+                     or (entry.key.storage_key, entry.key.context_digest) not in exact_keys)
+                and all(chunk_logical_sizes.get(digest) == size
+                        for digest, size in entry.chunks)
+            )
             return MaintenanceReport(
                 bytes_before=bytes_before,
                 bytes_after=bytes_after,
@@ -2762,6 +2783,7 @@ class ManifestStore:
                 aliases_evicted=aliases_removed,
                 segments_deleted=segments_deleted,
                 orphan_segments_deleted=orphan_segments_deleted,
+                surviving_entries=surviving_entries,
             )
         finally:
             self._maintenance_not_before = (

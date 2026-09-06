@@ -347,6 +347,35 @@ removal, and protected publication roots retain their complete object graphs.
 This is **not a scan-size or wall-clock bound**. Each admitted pass authenticates
 the complete reference inventory and reconciles survivors.
 
+Status: **implemented**. A completed pass also returns metadata-qualified
+surviving roots while the exclusive filesystem guard is held.
+
+The connector
+uses this inventory to reconcile offers without rereading every root or
+restatting shared chunks once per reference.
+
+Qualification checks logical
+file sizes, not allocated disk space. Exact roots shadow aliases even when
+invalid; aliases are eligible only for token-row storage.
+
+Protected roots and
+their referenced objects retain the same deletion rules.
+
+The inventory is not retained between passes. Failed or busy passes use
+independent metadata probes.
+
+If the offered-digest inventory changes during a
+pass or probe, reconciliation defers withdrawals to a stable pass, preserving
+concurrent publication of the same digest.
+
+The connector counter
+`capacity_stale_inventory_snapshots` and worker capacity-report field
+`maintenance_stale_inventory_snapshots` count these deferrals.
+
+Restore still
+authenticates payload bytes; metadata qualification cannot establish their
+integrity or turn an invalid restore into a hit.
+
 One filesystem
 operation or durability barrier can take arbitrarily long. Smaller deletion
 budgets can increase total scan work.
