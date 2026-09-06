@@ -6,16 +6,21 @@ repository assembles the model runtime, transport, image, and operator settings.
 
 ## Run the model
 
-Use the
-[four-node SparkRing quickstart](https://github.com/FujitsuPolycom/sparkring/blob/main/docs/GLM53_JJ_R8_GB10_SPARKCACHE_TP4_QUICKSTART.md).
-It uses one Linux/ARM64 image for TP4 with DCP1, DCP2, or DCP4 and documents
-both modes:
+Choose the guide matching the speculative runtime:
+
+- [Native MTP3 with caching and recurrent checkpoints](https://github.com/FujitsuPolycom/sparkring/blob/main/docs/GLM53_MTP3_CACHE_CHECKPOINTS_QUICKSTART.md)
+  uses four Sparks at TP4/DCP4, with no external draft model. Its
+  [implementation and issue status](MTP3_STATUS.md) separates merged code,
+  published images, live evidence, and remaining work for issues #60 and #61.
+- [DFlash2 with SparkCache](https://github.com/FujitsuPolycom/sparkring/blob/main/docs/GLM53_JJ_R8_GB10_SPARKCACHE_TP4_QUICKSTART.md)
+  uses a Linux/ARM64 image for TP4 with DCP1, DCP2, or DCP4 and documents
+  both modes below.
 
 - `SPARKCACHE_ENABLED=1` enables persistent SparkCache alongside vLLM's GPU
   prefix cache.
 - `SPARKCACHE_ENABLED=0` runs with vLLM's GPU prefix cache alone.
 
-The quickstart is the source of truth for the image digest, model revisions,
+The selected quickstart is the source of truth for the image digest, model revisions,
 launch variables, storage paths, and four-host procedure. Keeping those values
 in SparkRing prevents a copied deployment recipe here from becoming stale.
 
@@ -39,7 +44,7 @@ topology, launch settings, and cache namespace supplied by the deployment.
 
 GLM-5.3 execution and GB10 performance depend primarily on Local Inference
 Lab's [Jovian Judgement vLLM work](https://github.com/local-inference-lab/vllm/tree/dev/jovian-judgement)
-and [B12X kernels](https://github.com/local-inference-lab/b12x). The SparkRing
+and [B12X kernels](https://github.com/local-inference-lab/b12x). The DFlash2 SparkRing
 quickstart identifies the exact revisions and model artifacts, including
 [GLM-5.3-Flash-NVFP4](https://huggingface.co/local-inference-lab/GLM-5.3-Flash-NVFP4)
 and the BF16
