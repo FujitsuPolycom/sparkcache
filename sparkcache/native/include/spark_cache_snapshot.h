@@ -26,7 +26,7 @@ extern "C" {
  * serving; restored state must be verified or recomputed.
  */
 #define SPARK_CACHE_SNAPSHOT_ABI_VERSION 1u
-#define SPARK_CACHE_SNAPSHOT_MIN_SLOTS 2u
+#define SPARK_CACHE_SNAPSHOT_MIN_SLOTS 1u
 #define SPARK_CACHE_SNAPSHOT_MAX_SLOTS 3u
 #define SPARK_CACHE_SNAPSHOT_MAX_RECORD_KINDS 4u
 

@@ -77,7 +77,7 @@ engines, unified-memory bandwidth, host memory, and CPU encoding remain shared
 resources and require live measurement.
 
 Mapped host arenas are pinned and receive the gather kernel's output. The
-connector requires an explicit slot size and allocates two or three slots. It
+connector requires an explicit slot size and allocates one, two, or three slots. It
 does not wait for free space; saturation skips publication.
 
 The exact source contract

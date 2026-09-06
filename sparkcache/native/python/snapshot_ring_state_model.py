@@ -28,8 +28,8 @@ class SnapshotRing:
     would_block: int = 0
 
     def __post_init__(self) -> None:
-        if self.slot_count not in (2, 3):
-            raise ValueError("snapshot ring requires two or three slots")
+        if type(self.slot_count) is not int or self.slot_count not in (1, 2, 3):
+            raise ValueError("snapshot ring requires one, two, or three slots")
         self.slots = [Slot() for _ in range(self.slot_count)]
 
     def submit(self, context: int) -> str:

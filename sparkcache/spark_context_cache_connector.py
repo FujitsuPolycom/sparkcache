@@ -1087,9 +1087,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             config.shared_prefix_lease_ttl_seconds
         )
         # Coalesce requests selecting the same persistent digest around one
-        # restore. Followers own no restore blocks: they remain ordinary
-        # waiting requests until vLLM publishes the leader's verified blocks
-        # into its local prefix cache. Unique flights are bounded by the same
+        # restore. Followers own no restore blocks and recompute immediately;
+        # an already-verified lease may still serve a request whose empty
+        # block table can adopt it. Unique flights are bounded by the same
         # admission limit as SparkCache CUDA load lanes; excess unrelated work
         # recomputes immediately instead of joining a cache-side queue.
         self._restore_flights: dict[str, _RestoreFlight] = {}
@@ -1898,7 +1898,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 return 0, False
             flight = self._restore_flights.get(follower_digest.flight_digest)
             if flight is not None and num_computed_tokens < follower_digest.span_tokens:
-                return None, False
+                # No load targets were allocated for this follower. Waiting
+                # for optional cache work would delay a schedulable request;
+                # its own prefill can proceed without racing the leader.
+                return 0, False
             self._remove_restore_follower(request_id)
         leader_digest = self._restore_flight_leaders.get(request_id)
         if leader_digest is not None:
@@ -1913,15 +1916,25 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     # leave the flight and attach through ordinary lookup.
                     self._retire_restore_flight(leader_digest, outcome="completed")
                     return 0, False
-                if flight.dispatched:
+                if flight.dispatched or request_id in self._pending_async_loads:
                     # The leader cannot legitimately re-enter lookup before
                     # worker completion, but waiting is safer than creating a
                     # second writer into its private blocks.
                     return None, False
-                if self._has_full_quorum(leader_digest):
+                if num_computed_tokens == 0 and self._has_full_quorum(leader_digest):
                     return flight.span_tokens - num_computed_tokens, True
                 self._need_load.pop(request_id, None)
                 self._retire_restore_flight(leader_digest, outcome="cancelled")
+        if num_computed_tokens > 0:
+            # Placement restores the complete snapshot into the complete
+            # request table. vLLM may share an already-computed local prefix
+            # with another request, and no suffix-only write mask is carried
+            # in a restore plan. Preserve those pages and prefill the suffix;
+            # never assume whole-prefix destinations are privately owned.
+            self.counters["restore_skip_local_prefix"] = (
+                self.counters.get("restore_skip_local_prefix", 0) + 1
+            )
+            return 0, False
         aligned_span = self._aligned_span(len(token_ids))
         span_ceiling = min(
             aligned_span,
@@ -1988,13 +2001,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self.counters["restore_flights_joined"] += 1
             if lease_digest != digest:
                 self.counters["restore_segment_flights_joined"] += 1
-            return None, False
+            return 0, False
         if num_computed_tokens == 0 and self._join_segment_restore_flight(
             request_id,
             candidates,
             selected_digest=digest,
         ):
-            return None, False
+            return 0, False
         active_restore_flights = sum(
             not existing.lease_published for existing in self._restore_flights.values()
         )
@@ -3869,8 +3882,14 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     # Publish invalid blocks before the finished id while
                     # holding the same lock. vLLM collects finished ids then
                     # load errors in one connector-output pass.
+                    # BlockPool reserves block 0 as shared null padding, not
+                    # a restore destination. Reporting it would invalidate
+                    # unrelated requests whose sparse tables also contain 0.
                     self._load_errors.update(
-                        block for group in plan.group_block_ids for block in group
+                        block
+                        for group in plan.group_block_ids
+                        for block in group
+                        if block != 0
                     )
                     self.counters["load_failed"] += 1
                 self._finished_load_reqs.add(plan.request_id)

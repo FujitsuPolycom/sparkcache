@@ -414,8 +414,18 @@ def test_capture_settings_require_an_attested_bounded_artifact() -> None:
         ManagerPageCaptureSettings(Path("relative.so"), "a" * 64, 1024)
     with pytest.raises(RuntimeError, match="lowercase SHA-256"):
         ManagerPageCaptureSettings(Path("/absolute.so"), "bad", 1024)
-    with pytest.raises(RuntimeError, match="two or three"):
+    with pytest.raises(RuntimeError, match="one, two, or three"):
         ManagerPageCaptureSettings(Path("/absolute.so"), "a" * 64, 1024, 4)
+
+
+def test_single_capture_slot_bounds_staging_and_rejects_boolean_counts() -> None:
+    settings = ManagerPageCaptureSettings(
+        Path("/absolute.so"), "a" * 64, 4 * 1024**3, 1
+    )
+    assert settings.slot_count * settings.slot_bytes == 4 * 1024**3
+    for count in (0, 4, True):
+        with pytest.raises(RuntimeError, match="one, two, or three"):
+            ManagerPageCaptureSettings(Path("/absolute.so"), "a" * 64, 1024, count)
 
 
 def test_unknown_background_ownership_never_reports_finished() -> None:

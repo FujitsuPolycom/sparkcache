@@ -2491,10 +2491,10 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                 connector.get_num_new_matched_tokens(leader, 0), (2048, True)
             )
             self.assertEqual(
-                connector.get_num_new_matched_tokens(distinct, 0), (None, False)
+                connector.get_num_new_matched_tokens(distinct, 0), (0, False)
             )
             self.assertEqual(
-                connector.get_num_new_matched_tokens(same_root, 0), (None, False)
+                connector.get_num_new_matched_tokens(same_root, 0), (0, False)
             )
             for request in (distinct, same_root):
                 binding = connector._restore_flight_followers[request.request_id]
@@ -2744,7 +2744,7 @@ class ConnectorRoundTripTests(unittest.TestCase):
             self.assertEqual(connector.counters["load_failed"], 1)
             self.assertEqual(
                 connector.get_block_ids_with_load_errors(),
-                set(load_plan.block_ids),
+                set(load_plan.block_ids) - {0},
             )
             # errors drain once reported
             self.assertEqual(connector.get_block_ids_with_load_errors(), set())
@@ -2774,7 +2774,7 @@ class ConnectorRoundTripTests(unittest.TestCase):
             self.assertEqual(connector.counters["load_failed"], 1)
             self.assertEqual(
                 connector.get_block_ids_with_load_errors(),
-                set(load_plan.block_ids),
+                set(load_plan.block_ids) - {0},
             )
 
 
@@ -3380,7 +3380,7 @@ class StartupDiscoveryTests(unittest.TestCase):
             self.assertEqual(_drain(restarted), {"corrupt"})
             self.assertEqual(
                 restarted.get_block_ids_with_load_errors(),
-                set(load_plan.block_ids),
+                set(load_plan.block_ids) - {0},
             )
             self.assertNotIn(plan.digest, restarted._held)
             report = restarted.get_kv_connector_stats().data["reports"][0]
@@ -5369,7 +5369,7 @@ class AsyncRestoreTests(unittest.TestCase):
                 self.assertEqual(connector.counters["load_failed"], 1)
                 self.assertEqual(
                     connector.get_block_ids_with_load_errors(),
-                    set(self.BLOCKS),
+                    set(self.BLOCKS) - {0},
                 )
             finally:
                 connector.shutdown()
@@ -5440,6 +5440,38 @@ class AsyncRestoreTests(unittest.TestCase):
             finally:
                 connector.shutdown()
 
+    def test_pending_same_prefix_restore_never_parks_unallocated_request(self) -> None:
+        """An optional restore cannot delay a peer that owns no load blocks."""
+        with tempfile.TemporaryDirectory() as directory:
+            connector = self._cohort_connector(Path(directory))
+            tokens = list(range(1100))
+            digest = self._offer(connector, tokens)
+            leader = types.SimpleNamespace(
+                request_id="pending-leader", prompt_token_ids=tokens
+            )
+            follower = types.SimpleNamespace(
+                request_id="recomputing-peer", prompt_token_ids=tokens
+            )
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(leader, 0), (self.SPAN, True)
+            )
+            for dispatched in (False, True):
+                if dispatched:
+                    connector.update_state_after_alloc(
+                        leader, self._blocks_stub(), self.SPAN
+                    )
+                    connector.build_connector_meta(_empty_scheduler_output())
+                self.assertEqual(
+                    connector.get_num_new_matched_tokens(follower, 0), (0, False)
+                )
+                self.assertNotIn(follower.request_id, connector._need_load)
+                self.assertNotIn(follower.request_id, connector._pending_async_loads)
+                self.assertIn(digest, connector._restore_flights)
+            # The leader's allocated blocks may still have an active writer.
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(leader, 0), (None, False)
+            )
+
     def test_identical_requests_share_one_restore_plan(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector = self._cohort_connector(Path(directory))
@@ -5456,11 +5488,11 @@ class AsyncRestoreTests(unittest.TestCase):
             )
             self.assertEqual(
                 connector.get_num_new_matched_tokens(follower, 0),
-                (None, False),
+                (0, False),
             )
             self.assertEqual(
                 connector.get_num_new_matched_tokens(follower, 0),
-                (None, False),
+                (0, False),
             )
             connector.update_state_after_alloc(leader, self._blocks_stub(), self.SPAN)
             metadata = connector.build_connector_meta(_empty_scheduler_output())
@@ -5477,7 +5509,7 @@ class AsyncRestoreTests(unittest.TestCase):
             self.assertTrue(connector._restore_flights[digest].workers_finished)
             self.assertEqual(
                 connector.get_num_new_matched_tokens(follower, 0),
-                (None, False),
+                (0, False),
             )
             leader.status = types.SimpleNamespace(name="FINISHED_LENGTH_CAPPED")
             connector.request_finished(leader, list(self.BLOCKS))
@@ -5546,7 +5578,7 @@ class AsyncRestoreTests(unittest.TestCase):
 
             self.assertEqual(
                 connector.get_num_new_matched_tokens(joined_then_local, 0),
-                (None, False),
+                (0, False),
             )
             self.assertEqual(
                 connector.get_num_new_matched_tokens(joined_then_local, 256),
@@ -5702,7 +5734,7 @@ class AsyncRestoreTests(unittest.TestCase):
                 followers.append(follower)
                 self.assertEqual(
                     connector.get_num_new_matched_tokens(follower, 0),
-                    (None, False),
+                    (0, False),
                 )
 
             connector.update_state_after_alloc(leader, self._blocks_stub(), self.SPAN)
@@ -5756,11 +5788,11 @@ class AsyncRestoreTests(unittest.TestCase):
             )
             self.assertEqual(
                 connector.get_num_new_matched_tokens(distinct, 0),
-                (None, False),
+                (0, False),
             )
             self.assertEqual(
                 connector.get_num_new_matched_tokens(same_root, 0),
-                (None, False),
+                (0, False),
             )
             same_binding = connector._restore_flight_followers[same_root.request_id]
             self.assertEqual(
@@ -5828,7 +5860,7 @@ class AsyncRestoreTests(unittest.TestCase):
 
             connector.get_num_new_matched_tokens(leader, 0)
             self.assertEqual(
-                connector.get_num_new_matched_tokens(partial, 256), (768, True)
+                connector.get_num_new_matched_tokens(partial, 256), (0, False)
             )
             self.assertNotIn(partial.request_id, connector._restore_flight_followers)
 
@@ -6170,7 +6202,7 @@ class AsyncRestoreTests(unittest.TestCase):
             )
             self.assertEqual(
                 connector.get_num_new_matched_tokens(same_digest, 0),
-                (None, False),
+                (0, False),
             )
             self.assertEqual(
                 connector.get_num_new_matched_tokens(requests[2], 0),
@@ -6193,7 +6225,7 @@ class AsyncRestoreTests(unittest.TestCase):
             connector.get_num_new_matched_tokens(leader, 0)
             self.assertEqual(
                 connector.get_num_new_matched_tokens(follower, 0),
-                (None, False),
+                (0, False),
             )
             connector.update_state_after_alloc(leader, self._blocks_stub(), self.SPAN)
             connector.build_connector_meta(_empty_scheduler_output())
@@ -6235,7 +6267,7 @@ class AsyncRestoreTests(unittest.TestCase):
             )
             self.assertEqual(
                 connector.get_num_new_matched_tokens(newcomer, 0),
-                (None, False),
+                (0, False),
             )
 
             connector.update_connector_output(
@@ -6510,7 +6542,7 @@ class AsyncRestoreTests(unittest.TestCase):
             self.assertEqual(_drain(connector), {"bad-restore"})
             self.assertEqual(connector.get_finished(set()), (None, None))
             self.assertEqual(
-                connector.get_block_ids_with_load_errors(), set(self.BLOCKS)
+                connector.get_block_ids_with_load_errors(), set(self.BLOCKS) - {0}
             )
             self.assertEqual(connector.counters["load_failed"], 1)
             self.assertNotIn(digest, connector._held)

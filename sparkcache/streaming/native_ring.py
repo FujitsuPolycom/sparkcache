@@ -62,8 +62,8 @@ class NativeRingConfig:
     def __post_init__(self) -> None:
         if self.arena_mode not in (1, 2):
             raise ValueError("arena_mode must be mapped-host (1) or managed (2)")
-        if self.slot_count not in (2, 3):
-            raise ValueError("slot_count must be two or three")
+        if type(self.slot_count) is not int or self.slot_count not in (1, 2, 3):
+            raise ValueError("slot_count must be one, two, or three")
         for name in ("slot_bytes", "max_sources", "max_rows"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:

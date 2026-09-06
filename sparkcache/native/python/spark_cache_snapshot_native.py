@@ -17,7 +17,7 @@ from typing import Any, Callable, Iterable
 
 
 ABI_VERSION = 1
-MIN_SLOTS = 2
+MIN_SLOTS = 1
 MAX_SLOTS = 3
 MAX_RECORD_KINDS = 4
 
@@ -319,7 +319,9 @@ def load_library(
         )
         if (
             info.abi_version != ABI_VERSION
-            or info.min_slots != MIN_SLOTS
+            # Existing two-slot libraries retain the same struct ABI. Their
+            # create function rejects a one-slot request before allocation.
+            or info.min_slots not in (MIN_SLOTS, 2)
             or info.max_slots != MAX_SLOTS
             or info.max_record_kinds != MAX_RECORD_KINDS
         ):

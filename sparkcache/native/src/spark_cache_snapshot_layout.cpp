@@ -63,7 +63,7 @@ bool validate_config(
   }
   if (config.slot_count < SPARK_CACHE_SNAPSHOT_MIN_SLOTS ||
       config.slot_count > SPARK_CACHE_SNAPSHOT_MAX_SLOTS) {
-    return fail(detail, "snapshot slot_count must be two or three");
+    return fail(detail, "snapshot slot_count must be one, two, or three");
   }
   if (config.slot_bytes == 0 || config.max_sources == 0 ||
       config.max_rows == 0) {

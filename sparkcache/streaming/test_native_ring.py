@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import ctypes
 import dataclasses
 from collections import deque
@@ -17,6 +16,14 @@ from sparkcache.streaming.native_ring import (
     RawTicket,
     SnapshotSourceSpec,
 )
+
+
+def test_single_slot_config_keeps_size_bounded_and_rejects_boolean_counts():
+    config = NativeRingConfig(1, 1024, 1, 1, 8, 0)
+    assert config.slot_count * config.slot_bytes == 1024
+    for count in (0, True, 4):
+        with pytest.raises(ValueError, match="one, two, or three"):
+            NativeRingConfig(1, 1024, count, 1, 8, 0)
 
 
 class FakeBackend:

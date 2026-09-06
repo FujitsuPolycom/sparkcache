@@ -123,7 +123,8 @@ replication carrier. Physical slot IDs never enter the stored artifact.
 ## ABI decisions
 
 - Snapshot ABI is version 1 and separate from restore placement ABI 1.
-- Ring depth is exactly two or three slots.
+- Ring depth is one, two, or three slots. A one-slot ring skips capture while its
+  GPU or writer owns that slot; it never waits for a second staging allocation.
 - Supported arenas are `cudaHostAllocMapped` and `cudaMallocManaged`.
 - The caller supplies the producer CUDA stream as an integer handle.
 - A gather and completion event are enqueued on that same stream.

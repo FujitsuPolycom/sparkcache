@@ -33,10 +33,41 @@ def test_snapshot_ctypes_sizes_are_fixed() -> None:
     assert ctypes.sizeof(native.SnapshotAbiInfo) == 64
 
 
+@pytest.mark.parametrize("minimum", [0, 1, 2, 3])
+def test_binding_accepts_only_supported_slot_minima(monkeypatch, minimum):
+    from types import SimpleNamespace
+
+    def query(pointer):
+        info = pointer._obj
+        info.abi_version = native.ABI_VERSION
+        info.min_slots = minimum
+        info.max_slots = native.MAX_SLOTS
+        info.max_record_kinds = native.MAX_RECORD_KINDS
+        info.capability_flags = (
+            native.CAP_MAPPED_HOST | native.CAP_EXTERNAL_STREAM
+            | native.CAP_NONBLOCKING_ACQUIRE | native.CAP_CONTEXT_ABANDON
+            | native.CAP_ORDERLY_SHUTDOWN
+        )
+        for field, value in native.EXPECTED_SIZES.items():
+            setattr(info, field, value)
+        return native.STATUS_OK
+
+    library = SimpleNamespace(spark_cache_snapshot_query_abi=query)
+    monkeypatch.setattr(native, "_dlopen_attested", lambda *a, **kw: library)
+    monkeypatch.setattr(native, "_bind", lambda lib: None)
+    if minimum in (1, 2):
+        loaded, info = native.load_library("unused", expected_sha256="a" * 64)
+        assert loaded is library
+        assert info.min_slots == minimum
+    else:
+        with pytest.raises(native.NativeSnapshotError, match="ABI constants"):
+            native.load_library("unused", expected_sha256="a" * 64)
+
+
 def test_header_contract_preserves_serving_and_is_bounded() -> None:
     text = HEADER.read_text(encoding="utf-8")
     assert "#define SPARK_CACHE_SNAPSHOT_ABI_VERSION 1u" in text
-    assert "#define SPARK_CACHE_SNAPSHOT_MIN_SLOTS 2u" in text
+    assert "#define SPARK_CACHE_SNAPSHOT_MIN_SLOTS 1u" in text
     assert "#define SPARK_CACHE_SNAPSHOT_MAX_SLOTS 3u" in text
     assert "SPARK_CACHE_SNAPSHOT_WOULD_BLOCK" in text
     assert "spark_cache_snapshot_abandon_context" in text

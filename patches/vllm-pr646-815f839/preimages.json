@@ -1,0 +1,40 @@
+{
+  "schema": "sparkcache-vllm-runtime-patch/v1",
+  "vllm_commit": "815f839060c2781f6bcc47c0d584358b400ea0ea",
+  "patch": "010-sparkcache-runtime-contract.patch",
+  "patch_sha256": "28b70e370bb734ac94e206d86647d3292e956d45c8941b71ac60d0850fdf3e8f",
+  "files": {
+    "vllm/v1/worker/gpu/model_states/mamba_hybrid.py": {
+      "preimage_sha256": "b34cb130e233f4d322390acf7fec01a3a368090c7f79da1fa7770c622a2f0dde",
+      "postimage_sha256": "d4c12bb0ee823078951e551d8726e85e8be7c7722b64bfb2b9401066460b59a7"
+    },
+    "vllm/config/vllm.py": {
+      "preimage_sha256": "db57119a1b4c801471444a80d59944e70f71c64fa3b5d72988fb9c4da8c90c7a",
+      "postimage_sha256": "0da3e7cae35c256a00c88b64dcd101574649023f7a34f538b289ccbe5ba8f95d"
+    },
+    "vllm/distributed/kv_transfer/kv_connector/v1/base.py": {
+      "preimage_sha256": "bc1965431087676876f58360cd9cc07ab6c06febe6d747695f10b051fd85c412",
+      "postimage_sha256": "7460e0638c0c81808dbdbbad7114db2e840e531e9ce83360c55b9171fcc872b1"
+    },
+    "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py": {
+      "preimage_sha256": "aafafbf4b0e3a43e7c864270fe56ffaa4b0f3dc343e77a0871db25f075d984dd",
+      "postimage_sha256": "8741b86b0f3e91af06d01a52240cdc988e3073bf049f72b506f56d6ceebb1ac0"
+    },
+    "vllm/v1/core/kv_cache_manager.py": {
+      "preimage_sha256": "02c71da26bbac81629248ee42b0a71bd2db817d339894d647d2ff6b66fd5ad19",
+      "postimage_sha256": "1d1495b5392b3084362192df8b812df27f51ef388f77744abfc6be2172b99084"
+    },
+    "vllm/v1/core/sched/output.py": {
+      "preimage_sha256": "7392f9ee4ef3dddefda420dfefbe455d7af79217d7a30ff4497d37fde9a40a86",
+      "postimage_sha256": "881cdedd973c1d7e930ba478564254ce9855fb225d9ac46285ad9744b76dca2f"
+    },
+    "vllm/v1/core/sched/scheduler.py": {
+      "preimage_sha256": "c0045fd0cd41a7a0275ab552eeb1a88e678f80994415ffae54347f54402f20da",
+      "postimage_sha256": "a72444c2c29b2ff32baa7b7b8f2dbb62bcbf056987941d3867da48d472e4c92e"
+    },
+    "vllm/v1/core/single_type_kv_cache_manager.py": {
+      "preimage_sha256": "75ba324cdef57eb0e998b8e067d30c870647104a08eb2da8fd2410d19286883d",
+      "postimage_sha256": "d3c3ac1a8377c67e590e5462763307c9606741125a05bcea9051c5d67f86b720"
+    }
+  }
+}

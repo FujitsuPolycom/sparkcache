@@ -23,6 +23,8 @@ SLOT_BYTES_KEY = "spark_cache_async_page_capture_slot_bytes"
 SLOT_BYTES_ENV = "SPARK_CONTEXT_CACHE_ASYNC_PAGE_CAPTURE_SLOT_BYTES"
 SLOT_COUNT_KEY = "spark_cache_async_page_capture_slot_count"
 SLOT_COUNT_ENV = "SPARK_CONTEXT_CACHE_ASYNC_PAGE_CAPTURE_SLOT_COUNT"
+ARENA_MODE_KEY = "spark_cache_async_page_capture_arena_mode"
+ARENA_MODE_ENV = "SPARK_CONTEXT_CACHE_ASYNC_PAGE_CAPTURE_ARENA_MODE"
 VLLM_ROOT_KEY = "spark_cache_async_page_capture_vllm_root"
 VLLM_ROOT_ENV = "SPARK_CONTEXT_CACHE_ASYNC_PAGE_CAPTURE_VLLM_ROOT"
 LEASE_CONTRACT_KEY = "spark_cache_async_page_capture_lease_contract"
@@ -30,7 +32,9 @@ LEASE_CONTRACT_ENV = "SPARK_CONTEXT_CACHE_ASYNC_PAGE_CAPTURE_LEASE_CONTRACT"
 
 
 def _absolute(path: Path) -> bool:
-    return path.is_absolute() or bool(path.root) or PurePosixPath(str(path)).is_absolute()
+    return (
+        path.is_absolute() or bool(path.root) or PurePosixPath(str(path)).is_absolute()
+    )
 
 
 def _extra(connector: Any, key: str, environment: str, default: str = "") -> str:
@@ -48,8 +52,13 @@ class ManagerPageCaptureSettings:
     slot_count: int = 2
     vllm_root: Path | None = None
     lease_contract: Path | None = None
+    arena_mode: str = "mapped"
 
     def __post_init__(self) -> None:
+        if self.arena_mode not in ("mapped", "managed"):
+            raise RuntimeError(
+                "manager-page capture arena mode must be mapped or managed"
+            )
         if not _absolute(self.library_path):
             raise RuntimeError("manager-page capture library path must be absolute")
         if _SHA256_RE.fullmatch(self.library_sha256) is None:
@@ -58,8 +67,10 @@ class ManagerPageCaptureSettings:
             )
         if self.slot_bytes <= 0:
             raise RuntimeError("manager-page capture slot bytes must be positive")
-        if self.slot_count not in (2, 3):
-            raise RuntimeError("manager-page capture slot count must be two or three")
+        if type(self.slot_count) is not int or self.slot_count not in (1, 2, 3):
+            raise RuntimeError(
+                "manager-page capture slot count must be one, two, or three"
+            )
         for name in ("vllm_root", "lease_contract"):
             value = getattr(self, name)
             if value is not None and not _absolute(value):
@@ -78,13 +89,12 @@ class ManagerPageCaptureSettings:
             ) from error
         return cls(
             library_path=Path(_extra(connector, LIBRARY_KEY, LIBRARY_ENV)),
-            library_sha256=_extra(
-                connector, LIBRARY_SHA256_KEY, LIBRARY_SHA256_ENV
-            ),
+            library_sha256=_extra(connector, LIBRARY_SHA256_KEY, LIBRARY_SHA256_ENV),
             slot_bytes=slot_bytes,
             slot_count=slot_count,
             vllm_root=Path(vllm_root) if vllm_root else None,
             lease_contract=Path(lease) if lease else None,
+            arena_mode=_extra(connector, ARENA_MODE_KEY, ARENA_MODE_ENV, "mapped"),
         )
 
 
@@ -153,7 +163,7 @@ def build_manager_page_runtime(
         raise RuntimeError("manager-page sources must share one CUDA device")
     device_ordinal = next(iter(device_indexes))
     config = NativeRingConfig(
-        arena_mode=1,
+        arena_mode=1 if settings.arena_mode == "mapped" else 2,
         slot_bytes=settings.slot_bytes,
         slot_count=settings.slot_count,
         max_sources=len(sources),

@@ -1,0 +1,175 @@
+{
+  "schema": "sparkring-vllm-kv-block-lease-contract/v1",
+  "vllm_commit": "815f839060c2781f6bcc47c0d584358b400ea0ea",
+  "files": [
+    {
+      "path": "vllm/v1/worker/gpu/model_states/mamba_hybrid.py",
+      "accepted_sha256": {
+        "pr646_recurrent_boundary_contract": "d4c12bb0ee823078951e551d8726e85e8be7c7722b64bfb2b9401066460b59a7"
+      },
+      "required_symbols": [
+        "MambaHybridModelState.add_request",
+        "MambaHybridModelState.preprocess_state"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu/kv_connector.py",
+      "accepted_sha256": {
+        "pr646_recurrent_boundary_contract": "b50a13e7c4f62fa2c67ee0d40b8ec7a2b62a6f6dab23571227fd56682c24ecf6"
+      },
+      "required_symbols": [
+        "ActiveKVConnector.pre_forward",
+        "ActiveKVConnector.post_forward",
+        "ActiveKVConnector.no_forward"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu/model_runner.py",
+      "accepted_sha256": {
+        "pr646_recurrent_boundary_contract": "3fe7c5b06d506d35931a04c8228744cc8c88b68cf14f721a1babfa6654dc13ae"
+      },
+      "required_symbols": [
+        "GPUModelRunner.execute_model"
+      ]
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/base.py",
+      "accepted_sha256": {
+        "pr646_recurrent_boundary_contract": "7460e0638c0c81808dbdbbad7114db2e840e531e9ce83360c55b9171fcc872b1"
+      },
+      "required_symbols": [
+        "KVConnectorBase_V1.handle_preemptions",
+        "KVConnectorBase_V1.request_finished",
+        "KVConnectorBase_V1.get_finished",
+        "KVConnectorBase_V1.get_recurrent_publication_boundaries"
+      ]
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py",
+      "accepted_sha256": {
+        "pr646_recurrent_boundary_contract": "8741b86b0f3e91af06d01a52240cdc988e3073bf049f72b506f56d6ceebb1ac0"
+      },
+      "required_symbols": [
+        "MultiConnector.supports_recurrent_boundary_blocks",
+        "MultiConnector.get_recurrent_publication_boundaries"
+      ]
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/utils.py",
+      "accepted_sha256": {
+        "pr646_recurrent_boundary_contract": "115512dca36b0711223f55f5ff304abffccc6d078923ba4c6bbb3cdb7fdd39a2"
+      },
+      "required_symbols": [
+        "KVOutputAggregator.from_connector",
+        "KVOutputAggregator.aggregate"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "accepted_sha256": {
+        "pr646_recurrent_boundary_contract": "a72444c2c29b2ff32baa7b7b8f2dbb62bcbf056987941d3867da48d472e4c92e"
+      },
+      "required_symbols": [
+        "Scheduler.schedule",
+        "Scheduler._connector_finished",
+        "Scheduler._update_waiting_for_remote_kv",
+        "Scheduler._update_from_kv_xfer_finished",
+        "Scheduler._update_requests_with_invalid_blocks",
+        "Scheduler._free_blocks",
+        "Scheduler._recurrent_publication_boundaries",
+        "Scheduler._recurrent_publication_boundary_at"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_manager.py",
+      "accepted_sha256": {
+        "pr646_recurrent_boundary_contract": "1d1495b5392b3084362192df8b812df27f51ef388f77744abfc6be2172b99084"
+      },
+      "required_symbols": [
+        "KVCacheManager.get_block_ids",
+        "KVCacheManager.take_kv_cache_block_copies",
+        "KVCacheManager.take_recurrent_boundary_blocks",
+        "KVCacheManager.allocate_slots"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/output.py",
+      "accepted_sha256": {
+        "pr646_recurrent_boundary_contract": "881cdedd973c1d7e930ba478564254ce9855fb225d9ac46285ad9744b76dca2f"
+      },
+      "required_symbols": [
+        "SchedulerOutput.preempted_req_ids",
+        "SchedulerOutput.kv_cache_block_copies",
+        "SchedulerOutput.recurrent_boundary_blocks"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "accepted_sha256": {
+        "pr646_recurrent_boundary_contract": "ba3a5f201bff46ffb1839bf1ca4abe721385d9579751e6b9e25de3e8fddff985"
+      },
+      "required_symbols": [
+        "GPUModelRunner.execute_model",
+        "GPUModelRunner._update_states"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/block_pool.py",
+      "accepted_sha256": {
+        "pr646_recurrent_boundary_contract": "ddee56dccb2208411b3a035918e917ce8f56a9858471e9ca12b420d5d79bc69c"
+      },
+      "required_symbols": [
+        "BlockPool.touch",
+        "BlockPool.free_blocks"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_coordinator.py",
+      "accepted_sha256": {
+        "pr646_recurrent_boundary_contract": "4b78c45269455a809aedef9cf28321e3ba4bff1aa082359ee32a92aa6d102c4c"
+      },
+      "required_symbols": [
+        "KVCacheCoordinator.allocate_new_computed_blocks",
+        "KVCacheCoordinator.free",
+        "KVCacheCoordinator.get_blocks"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+      "accepted_sha256": {
+        "pr646_recurrent_boundary_contract": "d3c3ac1a8377c67e590e5462763307c9606741125a05bcea9051c5d67f86b720"
+      },
+      "required_symbols": [
+        "SingleTypeKVCacheManager.add_local_computed_blocks",
+        "SingleTypeKVCacheManager.get_num_skipped_tokens",
+        "SingleTypeKVCacheManager._apply_cow",
+        "SingleTypeKVCacheManager.take_pending_cow_copies",
+        "SingleTypeKVCacheManager.pop_blocks_for_free",
+        "MambaManager.remove_skipped_blocks",
+        "MambaManager.allocate_new_blocks",
+        "SingleTypeKVCacheManager.take_pending_aligned_recurrent_boundaries"
+      ]
+    },
+    {
+      "path": "vllm/v1/kv_cache_interface.py",
+      "accepted_sha256": {
+        "pr646_recurrent_boundary_contract": "8dfa7b98f3c6ee3a4dfafc43f9c87dda86223f71dcfe20a31ec0d952e8119ab7"
+      },
+      "required_symbols": [
+        "MambaSpec.max_num_blocks_per_req"
+      ]
+    },
+    {
+      "path": "vllm/model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py",
+      "accepted_sha256": {
+        "pr646_recurrent_boundary_contract": "79aabedc35ae2476581a1ac4a8fa64f76e2cd169287db1fb746fbe75102b85aa"
+      },
+      "required_symbols": [
+        "KimiGatedDeltaNetAttention._initialize_b12x_kda_decode",
+        "KimiGatedDeltaNetAttention._make_b12x_kda_plan",
+        "KimiGatedDeltaNetAttention.bind_kv_cache",
+        "KimiGatedDeltaNetAttention._run_b12x_kda_decode_post_conv"
+      ]
+    }
+  ]
+}

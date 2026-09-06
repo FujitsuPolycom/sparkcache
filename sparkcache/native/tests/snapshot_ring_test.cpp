@@ -98,6 +98,31 @@ void test_ring_never_blocks_and_rejects_stale_tickets() {
   assert(replacement.generation != first.generation);
 }
 
+void test_one_slot_retains_gpu_and_writer_until_release() {
+  std::string detail;
+  assert(validate_config(config(1), &detail));
+  assert(!validate_config(config(0), &detail));
+  RingState ring(1);
+  assert(ring.valid());
+  SparkCacheSnapshotTicket first{};
+  SparkCacheSnapshotTicket other{};
+  assert(ring.reserve(90, 4096, &first) == SPARK_CACHE_SNAPSHOT_OK);
+  assert(ring.reserve(91, 4096, &other) == SPARK_CACHE_SNAPSHOT_WOULD_BLOCK);
+  assert(ring.complete(first) == SPARK_CACHE_SNAPSHOT_OK);
+  assert(ring.reserve(91, 4096, &other) == SPARK_CACHE_SNAPSHOT_WOULD_BLOCK);
+  assert(ring.claim(first) == SPARK_CACHE_SNAPSHOT_OK);
+  assert(ring.reserve(91, 4096, &other) == SPARK_CACHE_SNAPSHOT_WOULD_BLOCK);
+  assert(ring.release(first) == SPARK_CACHE_SNAPSHOT_OK);
+  assert(ring.reserve(91, 4096, &other) == SPARK_CACHE_SNAPSHOT_OK);
+  assert(other.slot_index == first.slot_index);
+  assert(other.generation != first.generation);
+  assert(ring.complete(first) == SPARK_CACHE_SNAPSHOT_DROPPED);
+  assert(ring.abandon(91) == 1);
+  assert(ring.reserve(92, 4096, &first) == SPARK_CACHE_SNAPSHOT_WOULD_BLOCK);
+  assert(ring.reap_discarded(other.slot_index) == SPARK_CACHE_SNAPSHOT_OK);
+  assert(ring.reserve(92, 4096, &first) == SPARK_CACHE_SNAPSHOT_OK);
+}
+
 void test_abandon_drains_gpu_and_writer_ownership() {
   RingState ring(3);
   SparkCacheSnapshotTicket filling{};
@@ -208,6 +233,7 @@ void test_post_launch_failure_stays_quarantined_until_explicit_drain() {
 }  // namespace
 
 int main() {
+  test_one_slot_retains_gpu_and_writer_until_release();
   test_validation_and_layout();
   test_ring_never_blocks_and_rejects_stale_tickets();
   test_abandon_drains_gpu_and_writer_ownership();
