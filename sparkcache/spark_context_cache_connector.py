@@ -616,6 +616,10 @@ class SparkCacheStats(KVConnectorStats):
                 ),
             }
             reduced.update({key: value for key, value in alerts.items() if value})
+            for name in ("deletion_attempts", "budget_exhausted", "skipped_cooldown"):
+                reduced[f"sparkcache_maintenance_{name}"] = sum(
+                    int(status.get(f"maintenance_{name}", 0)) for status in capacity
+                )
         async_capture = [
             report.get("async_capture")
             for report in reports
@@ -792,6 +796,21 @@ class SparkCachePromMetrics(KVConnectorPromMetrics):
         "sparkcache_maintenance_active_ranks": (
             "vllm:sparkcache_maintenance_active_ranks",
             "Physical ranks reporting an active capacity scan or reconciliation at their last worker reports.",
+            1.0,
+        ),
+        "sparkcache_maintenance_deletion_attempts": (
+            "vllm:sparkcache_maintenance_deletion_attempts",
+            "Reported cumulative unlink attempts summed across physical ranks; resets with workers.",
+            1.0,
+        ),
+        "sparkcache_maintenance_budget_exhausted": (
+            "vllm:sparkcache_maintenance_budget_exhausted",
+            "Reported cumulative passes deferring deletion work across physical ranks.",
+            1.0,
+        ),
+        "sparkcache_maintenance_skipped_cooldown": (
+            "vllm:sparkcache_maintenance_skipped_cooldown",
+            "Reported cumulative cooldown skips across physical ranks.",
             1.0,
         ),
         "sparkcache_capture_delayed_requests": (
@@ -3076,7 +3095,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         ):
             report = self._maintain_capacity(force=True)
             self._ensure_capacity_thread()
-            if (report is not None and report.skipped_busy) or not bool(
+            if (report is not None and (report.skipped_busy or report.skipped_cooldown)) or not bool(
                 self._capacity_status["capacity_satisfied"]
             ):
                 self._capacity_wakeup.set()
@@ -3352,6 +3371,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 "spark-context-cache: capacity maintenance failed: %s", error
             )
             return None
+        if report.skipped_cooldown:
+            self.counters["capacity_skipped_cooldown"] = (
+                self.counters.get("capacity_skipped_cooldown", 0) + 1
+            )
+            if wake_worker_on_unsatisfied:
+                self._capacity_wakeup.set()
+            return report
         if report.skipped_busy:
             self.counters["capacity_skipped_busy"] += 1
             self._capacity_status.update(
@@ -3368,6 +3394,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             bytes=report.bytes_after,
             bytes_exact=True,
             capacity_satisfied=report.capacity_satisfied,
+        )
+        self.counters["capacity_deletion_attempts"] = (
+            self.counters.get("capacity_deletion_attempts", 0) + report.deletion_attempts
+        )
+        self.counters["capacity_budget_exhausted"] = (
+            self.counters.get("capacity_budget_exhausted", 0) + int(report.work_pending)
         )
         self.counters["capacity_runs"] += 1
         self.counters["capacity_manifests_evicted"] += report.manifests_evicted
@@ -3426,12 +3458,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         # alias. The targeted checks above retain the offer when either root
         # remains; this complete pass also catches entries removed as debris.
         self._reconcile_held_capacity()
-        if not report.capacity_satisfied and wake_worker_on_unsatisfied:
+        if (not report.capacity_satisfied or report.work_pending) and wake_worker_on_unsatisfied:
             self._capacity_wakeup.set()
         if force or report.bytes_reclaimed:
             logger.info(
                 "spark-context-cache: capacity bytes=%d max=%d reclaimed=%d"
-                " manifests=%d chunks=%d orphans=%d satisfied=%s",
+                " manifests=%d chunks=%d orphans=%d satisfied=%s"
+                " deletion_attempts=%d work_pending=%s",
                 report.bytes_after,
                 policy.max_bytes,
                 report.bytes_reclaimed,
@@ -3439,6 +3472,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 report.chunks_deleted,
                 report.orphan_chunks_deleted,
                 report.capacity_satisfied,
+                report.deletion_attempts,
+                report.work_pending,
             )
         return report
 
@@ -3463,7 +3498,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             force=force_maintenance,
             wake_worker_on_unsatisfied=True,
         )
-        if report is not None and not report.skipped_busy:
+        if report is not None and not (report.skipped_busy or report.skipped_cooldown):
             exact_evicted = (
                 EntryKey(
                     identity.storage_key,
@@ -3691,7 +3726,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 report = self._maintain_capacity_locked(force=True)
                 if (
                     report is None
-                    or report.skipped_busy
+                    or (report.skipped_busy or report.skipped_cooldown)
                     or not report.capacity_satisfied
                 ):
                     return False
@@ -3816,6 +3851,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             retry_unsatisfied = bool(
                 report is None
                 or not report.capacity_satisfied
+                or report.work_pending
                 or not bool(self._capacity_status["capacity_satisfied"])
             )
             if retry_unsatisfied:
@@ -6510,6 +6546,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     "streaming_capacity_shutdown_dropped"
                 ],
                 maintenance_retries=self.counters["capacity_retries"],
+                maintenance_deletion_attempts=self.counters.get("capacity_deletion_attempts", 0),
+                maintenance_budget_exhausted=self.counters.get("capacity_budget_exhausted", 0),
+                maintenance_skipped_cooldown=self.counters.get("capacity_skipped_cooldown", 0),
             )
             report["capacity"] = capacity
         runtime = self._async_page_capture_runtime

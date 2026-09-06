@@ -297,6 +297,8 @@ class ParseConnectorConfigTests(unittest.TestCase):
                 "SPARK_CONTEXT_CACHE_MAX_BYTES": "1000000",
                 "SPARK_CONTEXT_CACHE_LOW_WATERMARK_BYTES": "900000",
                 "SPARK_CONTEXT_CACHE_TTL_SECONDS": "3600",
+                "SPARK_CONTEXT_CACHE_MAINTENANCE_MAX_DELETIONS": "128",
+                "SPARK_CONTEXT_CACHE_MAINTENANCE_INTERVAL_MS": "1000",
                 "SPARK_CONTEXT_CACHE_MODEL_PROFILE": "glm52-nvfp4",
                 "SPARK_CONTEXT_CACHE_TARGET_CHECKPOINT_SHA256": "1" * 64,
                 "SPARK_CONTEXT_CACHE_DRAFT_CHECKPOINT_SHA256": "2" * 64,
@@ -307,6 +309,8 @@ class ParseConnectorConfigTests(unittest.TestCase):
         self.assertEqual(config.capacity_policy.max_bytes, 1000000)
         self.assertEqual(config.capacity_policy.low_watermark_bytes, 900000)
         self.assertEqual(config.capacity_policy.ttl_seconds, 3600)
+        self.assertEqual(config.capacity_policy.maintenance_max_deletions, 128)
+        self.assertEqual(config.capacity_policy.maintenance_interval_ms, 1000)
 
     def test_missing_model_profile_is_rejected_explicitly(self) -> None:
         vllm, _ = _make_vllm_config()

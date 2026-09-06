@@ -311,6 +311,63 @@ A larger gap amortizes maintenance across more writes, but each pass evicts
 more data and can increase future misses. Compare those costs with observed
 publication age and maintenance activity before changing the gap.
 
+### Deletion pacing
+
+Status: **implemented**; serving performance with these controls is
+**research-only**. Both settings default to `0`, preserving unrestricted passes:
+
+- `spark_cache_maintenance_max_deletions` caps filesystem unlink attempts per
+  pass, including failed attempts, across manifests, aliases, debris,
+  descriptor segments, and payload objects. Its environment fallback is
+  `SPARK_CONTEXT_CACHE_MAINTENANCE_MAX_DELETIONS`.
+- `spark_cache_maintenance_interval_ms` sets a minimum cooldown after a pass
+  finishes or fails. Forced post-commit calls also respect it; skipped calls
+  do not extend it. Its environment fallback is
+  `SPARK_CONTEXT_CACHE_MAINTENANCE_INTERVAL_MS`.
+
+Explicit connector settings take precedence over environment values. A test
+configuration can select `128` deletion attempts and `1000` milliseconds;
+these values are not a qualified serving-performance recommendation.
+
+With a deletion budget, existing orphan payloads and debris are reclaimed
+before additional roots are selected.
+
+A pass can stop above the low watermark
+or the capacity maximum; optional store admission remains blocked while
+capacity is unsatisfied.
+
+Background retries complete deferred cleanup without
+making serving wait. Root-directory durability barriers still precede object
+removal, and protected publication roots retain their complete object graphs.
+
+This is **not a scan-size or wall-clock bound**. Each admitted pass authenticates
+the complete reference inventory and reconciles survivors.
+
+One filesystem
+operation or durability barrier can take arbitrarily long. Smaller deletion
+budgets can increase total scan work.
+
+Cooldown trades reclamation throughput
+for gaps between that work. A larger watermark gap does not remove this cost.
+
+`MaintenanceReport.deletion_attempts` counts admitted unlink attempts;
+`work_pending` reports cleanup deferred by the budget or orphan-first policy;
+`skipped_cooldown` reports a pass skipped before inventory work.
+
+Connector
+counters `capacity_deletion_attempts`, `capacity_budget_exhausted`, and
+`capacity_skipped_cooldown` expose the same activity. Capacity log records
+include `deletion_attempts` and `work_pending`.
+
+Prometheus gauges
+`vllm:sparkcache_maintenance_deletion_attempts`,
+`vllm:sparkcache_maintenance_budget_exhausted`, and
+`vllm:sparkcache_maintenance_skipped_cooldown` sum reported cumulative counts
+across ranks.
+
+They reset with workers and reflect the last worker reports,
+not independent scrape-time measurements.
+
 `spark_cache_ttl_seconds` expires manifests by recency; zero disables TTL.
 Maintenance preserves shared objects referenced by surviving manifests.
 

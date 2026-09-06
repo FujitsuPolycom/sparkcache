@@ -444,9 +444,12 @@ class CapacityPolicy:
     max_bytes: int = 0
     low_watermark_bytes: int = 0
     ttl_seconds: int = 0
+    maintenance_max_deletions: int = 0
+    maintenance_interval_ms: int = 0
 
     def __post_init__(self) -> None:
-        for field in ("max_bytes", "low_watermark_bytes", "ttl_seconds"):
+        for field in ("max_bytes", "low_watermark_bytes", "ttl_seconds",
+                      "maintenance_max_deletions", "maintenance_interval_ms"):
             value = getattr(self, field)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{field} must be a non-negative integer")
@@ -473,6 +476,9 @@ class MaintenanceReport:
     evicted_entries: tuple[EntryKey, ...] = ()
     capacity_satisfied: bool = True
     skipped_busy: bool = False
+    skipped_cooldown: bool = False
+    deletion_attempts: int = 0
+    work_pending: bool = False
     aliases_evicted: int = 0
     segments_deleted: int = 0
     orphan_segments_deleted: int = 0
@@ -2410,7 +2416,22 @@ class ManifestStore:
             guard.__enter__()
         except BlockingIOError:
             return MaintenanceReport(capacity_satisfied=False, skipped_busy=True)
+        if time.monotonic() < getattr(self, "_maintenance_not_before", 0.0):
+            guard.__exit__(None, None, None)
+            return MaintenanceReport(capacity_satisfied=False, skipped_cooldown=True)
         try:
+            deletion_attempts = 0
+            work_pending = False
+
+            def admit_deletion() -> bool:
+                nonlocal deletion_attempts, work_pending
+                if (policy.maintenance_max_deletions > 0
+                        and deletion_attempts >= policy.maintenance_max_deletions):
+                    work_pending = True
+                    return False
+                deletion_attempts += 1
+                return True
+
             manifests_root = self.root / "manifests"
             aliases_root = self.root / "prefix-aliases"
             manifest_paths = (
@@ -2526,16 +2547,35 @@ class ManifestStore:
                     or references.get(path.stem, 0) == 0
                 )
             )
+            # With a deletion budget, reclaim already-unreferenced payloads
+            # before choosing further live roots. Otherwise a small budget
+            # could repeatedly remove roots while their orphan payloads wait.
+            orphan_debt = bool(root_debris_sizes) or any(
+                canonical_segments.get((path.parent.name, path.stem)) != path
+                or segment_references.get((path.parent.name, path.stem), 0) == 0
+                for path in segment_sizes
+            ) or any(
+                canonical_chunks.get(path.stem) != path
+                or references.get(path.stem, 0) == 0
+                for path in chunk_sizes
+            )
             projected_references = references.copy()
             projected_segment_references = segment_references.copy()
             selected: list[_CapacityEntry] = []
             selected_paths: set[Path] = set()
 
             def select(entry: _CapacityEntry) -> None:
-                nonlocal projected_bytes
+                nonlocal projected_bytes, work_pending
                 if entry.path in selected_paths or (
                     entry.valid and entry.key in protected
                 ):
+                    return
+                if policy.maintenance_max_deletions > 0 and orphan_debt:
+                    work_pending = True
+                    return
+                if (policy.maintenance_max_deletions > 0
+                        and len(selected) >= policy.maintenance_max_deletions):
+                    work_pending = True
                     return
                 selected.append(entry)
                 selected_paths.add(entry.path)
@@ -2571,6 +2611,8 @@ class ManifestStore:
             affected_root_directories: set[Path] = set()
             root_debris_deleted = 0
             for path, size in root_debris_sizes.items():
+                if not admit_deletion():
+                    continue
                 try:
                     path.unlink()
                 except FileNotFoundError:
@@ -2582,6 +2624,8 @@ class ManifestStore:
                     affected_root_directories.add(path.parent)
                     root_debris_deleted += size
             for entry in selected:
+                if not admit_deletion():
+                    continue
                 try:
                     entry.path.unlink()
                 except FileNotFoundError:
@@ -2627,6 +2671,8 @@ class ManifestStore:
                     and remaining_segment_references.get(reference, 0) > 0
                 ):
                     continue
+                if not admit_deletion():
+                    continue
                 try:
                     path.unlink()
                 except OSError:
@@ -2653,6 +2699,8 @@ class ManifestStore:
                     canonical_chunks.get(path.stem) == path
                     and remaining_references.get(path.stem, 0) > 0
                 ):
+                    continue
+                if not admit_deletion():
                     continue
                 try:
                     path.unlink()
@@ -2681,6 +2729,8 @@ class ManifestStore:
             return MaintenanceReport(
                 bytes_before=bytes_before,
                 bytes_after=bytes_after,
+                deletion_attempts=deletion_attempts,
+                work_pending=work_pending,
                 bytes_reclaimed=bytes_before - bytes_after,
                 manifests_evicted=exact_removed,
                 chunks_deleted=chunks_deleted,
@@ -2694,6 +2744,9 @@ class ManifestStore:
                 orphan_segments_deleted=orphan_segments_deleted,
             )
         finally:
+            self._maintenance_not_before = (
+                time.monotonic() + policy.maintenance_interval_ms / 1000.0
+            )
             guard.__exit__(None, None, None)
 
     def _manifest_path(self, identity: CacheIdentity, context_digest: str) -> Path:

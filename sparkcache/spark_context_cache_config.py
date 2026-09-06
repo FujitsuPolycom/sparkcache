@@ -634,6 +634,16 @@ def parse_connector_config(
             max_bytes=max_bytes,
             low_watermark_bytes=low_watermark_bytes,
             ttl_seconds=ttl_seconds,
+            maintenance_max_deletions=_nonnegative_config_int(
+                extra("spark_cache_maintenance_max_deletions", os.environ.get(
+                    "SPARK_CONTEXT_CACHE_MAINTENANCE_MAX_DELETIONS", "0")),
+                "spark_cache_maintenance_max_deletions",
+            ),
+            maintenance_interval_ms=_nonnegative_config_int(
+                extra("spark_cache_maintenance_interval_ms", os.environ.get(
+                    "SPARK_CONTEXT_CACHE_MAINTENANCE_INTERVAL_MS", "0")),
+                "spark_cache_maintenance_interval_ms",
+            ),
         )
     except ValueError as error:
         raise RuntimeError(f"spark-context-cache: {error}") from error
