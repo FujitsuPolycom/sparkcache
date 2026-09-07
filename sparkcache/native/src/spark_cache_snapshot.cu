@@ -535,6 +535,19 @@ extern "C" SparkCacheSnapshotStatus spark_cache_snapshot_create(
     delete snapshot;
     return status;
   }
+  // Load capture kernels during ring initialization so the first optional
+  // capture does not trigger CUDA lazy loading beside an active producer.
+  cudaFuncAttributes attributes{};
+  result = cudaFuncGetAttributes(&attributes, gather_snapshot_kernel);
+  if (result == cudaSuccess) {
+    result = cudaFuncGetAttributes(&attributes, gather_manager_pages_kernel);
+  }
+  if (result != cudaSuccess) {
+    const auto status =
+        cuda_failure(snapshot, "cudaFuncGetAttributes(capture preload)", result);
+    delete snapshot;
+    return status;
+  }
   result = cudaMalloc(
       reinterpret_cast<void**>(&snapshot->device_sources),
       static_cast<std::size_t>(config->max_sources) *
