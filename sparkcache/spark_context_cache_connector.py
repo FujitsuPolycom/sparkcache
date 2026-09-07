@@ -917,6 +917,10 @@ def _multimodal_feature_identities(
 class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     """Store/restore each rank's DCP shard on rank-local NVMe."""
 
+    # Capture/restore kernels use CUDA virtual addresses while the registered
+    # tensors remain owned. No KV physical pages are registered for RDMA.
+    supports_cuda_vmm = True
+
     @property
     def _held(self) -> HeldInventory:
         return self._held_inventory
