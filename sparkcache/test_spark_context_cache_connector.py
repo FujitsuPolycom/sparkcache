@@ -119,6 +119,9 @@ def _install_vllm_stubs() -> None:
     class KVConnectorHandshakeMetadata:
         pass
 
+    class KVConnectorWorkerMetadata:
+        pass
+
     class SupportsHMA:
         pass
 
@@ -141,6 +144,7 @@ def _install_vllm_stubs() -> None:
     base.KVConnectorBase_V1 = KVConnectorBase_V1
     base.KVConnectorHandshakeMetadata = KVConnectorHandshakeMetadata
     base.KVConnectorMetadata = KVConnectorMetadata
+    base.KVConnectorWorkerMetadata = KVConnectorWorkerMetadata
     base.KVConnectorRole = KVConnectorRole
     base.SupportsHMA = SupportsHMA
     for name, module in (
