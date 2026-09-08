@@ -5,14 +5,14 @@
     "platform": "Windows",
     "python": "3.12",
     "torch": "2.11.0+cpu",
-    "source_sha256": "2a501fbb4b83bc5a7a19b5551e3e19d563b39a280cfcf59d011cbbb798afee86"
+    "source_sha256": "e5930ba01d0974896108bbf29bc92913a6a6473ca0bfd913e5e8726fc12f27b3"
   },
   "commands": [
     {
       "command": "python -m pytest sparkcache research deploy -q -rs",
       "passed": 1305,
       "skipped": 9,
-      "seconds": 34.97,
+      "seconds": 34.43,
       "scope": "CPU; platform/compiler/source-fixture skips remain for Linux CI"
     },
     {
@@ -37,5 +37,12 @@
     "matched_committed_source_files": 10,
     "source_bytes": "Canonical LF Git blobs"
   },
-  "gpu_qualification": "The additional private-restore admission and null-block guards require integrated GPU qualification; live capture evidence names SparkCache 2bc05bc9e94a4344758e48db36f69a46dafa6946."
+  "gpu_qualification": "The additional private-restore admission and null-block guards require integrated GPU qualification; live capture evidence names SparkCache 2bc05bc9e94a4344758e48db36f69a46dafa6946.",
+  "common_glm_contract": {
+    "vllm_revision": "17bd258075f44dda8b405f384732f3c78d03f308",
+    "matched_committed_source_files": 10,
+    "source_bytes": "Canonical LF Git blobs; connector files match df62335 exactly",
+    "vllm_cpu_passed": 162,
+    "gpu_qualified": false
+  }
 }

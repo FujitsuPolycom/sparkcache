@@ -34,6 +34,7 @@ REQUIRED_WHEEL_MEMBERS = frozenset(
         "sparkcache/capture_read_leases.py",
         "sparkcache/runtime_patches/vllm-connector-jobs-hybrid-recovery-df62335.json",
         "sparkcache/runtime_patches/vllm-connector-jobs-hybrid-recovery-9b87df5.json",
+        "sparkcache/runtime_patches/vllm-connector-jobs-source-contract.json",
     }
 )
 

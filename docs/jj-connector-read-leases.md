@@ -85,6 +85,7 @@ contract verifies compatibility; it does not grant GPU qualification by itself.
 | R27 with four-checkpoint coalescing and token-sharded mHC, `5dede5bb7fa04949a02823411f2fdf135e29b3dc` | `sparkcache/runtime_patches/vllm-connector-jobs-r27-prefill-5dede5b.json` |
 | R27 composition with hybrid failed-restore recovery, `df62335d8248587f8d3fd1d9a234d1c162a9b84d` | `sparkcache/runtime_patches/vllm-connector-jobs-hybrid-recovery-df62335.json` |
 | JJ with standalone hybrid failed-restore recovery, `9b87df5d47b9c7163d1105ac5ea8c0a088baafc9` | `sparkcache/runtime_patches/vllm-connector-jobs-hybrid-recovery-9b87df5.json` |
+| Shared GLM prefill source with TP2 admission and TP4 recovery, `17bd258075f44dda8b405f384732f3c78d03f308` | `sparkcache/runtime_patches/vllm-connector-jobs-source-contract.json` |
 
 Each contract identifies ownership semantics, required API symbols, and exact
 SHA-256 values for ten source files. Hashes describe canonical LF source bytes
