@@ -541,8 +541,14 @@ class ManagerPageCaptureRuntime:
 
     def take_finished(self, finished_request_ids: set[str]) -> set[str]:
         with self._cv:
+            # Read jobs retire through job acknowledgements, not request completion.
             owned = set(finished_request_ids) & (
-                self._completed | set(self._pending)
+                self._completed
+                | {
+                    request_id
+                    for request_id, capture in self._pending.items()
+                    if not getattr(capture.plan, "capture_job_id", "")
+                }
             )
             self._pending_finished_requests.update(owned)
             if self._fatal is not None:

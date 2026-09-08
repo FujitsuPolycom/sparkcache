@@ -123,6 +123,62 @@ def test_d21_job_completes_at_read_fence_before_request_or_file_completion():
         runtime.shutdown()
 
 
+@pytest.mark.parametrize("finish_at", ["queued", "reading", "completed"])
+def test_d22_job_lease_completion_does_not_retain_finished_request_ids(finish_at):
+    pool = Pool()
+    leases = CaptureReadLeases(pool, ranks=4, max_jobs=1)
+
+    class LeaseConnector(JobConnector):
+        def _capture_read_completed(self, job):
+            super()._capture_read_completed(job)
+            assert leases.complete(job, [3])
+
+    connector = LeaseConnector()
+    ring = FakeRing(b"aabbxyz")
+    runtime = ManagerPageCaptureRuntime(
+        connector,
+        ring=ring,
+        progress_poll_seconds=0.001,
+        progress_thread_initializer=lambda: None,
+        job_stream_factory=lambda ready: 19,
+    )
+    # Step the real progress path deterministically around request completion.
+    runtime._ensure_thread_locked = lambda: None
+    try:
+        for sequence in range(3):
+            ring.ready.clear()
+            plan = _plan(f"finished-job-{sequence}")
+            plan.capture_job_id = leases.reserve([2, 5, 7])
+            assert plan.capture_job_id
+            assert runtime.submit(plan, producer_stream=19, producer_ready=object())
+            if finish_at == "queued":
+                assert runtime.take_finished({plan.request_id}) == set()
+            runtime._progress_once()
+            assert plan.request_id in runtime._pending
+            if finish_at == "reading":
+                assert runtime.take_finished({plan.request_id}) == set()
+            assert not leases.complete(plan.capture_job_id, [0, 1, 2])
+            assert [pool.blocks[bid].ref_cnt for bid in (2, 5, 7)] == [2, 2, 2]
+            ring.ready.set()
+            runtime._progress_once()
+            if finish_at == "completed":
+                assert runtime.take_finished({plan.request_id}) == set()
+            assert runtime.take_finished(set()) == set()
+            assert runtime.status() == {
+                "pending_requests": 0,
+                "completed_notifications": 0,
+                "delayed_requests": 0,
+                "retained_manager_pages": 0,
+                "oldest_delayed_ms": 0.0,
+                "ownership_uncertain": False,
+            }
+            assert not runtime._pending_finished_requests
+            assert not leases and ring.active_ticket_count == 0
+            assert [pool.blocks[bid].ref_cnt for bid in (2, 5, 7)] == [1, 1, 1]
+    finally:
+        runtime.shutdown()
+
+
 def test_d21_preemption_never_waits_for_job_copy_and_discards_publication():
     connector = JobConnector()
     ring = FakeRing(b"aabbxyz")
