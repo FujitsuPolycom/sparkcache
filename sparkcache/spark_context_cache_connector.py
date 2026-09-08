@@ -2078,12 +2078,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     # leave the flight and attach through ordinary lookup.
                     self._retire_restore_flight(leader_digest, outcome="completed")
                     return 0, False
-                if flight.dispatched:
+                if flight.dispatched or request_id in self._pending_async_loads:
                     # The leader cannot legitimately re-enter lookup before
                     # worker completion, but waiting is safer than creating a
                     # second writer into its private blocks.
                     return None, False
-                if self._has_full_quorum(leader_digest):
+                if num_computed_tokens == 0 and self._has_full_quorum(leader_digest):
                     self._trace_reuse(
                         "external_restore_offer", request_id,
                         digest=leader_digest[:12], selected_span_tokens=flight.span_tokens,
@@ -2094,6 +2094,14 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     return flight.span_tokens - num_computed_tokens, True
                 self._need_load.pop(request_id, None)
                 self._retire_restore_flight(leader_digest, outcome="cancelled")
+        if num_computed_tokens > 0:
+            # Whole-prefix placement has no suffix write mask. A local prefix
+            # may share pages with another request, so preserve it and compute
+            # the remaining tokens instead of offering a second writer.
+            self.counters["restore_skip_local_prefix"] = (
+                self.counters.get("restore_skip_local_prefix", 0) + 1
+            )
+            return 0, False
         aligned_span = self._aligned_span(len(token_ids))
         span_ceiling = min(
             aligned_span,
@@ -4257,6 +4265,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     # load errors in one connector-output pass.
                     self._load_errors.update(
                         block for group in plan.group_block_ids for block in group
+                        if block != 0  # Shared null padding is not a restore destination.
                     )
                     self.counters["load_failed"] += 1
                 self._finished_load_reqs.add(plan.request_id)
@@ -4375,6 +4384,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self._load_errors.update(
                     block for plan in load_plans
                     for group in plan.group_block_ids for block in group
+                    if block != 0
                 )
                 self._finished_load_reqs.update(queued)
                 self.counters["load_failed"] += len(queued)

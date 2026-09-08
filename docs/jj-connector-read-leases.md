@@ -1,7 +1,9 @@
 # Asynchronous capture through the generic KV connector API
 
-Status: implemented with CPU conformance coverage. CUDA ordering, eviction under
-GPU load, and full-model restore correctness require GPU qualification.
+Status: **implemented**. Capture retirement and persistent restore are
+**qualified** for the TP4/DCP1 cases and source revisions in the
+[GB10 validation record](evidence/connector-job-gb10-tp4-dcp1.md).
+Other runtime compositions and failure conditions require separate GPU evidence.
 
 The connector can persist immutable attention pages and retained recurrent
 checkpoints using JJ's scheduler-local block-state snapshot. The adapter uses
@@ -73,13 +75,16 @@ and 16384 tokens respectively. Recomputing the uncached tail is expected.
 
 ## Source compatibility
 
-Two source compositions have been reviewed and exercised with the actual CPU
-scheduler, block pool, metadata types, and worker connector callback:
+The source contracts below identify compositions reviewed with the actual CPU
+scheduler, block pool, metadata types, and worker connector callback. A source
+contract verifies compatibility; it does not grant GPU qualification by itself.
 
 | vLLM composition | Source contract |
 | --- | --- |
 | JJ with four-checkpoint coalescing and token-sharded mHC, `abb715f132bdccb592a34b2596a3d3a8d757ffbc` | `sparkcache/runtime_patches/vllm-connector-jobs-jj-prefill-abb715f.json` |
 | R27 with four-checkpoint coalescing and token-sharded mHC, `5dede5bb7fa04949a02823411f2fdf135e29b3dc` | `sparkcache/runtime_patches/vllm-connector-jobs-r27-prefill-5dede5b.json` |
+| R27 composition with hybrid failed-restore recovery, `df62335d8248587f8d3fd1d9a234d1c162a9b84d` | `sparkcache/runtime_patches/vllm-connector-jobs-hybrid-recovery-df62335.json` |
+| JJ with standalone hybrid failed-restore recovery, `9b87df5d47b9c7163d1105ac5ea8c0a088baafc9` | `sparkcache/runtime_patches/vllm-connector-jobs-hybrid-recovery-9b87df5.json` |
 
 Each contract identifies ownership semantics, required API symbols, and exact
 SHA-256 values for ten source files. Hashes describe canonical LF source bytes
@@ -135,6 +140,10 @@ not encoded in the identity and cross-composition state equivalence is unqualifi
 
 ## Validation scope
 
+The [integration CPU record](evidence/connector-job-integration-cpu.json)
+identifies the package-source digest, 1305 passing tests, platform-specific
+skips, source-contract verification, and isolated distribution checks.
+
 GPU-free regressions cover exact boundary selection, refusal to reuse stale
 offers, real block-pool references through request cleanup and allocator reuse,
 four physical-rank acknowledgements, persistent CPU-byte roundtrips, and producer
@@ -143,7 +152,16 @@ event recording before queue admission. Failure tests use the actual Python
 during backend submission failure and invalid-ticket recovery. They do not run
 the CUDA implementation.
 
-Before serving qualification, run the native CUDA ring tests and a model check
+The GB10 validation record covers four short cold requests, two explicit request
+cancellations, and two exact-answer restores after all model processes restarted.
+All four physical ranks completed native capture; pending work and retained
+source references returned to zero after each retirement case. These results
+apply to SparkCache `2bc05bc9e94a4344758e48db36f69a46dafa6946` and the listed
+vLLM composition. The additional [whole-prefix restore ownership
+guards](PRIVATE_RESTORE_SAFETY.md) have CPU regression coverage and require a
+GPU check at the integrated revision.
+
+For each additional serving composition, run the native CUDA ring tests and a model check
 with cache misses, persistent hits, continuation, concurrent decode, preemption,
 eviction, and forced capture backpressure. Confirm every rank completes its read
 before source reuse and that failed restores recompute. Compare against a cold

@@ -2759,7 +2759,7 @@ class ConnectorRoundTripTests(unittest.TestCase):
             self.assertEqual(connector.counters["load_failed"], 1)
             self.assertEqual(
                 connector.get_block_ids_with_load_errors(),
-                set(load_plan.block_ids),
+                set(load_plan.block_ids) - {0},
             )
             # errors drain once reported
             self.assertEqual(connector.get_block_ids_with_load_errors(), set())
@@ -2789,7 +2789,7 @@ class ConnectorRoundTripTests(unittest.TestCase):
             self.assertEqual(connector.counters["load_failed"], 1)
             self.assertEqual(
                 connector.get_block_ids_with_load_errors(),
-                set(load_plan.block_ids),
+                set(load_plan.block_ids) - {0},
             )
 
 
@@ -3395,7 +3395,7 @@ class StartupDiscoveryTests(unittest.TestCase):
             self.assertEqual(_drain(restarted), {"corrupt"})
             self.assertEqual(
                 restarted.get_block_ids_with_load_errors(),
-                set(load_plan.block_ids),
+                set(load_plan.block_ids) - {0},
             )
             self.assertNotIn(plan.digest, restarted._held)
             report = restarted.get_kv_connector_stats().data["reports"][0]
@@ -5384,7 +5384,7 @@ class AsyncRestoreTests(unittest.TestCase):
                 self.assertEqual(connector.counters["load_failed"], 1)
                 self.assertEqual(
                     connector.get_block_ids_with_load_errors(),
-                    set(self.BLOCKS),
+                    set(self.BLOCKS) - {0},
                 )
             finally:
                 connector.shutdown()
@@ -5843,7 +5843,7 @@ class AsyncRestoreTests(unittest.TestCase):
 
             connector.get_num_new_matched_tokens(leader, 0)
             self.assertEqual(
-                connector.get_num_new_matched_tokens(partial, 256), (768, True)
+                connector.get_num_new_matched_tokens(partial, 256), (0, False)
             )
             self.assertNotIn(partial.request_id, connector._restore_flight_followers)
 
@@ -6525,7 +6525,7 @@ class AsyncRestoreTests(unittest.TestCase):
             self.assertEqual(_drain(connector), {"bad-restore"})
             self.assertEqual(connector.get_finished(set()), (None, None))
             self.assertEqual(
-                connector.get_block_ids_with_load_errors(), set(self.BLOCKS)
+                connector.get_block_ids_with_load_errors(), set(self.BLOCKS) - {0}
             )
             self.assertEqual(connector.counters["load_failed"], 1)
             self.assertNotIn(digest, connector._held)

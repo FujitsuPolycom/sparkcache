@@ -31,6 +31,7 @@ If those checks do not pass, vLLM computes the prompt normally.
 | Longest exact-prefix selection | Reuse the longest stored part of a prompt, not only a complete prompt match. | **implemented** |
 | Sparse row-prefix aliases | Point to reusable earlier row boundaries without copying their payloads. | **implemented** |
 | Complete manager-page snapshots | Preserve model-managed pages whose state is not exposed as ordinary rows. | **implemented** |
+| Asynchronous capture with source leases | Keep source pages allocated until every physical worker finishes reading them, including after request completion or cancellation. | **implemented**; [TP4/DCP1 evidence](docs/evidence/connector-job-gb10-tp4-dcp1.md) |
 | Copy-on-write publication | Store only changed row tails or changed physical pages when extending a stored context. | **implemented** |
 | SparkCache CUDA restore | Move verified page data into request-owned GPU blocks through a C++/CUDA path. | **implemented** |
 | Shared bases and GPU prefixes | Read a common stored base once and let bounded concurrent requests share the restored GPU prefix. | **implemented** |
@@ -104,6 +105,8 @@ measurements, and known limits out of the generic cache design.
 |---|---|
 | Package setup and configuration | [`sparkcache/README.md`](sparkcache/README.md) |
 | CUDA placement and snapshot libraries | [`sparkcache/native/README.md`](sparkcache/native/README.md) |
+| Generic vLLM capture ownership and source contracts | [`docs/jj-connector-read-leases.md`](docs/jj-connector-read-leases.md) |
+| Whole-prefix restore ownership | [`docs/PRIVATE_RESTORE_SAFETY.md`](docs/PRIVATE_RESTORE_SAFETY.md) |
 | Interactive prefix explorer | [`docs/sparkcache-prefix-explainer.html`](docs/sparkcache-prefix-explainer.html) |
 | Research ideas and unsupported designs | [`ROADMAP.md`](ROADMAP.md) |
 | Open correctness defects | [`DEFECTS.md`](DEFECTS.md) |

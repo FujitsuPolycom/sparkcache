@@ -1,0 +1,41 @@
+{
+  "schema": "sparkcache-integration-cpu-validation/v1",
+  "status": "qualified",
+  "conditions": {
+    "platform": "Windows",
+    "python": "3.12",
+    "torch": "2.11.0+cpu",
+    "source_sha256": "2a501fbb4b83bc5a7a19b5551e3e19d563b39a280cfcf59d011cbbb798afee86"
+  },
+  "commands": [
+    {
+      "command": "python -m pytest sparkcache research deploy -q -rs",
+      "passed": 1305,
+      "skipped": 9,
+      "seconds": 34.97,
+      "scope": "CPU; platform/compiler/source-fixture skips remain for Linux CI"
+    },
+    {
+      "command": "python -m ruff check .",
+      "result": "passed"
+    },
+    {
+      "command": "python -m build",
+      "result": "wheel and source distribution built"
+    },
+    {
+      "command": "python -m twine check <distributions>",
+      "result": "passed"
+    },
+    {
+      "command": "python tools/verify_distribution.py <wheel> <sdist> --version 0.1.0a3",
+      "result": "passed, including isolated wheel installation and required connector modules/contracts"
+    }
+  ],
+  "standalone_jj_contract": {
+    "vllm_revision": "9b87df5d47b9c7163d1105ac5ea8c0a088baafc9",
+    "matched_committed_source_files": 10,
+    "source_bytes": "Canonical LF Git blobs"
+  },
+  "gpu_qualification": "The additional private-restore admission and null-block guards require integrated GPU qualification; live capture evidence names SparkCache 2bc05bc9e94a4344758e48db36f69a46dafa6946."
+}
