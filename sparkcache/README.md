@@ -311,6 +311,96 @@ A larger gap amortizes maintenance across more writes, but each pass evicts
 more data and can increase future misses. Compare those costs with observed
 publication age and maintenance activity before changing the gap.
 
+### Deletion pacing
+
+Status: **implemented**; serving performance with these controls is
+**research-only**. Both settings default to `0`, preserving unrestricted passes:
+
+- `spark_cache_maintenance_max_deletions` caps filesystem unlink attempts per
+  pass, including failed attempts, across manifests, aliases, debris,
+  descriptor segments, and payload objects. Its environment fallback is
+  `SPARK_CONTEXT_CACHE_MAINTENANCE_MAX_DELETIONS`.
+- `spark_cache_maintenance_interval_ms` sets a minimum cooldown after a pass
+  finishes or fails. Forced post-commit calls also respect it; skipped calls
+  do not extend it. Its environment fallback is
+  `SPARK_CONTEXT_CACHE_MAINTENANCE_INTERVAL_MS`.
+
+Explicit connector settings take precedence over environment values. A test
+configuration can select `128` deletion attempts and `1000` milliseconds;
+these values are not a qualified serving-performance recommendation.
+
+With a deletion budget, existing orphan payloads and debris are reclaimed
+before additional roots are selected.
+
+A pass can stop above the low watermark
+or the capacity maximum; optional store admission remains blocked while
+capacity is unsatisfied.
+
+A process-local pressure target retains the low watermark across passes,
+even after usage falls below the high watermark. Restarting the process
+loses this target; a later high-watermark crossing establishes it again.
+
+Background retries complete deferred cleanup without
+making serving wait. Root-directory durability barriers still precede object
+removal, and protected publication roots retain their complete object graphs.
+
+This is **not a scan-size or wall-clock bound**. Each admitted pass authenticates
+the complete reference inventory and reconciles survivors.
+
+Status: **implemented**. A completed pass also returns metadata-qualified
+surviving roots while the exclusive filesystem guard is held.
+
+The connector
+uses this inventory to reconcile offers without rereading every root or
+restatting shared chunks once per reference.
+
+Qualification checks logical
+file sizes, not allocated disk space. Exact roots shadow aliases even when
+invalid; aliases are eligible only for token-row storage.
+
+Protected roots and
+their referenced objects retain the same deletion rules.
+
+The inventory is not retained between passes. Failed or busy passes use
+independent metadata probes.
+
+If the offered-digest inventory changes during a
+pass or probe, reconciliation defers withdrawals to a stable pass, preserving
+concurrent publication of the same digest.
+
+The connector counter
+`capacity_stale_inventory_snapshots` and worker capacity-report field
+`maintenance_stale_inventory_snapshots` count these deferrals.
+
+Restore still
+authenticates payload bytes; metadata qualification cannot establish their
+integrity or turn an invalid restore into a hit.
+
+One filesystem
+operation or durability barrier can take arbitrarily long. Smaller deletion
+budgets can increase total scan work.
+
+Cooldown trades reclamation throughput
+for gaps between that work. A larger watermark gap does not remove this cost.
+
+`MaintenanceReport.deletion_attempts` counts admitted unlink attempts;
+`work_pending` reports cleanup deferred by the budget or orphan-first policy;
+`skipped_cooldown` reports a pass skipped before inventory work.
+
+Connector
+counters `capacity_deletion_attempts`, `capacity_budget_exhausted`, and
+`capacity_skipped_cooldown` expose the same activity. Capacity log records
+include `deletion_attempts` and `work_pending`.
+
+Prometheus gauges
+`vllm:sparkcache_maintenance_deletion_attempts`,
+`vllm:sparkcache_maintenance_budget_exhausted`, and
+`vllm:sparkcache_maintenance_skipped_cooldown` sum reported cumulative counts
+across ranks.
+
+They reset with workers and reflect the last worker reports,
+not independent scrape-time measurements.
+
 `spark_cache_ttl_seconds` expires manifests by recency; zero disables TTL.
 Maintenance preserves shared objects referenced by surviving manifests.
 
@@ -423,6 +513,39 @@ Exact process-local totals are available from
 The counters describe host-side operations. They do not report filesystem
 allocation, NVMe Data Units Written, controller write amplification, or NAND
 writes.
+
+### Request reuse attribution
+
+Status: **implemented** with an optional scheduler callback. A runtime without
+that callback cannot produce exact request attribution from connector offers.
+
+Set `SPARK_CONTEXT_CACHE_TRACE_REUSE=1` before startup. An instrumented scheduler
+emits one `request_cache_attribution` event in `sparkcache-reuse-trace/v1` at
+request cleanup. No request IDs are added to Prometheus labels.
+
+| Field | Meaning |
+|---|---|
+| `local_tokens_reused` | GPU-resident prompt tokens consumed by accepted target execution, including resident shared leases. |
+| `external_tokens_reused` | Prompt tokens consumed after a successful all-rank persistent restore and the scheduler's final-token adjustment. |
+| `prompt_tokens_computed` | Prompt intervals completed by accepted target execution, accumulated across preemption attempts. |
+| `preemptions` | Request preemption generation observed by the scheduler. |
+| `attribution_complete` | True only for normal completion with observed prompt completion and no missing or invalid accounting boundary. |
+
+Counts cover accepted target-prompt work across attempts. They can exceed the
+original prompt length after preemption. They exclude output tokens, draft
+execution, replay inside kernels, and rejected worker output.
+
+An offered restore earns no credit. A verified restore aborted before target
+execution earns no reused-token credit. A follower consuming a resident GPU
+lease records local reuse, even if a different request restored that lease.
+
+The restored state span and external prompt tokens reused are distinct. A
+restore can write an already-local prefix, and a full prompt hit still needs
+the final prompt token recomputed for sampling logits.
+
+Incomplete observations remain labeled incomplete. Their token fields are not
+added to the connector's `attribution_completed_*` aggregate counters. Request
+cleanup releases the ledger even when logging fails.
 
 Telemetry is observational. It cannot change publication, restore, cache
 identity, or serving decisions.

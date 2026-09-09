@@ -3552,6 +3552,7 @@ class CapacityPolicyConnectorTests(unittest.TestCase):
                     manifests_evicted=1,
                     chunks_deleted=2,
                     evicted_entries=(EntryKey(storage_key, removed),),
+                    surviving_entries=(EntryKey(storage_key, survivor),),
                 )
             )
             connector._reconcile_held_capacity = mock.Mock()
