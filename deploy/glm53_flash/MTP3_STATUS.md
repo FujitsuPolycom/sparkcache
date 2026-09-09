@@ -29,21 +29,35 @@ identified above. It requires a rebuilt image and startup validation.
 
 ## What remains in the performance issues
 
+Source builds include request-attribution accounting, same-pass maintenance
+inventory reuse, and optional deletion pacing. The immutable image identified
+above does not contain these additions. Attribution also requires the matching
+instrumented SparkRing scheduler; a package update alone cannot supply its events.
+
 | Issue | Implemented | Remaining work |
 |---|---|---|
-| [#60: sustained publication and eviction slowdown](https://github.com/FujitsuPolycom/sparkcache/issues/60) | Fewer repeated restore reads and hashes, bounded restore arenas, tiled native placement, publication-dependency protection, publication-backlog gauges, optional periodic full captures, and capacity guidance. | Maintenance still scans and sorts the inventory and evicts toward the low watermark; it has no per-pass time or entry budget. Reproduce the reported slowdown with a near-full 40 GiB store and matched before/after probes. |
-| [#61: growing conversations lose local prefix reuse](https://github.com/FujitsuPolycom/sparkcache/issues/61) | Runtime GPU-lease accounting, preference for longer local prefixes, recurrent checkpoint retention, and opt-in restore/lease traces. | Exact per-request local-hit, verified-restore, and recompute token counters are not implemented. Validate local retention on the reported long-context, multi-turn workload with occasional images. |
+| [#60: sustained publication and eviction slowdown](https://github.com/FujitsuPolycom/sparkcache/issues/60) | Reduced restore work, publication-dependency protection, backlog gauges, capacity guidance, same-pass inventory reuse, and opt-in deletion-attempt limits and cooldown. | Full inventory scans and individual filesystem operations still have no hard time bound. Validate the combined implementation against near-full 40 GiB traffic and matched before/after probes. |
+| [#61: growing conversations lose local prefix reuse](https://github.com/FujitsuPolycom/sparkcache/issues/61) | Runtime lease accounting, local-prefix preference, checkpoint retention, and opt-in request attribution for accepted target execution. | Deploy the matching scheduler instrumentation and validate attribution and local retention on the reported long-context conversations with occasional images. |
 
 One saver admission per rank bounds concurrent optional work; it does not bound
-the duration of an inventory scan or eviction pass. See
+the duration of an inventory scan. Deletion pacing is disabled by default.
+Smaller deletion budgets can repeat scans and increase total work. See
 [capacity and cleanup](../../sparkcache/README.md#capacity-and-cleanup).
 Backlog reports distinguish pending publications, their oldest age, and active
 maintenance, but reports may not refresh while the connector is idle.
 
-Reuse traces distinguish restore offers, verified worker completion, and GPU
-lease attachment. Their scheduler prefix-token field is block-aligned input,
-not an exact local hash-hit measurement. API `cached_tokens` alone is not enough
-to attribute reuse to GPU retention rather than persistent restoration.
+Matching traces distinguish restore offers, worker completion, and GPU lease
+attachment. Their scheduler prefix-token input and API `cached_tokens` alone
+cannot establish exact attribution.
+
+The [request-attribution record](../../sparkcache/README.md#request-reuse-attribution)
+uses authoritative scheduler events to distinguish consumed local prefixes,
+verified external reuse, and accepted prompt computation. Counts accumulate
+across preemption attempts; incomplete observations are labeled explicitly.
+
+The [maintenance inventory benchmark](../../docs/maintenance-inventory-validation.md)
+measures reduced metadata work on CPU fixtures. It is not a DGX4 serving result
+or confirmation that the original slowdown is resolved.
 
 Both issues should remain open until their remaining implementation questions
 and workload-specific results are recorded explicitly.

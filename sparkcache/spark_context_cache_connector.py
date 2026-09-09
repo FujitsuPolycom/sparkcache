@@ -94,6 +94,7 @@ from sparkcache.spark_context_cache_hybrid import (
     split_snapshot,
 )
 from sparkcache.spark_context_cache_restore_timing import RestoreTiming
+from sparkcache.request_attribution import RequestAttribution
 from sparkcache.held_inventory import HeldInventory
 from sparkcache.page_base_read_flights import (
     PageBaseReadEvidence,
@@ -615,6 +616,10 @@ class SparkCacheStats(KVConnectorStats):
                 ),
             }
             reduced.update({key: value for key, value in alerts.items() if value})
+            for name in ("deletion_attempts", "budget_exhausted", "skipped_cooldown"):
+                reduced[f"sparkcache_maintenance_{name}"] = sum(
+                    int(status.get(f"maintenance_{name}", 0)) for status in capacity
+                )
         async_capture = [
             report.get("async_capture")
             for report in reports
@@ -793,6 +798,21 @@ class SparkCachePromMetrics(KVConnectorPromMetrics):
             "Physical ranks reporting an active capacity scan or reconciliation at their last worker reports.",
             1.0,
         ),
+        "sparkcache_maintenance_deletion_attempts": (
+            "vllm:sparkcache_maintenance_deletion_attempts",
+            "Reported cumulative unlink attempts summed across physical ranks; resets with workers.",
+            1.0,
+        ),
+        "sparkcache_maintenance_budget_exhausted": (
+            "vllm:sparkcache_maintenance_budget_exhausted",
+            "Reported cumulative passes deferring deletion work across physical ranks.",
+            1.0,
+        ),
+        "sparkcache_maintenance_skipped_cooldown": (
+            "vllm:sparkcache_maintenance_skipped_cooldown",
+            "Reported cumulative cooldown skips across physical ranks.",
+            1.0,
+        ),
         "sparkcache_capture_delayed_requests": (
             "vllm:sparkcache_capture_delayed_requests",
             "Maximum delayed SparkCache capture requests on any physical rank.",
@@ -961,6 +981,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         )
         self._config = config
         self._trace_reuse_enabled = os.environ.get("SPARK_CONTEXT_CACHE_TRACE_REUSE") == "1"
+        self.request_cache_events_enabled = (
+            self._trace_reuse_enabled and role is KVConnectorRole.SCHEDULER
+        )
+        self._request_attribution: dict[str, RequestAttribution] = {}
         self._block_size = config.block_size
         self._tp_degree = config.tp_degree
         self._dcp_degree = config.dcp_degree
@@ -1976,6 +2000,52 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 "spark-context-cache-reuse:%s",
                 json.dumps(record, sort_keys=True, separators=(",", ":")),
             )
+
+    def record_request_cache_event(self, request: "Request", event: str, **fields) -> None:
+        """Consume optional scheduler observations without changing serving.
+
+        Matching offers and worker-local completion traces never call this
+        accounting path. The runtime must report adopted prefixes, final
+        receive outcomes, and accepted target-model execution explicitly.
+        """
+        if not getattr(self, "request_cache_events_enabled", False):
+            return
+        request_id = request.request_id
+        state = self._request_attribution.get(request_id)
+        try:
+            if event == "finished":
+                state = self._request_attribution.pop(request_id, None)
+                if state is None:
+                    return
+                status = fields.get("status", getattr(request, "status", "unknown"))
+                status = str(getattr(status, "name", status))
+                summary = state.summary(status)
+                category = "complete" if summary["attribution_complete"] else "incomplete"
+                key = f"attribution_requests_{category}"
+                self.counters[key] = self.counters.get(key, 0) + 1
+                if summary["attribution_complete"]:
+                    for field in ("local_tokens_reused", "external_tokens_reused",
+                                  "prompt_tokens_computed"):
+                        key = "attribution_completed_" + field
+                        self.counters[key] = self.counters.get(key, 0) + summary[field]
+                self._trace_reuse("request_cache_attribution", request_id, **summary)
+                return
+            if state is None:
+                if event != "admitted":
+                    # Late receive drains for retired requests do not allocate
+                    # another ledger or credit an aborted response.
+                    return
+                prompt_tokens = getattr(request, "num_prompt_tokens", None)
+                if prompt_tokens is None:
+                    prompt_tokens = len(request.prompt_token_ids or ())
+                state = RequestAttribution(prompt_tokens)
+                self._request_attribution[request_id] = state
+            state.record(event, **fields)
+        except Exception:  # Diagnostics cannot interrupt verified-or-recompute.
+            if state is not None:
+                state.valid = False
+            key = "attribution_invalid_events"
+            self.counters[key] = self.counters.get(key, 0) + 1
 
     def shared_prefix_lease_attached(self, request_id: str, lease_key: str) -> None:
         follower = self._restore_flight_followers.get(request_id)
@@ -3025,7 +3095,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         ):
             report = self._maintain_capacity(force=True)
             self._ensure_capacity_thread()
-            if (report is not None and report.skipped_busy) or not bool(
+            if (report is not None and (report.skipped_busy or report.skipped_cooldown)) or not bool(
                 self._capacity_status["capacity_satisfied"]
             ):
                 self._capacity_wakeup.set()
@@ -3258,7 +3328,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         if not policy.enabled:
             return None
         if not force and (
-            policy.max_bytes == 0 or self._capacity_estimated_bytes <= policy.max_bytes
+            (policy.max_bytes == 0 or self._capacity_estimated_bytes <= policy.max_bytes)
+            and not self._capacity_status.get("maintenance_work_pending", False)
         ):
             return None
         self._capacity_maintenance_depth = getattr(self, "_capacity_maintenance_depth", 0) + 1
@@ -3279,6 +3350,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         """Keep scans and survivor reconciliation within the maintenance activity gauge."""
         try:
             with self._store_cv:
+                held_snapshot = (self._held, self._held.revision, set(self._held))
                 protected = tuple(
                     key
                     for result_digest, base in getattr(self, "_publication_base_pins", {}).items()
@@ -3301,6 +3373,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 "spark-context-cache: capacity maintenance failed: %s", error
             )
             return None
+        if report.skipped_cooldown:
+            self.counters["capacity_skipped_cooldown"] = (
+                self.counters.get("capacity_skipped_cooldown", 0) + 1
+            )
+            if wake_worker_on_unsatisfied:
+                self._capacity_wakeup.set()
+            return report
         if report.skipped_busy:
             self.counters["capacity_skipped_busy"] += 1
             self._capacity_status.update(
@@ -3317,6 +3396,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             bytes=report.bytes_after,
             bytes_exact=True,
             capacity_satisfied=report.capacity_satisfied,
+            maintenance_work_pending=report.work_pending,
+        )
+        self.counters["capacity_deletion_attempts"] = (
+            self.counters.get("capacity_deletion_attempts", 0) + report.deletion_attempts
+        )
+        self.counters["capacity_budget_exhausted"] = (
+            self.counters.get("capacity_budget_exhausted", 0) + int(report.work_pending)
         )
         self.counters["capacity_runs"] += 1
         self.counters["capacity_manifests_evicted"] += report.manifests_evicted
@@ -3328,59 +3414,24 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self.counters["prefix_alias_segments_deleted"] += int(
             getattr(report, "segments_deleted", 0)
         )
-        if report.evicted_entries:
+        if report.surviving_entries is None:
+            # A report without an inventory cannot authorize withdrawals.
+            self._reconcile_held_capacity()
+        elif held_snapshot[2]:
             identity = self._identity(self._worker_rank())
-            withdrawn = set()
-            candidates: dict[str, set[str]] = {}
-            for entry in report.evicted_entries:
-                if entry.storage_key != identity.storage_key:
-                    continue
-                candidates.setdefault(entry.context_digest, set()).add(
-                    getattr(entry, "root_kind", "manifest")
-                )
-            for digest, evicted_roots in candidates.items():
-                exact_exists = (
-                    "manifest" not in evicted_roots
-                    and (
-                        Path(self._root)
-                        / "manifests"
-                        / identity.storage_key
-                        / f"{digest}.json"
-                    ).exists()
-                )
-                alias_exists = (
-                    self._storage_mode == "per_token_rows"
-                    and "prefix_alias" not in evicted_roots
-                    and (
-                        Path(self._root)
-                        / "prefix-aliases"
-                        / identity.storage_key
-                        / f"{digest}.json"
-                    ).exists()
-                )
-                if not exact_exists and not alias_exists:
-                    withdrawn.add(digest)
-                    continue
-                lookup, _is_alias = self._lookup_reusable(
-                    identity,
-                    digest,
-                    verify_chunks=False,
-                    verify_chunk_metadata=True,
-                )
-                if not lookup.is_hit:
-                    withdrawn.add(digest)
-            with self._store_cv:
-                self._held.difference_update(withdrawn)
-        # One digest can name both an exact manifest and its source-boundary
-        # alias. The targeted checks above retain the offer when either root
-        # remains; this complete pass also catches entries removed as debris.
-        self._reconcile_held_capacity()
-        if not report.capacity_satisfied and wake_worker_on_unsatisfied:
+            surviving = {
+                entry.context_digest for entry in report.surviving_entries
+                if entry.storage_key == identity.storage_key
+                and (entry.root_kind == "manifest" or self._storage_mode == "per_token_rows")
+            }
+            self._apply_held_capacity_survivors(held_snapshot, surviving)
+        if (not report.capacity_satisfied or report.work_pending) and wake_worker_on_unsatisfied:
             self._capacity_wakeup.set()
         if force or report.bytes_reclaimed:
             logger.info(
                 "spark-context-cache: capacity bytes=%d max=%d reclaimed=%d"
-                " manifests=%d chunks=%d orphans=%d satisfied=%s",
+                " manifests=%d chunks=%d orphans=%d satisfied=%s"
+                " deletion_attempts=%d work_pending=%s",
                 report.bytes_after,
                 policy.max_bytes,
                 report.bytes_reclaimed,
@@ -3388,6 +3439,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 report.chunks_deleted,
                 report.orphan_chunks_deleted,
                 report.capacity_satisfied,
+                report.deletion_attempts,
+                report.work_pending,
             )
         return report
 
@@ -3412,7 +3465,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             force=force_maintenance,
             wake_worker_on_unsatisfied=True,
         )
-        if report is not None and not report.skipped_busy:
+        if report is not None and not (report.skipped_busy or report.skipped_cooldown):
             exact_evicted = (
                 EntryKey(
                     identity.storage_key,
@@ -3640,7 +3693,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 report = self._maintain_capacity_locked(force=True)
                 if (
                     report is None
-                    or report.skipped_busy
+                    or (report.skipped_busy or report.skipped_cooldown)
                     or not report.capacity_satisfied
                 ):
                     return False
@@ -3684,15 +3737,32 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self.counters["streaming_store_evicted"] += len(evicted)
             return True
 
+    def _apply_held_capacity_survivors(
+        self,
+        snapshot: tuple[HeldInventory, int, set[str]],
+        surviving: set[str],
+    ) -> None:
+        inventory, revision, held = snapshot
+        with self._store_cv:
+            if self._held is not inventory or self._held.revision != revision:
+                # A digest can be withdrawn and republished during a probe.
+                # An earlier inventory cannot revoke that publication; a
+                # stable pass reconciles it, and restores still verify bytes.
+                self.counters["capacity_stale_inventory_snapshots"] = (
+                    self.counters.get("capacity_stale_inventory_snapshots", 0) + 1
+                )
+                return
+            self._held.difference_update(held - surviving)
+
     def _reconcile_held_capacity(self) -> None:
-        if not self._held:
+        with self._store_cv:
+            snapshot = (self._held, self._held.revision, set(self._held))
+        if not snapshot[2]:
             return
         rank = self._worker_rank()
         identity = self._identity(rank)
-        with self._store_cv:
-            held = set(self._held)
         surviving = set()
-        for digest in held:
+        for digest in snapshot[2]:
             lookup, _is_alias = self._lookup_reusable(
                 identity,
                 digest,
@@ -3701,8 +3771,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             )
             if lookup.is_hit:
                 surviving.add(digest)
-        with self._store_cv:
-            self._held.intersection_update(surviving)
+        self._apply_held_capacity_survivors(snapshot, surviving)
 
     def _ensure_capacity_thread(self) -> None:
         if self._capacity_thread is not None:
@@ -3752,7 +3821,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     with self._capacity_handoff_cv:
                         self._streaming_capacity_pending.difference_update(resolved)
                         self._capacity_handoff_cv.notify_all()
-                    retry_unsatisfied = False
+                    retry_unsatisfied = bool(
+                        self._capacity_status.get("maintenance_work_pending", False)
+                    )
                 else:
                     self.counters["streaming_capacity_retries"] += 1
                     retry_unsatisfied = True
@@ -3765,6 +3836,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             retry_unsatisfied = bool(
                 report is None
                 or not report.capacity_satisfied
+                or report.work_pending
                 or not bool(self._capacity_status["capacity_satisfied"])
             )
             if retry_unsatisfied:
@@ -4940,6 +5012,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
+        self.record_request_cache_event(request, "finished")
         # A finished request id never recurs, so its scheduler-side tracking
         # state is dropped here. This is what keeps _need_load, _admitted,
         # and _store_progress bounded without evicting live entries.
@@ -6458,6 +6531,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     "streaming_capacity_shutdown_dropped"
                 ],
                 maintenance_retries=self.counters["capacity_retries"],
+                maintenance_deletion_attempts=self.counters.get("capacity_deletion_attempts", 0),
+                maintenance_stale_inventory_snapshots=self.counters.get("capacity_stale_inventory_snapshots", 0),
+                maintenance_budget_exhausted=self.counters.get("capacity_budget_exhausted", 0),
+                maintenance_skipped_cooldown=self.counters.get("capacity_skipped_cooldown", 0),
             )
             report["capacity"] = capacity
         runtime = self._async_page_capture_runtime

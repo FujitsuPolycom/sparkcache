@@ -122,3 +122,59 @@ def test_trace_logger_failure_does_not_change_lease_decision(tmp_path, monkeypat
         assert connector.counters["shared_prefix_leases_attached"] == 1
     finally:
         connector.shutdown()
+
+
+def test_request_attribution_credits_scheduler_events_and_cleans_up(tmp_path, monkeypatch):
+    monkeypatch.setenv("SPARK_CONTEXT_CACHE_TRACE_REUSE", "1")
+    records = _records(monkeypatch)
+    connector = fixtures._make_connector(tmp_path, 0, role=connector_module.KVConnectorRole.SCHEDULER)
+    request = SimpleNamespace(request_id="attributed", num_prompt_tokens=1100,
+                              status=SimpleNamespace(name="FINISHED_STOPPED"))
+    try:
+        assert connector.request_cache_events_enabled
+        connector.record_request_cache_event(request, "admitted", local_tokens=1031,
+                                             external_tokens=0, preemptions=0)
+        connector.record_request_cache_event(request, "prompt_step_completed",
+                                             start_token=1031, end_token=1100, preemptions=0)
+        connector.record_request_cache_event(request, "finished")
+        connector.record_request_cache_event(request, "finished")
+        connector.record_request_cache_event(request, "restore_finalized",
+                                             success=True, valid_prefix_tokens=1024)
+        assert connector._request_attribution == {}
+        assert len(records) == 1
+        assert records[0]["local_tokens_reused"] == 1031
+        assert records[0]["prompt_tokens_computed"] == 69
+        assert records[0]["external_tokens_reused"] == 0
+        assert records[0]["attribution_complete"]
+        assert connector.counters["attribution_requests_complete"] == 1
+    finally:
+        connector.shutdown()
+
+
+def test_request_attribution_invalid_event_and_log_failure_do_not_affect_serving(tmp_path, monkeypatch):
+    monkeypatch.setenv("SPARK_CONTEXT_CACHE_TRACE_REUSE", "1")
+    connector = fixtures._make_connector(tmp_path, 0, role=connector_module.KVConnectorRole.SCHEDULER)
+    request = SimpleNamespace(request_id="invalid", num_prompt_tokens=100,
+                              status=SimpleNamespace(name="FINISHED_ABORTED"))
+    try:
+        connector.record_request_cache_event(request, "admitted", local_tokens=-1,
+                                             external_tokens=0, preemptions=0)
+        assert connector.counters["attribution_invalid_events"] == 1
+        monkeypatch.setattr(connector_module.logger, "info",
+                            lambda *args, **kwargs: (_ for _ in ()).throw(OSError("sink failed")))
+        connector.record_request_cache_event(request, "finished")
+        assert connector._request_attribution == {}
+        assert connector.counters["attribution_requests_incomplete"] == 1
+    finally:
+        connector.shutdown()
+
+
+def test_request_attribution_disabled_has_no_per_request_state(tmp_path, monkeypatch):
+    monkeypatch.delenv("SPARK_CONTEXT_CACHE_TRACE_REUSE", raising=False)
+    connector = fixtures._make_connector(tmp_path, 0, role=connector_module.KVConnectorRole.SCHEDULER)
+    try:
+        assert not connector.request_cache_events_enabled
+        connector.record_request_cache_event(SimpleNamespace(request_id="off"), "admitted")
+        assert connector._request_attribution == {}
+    finally:
+        connector.shutdown()
