@@ -27,6 +27,8 @@ VLLM_ROOT_KEY = "spark_cache_async_page_capture_vllm_root"
 VLLM_ROOT_ENV = "SPARK_CONTEXT_CACHE_ASYNC_PAGE_CAPTURE_VLLM_ROOT"
 LEASE_CONTRACT_KEY = "spark_cache_async_page_capture_lease_contract"
 LEASE_CONTRACT_ENV = "SPARK_CONTEXT_CACHE_ASYNC_PAGE_CAPTURE_LEASE_CONTRACT"
+LEASE_MODE_KEY = "spark_cache_async_page_capture_lease_mode"
+LEASE_MODE_ENV = "SPARK_CONTEXT_CACHE_ASYNC_PAGE_CAPTURE_LEASE_MODE"
 
 
 def _absolute(path: Path) -> bool:
@@ -48,6 +50,7 @@ class ManagerPageCaptureSettings:
     slot_count: int = 2
     vllm_root: Path | None = None
     lease_contract: Path | None = None
+    lease_mode: str = "request-finish"
 
     def __post_init__(self) -> None:
         if not _absolute(self.library_path):
@@ -60,6 +63,10 @@ class ManagerPageCaptureSettings:
             raise RuntimeError("manager-page capture slot bytes must be positive")
         if self.slot_count not in (2, 3):
             raise RuntimeError("manager-page capture slot count must be two or three")
+        if self.lease_mode not in ("request-finish", "connector-jobs"):
+            raise RuntimeError("manager-page capture lease mode is unsupported")
+        if self.lease_mode == "connector-jobs" and self.lease_contract is None:
+            raise RuntimeError("connector-job capture requires an explicit source contract")
         for name in ("vllm_root", "lease_contract"):
             value = getattr(self, name)
             if value is not None and not _absolute(value):
@@ -85,6 +92,7 @@ class ManagerPageCaptureSettings:
             slot_count=slot_count,
             vllm_root=Path(vllm_root) if vllm_root else None,
             lease_contract=Path(lease) if lease else None,
+            lease_mode=_extra(connector, LEASE_MODE_KEY, LEASE_MODE_ENV, "request-finish"),
         )
 
 
@@ -104,6 +112,12 @@ def verify_manager_page_lease_contract(
         / "runtime_patches"
         / "vllm-manager-page-async-contract-55969c16.json"
     )
+    if settings.lease_mode == "connector-jobs":
+        from sparkcache.runtime_patches.generic_connector_contract import (
+            verify_connector_job_contract,
+        )
+
+        return tuple(verify_connector_job_contract(root, contract))
     return tuple(verify_contract(root, contract))
 
 

@@ -2684,3 +2684,151 @@ class DefectD19MultimodalPromptAliasingTests(unittest.TestCase):
                 (0, False),
             )
             self.assertEqual(connector.counters["multimodal_bypass"], 3)
+
+
+class DefectD20GenericCheckpointOfferTests(unittest.TestCase):
+    """Consume exact scheduler-local offers without extending their lifetime."""
+
+    @staticmethod
+    def _config():
+        class FullAttentionSpec:
+            block_size = 512
+            storage_block_size = 512
+            page_size_bytes = 64
+
+        class MambaSpec:
+            block_size = 512
+            storage_block_size = 512
+            page_size_bytes = 64
+            mamba_cache_mode = "align"
+            tokens_per_state = 512
+            num_speculative_blocks = 3
+            num_prefill_checkpoint_blocks = 4
+
+        return types.SimpleNamespace(
+            num_blocks=128,
+            kv_cache_groups=tuple(
+                types.SimpleNamespace(
+                    kv_cache_spec=spec,
+                    is_eagle_group=False,
+                    layer_names=(name,),
+                )
+                for name, spec in (
+                    ("full", FullAttentionSpec()),
+                    ("recurrent", MambaSpec()),
+                    ("recurrent_second", MambaSpec()),
+                )
+            ),
+        )
+
+    @staticmethod
+    def _output(request_id="native-checkpoints", start=0, length=8192):
+        groups = ((20, 21, 22, 23), tuple(range(40, 60)), tuple(range(60, 80)))
+        offers = [
+            (group, block + index, position)
+            for group, block in ((1, 90), (2, 100))
+            for index, position in enumerate((4096, 6144, 7168, 7680))
+        ]
+        return types.SimpleNamespace(
+            scheduled_new_reqs=[types.SimpleNamespace(
+                req_id=request_id,
+                prompt_token_ids=list(range(8192)),
+                block_ids=((1, 2, 3, 4), tuple(range(10, 30)), tuple(range(30, 50))),
+                num_computed_tokens=start,
+            )],
+            scheduled_cached_reqs=types.SimpleNamespace(
+                req_ids=[], resumed_req_ids=set(), num_computed_tokens=[], new_block_ids=[],
+            ),
+            num_scheduled_tokens={request_id: length},
+            preempted_req_ids=set(),
+            kv_connector_block_state=types.SimpleNamespace(
+                block_ids={request_id: groups},
+                boundary_state_offloads={request_id: offers},
+            ),
+        )
+
+    def _connector(self, root, rank=0, role=KVConnectorRole.SCHEDULER):
+        result = _make_connector(
+            root, rank, block_size=512, role=role,
+            tp=4, dcp=4, kv_cache_config=self._config(),
+            extra_config={"spark_cache_model_profile": "glm53-flash-hybrid"},
+        )
+        self.addCleanup(result.shutdown)
+        return result
+
+    def test_d20_completed_new_prefill_captures_exact_four_checkpoint_offer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scheduler = self._connector(Path(directory) / "scheduler")
+            output = self._output()
+            meta = scheduler.build_connector_meta(output)
+            self.assertEqual(len(meta.plans), 1)
+            plan = meta.plans[0]
+            self.assertEqual(plan.span_tokens, 6144)
+            self.assertEqual(plan.recurrent_boundary_blocks, ((1, 91), (2, 101)))
+            self.assertEqual(plan.block_ids_by_group[0], (20, 21, 22, 23))
+            self.assertNotIn("native-checkpoints", scheduler._store_progress)
+            for rank in range(4):
+                worker = self._connector(Path(directory) / f"rank{rank}", rank, KVConnectorRole.WORKER)
+                pools = {
+                    name: ((torch.arange(128 * 64, dtype=torch.int32) + offset + rank)
+                           .remainder(251).to(torch.uint8).reshape(128, 1, 64))
+                    for name, offset in (("full", 0), ("recurrent", 29), ("recurrent_second", 61))
+                }
+                worker.register_kv_caches(pools)
+                expected = {"full": pools["full"][[20, 21, 22]].clone(),
+                            "recurrent": pools["recurrent"][[91]].clone(),
+                            "recurrent_second": pools["recurrent_second"][[101]].clone()}
+                worker._store_one(plan)
+                destination = ((110, 111, 112), tuple([0] * 11 + [113]), tuple([0] * 11 + [114]))
+                for name in pools:
+                    pools[name].zero_()
+                self.assertTrue(worker._load_one(_ReqPlan(
+                    "restored", plan.digest, 6144, destination[0], False,
+                    block_ids_by_group=destination,
+                )))
+                self.assertTrue(torch.equal(pools["full"][[110, 111, 112]], expected["full"]))
+                self.assertTrue(torch.equal(pools["recurrent"][[113]], expected["recurrent"]))
+                self.assertTrue(torch.equal(pools["recurrent_second"][[114]], expected["recurrent_second"]))
+
+    def test_d20_native_offers_cannot_reuse_a_previous_step_latch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scheduler = self._connector(Path(directory))
+            output = self._output()
+            output.kv_connector_block_state.boundary_state_offloads = {}
+            self.assertEqual(scheduler._validated_recurrent_boundary_blocks(
+                output, "native-checkpoints", 6144, latched=((1, 91), (2, 101)),
+            ), ())
+
+    def test_d20_missing_or_conflicting_required_group_rejects_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for fault in ("missing", "duplicate", "null", "malformed"):
+                with self.subTest(fault=fault):
+                    scheduler = self._connector(Path(directory) / fault)
+                    output = self._output()
+                    offers = output.kv_connector_block_state.boundary_state_offloads["native-checkpoints"]
+                    if fault == "missing":
+                        offers[:] = [entry for entry in offers if entry[0] != 2]
+                    elif fault == "duplicate":
+                        offers.append((1, 92, 6144))
+                    elif fault == "null":
+                        offers[0] = (1, 0, 4096)
+                    else:
+                        offers.append((1, "not-a-block", 7680))
+                    self.assertEqual(scheduler.build_connector_meta(output).plans, [])
+                    self.assertGreater(scheduler.counters["recurrent_boundary_metadata_rejected"], 0)
+
+    def test_d20_generic_offer_rejects_unleased_asynchronous_capture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scheduler = self._connector(Path(directory))
+            scheduler._async_page_capture_enabled = True
+            self.assertIsNone(scheduler._validated_recurrent_boundary_blocks(
+                self._output(), "native-checkpoints", 6144,
+            ))
+            scheduler._async_page_capture_enabled = False
+
+    def test_d20_missing_current_tables_never_uses_worker_append_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scheduler = self._connector(Path(directory))
+            output = self._output()
+            output.kv_connector_block_state.block_ids = {}
+            self.assertEqual(scheduler.build_connector_meta(output).plans, [])

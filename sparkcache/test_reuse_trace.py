@@ -30,7 +30,7 @@ def test_offer_trace_uses_caller_prefix_and_is_latched_at_construction(tmp_path,
     digest = fixtures.AsyncRestoreTests._offer(connector, tokens)
     request = SimpleNamespace(request_id="offer", prompt_token_ids=tokens)
     try:
-        assert connector.get_num_new_matched_tokens(request, 256) == (768, True)
+        assert connector.get_num_new_matched_tokens(request, 0) == (1024, True)
         assert connector.counters["restore_hit"] == 1
         assert connector._need_load["offer"] == (digest, 1024)
         if not enabled:
@@ -39,8 +39,8 @@ def test_offer_trace_uses_caller_prefix_and_is_latched_at_construction(tmp_path,
         assert len(records) == 1
         record = records[0]
         assert record["event"] == "external_restore_offer"
-        assert record["caller_block_aligned_prefix_tokens"] == 256
-        assert record["offered_external_tokens"] == 768
+        assert record["caller_block_aligned_prefix_tokens"] == 0
+        assert record["offered_external_tokens"] == 1024
         assert record["selected_span_tokens"] == 1024
         assert record["request_id"] == "offer"
         assert "local_hit_tokens" not in record

@@ -1,0 +1,218 @@
+{
+  "schema": "sparkcache-connector-job-live-evidence/v1",
+  "status": "qualified-for-listed-cases",
+  "sparkcache_revision": "2bc05bc9e94a4344758e48db36f69a46dafa6946",
+  "vllm_revision": "df62335d8248587f8d3fd1d9a234d1c162a9b84d",
+  "b12x_revision": "0b6d61c37c87ae49d2f9d20d38b9da023146e243",
+  "image": "sha256:cd92adc4436c61290dbecc35362db447c7ae69e1d03bdb99704af0ed6c517b38",
+  "conditions": {
+    "model": "local-inference-lab/GLM-5.3-Flash-NVFP4-Spark",
+    "model_revision": "df116c4fb16b1d37ae43d2cfd624de26ffbc832e",
+    "tensor_parallel_size": 4,
+    "decode_context_parallel_size": 1,
+    "speculative_tokens": 3,
+    "batch_tokens": 8192,
+    "block_tokens": 512,
+    "coalescing": true,
+    "mhc_prefill_sharding": true,
+    "compact_index_cache": false,
+    "capture_slots": 2,
+    "capture_slot_bytes": 536870912
+  },
+  "capture_retirement_cases": [
+    {
+      "kind": "prefill",
+      "index": 0,
+      "native_capture_verified_physical_ranks": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "common_captured_prefixes": [
+        {
+          "tokens": 7680,
+          "context_digest": "5501adf1edc02e57bc007c37d8db64de62032b93d5081f1659fa0506ed2e3cb3"
+        }
+      ],
+      "post_drain_values": {
+        "sparkcache_ranks": 4.0,
+        "sparkcache_capture_pending_rank_slots": 0.0,
+        "sparkcache_capture_completed_rank_slots": 0.0,
+        "sparkcache_capture_delayed_requests": 0.0,
+        "sparkcache_capture_delayed_rank_slots": 0.0,
+        "sparkcache_capture_retained_pages": 0.0,
+        "sparkcache_capture_oldest_delayed_ms": 0.0,
+        "sparkcache_capture_uncertain_ranks": 0.0,
+        "sparkcache_capture_busy_ranks": 0.0,
+        "sparkcache_publication_pending_rank_slots": 0.0
+      }
+    },
+    {
+      "kind": "prefill",
+      "index": 1,
+      "native_capture_verified_physical_ranks": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "common_captured_prefixes": [
+        {
+          "tokens": 15872,
+          "context_digest": "9211bc84d8579ee52822b3d1ef216ca1bc7cdc47e437e069544d8fbcf2682260"
+        }
+      ],
+      "post_drain_values": {
+        "sparkcache_ranks": 4.0,
+        "sparkcache_capture_pending_rank_slots": 0.0,
+        "sparkcache_capture_completed_rank_slots": 0.0,
+        "sparkcache_capture_delayed_requests": 0.0,
+        "sparkcache_capture_delayed_rank_slots": 0.0,
+        "sparkcache_capture_retained_pages": 0.0,
+        "sparkcache_capture_oldest_delayed_ms": 0.0,
+        "sparkcache_capture_uncertain_ranks": 0.0,
+        "sparkcache_capture_busy_ranks": 0.0,
+        "sparkcache_publication_pending_rank_slots": 0.0
+      }
+    },
+    {
+      "kind": "prefill",
+      "index": 2,
+      "native_capture_verified_physical_ranks": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "common_captured_prefixes": [
+        {
+          "tokens": 7680,
+          "context_digest": "340fb240aaeb79c3db0b0bba4eab29c1588ee717c3ee6636b124bfd8c1febf87"
+        }
+      ],
+      "post_drain_values": {
+        "sparkcache_ranks": 4.0,
+        "sparkcache_capture_pending_rank_slots": 0.0,
+        "sparkcache_capture_completed_rank_slots": 0.0,
+        "sparkcache_capture_delayed_requests": 0.0,
+        "sparkcache_capture_delayed_rank_slots": 0.0,
+        "sparkcache_capture_retained_pages": 0.0,
+        "sparkcache_capture_oldest_delayed_ms": 0.0,
+        "sparkcache_capture_uncertain_ranks": 0.0,
+        "sparkcache_capture_busy_ranks": 0.0,
+        "sparkcache_publication_pending_rank_slots": 0.0
+      }
+    },
+    {
+      "kind": "prefill",
+      "index": 3,
+      "native_capture_verified_physical_ranks": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "common_captured_prefixes": [
+        {
+          "tokens": 15872,
+          "context_digest": "b6428e877496ad42b9305eea7368b209171f2c7a9e991c1875a5fe4b30f1409c"
+        }
+      ],
+      "post_drain_values": {
+        "sparkcache_ranks": 4.0,
+        "sparkcache_capture_pending_rank_slots": 0.0,
+        "sparkcache_capture_completed_rank_slots": 0.0,
+        "sparkcache_capture_delayed_requests": 0.0,
+        "sparkcache_capture_delayed_rank_slots": 0.0,
+        "sparkcache_capture_retained_pages": 0.0,
+        "sparkcache_capture_oldest_delayed_ms": 0.0,
+        "sparkcache_capture_uncertain_ranks": 0.0,
+        "sparkcache_capture_busy_ranks": 0.0,
+        "sparkcache_publication_pending_rank_slots": 0.0
+      }
+    },
+    {
+      "kind": "cancellation",
+      "index": 0,
+      "native_capture_verified_physical_ranks": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "common_captured_prefixes": [
+        {
+          "tokens": 16384,
+          "context_digest": "87bb71884a5409ad5a5cfe04bf7fd1a5acd897968514beea97bc09876de55785"
+        }
+      ],
+      "post_drain_values": {
+        "sparkcache_ranks": 4.0,
+        "sparkcache_capture_pending_rank_slots": 0.0,
+        "sparkcache_capture_completed_rank_slots": 0.0,
+        "sparkcache_capture_delayed_requests": 0.0,
+        "sparkcache_capture_delayed_rank_slots": 0.0,
+        "sparkcache_capture_retained_pages": 0.0,
+        "sparkcache_capture_oldest_delayed_ms": 0.0,
+        "sparkcache_capture_uncertain_ranks": 0.0,
+        "sparkcache_capture_busy_ranks": 0.0,
+        "sparkcache_publication_pending_rank_slots": 0.0
+      }
+    },
+    {
+      "kind": "cancellation",
+      "index": 1,
+      "native_capture_verified_physical_ranks": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "common_captured_prefixes": [
+        {
+          "tokens": 16384,
+          "context_digest": "5573a7d3c5cc6914e1e8efe9066f677ecd60cd8cea6f1e1f944defe0cc28a1ec"
+        }
+      ],
+      "post_drain_values": {
+        "sparkcache_ranks": 4.0,
+        "sparkcache_capture_pending_rank_slots": 0.0,
+        "sparkcache_capture_completed_rank_slots": 0.0,
+        "sparkcache_capture_delayed_requests": 0.0,
+        "sparkcache_capture_delayed_rank_slots": 0.0,
+        "sparkcache_capture_retained_pages": 0.0,
+        "sparkcache_capture_oldest_delayed_ms": 0.0,
+        "sparkcache_capture_uncertain_ranks": 0.0,
+        "sparkcache_capture_busy_ranks": 0.0,
+        "sparkcache_publication_pending_rank_slots": 0.0
+      }
+    }
+  ],
+  "persistent_restore_cases": [
+    {
+      "prompt_tokens": 8192,
+      "restored_tokens": 7680,
+      "context_digest": "07eb980ee37d6144707a10511bf39045e8171390eaa0b993302fa46ad78a47ba",
+      "all_four_workers_verified": true,
+      "exact_semantics_passed": true
+    },
+    {
+      "prompt_tokens": 16384,
+      "restored_tokens": 15872,
+      "context_digest": "7fde152f137997bc5636a7c011bfa5db17cd435bbae22fe3fe9a037b4cb01a45",
+      "all_four_workers_verified": true,
+      "exact_semantics_passed": true
+    }
+  ],
+  "raw_receipt_sha256": {
+    "capture_stress": "dd2637e02ccea4601aa5f61534163ea8636e140cd297bba5e363a2a44cdf00f4",
+    "roundtrip": "981a5bc6955fe295280acfe097a4db84e669cbb2eb99fca2218a660aed51e3e5"
+  },
+  "limits": [
+    "Finite text workloads; no direct GPU-timeline or allocator-reference instrumentation.",
+    "The private-restore admission and null-block safeguards added after this tested revision have CPU coverage only.",
+    "The separate standalone JJ recovery head 9b87df5 has CPU/source-contract qualification; this serving run uses df62335.",
+    "No TP2 SparkCache or multimodal qualification is established by these TP4 tests."
+  ]
+}

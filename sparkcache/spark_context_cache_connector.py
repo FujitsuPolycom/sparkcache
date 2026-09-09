@@ -52,6 +52,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
+    KVConnectorWorkerMetadata,
     KVConnectorRole,
     SupportsHMA,
 )
@@ -102,6 +103,7 @@ from sparkcache.page_base_read_flights import (
     PageBaseReadFlights,
     PageBaseReadResult,
 )
+from sparkcache.capture_read_leases import CaptureReadLeases
 from sparkcache.spark_context_cache_store import (
     CacheIdentity,
     CapacityPolicy,
@@ -250,6 +252,7 @@ class _ReqPlan:
     # alias and tail derivation cannot reproduce that identity and must not
     # publish alternative keys for this plan.
     has_multimodal_identity: bool = False
+    capture_job_id: str = ""
 
     @property
     def group_block_ids(self) -> tuple[tuple[int, ...], ...]:
@@ -487,6 +490,23 @@ class SparkCacheConnectorMetadata(KVConnectorMetadata):
     @property
     def offers(self) -> list[_StreamingSnapshotOffer]:
         return self.streaming_snapshot_offers
+
+
+@dataclass
+class SparkCacheReadCompletionMetadata(KVConnectorWorkerMetadata):
+    """Distinct physical ranks whose capture reads finished for each job."""
+
+    completed_reads: dict[str, set[int]] = field(default_factory=dict)
+    uncertain_reads: dict[str, set[int]] = field(default_factory=dict)
+
+    def aggregate(self, other: "KVConnectorWorkerMetadata"):
+        if not isinstance(other, SparkCacheReadCompletionMetadata):
+            raise TypeError("incompatible SparkCache read-completion metadata")
+        for job, ranks in other.completed_reads.items():
+            self.completed_reads.setdefault(job, set()).update(ranks)
+        for job, ranks in other.uncertain_reads.items():
+            self.uncertain_reads.setdefault(job, set()).update(ranks)
+        return self
 
 
 @dataclass
@@ -917,6 +937,10 @@ def _multimodal_feature_identities(
 class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     """Store/restore each rank's DCP shard on rank-local NVMe."""
 
+    # Capture/restore kernels use CUDA virtual addresses while the registered
+    # tensors remain owned. No KV physical pages are registered for RDMA.
+    supports_cuda_vmm = True
+
     @property
     def _held(self) -> HeldInventory:
         return self._held_inventory
@@ -932,6 +956,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     # wait_for_save. Explicit asynchronous page capture retains all groups until
     # its completion event or preemption drain proves CUDA stopped reading.
     supports_recurrent_boundary_blocks = True
+
+    @property
+    def requires_kv_delivery(self) -> bool:
+        """Optional persistence failures remain cache misses, not request failures."""
+        return False
 
     @property
     def recurrent_boundary_granularity(self) -> int:
@@ -1044,6 +1073,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._async_page_capture_eligible: set[str] = set()
         self._max_delayed_stores = config.max_delayed_stores
         self._async_page_capture_reservations: dict[str, int] = {}
+        self._capture_read_leases: CaptureReadLeases | None = None
+        self._capture_read_done: set[str] = set()
+        self._capture_read_uncertain: set[str] = set()
+        self._capture_read_lock = threading.Lock()
         self._streaming_runtime: Any = None
         if self._streaming_snapshots_enabled:
             # An explicit opt-in never falls back to end-of-prefill snapshots.
@@ -2115,12 +2148,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     # leave the flight and attach through ordinary lookup.
                     self._retire_restore_flight(leader_digest, outcome="completed")
                     return 0, False
-                if flight.dispatched:
+                if flight.dispatched or request_id in self._pending_async_loads:
                     # The leader cannot legitimately re-enter lookup before
                     # worker completion, but waiting is safer than creating a
                     # second writer into its private blocks.
                     return None, False
-                if self._has_full_quorum(leader_digest):
+                if num_computed_tokens == 0 and self._has_full_quorum(leader_digest):
                     self._trace_reuse(
                         "external_restore_offer", request_id,
                         digest=leader_digest[:12], selected_span_tokens=flight.span_tokens,
@@ -2131,6 +2164,14 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     return flight.span_tokens - num_computed_tokens, True
                 self._need_load.pop(request_id, None)
                 self._retire_restore_flight(leader_digest, outcome="cancelled")
+        if num_computed_tokens > 0:
+            # Whole-prefix placement has no suffix write mask. A local prefix
+            # may share pages with another request, so preserve it and compute
+            # the remaining tokens instead of offering a second writer.
+            self.counters["restore_skip_local_prefix"] = (
+                self.counters.get("restore_skip_local_prefix", 0) + 1
+            )
+            return 0, False
         aligned_span = self._aligned_span(len(token_ids))
         span_ceiling = min(
             aligned_span,
@@ -2341,6 +2382,20 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         if not required_groups:
             return ()
         raw = getattr(scheduler_output, "recurrent_boundary_blocks", None)
+        block_state = getattr(scheduler_output, "kv_connector_block_state", None)
+        native_offers = raw is None and block_state is not None
+        if native_offers:
+            # Generic offers belong to this worker step. They do not grant the
+            # request-lifetime lease required to reuse a latched offer later.
+            latched = ()
+            if self._streaming_snapshots_enabled or (
+                self._async_page_capture_enabled
+                and not self._uses_capture_job_leases()
+            ):
+                return reject("generic boundary offers require synchronous or job-leased capture")
+            raw = getattr(block_state, "boundary_state_offloads", None)
+            if raw is None:
+                return reject("generic block state lacks boundary offers")
         if raw is None:
             return latched
         if not isinstance(raw, Mapping):
@@ -2371,6 +2426,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             if entry_boundary < boundary_tokens:
                 continue
             if entry_boundary > boundary_tokens:
+                if native_offers:
+                    # The generic producer offers all retained checkpoints;
+                    # later positions are independent of this store boundary.
+                    continue
                 return reject(
                     "entry boundary is ahead of the store plan"
                     f" observed={entry_boundary} target={boundary_tokens}"
@@ -2388,6 +2447,31 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         if latched and validated != latched:
             return reject("entries conflict with the latched recurrent boundary")
         return validated
+
+    def _current_group_blocks(
+        self,
+        scheduler_output: "SchedulerOutput",
+        request_id: str,
+    ) -> tuple[bool, tuple[tuple[int, ...], ...] | None]:
+        """Read generic scheduler tables without reconstructing reused slots."""
+        block_state = getattr(scheduler_output, "kv_connector_block_state", None)
+        if block_state is None:
+            return False, None
+        tables = getattr(block_state, "block_ids", None)
+        groups = tables.get(request_id) if isinstance(tables, Mapping) else None
+        if (
+            not isinstance(groups, (list, tuple))
+            or len(groups) != len(self._group_topology)
+            or any(
+                not isinstance(group, (list, tuple))
+                or not group
+                or any(type(block) is not int or block < 0 for block in group)
+                for group in groups
+            )
+        ):
+            self.counters["recurrent_boundary_metadata_rejected"] += 1
+            return True, None
+        return True, tuple(tuple(group) for group in groups)
 
     def build_connector_meta(
         self, scheduler_output: "SchedulerOutput"
@@ -2444,7 +2528,16 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self.counters["multimodal_bypass"] += 1
                 continue
             scheduled = scheduler_output.num_scheduled_tokens.get(req_id, 0)
-            group_blocks = self._normalize_group_blocks(new_req.block_ids)
+            native_tables, current_groups = self._current_group_blocks(
+                scheduler_output, req_id,
+            )
+            if native_tables and current_groups is None:
+                continue
+            group_blocks = (
+                current_groups if native_tables
+                else self._normalize_group_blocks(new_req.block_ids)
+            )
+            assert group_blocks is not None
             block_ids = group_blocks[0]
             span = self._aligned_span(len(token_ids))
             if self._store_enabled and self._min_span <= span <= self._max_span:
@@ -2504,6 +2597,22 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         )
                     )
                     if recurrent_boundary_blocks is None:
+                        continue
+                    if native_tables and already >= span and recurrent_boundary_blocks:
+                        # Fresh offers are consumed in this step's post-forward
+                        # CPU snapshot, including requests that finish after one
+                        # generated token and never enter scheduled_cached_reqs.
+                        meta.plans.append(
+                            _ReqPlan(
+                                req_id, digest, span, group_blocks[0], True,
+                                block_ids_by_group=group_blocks,
+                                token_ids=exact_token_ids,
+                                base_context_digest=base_digest,
+                                base_span_tokens=base_span,
+                                recurrent_boundary_blocks=recurrent_boundary_blocks,
+                                has_multimodal_identity=has_multimodal_identity,
+                            )
+                        )
                         continue
                     # Full-page proof and partial-tail CoW hand-offs can arrive
                     # after the prefill which began this store. Retain the
@@ -2586,7 +2695,16 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 continue
             if recurrent_boundary_blocks:
                 self._store_recurrent_boundaries[req_id] = recurrent_boundary_blocks
-            if done < span or req_id in cached.resumed_req_ids:
+            native_tables, current_groups = self._current_group_blocks(
+                scheduler_output, req_id,
+            )
+            if native_tables and current_groups is None:
+                self._store_recurrent_boundaries.pop(req_id, None)
+                continue
+            if native_tables:
+                assert current_groups is not None
+                blocks_by_group = [list(group) for group in current_groups]
+            elif done < span or req_id in cached.resumed_req_ids:
                 new_block_ids = cached.new_block_ids[index]
                 appended = (
                     [
@@ -2694,6 +2812,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             # the exact offers sent to workers so it delays block reuse only
             # for requests whose final gather may still be in flight.
             runtime.observe_metadata(meta)
+        if (
+            getattr(scheduler_output, "kv_connector_block_state", None) is not None
+            and not any(scheduler_output.num_scheduled_tokens.values())
+        ):
+            # V2 no-forward callbacks do not invoke wait_for_save.
+            meta.plans[:] = [plan for plan in meta.plans if not plan.is_store]
         self._reserve_async_page_capture_plans(meta)
         return meta
 
@@ -2707,6 +2831,40 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             not self._async_page_capture_enabled
             or self._role is not KVConnectorRole.SCHEDULER
         ):
+            return
+        if self._uses_capture_job_leases():
+            leases = self._capture_read_leases
+            if leases is None:
+                raise RuntimeError("GPU block pool must be bound before capture dispatch")
+            accepted = []
+            for plan in meta.plans:
+                if not plan.is_store:
+                    accepted.append(plan)
+                    continue
+                # Exact recurrent offers and complete attention pages are
+                # immutable sources. Reference counts alone cannot protect a
+                # mutable partial-page or running recurrent slot from writes.
+                if any(
+                    group["reuse_policy"] != "recurrent_align"
+                    and plan.span_tokens % int(group["logical_tokens_per_block"])
+                    for group in self._group_topology
+                ):
+                    self.counters["store_skipped_delayed_limit"] += 1
+                    continue
+                selected = self._select_group_blocks_for_span(
+                    plan.group_block_ids, plan.span_tokens,
+                    recurrent_boundary_blocks=plan.recurrent_boundary_blocks,
+                )
+                try:
+                    job = leases.reserve(bid for group in selected for bid in group)
+                except ValueError:
+                    self.counters["recurrent_boundary_metadata_rejected"] += 1
+                    continue
+                if job is None:
+                    self.counters["store_skipped_delayed_limit"] += 1
+                    continue
+                accepted.append(replace(plan, capture_job_id=job))
+            meta.plans[:] = accepted
             return
         accepted: list[_ReqPlan] = []
         for plan in meta.plans:
@@ -2726,6 +2884,52 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self._async_page_capture_eligible.add(plan.request_id)
             accepted.append(plan)
         meta.plans[:] = accepted
+
+    def _uses_capture_job_leases(self) -> bool:
+        return (
+            self._async_page_capture_enabled
+            and getattr(
+                getattr(self, "_async_page_capture_settings", None), "lease_mode", None,
+            )
+            == "connector-jobs"
+        )
+
+    def bind_gpu_block_pool(self, gpu_block_pool: Any) -> None:
+        """Use the generic connector API to retain exact capture sources."""
+        if self._capture_read_leases is not None:
+            if self._capture_read_leases.pool is not gpu_block_pool:
+                raise RuntimeError("capture source pool cannot change after binding")
+            return
+        self._capture_read_leases = CaptureReadLeases(
+            gpu_block_pool, ranks=self._tp_degree, max_jobs=self._max_delayed_stores,
+        )
+
+    def has_pending_push_work(self) -> bool:
+        return bool(self._capture_read_leases)
+
+    def _capture_read_completed(self, job: str) -> None:
+        if not job:
+            return
+        with self._capture_read_lock:
+            self._capture_read_done.add(job)
+
+    def _capture_read_failed(self, job: str) -> None:
+        with self._capture_read_lock:
+            self._capture_read_uncertain.add(job)
+
+    def build_connector_worker_meta(self):
+        with self._capture_read_lock:
+            completed = self._capture_read_done
+            uncertain = self._capture_read_uncertain
+            self._capture_read_done = set()
+            self._capture_read_uncertain = set()
+        if not completed and not uncertain:
+            return None
+        rank = self._physical_rank()
+        return SparkCacheReadCompletionMetadata(
+            completed_reads={job: {rank} for job in completed},
+            uncertain_reads={job: {rank} for job in uncertain},
+        )
 
     def _release_async_page_capture_reservations(
         self,
@@ -3079,6 +3283,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 "quiesce",
                 "shutdown",
             )
+            if self._uses_capture_job_leases():
+                required += ("finish_failed_job",)
             missing = [
                 name for name in required if not callable(getattr(runtime, name, None))
             ]
@@ -4131,6 +4337,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     # load errors in one connector-output pass.
                     self._load_errors.update(
                         block for group in plan.group_block_ids for block in group
+                        if block != 0  # Shared null padding is not a restore destination.
                     )
                     self.counters["load_failed"] += 1
                 self._finished_load_reqs.add(plan.request_id)
@@ -4249,6 +4456,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self._load_errors.update(
                     block for plan in load_plans
                     for group in plan.group_block_ids for block in group
+                    if block != 0
                 )
                 self._finished_load_reqs.update(queued)
                 self.counters["load_failed"] += len(queued)
@@ -5093,6 +5301,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         until every worker reports its native read complete. Row-oriented
         streaming snapshots do not support multiple KV-cache groups.
         """
+        if self._uses_capture_job_leases():
+            # Per-job references survive ordinary request cleanup and are
+            # released by read-completion metadata, independent of disk commit.
+            return self.request_finished(request, [])
         if self._async_page_capture_enabled:
             request_id = request.request_id
             cleanup_delay, _ = self.request_finished(request, [])
@@ -5364,6 +5576,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     self._store_inflight = 1
                     self._store_pending_started_ns = time.perf_counter_ns()
             if skipped_before_submit:
+                if plan.capture_job_id:
+                    self._capture_read_completed(plan.capture_job_id)
+                    continue
                 if self._async_page_capture_enabled:
                     runtime = self._async_page_capture_runtime
                     if runtime is None:
@@ -5381,6 +5596,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             if self._async_page_capture_enabled:
                 runtime = self._async_page_capture_runtime
                 if runtime is None:
+                    if plan.capture_job_id:
+                        self._capture_read_completed(plan.capture_job_id)
                     self._finish_store(
                         plan.digest,
                         committed=False,
@@ -5389,12 +5606,27 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         ),
                     )
                     continue
-                producer_stream = int(torch.cuda.current_stream().cuda_stream)
                 try:
-                    plan = self._protect_capture_publication_base(plan)
-                    runtime.submit(plan, producer_stream=producer_stream)
+                    stream = torch.cuda.current_stream()
+                    producer_stream = int(stream.cuda_stream)
+                    if plan.capture_job_id:
+                        # post_forward follows target and MTP state writes.
+                        # The background submitter waits on this event before
+                        # launching reads against connector-owned source pages.
+                        ready = torch.cuda.Event()
+                        ready.record(stream)
+                        runtime.submit(
+                            plan,
+                            producer_stream=producer_stream,
+                            producer_ready=ready,
+                        )
+                    else:
+                        plan = self._protect_capture_publication_base(plan)
+                        runtime.submit(plan, producer_stream=producer_stream)
                 except Exception as error:  # noqa: BLE001 - serving continues
                     runtime.preempt(plan.request_id)
+                    if plan.capture_job_id:
+                        runtime.finish_failed_job(plan)
                     self._finish_store(
                         plan.digest,
                         committed=False,
@@ -6307,6 +6539,16 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
 
     def update_connector_output(self, connector_output: Any) -> None:
         self._absorb_quorum(connector_output)
+        reads = getattr(connector_output, "kv_connector_worker_meta", None)
+        if isinstance(reads, SparkCacheReadCompletionMetadata):
+            leases = self._capture_read_leases
+            if leases is None and reads.completed_reads:
+                raise RuntimeError("capture completion arrived without a source pool")
+            if leases is not None:
+                for job, ranks in reads.uncertain_reads.items():
+                    leases.quarantine(job, ranks)
+                for job, ranks in reads.completed_reads.items():
+                    leases.complete(job, ranks)
         self._release_async_page_capture_reservations(
             tuple(getattr(connector_output, "finished_sending", None) or ())
         )

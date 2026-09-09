@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from sparkcache.streaming.manager_page_capture import (
 )
 
 logger = logging.getLogger("vllm.spark_context_cache")
+_CAPTURE_JOB_ID = re.compile(r"([0-9a-f]{32}):([1-9][0-9]{0,19})\Z")
 
 
 def _format_token_rate(token_rate: float) -> str:
@@ -65,6 +67,16 @@ class _PendingCapture:
     result_block_counts: tuple[int, ...]
     reused_pages_by_group: tuple[int, ...]
     submitted_ns: int
+    abandoned: bool = False
+    producer_ready: Any = None
+
+
+@dataclass(slots=True)
+class _QueuedCapture:
+    plan: Any
+    producer_ready: Any
+    submitted_ns: int
+    abandoned: bool = False
 
 
 class PageSnapshotScatter:
@@ -158,6 +170,7 @@ class ManagerPageCaptureRuntime:
         ring: Any,
         progress_poll_seconds: float = 0.005,
         progress_thread_initializer: Callable[[], None],
+        job_stream_factory: Callable[[Any], int] | None = None,
     ) -> None:
         if progress_poll_seconds <= 0:
             raise ValueError("progress_poll_seconds must be positive")
@@ -188,6 +201,14 @@ class ManagerPageCaptureRuntime:
         self._completed_manager_pages: dict[str, int] = {}
         self._closed = False
         self._fatal: BaseException | None = None
+        self._queued_jobs: dict[str, _QueuedCapture] = {}
+        self._submitting_jobs: dict[str, _QueuedCapture] = {}
+        self._job_stream_factory = job_stream_factory
+        self._submission_stream: Any = None
+        self._failed_jobs: set[str] = set()
+        self._draining_jobs: set[str] = set()
+        self._job_epoch: str | None = None
+        self._job_high_watermark = 0
 
     def _mark_completed_locked(
         self,
@@ -195,7 +216,11 @@ class ManagerPageCaptureRuntime:
         retained_manager_pages: int,
         *,
         started_ns: int | None = None,
+        capture_job_id: str = "",
     ) -> None:
+        if capture_job_id:
+            self._connector._capture_read_completed(capture_job_id)
+            return
         self._completed.add(request_id)
         self._completed_started_ns.setdefault(
             request_id,
@@ -206,7 +231,147 @@ class ManagerPageCaptureRuntime:
             self._completed_manager_pages.get(request_id, 0),
         )
 
-    def submit(self, plan: Any, *, producer_stream: int) -> bool:
+    def submit(self, plan: Any, *, producer_stream: int, producer_ready: Any = None) -> bool:
+        """Queue job-leased reads after a caller-recorded producer event."""
+        job = getattr(plan, "capture_job_id", "")
+        if not job:
+            return self._submit_request(plan, producer_stream=producer_stream)
+        if producer_ready is None:
+            raise ValueError("job-leased capture requires a recorded producer event")
+        request_id = str(plan.request_id)
+        with self._cv:
+            # Ownership outranks replay filtering. A lower sequence can still
+            # name an active read after a higher sequence has been accepted.
+            if self._job_read_is_owned_locked(job):
+                if self._closed or self._fatal is not None:
+                    return False
+                return any(
+                    getattr(capture.plan, "capture_job_id", "") == job
+                    and str(capture.plan.request_id) == request_id
+                    for capture in (
+                        *self._queued_jobs.values(),
+                        *self._submitting_jobs.values(),
+                        *self._pending.values(),
+                    )
+                )
+            match = _CAPTURE_JOB_ID.fullmatch(job) if isinstance(job, str) else None
+            if match is None or int(match[2]) > 0xFFFFFFFFFFFFFFFF:
+                raise ValueError("capture job must name a lowercase UUID epoch and positive uint64 sequence")
+            epoch, sequence_text = match.groups()
+            sequence = int(sequence_text)
+            if self._closed or self._fatal is not None:
+                self._connector._capture_read_completed(job)
+                self._connector._abort_async_page_capture(plan.digest, "capture runtime unavailable")
+                return False
+            if (
+                self._job_epoch is not None and epoch != self._job_epoch
+            ) or sequence <= self._job_high_watermark:
+                self._connector._capture_read_completed(job)
+                self._connector._abort_async_page_capture(plan.digest, "capture job is outside the accepted epoch or increasing sequence")
+                return False
+            self._job_epoch = epoch
+            self._job_high_watermark = sequence
+            existing = self._queued_jobs.get(request_id) or self._submitting_jobs.get(request_id)
+            if existing is None:
+                existing = self._pending.get(request_id)
+            if existing is not None:
+                self._connector._capture_read_completed(job)
+                self._connector._abort_async_page_capture(plan.digest, "request already has a capture read")
+                return False
+            self._queued_jobs[request_id] = _QueuedCapture(plan, producer_ready, time.perf_counter_ns())
+            try:
+                self._ensure_thread_locked()
+            except Exception:
+                self._queued_jobs.pop(request_id)
+                self._thread = None
+                self._connector._capture_read_completed(job)
+                self._connector._abort_async_page_capture(plan.digest, "capture progress thread unavailable")
+                return False
+            self._wake.set()
+            return True
+
+    def _producer_stream_for_job(self, ready: Any) -> int:
+        if self._job_stream_factory is not None:
+            return self._job_stream_factory(ready)
+        import torch
+        if self._submission_stream is None:
+            self._submission_stream = torch.cuda.Stream()
+        self._submission_stream.wait_event(ready)
+        return int(self._submission_stream.cuda_stream)
+
+    def _submit_queued_job(self, queued: _QueuedCapture) -> None:
+        """Submit and, on failure, drain without holding the callback lock."""
+        plan = queued.plan
+        job = plan.capture_job_id
+        context_sequence = None
+        entered_native = False
+        try:
+            with self._cv:
+                if queued.abandoned or self._closed or self._fatal is not None:
+                    self._connector._capture_read_completed(job)
+                    self._connector._abort_async_page_capture(plan.digest, "capture cancelled before submission")
+                    return
+                context_sequence = self._next_sequence
+                self._next_sequence += 1
+            plan = self._connector._protect_capture_publication_base(plan)
+            groups = self._connector._select_group_blocks_for_span(
+                plan.group_block_ids, plan.span_tokens,
+                recurrent_boundary_blocks=plan.recurrent_boundary_blocks,
+            )
+            capture_groups = groups
+            result_counts = tuple(len(group) for group in groups)
+            reused = tuple(0 for _ in groups)
+            logical_start = 0
+            if plan.base_context_digest:
+                capture_groups, _base, result_counts, reused = select_manager_page_extension_pages(
+                    groups,
+                    base_page_counts=self._connector._group_block_counts_for_span(plan.base_span_tokens),
+                    logical_tokens_per_page=tuple(int(group["logical_tokens_per_block"]) for group in self._connector._group_topology),
+                    reuse_policies=tuple(str(group["reuse_policy"]) for group in self._connector._group_topology),
+                    base_boundary_tokens=plan.base_span_tokens,
+                )
+                logical_start = plan.base_span_tokens
+            stream = self._producer_stream_for_job(queued.producer_ready)
+            with self._cv:
+                if queued.abandoned:
+                    self._connector._capture_read_completed(job)
+                    self._connector._abort_async_page_capture(plan.digest, "capture cancelled before submission")
+                    return
+            entered_native = True
+            ticket = self._ring.submit(
+                context_sequence=context_sequence, logical_start=logical_start,
+                physical_pages_by_group=capture_groups, producer_stream=stream,
+            )
+            if ticket is None:
+                self._connector._capture_read_completed(job)
+                self._connector._abort_async_page_capture(plan.digest, "capture ring rejected optional work")
+                return
+            with self._cv:
+                self._pending[str(plan.request_id)] = _PendingCapture(
+                    str(plan.request_id), context_sequence, plan, ticket,
+                    tuple(len(group) for group in capture_groups), result_counts,
+                    reused, queued.submitted_ns, queued.abandoned, queued.producer_ready,
+                )
+        except Exception as error:
+            retired = not entered_native
+            if entered_native:
+                try:
+                    self._ring.drain_context(context_sequence)
+                    retired = True
+                except Exception as drain_error:
+                    with self._cv:
+                        self._failed_jobs.add(job)
+                        self._fatal = drain_error
+                    self._connector._capture_read_failed(job)
+            if retired:
+                self._connector._capture_read_completed(job)
+            self._connector._abort_async_page_capture(plan.digest, f"capture submission failed: {error}")
+        finally:
+            with self._cv:
+                self._submitting_jobs.pop(str(plan.request_id), None)
+                self._cv.notify_all()
+
+    def _submit_request(self, plan: Any, *, producer_stream: int) -> bool:
         request_id = str(plan.request_id)
         groups = self._connector._select_group_blocks_for_span(
             plan.group_block_ids,
@@ -294,9 +459,21 @@ class ManagerPageCaptureRuntime:
 
     def preempt(self, request_id: str) -> None:
         with self._cv:
-            pending = self._pending.pop(request_id, None)
+            queued = self._queued_jobs.get(request_id) or self._submitting_jobs.get(request_id)
+            if queued is not None:
+                queued.abandoned = True
+                self._wake.set()
+                return
+            pending = self._pending.get(request_id)
             if pending is None:
                 return
+            if getattr(pending.plan, "capture_job_id", ""):
+                # Connector-owned references protect the sources while the
+                # background copy drains; preemption does not wait for cache I/O.
+                pending.abandoned = True
+                self._wake.set()
+                return
+            self._pending.pop(request_id)
             # vLLM may reuse every group page as soon as this callback returns.
             # The native drain synchronizes only this context's capture event.
             self._ring.drain_context(pending.context_sequence)
@@ -309,6 +486,31 @@ class ManagerPageCaptureRuntime:
                 started_ns=pending.submitted_ns,
             )
             self._cv.notify_all()
+
+    def finish_failed_job(self, plan: Any) -> None:
+        """Acknowledge rejected jobs only when no read has uncertain ownership."""
+        job = getattr(plan, "capture_job_id", "")
+        if not job:
+            return
+        with self._cv:
+            if self._job_read_is_owned_locked(job):
+                return
+            self._connector._capture_read_completed(job)
+
+    def _job_read_is_owned_locked(self, job: str) -> bool:
+        """Include reads detached from the queue while shutdown drains them."""
+        return (
+            job in self._failed_jobs
+            or job in self._draining_jobs
+            or any(
+                getattr(queued.plan, "capture_job_id", "") == job
+                for queued in (*self._queued_jobs.values(), *self._submitting_jobs.values())
+            )
+            or any(
+                getattr(capture.plan, "capture_job_id", "") == job
+                for capture in self._pending.values()
+            )
+        )
 
     def finish_without_capture(
         self,
@@ -339,8 +541,14 @@ class ManagerPageCaptureRuntime:
 
     def take_finished(self, finished_request_ids: set[str]) -> set[str]:
         with self._cv:
+            # Read jobs retire through job acknowledgements, not request completion.
             owned = set(finished_request_ids) & (
-                self._completed | set(self._pending)
+                self._completed
+                | {
+                    request_id
+                    for request_id, capture in self._pending.items()
+                    if not getattr(capture.plan, "capture_job_id", "")
+                }
             )
             self._pending_finished_requests.update(owned)
             if self._fatal is not None:
@@ -382,7 +590,7 @@ class ManagerPageCaptureRuntime:
                 for request_id in delayed_ids
             )
             return {
-                "pending_requests": len(self._pending),
+                "pending_requests": len(self._pending) + len(self._queued_jobs) + len(self._submitting_jobs),
                 "completed_notifications": len(self._completed),
                 "delayed_requests": len(delayed_ids),
                 "retained_manager_pages": retained_manager_pages,
@@ -392,7 +600,9 @@ class ManagerPageCaptureRuntime:
 
     def wait_idle(self, timeout: float | None = None) -> bool:
         with self._cv:
-            return self._cv.wait_for(lambda: not self._pending, timeout)
+            return self._cv.wait_for(
+                lambda: not self._pending and not self._queued_jobs and not self._submitting_jobs, timeout,
+            )
 
     def shutdown(self) -> bool:
         self.quiesce()
@@ -406,18 +616,39 @@ class ManagerPageCaptureRuntime:
             if self._closed:
                 return
             self._closed = True
-            pending = tuple(self._pending.values())
-            self._pending.clear()
+            for queued in (*self._queued_jobs.values(), *self._submitting_jobs.values()):
+                queued.abandoned = True
             self._stop.set()
             self._wake.set()
             thread = self._thread
+        # A submit may be inside native recovery. Join before collecting its
+        # ticket or acknowledging a queued job that could otherwise start.
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+        with self._cv:
+            pending = tuple(self._pending.values())
+            self._draining_jobs.update(
+                capture.plan.capture_job_id for capture in pending
+                if getattr(capture.plan, "capture_job_id", "")
+            )
+            self._pending.clear()
+            queued_jobs = tuple(self._queued_jobs.values())
+            self._queued_jobs.clear()
+        for queued in queued_jobs:
+            self._connector._capture_read_completed(queued.plan.capture_job_id)
+            self._connector._abort_async_page_capture(
+                queued.plan.digest, "capture runtime shut down before submission"
+            )
         for capture in pending:
             self._ring.drain_context(capture.context_sequence)
+            job = getattr(capture.plan, "capture_job_id", "")
+            if job:
+                with self._cv:
+                    self._connector._capture_read_completed(job)
+                    self._draining_jobs.discard(job)
             self._connector._abort_async_page_capture(
                 capture.plan.digest, "capture runtime shut down"
             )
-        if thread is not None and thread is not threading.current_thread():
-            thread.join()
 
     def _ensure_thread_locked(self) -> None:
         if self._thread is not None:
@@ -448,31 +679,87 @@ class ManagerPageCaptureRuntime:
                         capture.plan.digest,
                         f"background capture failed: {error}",
                     )
+                    job = getattr(capture.plan, "capture_job_id", "")
+                    if job:
+                        self._failed_jobs.add(job)
+                        self._connector._capture_read_failed(job)
+                for queued in self._submitting_jobs.values():
+                    job = queued.plan.capture_job_id
+                    self._failed_jobs.add(job)
+                    self._connector._capture_read_failed(job)
+                for queued in self._queued_jobs.values():
+                    self._connector._capture_read_completed(queued.plan.capture_job_id)
+                    self._connector._abort_async_page_capture(
+                        queued.plan.digest, f"capture progress unavailable: {error}"
+                    )
+                self._queued_jobs.clear()
                 # Do not report finished_sending. vLLM must retain every page
                 # until a later drain or worker termination proves ownership.
                 self._cv.notify_all()
 
     def _progress_once(self) -> None:
+        with self._cv:
+            requests = tuple(self._queued_jobs)
+        for request_id in requests:
+            with self._cv:
+                queued = self._queued_jobs.pop(request_id, None)
+                if queued is None:
+                    continue
+                self._submitting_jobs[request_id] = queued
+            self._submit_queued_job(queued)
+        if self._fatal is not None:
+            with self._cv:
+                for capture in self._pending.values():
+                    job = getattr(capture.plan, "capture_job_id", "")
+                    if job:
+                        self._failed_jobs.add(job)
+                        self._connector._capture_read_failed(job)
+                self._wake.clear()
+            return
         ready: list[tuple[_PendingCapture, Any, int]] = []
         with self._cv:
-            for capture in tuple(self._pending.values()):
+            captures = tuple(self._pending.values())
+        for capture in captures:
+            if getattr(capture.plan, "capture_job_id", ""):
+                # Job preemption only marks the read abandoned. It cannot
+                # retire this ticket while polling runs outside the callback
+                # lock; native recovery may hold the ring's separate lock.
                 view = self._ring.poll(capture.ticket)
                 if view is None:
                     continue
                 claimed = self._ring.claim(capture.ticket)
+            else:
+                with self._cv:
+                    if capture.request_id not in self._pending:
+                        continue
+                    view = self._ring.poll(capture.ticket)
+                    if view is None:
+                        continue
+                    claimed = self._ring.claim(capture.ticket)
+            with self._cv:
                 if self._pending.pop(capture.request_id, None) is not None:
                     self._mark_completed_locked(
                         capture.request_id,
                         sum(capture.result_block_counts),
                         started_ns=capture.submitted_ns,
+                        capture_job_id=getattr(capture.plan, "capture_job_id", ""),
                     )
                     ready.append((capture, claimed, time.perf_counter_ns()))
-                if not self._pending:
+                if not self._pending and not self._queued_jobs and not self._submitting_jobs:
                     self._wake.clear()
                 self._cv.notify_all()
+        with self._cv:
+            if not self._pending and not self._queued_jobs and not self._submitting_jobs:
+                self._wake.clear()
         for capture, claimed, completed_ns in ready:
             scatter = None
             try:
+                if capture.abandoned:
+                    self._ring.release(capture.ticket)
+                    self._connector._abort_async_page_capture(
+                        capture.plan.digest, "request was preempted",
+                    )
+                    continue
                 elapsed_ns = max(0, completed_ns - capture.submitted_ns)
                 _log_capture_observed(
                     rank=self._rank,

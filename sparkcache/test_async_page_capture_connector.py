@@ -275,6 +275,72 @@ def test_wait_for_save_submits_native_pages_without_synchronous_snapshot(
     assert connector._store_inflight == 1
 
 
+def test_d21_job_capture_records_producer_event_before_queueing(monkeypatch):
+    calls = []
+    stream = types.SimpleNamespace(cuda_stream=91)
+
+    class Event:
+        def record(self, actual_stream):
+            assert actual_stream is stream
+            calls.append(("record", self))
+
+    class JobRuntime(FakeRuntime):
+        def submit(self, plan, *, producer_stream, producer_ready):
+            assert producer_stream == 91
+            assert calls == [("record", producer_ready)]
+            calls.append(("queue", plan.capture_job_id))
+            return True
+
+    plan = _ReqPlan("request", "a" * 64, 512, (2, 5), True,
+                    capture_job_id="epoch:1")
+    connector = _connector(plan, JobRuntime())
+    connector._protect_capture_publication_base = lambda _plan: pytest.fail(
+        "publication-base work ran on the model thread"
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    connector.wait_for_save()
+    assert calls[1] == ("queue", "epoch:1")
+
+
+@pytest.mark.parametrize("skip", ["busy", "present", "runtime-unavailable"])
+def test_d21_job_skipped_before_submission_reports_read_complete(monkeypatch, skip):
+    plan = _ReqPlan("request", "a" * 64, 512, (2, 5), True,
+                    capture_job_id="epoch:1")
+    connector = _connector(plan, FakeRuntime())
+    connector._capture_read_lock = threading.Lock()
+    connector._capture_read_done = set()
+    connector._capture_read_uncertain = set()
+    connector._physical_rank = lambda: 2
+    if skip == "busy":
+        connector._store_inflight = 1
+    elif skip == "present":
+        connector._held.add(plan.digest)
+    else:
+        connector._async_page_capture_runtime = None
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: pytest.fail(
+        "skipped job inspected a CUDA stream"
+    ))
+    connector.wait_for_save()
+    metadata = connector.build_connector_worker_meta()
+    assert metadata.completed_reads == {"epoch:1": {2}}
+    assert connector.build_connector_worker_meta() is None
+
+
+def test_d21_worker_completion_aggregation_preserves_distinct_ranks():
+    from sparkcache.spark_context_cache_connector import SparkCacheReadCompletionMetadata
+
+    metadata = SparkCacheReadCompletionMetadata(completed_reads={"epoch:1": {0}})
+    metadata.aggregate(SparkCacheReadCompletionMetadata(
+        completed_reads={"epoch:1": {0, 1}}, uncertain_reads={"epoch:2": {2}},
+    ))
+    metadata.aggregate(SparkCacheReadCompletionMetadata(
+        completed_reads={"epoch:1": {3}}, uncertain_reads={"epoch:2": {2}},
+    ))
+    assert metadata.completed_reads == {"epoch:1": {0, 1, 3}}
+    assert metadata.uncertain_reads == {"epoch:2": {2}}
+
+
 def test_all_group_lifetime_ends_only_after_worker_completion() -> None:
     plan = _ReqPlan("request", "a" * 64, 512, (2, 5), True)
     runtime = FakeRuntime()
