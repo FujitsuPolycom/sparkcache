@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools>=84.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -37,9 +37,9 @@ sparkcache-verify-vllm = "sparkcache.runtime_patches.verify_lease_contract:main"
 
 [project.optional-dependencies]
 connector = ["torch"]
-test = ["numpy>=1.26", "pytest>=8", "torch"]
+test = ["numpy>=2.4.6", "pytest>=9.1.1", "torch"]
 lint = ["ruff==0.15.17"]
-release = ["build>=1.2", "ruff==0.15.17", "twine>=6"]
+release = ["build>=1.6.0", "ruff==0.15.17", "twine>=7.0.0"]
 
 [tool.setuptools]
 include-package-data = false
