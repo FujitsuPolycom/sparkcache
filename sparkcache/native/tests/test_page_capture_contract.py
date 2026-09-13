@@ -21,7 +21,7 @@ LEASE_CONTRACT = (
 def test_page_capture_contract_is_bounded_and_pointer_free_on_disk() -> None:
     header = HEADER.read_text(encoding="utf-8")
     assert "SPARK_CACHE_PAGE_CAPTURE_CONTRACT_VERSION 1u" in header
-    assert "SPARK_CACHE_PAGE_CAPTURE_MAX_GROUPS 16u" in header
+    assert "SPARK_CACHE_PAGE_CAPTURE_MAX_GROUPS 64u" in header
     assert "SPARK_CACHE_PAGE_CAPTURE_MAX_SOURCES 256u" in header
     assert "physical" in header
     assert "page IDs are transient" in header
