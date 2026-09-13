@@ -19,6 +19,31 @@ def request(name, salt, tokens=None):
     )
 
 
+@pytest.mark.parametrize("salt", [None, "", "tenant-A", "租户🔐"])
+def test_qwen_page_boundary_prefix_candidates_remain_scope_isolated(salt):
+    """Qwen physical-page boundaries need 32-token digest chunks and scope."""
+    with tempfile.TemporaryDirectory() as directory:
+        c = fixtures.AsyncRestoreTests()._cohort_connector(Path(directory))
+        c._chunk_tokens = 32
+        c._min_span = 4096
+        tokens = list(range(6000))
+        scope = fingerprint(salt)
+        candidates = c._request_prefix_candidates(
+            "qwen", tokens, 5696, request_scope=scope,
+        )
+        assert candidates[-1] == (5696, c._digest(tokens, 5696, request_scope=scope))
+        other = fingerprint("different-tenant")
+        changed = c._request_prefix_candidates(
+            "qwen", tokens, 5696, request_scope=other,
+        )
+        assert {digest for _, digest in candidates}.isdisjoint(
+            digest for _, digest in changed
+        )
+        assert c._request_prefix_candidates(
+            "qwen", tokens, 5696, request_scope=other,
+        ) == changed
+
+
 def test_salted_request_does_not_join_an_unsalted_restore_flight():
     fixture = fixtures.AsyncRestoreTests()
     with tempfile.TemporaryDirectory() as directory:

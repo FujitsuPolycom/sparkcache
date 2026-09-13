@@ -36,6 +36,22 @@ from sparkcache.spark_context_cache_restore_timing import (
 from sparkcache.page_base_read_flights import PageBaseReadEvidence
 
 
+def test_qwen_chunk_geometry_reaches_prefix_digest_call_site():
+    connector = object.__new__(SparkContextCacheConnector)
+    connector._chunk_tokens = 32
+    connector._min_span = 4096
+    connector._context_digest_salt = 'qwen-profile-identity'
+    connector._prefix_digest_candidates = {}
+    connector.counters = {'prefix_digest_cache_hits': 0, 'prefix_digest_cache_misses': 0}
+    tokens = list(range(6000))
+    candidates = connector._request_prefix_candidates('request', tokens, 5696)
+    assert candidates[-1] == (5696, codec.context_prefix_digest(
+        tokens, connector._scope_salt(UNSALTED_SCOPE), token_count=5696,
+    ))
+    assert connector._request_prefix_candidates('request', tokens, 5696) == candidates
+    assert connector.counters['prefix_digest_cache_hits'] == 1
+
+
 def _install_vllm_stubs() -> None:
     if "vllm" in sys.modules:
         return

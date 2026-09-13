@@ -271,6 +271,24 @@ PROFILES: Mapping[str, ModelProfile] = {
         cuda_page_restore=True,
         kv_replicated_across_tp=True,
     ),
+    "qwen38-flash-next-hybrid": ModelProfile(
+        name="qwen38-flash-next-hybrid",
+        description=(
+            "Qwen3.8 Flash Next attention pages and aligned GDN recurrent"
+            " checkpoints. External speculative-draft state is recomputed;"
+            " its checkpoint identity remains namespace-bound."
+        ),
+        quantization_layout="qwen38-flash-next-hybrid-block-pages-v1",
+        rope_layout="qwen38-flash-next-mrope-v1",
+        boundary_hidden_policy="live_forward",
+        default_draft_kv_policy="separate",
+        classification_rules=(),
+        required_families=frozenset({"target_ckv"}),
+        chunk_tokens=32,
+        storage_mode="block_pages_v1",
+        cuda_page_restore=True,
+        kv_replicated_across_tp=False,
+    ),
     "deepseek-v4-fp8-hma": ModelProfile(
         name="deepseek-v4-fp8-hma",
         description=(

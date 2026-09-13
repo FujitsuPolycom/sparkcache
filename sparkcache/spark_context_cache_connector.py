@@ -1526,6 +1526,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             signature[0],
             self._scope_salt(request_scope),
             boundaries=range(first, span_ceiling + 1, self._chunk_tokens),
+            chunk_tokens=self._chunk_tokens,
             multimodal_features=multimodal_features,
         )
         self._prefix_digest_candidates[request_id] = (signature, candidates)
@@ -1564,6 +1565,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 token_ids,
                 self._scope_salt(request_scope),
                 boundaries=range(first, span_tokens, self._chunk_tokens),
+                chunk_tokens=self._chunk_tokens,
                 multimodal_features=multimodal_features,
             )
         )

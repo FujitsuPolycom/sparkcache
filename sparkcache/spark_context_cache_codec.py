@@ -228,9 +228,12 @@ def chunk_prefix_digests(
     *,
     boundaries: Iterable[int],
     multimodal_features: Sequence[MultimodalFeatureIdentity] = (),
+    chunk_tokens: int = CHUNK_TOKENS,
 ) -> tuple[tuple[int, str], ...]:
     """Return exact token-and-media prefix digests in one token hash pass."""
 
+    if isinstance(chunk_tokens, bool) or not isinstance(chunk_tokens, int) or chunk_tokens <= 0:
+        raise CodecError("chunk_tokens must be a positive integer")
     packed = _u32_array(token_ids, "token_ids")
     try:
         requested = tuple(boundaries)
@@ -242,10 +245,10 @@ def chunk_prefix_digests(
             isinstance(boundary, bool)
             or not isinstance(boundary, int)
             or boundary <= 0
-            or boundary % CHUNK_TOKENS
+            or boundary % chunk_tokens
         ):
             raise CodecError(
-                f"boundaries must be positive multiples of {CHUNK_TOKENS} tokens"
+                f"boundaries must be positive multiples of {chunk_tokens} tokens"
             )
         if boundary <= previous:
             raise CodecError("boundaries must be strictly increasing")
