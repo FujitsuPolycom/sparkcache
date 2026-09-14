@@ -12,7 +12,7 @@ from .native_ring import NativeRingConfig, NativeStatus, RawReadyView, RawTicket
 
 
 CONTRACT_VERSION = 1
-MAX_GROUPS = 16
+MAX_GROUPS = 64
 MAX_SOURCES = 256
 
 

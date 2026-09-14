@@ -144,9 +144,35 @@ void test_failure_leaves_caller_outputs_unchanged() {
   assert(plan.used_bytes == 99);
 }
 
+void test_group_capacity_and_output_order() {
+  constexpr std::uint32_t count = 64;
+  std::array<SparkCachePageCaptureSource, count> inventory{};
+  std::array<SparkCachePageCaptureGroup, count> request{};
+  std::array<std::uint32_t, count> pages{};
+  std::array<SparkCachePageCaptureSpan, count> spans{};
+  for (std::uint32_t i = 0; i < count; ++i) {
+    inventory[i] = {0x1000 + i * 1024, 8, 16, 16, i, 0, 0};
+    request[i] = {i, 1, {0, 0}};
+    pages[i] = 2;
+  }
+  SparkCachePageCapturePlan plan{};
+  std::string detail;
+  assert(validate_sources(inventory.data(), count, count, &detail));
+  assert(!validate_sources(inventory.data(), count, count + 1, &detail));
+  assert(plan_capture(inventory.data(), count, request.data(), count,
+      pages.data(), count, count * 16, spans.data(), count, &plan, &detail));
+  assert(plan.group_count == count);
+  assert(plan.used_bytes == count * 16);
+  for (std::uint32_t i = 0; i < count; ++i) {
+    assert(spans[i].source_index == i);
+    assert(spans[i].destination_offset_bytes == i * 16);
+  }
+}
+
 }  // namespace
 
 int main() {
+  test_group_capacity_and_output_order();
   test_multigroup_layout_matches_block_page_body_order();
   test_invalid_inventory_is_rejected();
   test_request_geometry_is_exact_and_bounded();
