@@ -11,7 +11,8 @@ distinct Unicode string identify different scopes. Strings are not normalized.
 Raw salts are not copied into connector metadata, cache filenames, or logs.
 
 The original Request must expose `cache_salt`, and the field must remain
-immutable for that request's lifetime. The allocation callback records it even
+immutable before and after restore dispatch; changing a salt is not a revocation
+mechanism for work already dispatched. The allocation callback records it even
 for a zero-external-token allocation, so store-only deployments and native local
 prefix hits retain the same scope. Scheduler output that omits this field must
 have an already recorded original Request. Missing, invalid, or conflicting
