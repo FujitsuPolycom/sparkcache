@@ -405,7 +405,7 @@ def test_worker_finishes_manifest_without_another_foreground_callback(
 
     adapter.offer_completed(
         types.SimpleNamespace(
-            request_id="request-idle-tail",
+            cache_salt=None, request_id="request-idle-tail",
             digest="9" * 64,
             span_tokens=32768,
             completed_tokens=32768,
@@ -491,7 +491,7 @@ def test_background_writer_failure_aborts_cache_without_failing_serving(
     ):
         adapter.offer_completed(
             types.SimpleNamespace(
-                request_id="request-writer-failure",
+                cache_salt=None, request_id="request-writer-failure",
                 digest="8" * 64,
                 span_tokens=32768,
                 completed_tokens=32768,
@@ -583,7 +583,7 @@ def test_background_and_foreground_poll_are_serialized(tmp_path: Path) -> None:
     adapter._runtime = runtime
     adapter.offer_completed(
         types.SimpleNamespace(
-            request_id="request-serialized",
+            cache_salt=None, request_id="request-serialized",
             digest="7" * 64,
             span_tokens=32768,
             completed_tokens=32768,
@@ -741,7 +741,7 @@ def test_scheduler_delays_only_observed_streaming_requests() -> None:
     adapter = SchedulerStreamingSnapshotAdapter(types.SimpleNamespace())
     metadata = types.SimpleNamespace(
         streaming_snapshot_offers=[
-            types.SimpleNamespace(request_id="streaming")
+            types.SimpleNamespace(cache_salt=None, request_id="streaming")
         ],
         preempted_request_ids=(),
     )
@@ -760,7 +760,7 @@ def test_scheduler_same_step_preemption_then_resume_keeps_current_offer() -> Non
     adapter.observe_metadata(
         types.SimpleNamespace(
             streaming_snapshot_offers=[
-                types.SimpleNamespace(request_id="preempted")
+                types.SimpleNamespace(cache_salt=None, request_id="preempted")
             ],
             preempted_request_ids=("preempted",),
         )
@@ -882,7 +882,7 @@ def test_worker_ignores_later_watermarks_after_publication_abort() -> None:
     adapter._runtime = runtime
     adapter._bound = True
     offer = types.SimpleNamespace(
-        request_id="request",
+        cache_salt=None, request_id="request",
         digest="e" * 64,
         span_tokens=4096,
         completed_tokens=4096,
@@ -1055,7 +1055,7 @@ def test_worker_cancels_changed_offer_identity_without_new_submission() -> None:
     adapter._contexts["request"] = ("1" * 64, 4096, time.monotonic())
     adapter._admitted_requests.add("request")
     changed = types.SimpleNamespace(
-        request_id="request",
+        cache_salt=None, request_id="request",
         digest="2" * 64,
         span_tokens=4096,
         completed_tokens=4096,

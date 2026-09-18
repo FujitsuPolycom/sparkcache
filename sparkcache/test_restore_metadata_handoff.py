@@ -1,5 +1,7 @@
 """Filesystem cohort preparation runs outside the model callback."""
 
+from sparkcache.request_cache_scope import UNSALTED_SCOPE
+
 import threading
 from types import SimpleNamespace
 
@@ -12,7 +14,7 @@ def test_slow_cohort_metadata_does_not_block_model_callback(tmp_path, monkeypatc
     connector = _make_connector(tmp_path, 0)
     connector._storage_mode = "block_pages_v1"
     entered, release, returned = (threading.Event() for _ in range(3))
-    plan = _ReqPlan("slow-metadata", "a" * 64, 256, (3,), False)
+    plan = _ReqPlan("slow-metadata", "a" * 64, 256, (3,), False, request_scope=UNSALTED_SCOPE)
     connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[plan]))
     timings = []
 
@@ -51,7 +53,7 @@ def test_slow_cohort_metadata_does_not_block_model_callback(tmp_path, monkeypatc
 def test_cohort_preparation_failure_completes_as_recompute(tmp_path, monkeypatch):
     connector = _make_connector(tmp_path, 0)
     connector._storage_mode = "block_pages_v1"
-    plan = _ReqPlan("bad-metadata", "b" * 64, 256, (3,), False)
+    plan = _ReqPlan("bad-metadata", "b" * 64, 256, (3,), False, request_scope=UNSALTED_SCOPE)
     connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[plan]))
 
     def failed(_plans):
@@ -71,7 +73,7 @@ def test_cohort_preparation_failure_completes_as_recompute(tmp_path, monkeypatch
 def test_finished_request_cannot_join_a_queued_cohort(tmp_path, monkeypatch):
     connector = _make_connector(tmp_path, 0)
     connector._storage_mode = "block_pages_v1"
-    plan = _ReqPlan("cancelled-metadata", "c" * 64, 256, (3,), False)
+    plan = _ReqPlan("cancelled-metadata", "c" * 64, 256, (3,), False, request_scope=UNSALTED_SCOPE)
     connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[plan]))
     start_workers = connector._ensure_load_threads
     monkeypatch.setattr(connector, "_ensure_load_threads", lambda: None)
@@ -85,7 +87,7 @@ def test_finished_request_cannot_join_a_queued_cohort(tmp_path, monkeypatch):
     monkeypatch.setattr(connector, "_load_one", lambda *_args, **_kwargs: True)
     try:
         connector.start_load_kv(None)
-        connector.request_finished(SimpleNamespace(request_id=plan.request_id), [])
+        connector.request_finished(SimpleNamespace(cache_salt=None, request_id=plan.request_id), [])
         start_workers()
         assert connector.wait_for_pending_loads(timeout=5)
         assert not prepared
@@ -131,7 +133,7 @@ def test_shutdown_timeout_does_not_stop_worker_before_requeued_load(tmp_path, mo
     connector = _make_connector(tmp_path, 0)
     connector._storage_mode = "block_pages_v1"
     entered, release = threading.Event(), threading.Event()
-    plan = _ReqPlan("shutdown-metadata", "d" * 64, 256, (3,), False)
+    plan = _ReqPlan("shutdown-metadata", "d" * 64, 256, (3,), False, request_scope=UNSALTED_SCOPE)
     connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[plan]))
 
     def prepare(plans):
@@ -162,7 +164,7 @@ def test_shutdown_timeout_does_not_stop_worker_before_requeued_load(tmp_path, mo
 def test_load_after_shutdown_is_rejected_without_starting_workers(tmp_path):
     connector = _make_connector(tmp_path, 0)
     connector.shutdown()
-    plan = _ReqPlan("after-shutdown", "e" * 64, 256, (3,), False)
+    plan = _ReqPlan("after-shutdown", "e" * 64, 256, (3,), False, request_scope=UNSALTED_SCOPE)
     connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[plan]))
     connector.start_load_kv(None)
     assert connector._load_threads == []

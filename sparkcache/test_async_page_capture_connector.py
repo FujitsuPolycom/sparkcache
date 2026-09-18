@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sparkcache.request_cache_scope import UNSALTED_SCOPE
+
 import threading
 import tempfile
 import types
@@ -233,7 +235,7 @@ def _connector(plan: _ReqPlan, runtime: FakeRuntime) -> SparkContextCacheConnect
 
 
 def test_restore_only_worker_ignores_stale_async_store_plan(monkeypatch) -> None:
-    plan = _ReqPlan("request", "a" * 64, 512, (2, 5), True)
+    plan = _ReqPlan("request", "a" * 64, 512, (2, 5), True, request_scope=UNSALTED_SCOPE)
     runtime = FakeRuntime()
     connector = _connector(plan, runtime)
     connector._store_enabled = False
@@ -261,6 +263,7 @@ def test_wait_for_save_submits_native_pages_without_synchronous_snapshot(
         True,
         block_ids_by_group=((2, 5), (7,)),
         recurrent_boundary_blocks=((1, 7),),
+        request_scope=UNSALTED_SCOPE,
     )
     runtime = FakeRuntime()
     connector = _connector(plan, runtime)
@@ -292,7 +295,7 @@ def test_d21_job_capture_records_producer_event_before_queueing(monkeypatch):
             return True
 
     plan = _ReqPlan("request", "a" * 64, 512, (2, 5), True,
-                    capture_job_id="epoch:1")
+                    capture_job_id="epoch:1", request_scope=UNSALTED_SCOPE)
     connector = _connector(plan, JobRuntime())
     connector._protect_capture_publication_base = lambda _plan: pytest.fail(
         "publication-base work ran on the model thread"
@@ -306,7 +309,7 @@ def test_d21_job_capture_records_producer_event_before_queueing(monkeypatch):
 @pytest.mark.parametrize("skip", ["busy", "present", "runtime-unavailable"])
 def test_d21_job_skipped_before_submission_reports_read_complete(monkeypatch, skip):
     plan = _ReqPlan("request", "a" * 64, 512, (2, 5), True,
-                    capture_job_id="epoch:1")
+                    capture_job_id="epoch:1", request_scope=UNSALTED_SCOPE)
     connector = _connector(plan, FakeRuntime())
     connector._capture_read_lock = threading.Lock()
     connector._capture_read_done = set()
@@ -342,10 +345,10 @@ def test_d21_worker_completion_aggregation_preserves_distinct_ranks():
 
 
 def test_all_group_lifetime_ends_only_after_worker_completion() -> None:
-    plan = _ReqPlan("request", "a" * 64, 512, (2, 5), True)
+    plan = _ReqPlan("request", "a" * 64, 512, (2, 5), True, request_scope=UNSALTED_SCOPE)
     runtime = FakeRuntime()
     connector = _connector(plan, runtime)
-    request = types.SimpleNamespace(request_id="request")
+    request = types.SimpleNamespace(cache_salt=None, request_id="request")
 
     assert connector.request_finished_all_groups(request, ([2, 5], [7])) == (
         True,
@@ -358,7 +361,7 @@ def test_all_group_lifetime_ends_only_after_worker_completion() -> None:
 
 
 def test_preemption_uses_the_runtime_drain_edge() -> None:
-    plan = _ReqPlan("request", "a" * 64, 512, (2, 5), True)
+    plan = _ReqPlan("request", "a" * 64, 512, (2, 5), True, request_scope=UNSALTED_SCOPE)
     runtime = FakeRuntime()
     connector = _connector(plan, runtime)
     metadata = SparkCacheConnectorMetadata(preempted_request_ids=("request",))
@@ -369,7 +372,7 @@ def test_preemption_uses_the_runtime_drain_edge() -> None:
 
 
 def test_submission_error_releases_delayed_free_ownership(monkeypatch) -> None:
-    plan = _ReqPlan("request", "a" * 64, 512, (2, 5), True)
+    plan = _ReqPlan("request", "a" * 64, 512, (2, 5), True, request_scope=UNSALTED_SCOPE)
     runtime = FakeRuntime()
     runtime.submit_error = RuntimeError("rejected")
     connector = _connector(plan, runtime)
@@ -443,6 +446,7 @@ def test_async_full_page_capture_publishes_authenticated_page_delta() -> None:
                 True,
                 block_ids_by_group=((3,), (4,)),
                 token_ids=tokens[:256],
+                request_scope=UNSALTED_SCOPE,
             )
         )
         extension = _ReqPlan(
@@ -456,6 +460,7 @@ def test_async_full_page_capture_publishes_authenticated_page_delta() -> None:
             base_context_digest=base_digest,
             base_span_tokens=256,
             recurrent_boundary_blocks=((1, 7),),
+            request_scope=UNSALTED_SCOPE,
         )
         captured = connector._snapshot_hybrid_store(extension)
 
@@ -541,6 +546,7 @@ def test_sparse_async_capture_publishes_restorable_page_delta(monkeypatch) -> No
                 True,
                 block_ids_by_group=((3,), (4,)),
                 token_ids=tokens[:256],
+                request_scope=UNSALTED_SCOPE,
             )
         )
         extension = _ReqPlan(
@@ -554,6 +560,7 @@ def test_sparse_async_capture_publishes_restorable_page_delta(monkeypatch) -> No
             base_context_digest=base_digest,
             base_span_tokens=256,
             recurrent_boundary_blocks=((1, 7),),
+            request_scope=UNSALTED_SCOPE,
         )
         expected = connector._snapshot_hybrid_store(extension)
         ring = FakeSparseRing(bytes(range(40, 48)) + bytes(range(56, 64)))

@@ -61,6 +61,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorStats,
 )
 from vllm.logger import init_logger
+from sparkcache.request_cache_scope import (
+    UNSALTED_SCOPE,
+    fingerprint,
+    metadata_binding,
+    valid_metadata,
+    valid_scope,
+)
 
 from sparkcache.spark_context_cache_codec import (
     CHUNK_TOKENS,
@@ -148,7 +155,7 @@ _MAX_PAGE_BASE_READ_FLIGHTS = 2
 _MAX_PAGE_BASE_READ_MEMBERS = 16
 _MAX_PAGE_BASE_BYTES_PER_FLIGHT = 1024**3
 _MAX_PAGE_BASE_BYTES_TOTAL = 2 * 1024**3
-_CONTEXT_DIGEST_NAMESPACE = "sparkcache-context-v2-multimodal"
+_CONTEXT_DIGEST_NAMESPACE = "sparkcache-context-v3-request-scope"
 
 # The runtime is deliberately supplied by the embedding process instead of
 # importing or constructing the optional streaming-snapshot runtime here.
@@ -253,6 +260,13 @@ class _ReqPlan:
     # publish alternative keys for this plan.
     has_multimodal_identity: bool = False
     capture_job_id: str = ""
+    request_scope: str | None = None
+    # Consistency check for the trusted scheduler/worker channel, not a MAC.
+    scope_binding: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.scope_binding:
+            self.scope_binding = metadata_binding(self.request_scope, self.digest)
 
     @property
     def group_block_ids(self) -> tuple[tuple[int, ...], ...]:
@@ -328,6 +342,13 @@ class _StreamingSnapshotOffer:
     span_tokens: int
     completed_tokens: int
     block_ids: tuple[int, ...]
+    request_scope: str | None = None
+    scope_binding: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.scope_binding:
+            object.__setattr__(self, "scope_binding",
+                               metadata_binding(self.request_scope, self.digest))
 
     @property
     def span(self) -> int:
@@ -1112,10 +1133,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._native_arena_bytes = config.native_arena_bytes
         self._native_io_workers = config.native_io_workers
         self._identity_base = config.identity_base
-        # The namespace change cleanly misses legacy token-only digests, which
-        # cannot reveal whether their KV bytes came from multimodal embeddings.
-        # Without this one-time rollover, a text request could still select an
-        # unsafe multimodal entry published before media identity was bound.
+        self._request_cache_scopes: dict[str, str | None] = {}
+        # Legacy digests cannot reveal which request salt produced their bytes.
+        # All requests, including unsalted text, therefore use a distinct
+        # namespace. Media content/range identity remains bound independently.
         self._context_digest_salt = (
             f"{_CONTEXT_DIGEST_NAMESPACE}:"
             f"{config.build_identity(0, 0).storage_key}"
@@ -1263,7 +1284,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._prefix_digest_candidates: dict[
             str,
             tuple[
-                tuple[tuple[int, ...], int, tuple[MultimodalFeatureIdentity, ...]],
+                tuple[tuple[int, ...], int, tuple[MultimodalFeatureIdentity, ...], str],
                 tuple[tuple[int, str], ...],
             ],
         ] = {}
@@ -1410,6 +1431,38 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     # identity helpers
     # ------------------------------------------------------------------
 
+    def _remember_request_scope(self, request: Any) -> str | None:
+        """Latch scope from the original Request, never from incomplete output data."""
+        scopes = self._request_cache_scopes
+        request_id = request.request_id
+        try:
+            scope = fingerprint(request.cache_salt)
+        except (AttributeError, ValueError, UnicodeError):
+            scope = None
+        if request_id in scopes and scopes[request_id] != scope:
+            scope = None
+        scopes[request_id] = scope
+        if scope is None:
+            self._remove_restore_follower(request_id)
+            leader = self._restore_flight_leaders.get(request_id)
+            flight = self._restore_flights.get(leader)
+            if flight is not None and not flight.dispatched:
+                self._retire_restore_flight(leader, outcome="cancelled")
+            self._prefix_digest_candidates.pop(request_id, None)
+            self._store_progress.pop(request_id, None)
+            self._store_token_ids.pop(request_id, None)
+            self._store_bases.pop(request_id, None)
+            self._store_multimodal.discard(request_id)
+            self._store_recurrent_boundaries.pop(request_id, None)
+            # Keep pending/admitted allocation evidence until the ordinary
+            # failed-load handoff returns its blocks for recomputation.
+        return scope
+
+    def _scope_salt(self, scope: str = UNSALTED_SCOPE) -> str:
+        if not valid_scope(scope):
+            raise ValueError("Missing or invalid request cache scope")
+        return self._context_digest_salt + ":" + scope
+
     def _identity(
         self, shard_rank: int, tp_shard_rank: int | None = None
     ) -> CacheIdentity:
@@ -1434,6 +1487,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         token_ids: list[int],
         span: int,
         multimodal_features: Sequence[MultimodalFeatureIdentity] = (),
+        *, request_scope: str = UNSALTED_SCOPE,
     ) -> str:
         # The salt must be identical on every role and rank: it names the
         # shared context, not this process's shard. Pin both shard fields to
@@ -1441,7 +1495,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         # its physical rank, which would fork the namespace per worker.
         return context_prefix_digest(
             token_ids,
-            self._context_digest_salt,
+            self._scope_salt(request_scope),
             token_count=span,
             multimodal_features=multimodal_features,
         )
@@ -1452,12 +1506,14 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         token_ids: Sequence[int],
         span_ceiling: int,
         multimodal_features: Sequence[MultimodalFeatureIdentity] = (),
+        *, request_scope: str = UNSALTED_SCOPE,
     ) -> tuple[tuple[int, str], ...]:
         """Reuse exact digest analysis across scheduler and publication callbacks."""
         signature = (
             tuple(token_ids),
             span_ceiling,
             tuple(multimodal_features),
+            request_scope,
         )
         cached = self._prefix_digest_candidates.get(request_id)
         if cached is not None and cached[0] == signature:
@@ -1468,7 +1524,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         ) * self._chunk_tokens
         candidates = chunk_prefix_digests(
             signature[0],
-            self._context_digest_salt,
+            self._scope_salt(request_scope),
             boundaries=range(first, span_ceiling + 1, self._chunk_tokens),
             multimodal_features=multimodal_features,
         )
@@ -1483,6 +1539,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         multimodal_features: Sequence[MultimodalFeatureIdentity] = (),
         *,
         request_id: str | None = None,
+        request_scope: str = UNSALTED_SCOPE,
     ) -> tuple[str, int]:
         """Select the longest all-rank prefix eligible for tail publication."""
 
@@ -1500,11 +1557,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         candidates = (
             self._request_prefix_candidates(
                 request_id, token_ids, span_tokens, multimodal_features,
+                request_scope=request_scope,
             )
             if request_id is not None
             else chunk_prefix_digests(
                 token_ids,
-                self._context_digest_salt,
+                self._scope_salt(request_scope),
                 boundaries=range(first, span_tokens, self._chunk_tokens),
                 multimodal_features=multimodal_features,
             )
@@ -1912,6 +1970,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self, request: "Request"
     ) -> tuple[str, int] | None:
         """Return the longest live verified lease matching this request prefix."""
+        request_scope = self._remember_request_scope(request)
+        if request_scope is None:
+            return None
         if not self._restore_enabled:
             return None
         self._expire_shared_prefix_flights()
@@ -1946,6 +2007,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             return None
         candidates = self._request_prefix_candidates(
             request_id, token_ids, span_ceiling, multimodal_features,
+            request_scope=request_scope,
         )
         selected = next(
             (
@@ -2109,6 +2171,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int | None, bool]:
+        request_scope = self._remember_request_scope(request)
+        if request_scope is None:
+            return 0, False
         if not self._restore_enabled:
             return 0, False
         token_ids = request.prompt_token_ids or ()
@@ -2195,6 +2260,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             candidate
             for candidate in self._request_prefix_candidates(
                 request_id, token_ids, span_ceiling, multimodal_features,
+                request_scope=request_scope,
             )
             if candidate[0] >= first_candidate
         )
@@ -2303,6 +2369,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         blocks: "KVCacheBlocks",
         num_external_tokens: int,
     ) -> None:
+        self._remember_request_scope(request)
         request_id = request.request_id
         if num_external_tokens <= 0:
             entry = self._need_load.pop(request_id, None)
@@ -2329,6 +2396,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         span: int,
         promised_completed_tokens: int,
         block_ids: Sequence[int],
+        request_scope: str = UNSALTED_SCOPE,
     ) -> None:
         """Record a scheduler promise without claiming forward completed it."""
 
@@ -2342,6 +2410,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 span_tokens=span,
                 completed_tokens=completed_tokens,
                 block_ids=tuple(block_ids),
+                request_scope=request_scope,
             )
         )
 
@@ -2491,6 +2560,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             span,
             group_blocks,
         ) in self._pending_async_loads.items():
+            request_scope = self._request_cache_scopes.get(request_id)
+            # An allocated external hit must receive a completion even when
+            # its scope was rejected. The worker rejects None before reading
+            # KV and reports failed blocks through the existing async handoff.
             all_blocks = frozenset(block for group in group_blocks for block in group)
             self._admitted[request_id] = (digest, all_blocks)
             flight = self._restore_flights.get(digest)
@@ -2511,12 +2584,22 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     is_store=False,
                     block_ids_by_group=group_blocks,
                     shared_segments=shared_segments,
+                    request_scope=request_scope,
                 )
             )
         self._pending_async_loads.clear()
         for new_req in scheduler_output.scheduled_new_reqs:
             token_ids = new_req.prompt_token_ids or ()
             req_id = new_req.req_id
+            # Some adapters export the scope explicitly; Kraken instead supplies
+            # it through update_state_after_alloc on the original Request.
+            if hasattr(new_req, "cache_salt"):
+                self._remember_request_scope(SimpleNamespace(
+                    request_id=req_id, cache_salt=new_req.cache_salt,
+                ))
+            request_scope = self._request_cache_scopes.get(req_id)
+            if request_scope is None:
+                continue
             self._need_load.pop(req_id, None)
             multimodal_features = _multimodal_feature_identities(
                 new_req,
@@ -2546,6 +2629,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 )
                 candidates = self._request_prefix_candidates(
                     req_id, token_ids, span, multimodal_features,
+                    request_scope=request_scope,
                 )
                 digest = candidates[-1][1]
                 admitted = self._admitted.get(req_id)
@@ -2564,6 +2648,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     span,
                     multimodal_features,
                     request_id=req_id,
+                    request_scope=request_scope,
                 )
                 already = new_req.num_computed_tokens + scheduled
                 if self._streaming_snapshots_enabled:
@@ -2574,6 +2659,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         span=span,
                         promised_completed_tokens=already,
                         block_ids=block_ids,
+                        request_scope=request_scope,
                     )
                     if already < span:
                         # CachedRequestData.new_block_ids only carries the
@@ -2611,6 +2697,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                                 base_span_tokens=base_span,
                                 recurrent_boundary_blocks=recurrent_boundary_blocks,
                                 has_multimodal_identity=has_multimodal_identity,
+                                request_scope=request_scope,
                             )
                         )
                         continue
@@ -2647,6 +2734,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                             base_context_digest=base_digest,
                             base_span_tokens=base_span,
                             has_multimodal_identity=has_multimodal_identity,
+                            request_scope=request_scope,
                         )
                     )
                 else:
@@ -2666,6 +2754,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         self._store_bases[req_id] = (base_digest, base_span)
         cached = scheduler_output.scheduled_cached_reqs
         for index, req_id in enumerate(cached.req_ids):
+            request_scope = self._request_cache_scopes.get(req_id)
+            if request_scope is None:
+                continue
             if req_id not in self._store_progress:
                 continue
             digest, span, done, blocks_by_group = self._store_progress[req_id]
@@ -2757,6 +2848,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     span=span,
                     promised_completed_tokens=done,
                     block_ids=blocks,
+                    request_scope=request_scope,
                 )
             elif done >= span:
                 if self._recurrent_group_indexes and not recurrent_boundary_blocks:
@@ -2777,6 +2869,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         exact_token_ids,
                         span,
                         request_id=req_id,
+                        request_scope=request_scope,
                     )
                 del self._store_progress[req_id]
                 self._store_token_ids.pop(req_id, None)
@@ -2797,6 +2890,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         base_span_tokens=base_span,
                         recurrent_boundary_blocks=recurrent_boundary_blocks,
                         has_multimodal_identity=has_multimodal_identity,
+                        request_scope=request_scope,
                     )
                 )
             else:
@@ -4747,6 +4841,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> bool:
         is_alias = False
         try:
+            if not valid_metadata(plan):
+                return False
+            self._scope_salt(plan.request_scope)
             rank = self._worker_rank()
             identity = self._identity(rank)
             lookup_started = time.perf_counter_ns()
@@ -5274,6 +5371,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         # optional scheduler-side digest cache. Request completion must remain
         # idempotent for those callers.
         getattr(self, "_prefix_digest_candidates", {}).pop(request_id, None)
+        getattr(self, "_request_cache_scopes", {}).pop(request_id, None)
         self._pending_async_loads.pop(request_id, None)
         self._admitted.pop(request_id, None)
         self._store_progress.pop(request_id, None)
@@ -5535,6 +5633,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     if offers:
                         producer_stream = int(torch.cuda.current_stream().cuda_stream)
                     for offer in offers:
+                        if not valid_metadata(offer):
+                            continue
                         runtime.offer_completed(
                             offer,
                             producer_stream=producer_stream,
@@ -5557,7 +5657,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             # busy store is a cache miss opportunity, never a serving stall.
             skipped_before_submit = False
             with self._store_cv:
-                if plan.digest in self._held:
+                if not valid_metadata(plan):
+                    self.counters["store_skipped_invalid_scope"] = (
+                        self.counters.get("store_skipped_invalid_scope", 0) + 1
+                    )
+                    skipped_before_submit = True
+                elif plan.digest in self._held:
                     self.counters["store_skipped_present"] += 1
                     logger.info(
                         "spark-context-cache: store skipped; entry already"
@@ -5663,6 +5768,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
 
     def _snapshot_store(self, plan: _ReqPlan) -> _StoreSnapshot | _HybridStoreSnapshot:
         """Synchronously detach source KV blocks into owned CPU bytes."""
+        if not valid_metadata(plan):
+            raise ValueError("Missing or inconsistent request cache scope metadata")
+        self._scope_salt(plan.request_scope)
 
         if self._storage_mode == "block_pages_v1":
             return self._snapshot_hybrid_store(plan)
@@ -5881,6 +5989,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     != self._digest(
                         list(snapshot.plan.token_ids),
                         snapshot.plan.span_tokens,
+                        request_scope=snapshot.plan.request_scope,
                     )
                 ):
                     raise RuntimeError(
@@ -5934,7 +6043,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                             identity=snapshot.identity,
                             base_context_digest=snapshot.plan.base_context_digest,
                             token_ids=snapshot.plan.token_ids,
-                            identity_salt=self._context_digest_salt,
+                            identity_salt=self._scope_salt(snapshot.plan.request_scope),
                             layout=layout,
                             base_block_counts=self._group_block_counts_for_span(
                                 snapshot.plan.base_span_tokens
@@ -5959,7 +6068,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         identity=snapshot.identity,
                         base_context_digest=snapshot.plan.base_context_digest,
                         token_ids=snapshot.plan.token_ids,
-                        identity_salt=self._context_digest_salt,
+                        identity_salt=self._scope_salt(snapshot.plan.request_scope),
                         tail_chunks=chunks,
                     )
                 elif isinstance(snapshot, _HybridStoreSnapshot):
@@ -6052,7 +6161,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 identity=snapshot.identity,
                 source_context_digest=plan.digest,
                 token_ids=plan.token_ids,
-                identity_salt=self._context_digest_salt,
+                identity_salt=self._scope_salt(plan.request_scope),
                 storage_mode="per_token_rows",
             )
         except Exception as error:  # noqa: BLE001 - exact entry remains usable
@@ -6149,7 +6258,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             else _SnapshotChunks(snapshot, self._dcp_degree, self._chunk_tokens)
         )
         if plan.base_context_digest and (
-            plan.digest != self._digest(list(plan.token_ids), plan.span_tokens)
+            plan.digest != self._digest(list(plan.token_ids), plan.span_tokens,
+                                       request_scope=plan.request_scope)
         ):
             raise RuntimeError("tail publication result digest differs from request")
         if isinstance(snapshot, _HybridStoreSnapshot) and plan.base_context_digest:
@@ -6161,7 +6271,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     identity=snapshot.identity,
                     base_context_digest=plan.base_context_digest,
                     token_ids=plan.token_ids,
-                    identity_salt=self._context_digest_salt,
+                    identity_salt=self._scope_salt(plan.request_scope),
                     layout=layout,
                     base_block_counts=self._group_block_counts_for_span(
                         plan.base_span_tokens
@@ -6185,7 +6295,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 identity=snapshot.identity,
                 base_context_digest=plan.base_context_digest,
                 token_ids=plan.token_ids,
-                identity_salt=self._context_digest_salt,
+                identity_salt=self._scope_salt(plan.request_scope),
                 tail_chunks=chunks,
             )
         elif isinstance(snapshot, _HybridStoreSnapshot):

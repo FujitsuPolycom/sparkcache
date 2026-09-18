@@ -146,7 +146,7 @@ class FakeConnector:
 
 def _plan(request_id: str = "request"):
     return types.SimpleNamespace(
-        request_id=request_id,
+        cache_salt=None, request_id=request_id,
         digest="a" * 64,
         span_tokens=512,
         group_block_ids=((2, 5), (7,)),

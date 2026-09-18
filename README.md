@@ -44,6 +44,9 @@ details belong to the deployment profiles linked below.
 
 ## How it works
 
+Request-level `cache_salt` isolation and its cache-namespace compatibility are
+described in [Request cache isolation](docs/request-cache-isolation.md).
+
 1. The scheduler hashes eligible prompt boundaries in one pass.
 2. Every rank reports which matching entries it can read.
 3. The scheduler chooses the longest entry available on every expected rank.

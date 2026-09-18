@@ -6,6 +6,8 @@ test_spark_context_cache_connector, which installs them at import.
 
 from __future__ import annotations
 
+from sparkcache.request_cache_scope import UNSALTED_SCOPE
+
 import dataclasses
 import tempfile
 import types
@@ -219,6 +221,7 @@ class Tp2Dcp1RoundTripTests(unittest.TestCase):
             span_tokens=self.SPAN,
             block_ids=tuple(range(16)),
             is_store=is_store,
+            request_scope=UNSALTED_SCOPE,
         )
 
     def test_two_rank_store_wipe_restore_is_byte_exact(self) -> None:
@@ -294,7 +297,7 @@ class Tp1RoundTripTests(unittest.TestCase):
             pool = _make_pools(18, 64)
             connector.register_kv_caches(pool)
             original = {k: v.clone() for k, v in pool.items()}
-            plan = _ReqPlan("req-1", "e" * 64, 1024, tuple(range(16)), True)
+            plan = _ReqPlan("req-1", "e" * 64, 1024, tuple(range(16)), True, request_scope=UNSALTED_SCOPE)
             connector.bind_connector_metadata(
                 SparkCacheConnectorMetadata(plans=[plan])
             )
@@ -335,7 +338,7 @@ class SchedulerProbeNoneTests(unittest.TestCase):
             digest = connector._digest(tokens, 1024)
             connector._quorum[digest] = set(range(4))
             request = types.SimpleNamespace(
-                request_id="probe-none", prompt_token_ids=tokens
+                cache_salt=None, request_id="probe-none", prompt_token_ids=tokens
             )
             self.assertEqual(
                 connector.get_num_new_matched_tokens(request, 0), (1024, True)
