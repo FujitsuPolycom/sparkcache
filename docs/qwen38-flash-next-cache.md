@@ -1,8 +1,8 @@
 # Qwen3.8 Flash Next persistent cache
 
-Status: **implemented**, with bounded GPU validation on two GB10 nodes using
-the R37 vLLM composition described below. This is not long-duration or general
-multimodal accuracy qualification. The profile is `qwen38-flash-next-hybrid` in
+Status: **qualified for the bounded TP2 and TP4 configurations below**. This is
+not long-duration or general multimodal accuracy qualification.
+The profile is `qwen38-flash-next-hybrid` in
 `sparkcache/spark_context_cache_profiles.py`.
 
 The profile uses opaque manager pages for attention KV and aligned recurrent
@@ -49,6 +49,29 @@ and admission of logical and physical TP2 page geometry. These GPU-free checks
 do not establish runtime persistence correctness.
 
 ## Bounded GPU evidence
+
+### Four-node QAD persistence and corruption recovery
+
+The [TP4 qualification record](qwen38-tp4-cache-qualification.json) binds
+SparkRing 2026.09.3, Qwen QAD revision `629bc321`, TP4/DCP1 and the matching
+64-group snapshot library. The packaged SparkCache runtime source is identical
+to the Qwen-support implementation in this repository; the record identifies
+the full commits, image digest and configuration.
+
+Two independent text fixtures restored 7,200 tokens each on all four physical
+ranks after every serving process restarted, with correct exact answers.
+Changing one byte in only the first fixture's rank-zero payload caused an
+explicit SHA-256 rejection. The scheduler rescheduled 7,200 affected tokens;
+the request returned the correct answer with zero cached-token credit. The
+independent second fixture still restored 7,200 tokens on all four ranks.
+
+The fault was applied with all workers stopped, only inside an isolated store
+whose container mount, ownership marker, manifest and payload hashes were checked.
+Production cache entries were not modified. This establishes bounded TP4 text
+persistence and failed-restore recomputation, not performance, general media
+accuracy, full-context pressure or request-salt isolation.
+
+### Two-node R37 configuration
 
 The serving composition used vLLM tree
 `8e0bb7da60e882c095385222d5878981a2666b60` and B12X tree

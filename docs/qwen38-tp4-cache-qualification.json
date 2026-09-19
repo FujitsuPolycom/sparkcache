@@ -1,0 +1,95 @@
+{
+  "schema": "sparkcache-qwen-bounded-qualification/v1",
+  "status": "qualified",
+  "model": {
+    "repository": "local-inference-lab/Qwen3.8-Flash-Next-NVFP4",
+    "revision": "629bc3218833a38b475b719f34aa571666f4a03e",
+    "quantization": "NVFP4 QAD"
+  },
+  "image": {
+    "release": "SparkRing 2026.09.3",
+    "config_id": "sha256:bc16a9819d853b42c28823c9c937638b545787a7d305917ff00f2ff902d04855",
+    "reference": "ghcr.io/fujitsupolycom/sparkring@sha256:2375f876bc9ea065e85ae10cebad7a8db8a2ec0e6862b4441c269c5bf56365c6"
+  },
+  "source": {
+    "sparkcache_runtime_commit": "76598d1d368d7a8fad2ebd03b7a0550e09eb7f99",
+    "pull_request_head": "b1b93c18b585275a7c43de406a8d558222b8e0bd",
+    "correspondence": "The sparkcache/ package and native source are identical between these commits; the only additional change is a DeepSeek deployment fingerprint.",
+    "vllm_tree_sha256": "c1659b268b292c738b1a36faec17a242b51a35c83879a108c82313aa2a5be63f",
+    "b12x_tree_sha256": "1104cc99243d5533544d089583e39f46d7ac3027caa3f3a37139c4d4f59a5313",
+    "snapshot_library_sha256": "b50db45123c4faf0fdfb021da0a0f1b7f329869ae5dc13dcc7432dd4ce765b68",
+    "snapshot_max_groups": 64
+  },
+  "conditions": {
+    "hardware": "Four NVIDIA GB10 nodes on a switchless ring",
+    "tp": 4,
+    "dcp": 1,
+    "speculation": "MTP3",
+    "max_model_len": 262144,
+    "max_num_seqs": 16,
+    "max_num_batched_tokens": 8192,
+    "kv_bytes_per_rank": 25769803776,
+    "loader": "managed B12X",
+    "recurrent_policy": "aligned",
+    "sparkcache_profile": "qwen38-flash-next-hybrid",
+    "publication_schema": "tail-cow-v2",
+    "workload": "Two unique-nonce exact-answer text fixtures; deterministic saved requests; isolated persistent stores."
+  },
+  "checks": [
+    {
+      "condition": "All four processes restarted after publication",
+      "prompt_tokens": 7870,
+      "cached_tokens": 7200,
+      "restored_physical_ranks": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "result": "Exact answer and normal stop"
+    },
+    {
+      "condition": "All four processes restarted after publication",
+      "prompt_tokens": 8194,
+      "cached_tokens": 7200,
+      "restored_physical_ranks": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "result": "Exact answer and normal stop"
+    },
+    {
+      "condition": "One byte changed in rank-zero payload while all workers stopped",
+      "prompt_tokens": 7870,
+      "cached_tokens": 0,
+      "affected_tokens_rescheduled": 7200,
+      "rejection": "page object SHA-256 mismatch",
+      "result": "Correct exact answer through recomputation; no unverified cache credit"
+    },
+    {
+      "condition": "Independent intact fixture after corruption rejection",
+      "prompt_tokens": 8194,
+      "cached_tokens": 7200,
+      "restored_physical_ranks": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "result": "Exact answer and normal stop"
+    }
+  ],
+  "evidence_sha256": {
+    "pr68-positive-replay.json": "a4ce2c03c8fe50d32a234f162d4ad2d344f123ab1f728f2f753df8638d549379",
+    "pr68-negative-probe.json": "08839f37f3d76284324bb727f5a161dd32779bd6cb3f5493bbed760c647ddf9a",
+    "pr68-fixtures.json": "5923fdff0c3591fba2e8f03b4efd0e7d223abe4e0fdf743b17c8a45dcd79fb1f",
+    "pr68-seed.json": "a9e46ae86654a3ec81907708accff33cde9da944088dca9dd29752e24f736ffc",
+    "pr68-fault-applied.json": "7f19d11446060852473ea5d0991f44d15a4b48b2aaf052dbca77b5953b5976f1",
+    "pr68-store-inspection.json": "5eac638ba403a574ea9b53ac7dd982bc8f5f9372656baddd1c60a15fb8eb41a0"
+  },
+  "isolation": "Dedicated direct-bound test roots, ownership markers, exact container/manifest identities; no production cache entry modified. Fault-injector safety suite passed eight checks on Linux.",
+  "compatibility": "No additional runtime change or cache namespace migration is introduced by this evidence record.",
+  "limitations": "Bounded text persistence and corruption recovery only. No throughput, full-context pressure, general media accuracy, long-duration stability or cache_salt qualification."
+}
