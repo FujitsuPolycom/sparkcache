@@ -1,6 +1,48 @@
 # Request cache isolation hardware qualification
 
-Status: **implemented test protocol; hardware results required**.
+Status: **implemented; hardware qualification in progress**.
+
+## Recorded candidate checks
+
+The private candidate image
+`sha256:c7a92265c93a4b9f18a487919c8fdb1e7372184431462f6bc836481d8a3d3095`
+combines Qwen support with request-scope isolation from SparkCache commit
+`677b172fed46845d55e8b3409622c4ec11acec7d`. The main-reconciled commit
+`27ef4454af3d8bd729b10a4049cb9fcd628e55fd` has an identical serving package.
+The [machine-readable record](request-cache-isolation-qualification.json)
+binds conditions, per-rank counts and private evidence hashes. These observations
+do not qualify the published SparkRing parent image for request-scope isolation.
+
+| Conditions | TP2/DCP1 | TP4/DCP1 |
+|---|---|---|
+| Empty synthetic store, salt A | Correct answer, zero restore credit | Correct answer, zero restore credit |
+| Repeat A after local prefix reset | 5,696 tokens restored on each rank | 7,200 tokens restored on each rank |
+| Identical prompt with unseen salt B | Correct answer, zero restore credit | Correct answer, zero restore credit |
+| Repeat B after local prefix reset | 5,696 tokens restored on each rank | 7,200 tokens restored on each rank |
+| Omitted salt, then local reset and repeat | Cold miss, then 5,696 restored on each rank | Cold miss, then 7,200 restored on each rank |
+| Concurrent A/A/B/B/C submissions | Four warm hits; unseen C misses; correct answers | Four warm hits; unseen C misses; correct answers |
+| Restart all processes, replay A/B and unseen D | A/B each restore 5,696 on each rank; D misses | A/B each restore 7,200 on each rank; D misses |
+| Genuine pre-scope entry presented to scoped connector | Pending hardware check | Intact legacy entry misses; scoped publication then restores 7,200 on every rank |
+
+The prompt contains 8,194 tokens and an exact retrieval key. External-restore
+claims above require worker logs from every physical rank, not merely API cache
+credit. Local resets preserve the external store and use loopback-only developer
+endpoints through SSH. Production cache directories are not used by the checks.
+Concurrent submission does not establish shared-flight joining inside the engine;
+that behavior remains covered by GPU-free tests rather than a hardware claim.
+No throughput or long-duration stability qualification is implied.
+
+The TP4 legacy-entry check uses the intact 8,194-token control from the
+[Qwen TP4 corruption-recovery qualification](qwen38-tp4-cache-qualification.json).
+Every payload object, aggregate snapshot and manifest was verified
+before copying unchanged into the stopped candidate's isolated store. After
+restart, the unsalted request recomputed with zero external restore credit;
+after publication and a local prefix reset it restored 7,200 tokens on every
+rank. The legacy manifest and payload hashes remained unchanged afterward.
+This distinguishes namespace rejection from accepting a corrupted entry or
+disabling all restoration.
+
+## Protocol
 
 This protocol qualifies `cache_salt` routing through the original vLLM Request,
 the SparkCache scheduler and every physical worker. Run it independently on
