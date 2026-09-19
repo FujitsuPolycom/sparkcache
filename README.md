@@ -1,8 +1,7 @@
 # SparkCache
 
 > [!WARNING]
-> SparkCache is experimental software. Pin package, image, and source revisions
-> when you need a reproducible deployment.
+> SparkCache is experimental software.
 
 SparkCache gives vLLM persistent memory for previously computed prompts. It
 saves reusable context to local storage.
