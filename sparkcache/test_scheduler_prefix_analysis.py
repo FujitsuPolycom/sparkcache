@@ -26,7 +26,7 @@ def connector(tmp_path):
 def publication_output(request, scheduled=1024):
     output = _empty_scheduler_output()
     output.scheduled_new_reqs = [SimpleNamespace(
-        req_id=request.request_id,
+        cache_salt=None, req_id=request.request_id,
         prompt_token_ids=request.prompt_token_ids,
         num_computed_tokens=0,
         block_ids=([10, 11, 12, 13],),
@@ -36,7 +36,7 @@ def publication_output(request, scheduled=1024):
 
 
 def test_lease_lookup_and_publication_share_one_hash_pass(connector):
-    request = SimpleNamespace(request_id="prefix", prompt_token_ids=list(range(1100)))
+    request = SimpleNamespace(cache_salt=None, request_id="prefix", prompt_token_ids=list(range(1100)))
     base_digest = connector._digest(request.prompt_token_ids, 512)
     with mock.patch(
         "sparkcache.spark_context_cache_connector.chunk_prefix_digests",
@@ -56,7 +56,7 @@ def test_lease_lookup_and_publication_share_one_hash_pass(connector):
 
 
 def test_prefix_cache_rejects_same_length_mutation(connector):
-    request = SimpleNamespace(request_id="mutable", prompt_token_ids=list(range(1100)))
+    request = SimpleNamespace(cache_salt=None, request_id="mutable", prompt_token_ids=list(range(1100)))
     connector.get_shared_prefix_lease_candidate(request)
     request.prompt_token_ids[1] = 12345
     with mock.patch(
@@ -70,7 +70,7 @@ def test_prefix_cache_rejects_same_length_mutation(connector):
 
 
 def test_present_root_skips_publication_base_work(connector):
-    request = SimpleNamespace(request_id="present", prompt_token_ids=list(range(1100)))
+    request = SimpleNamespace(cache_salt=None, request_id="present", prompt_token_ids=list(range(1100)))
     connector._quorum[connector._digest(request.prompt_token_ids, 1024)] = {0, 1, 2, 3}
     with mock.patch.object(connector, "_publication_base", wraps=connector._publication_base) as base:
         assert connector.build_connector_meta(publication_output(request)).plans == []
@@ -78,7 +78,7 @@ def test_present_root_skips_publication_base_work(connector):
 
 
 def test_local_prefix_filters_cached_candidates(connector):
-    request = SimpleNamespace(request_id="local", prompt_token_ids=list(range(1100)))
+    request = SimpleNamespace(cache_salt=None, request_id="local", prompt_token_ids=list(range(1100)))
     connector.get_shared_prefix_lease_candidate(request)
     connector._quorum[connector._digest(request.prompt_token_ids, 512)] = {0, 1, 2, 3}
     with mock.patch(

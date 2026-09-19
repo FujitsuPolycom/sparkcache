@@ -1,5 +1,7 @@
 """Opt-in diagnostics distinguish GPU lease attachment from persistent restore."""
 
+from sparkcache.request_cache_scope import UNSALTED_SCOPE
+
 import json
 from types import SimpleNamespace
 
@@ -28,7 +30,7 @@ def test_offer_trace_uses_caller_prefix_and_is_latched_at_construction(tmp_path,
     monkeypatch.setenv("SPARK_CONTEXT_CACHE_TRACE_REUSE", "0" if enabled else "1")
     tokens = list(range(1100))
     digest = fixtures.AsyncRestoreTests._offer(connector, tokens)
-    request = SimpleNamespace(request_id="offer", prompt_token_ids=tokens)
+    request = SimpleNamespace(cache_salt=None, request_id="offer", prompt_token_ids=tokens)
     try:
         assert connector.get_num_new_matched_tokens(request, 0) == (1024, True)
         assert connector.counters["restore_hit"] == 1
@@ -84,7 +86,7 @@ def test_worker_trace_follows_actual_verified_or_recompute_result(tmp_path, monk
         payload[-1] ^= 1
         path.write_bytes(payload)
     connector.bind_connector_metadata(connector_module.SparkCacheConnectorMetadata(plans=[
-        connector_module._ReqPlan("restore", digest, 1024, fixture.BLOCKS, False),
+        connector_module._ReqPlan("restore", digest, 1024, fixture.BLOCKS, False, request_scope=UNSALTED_SCOPE),
     ]))
     try:
         connector.start_load_kv(None)
@@ -128,7 +130,7 @@ def test_request_attribution_credits_scheduler_events_and_cleans_up(tmp_path, mo
     monkeypatch.setenv("SPARK_CONTEXT_CACHE_TRACE_REUSE", "1")
     records = _records(monkeypatch)
     connector = fixtures._make_connector(tmp_path, 0, role=connector_module.KVConnectorRole.SCHEDULER)
-    request = SimpleNamespace(request_id="attributed", num_prompt_tokens=1100,
+    request = SimpleNamespace(cache_salt=None, request_id="attributed", num_prompt_tokens=1100,
                               status=SimpleNamespace(name="FINISHED_STOPPED"))
     try:
         assert connector.request_cache_events_enabled
@@ -154,7 +156,7 @@ def test_request_attribution_credits_scheduler_events_and_cleans_up(tmp_path, mo
 def test_request_attribution_invalid_event_and_log_failure_do_not_affect_serving(tmp_path, monkeypatch):
     monkeypatch.setenv("SPARK_CONTEXT_CACHE_TRACE_REUSE", "1")
     connector = fixtures._make_connector(tmp_path, 0, role=connector_module.KVConnectorRole.SCHEDULER)
-    request = SimpleNamespace(request_id="invalid", num_prompt_tokens=100,
+    request = SimpleNamespace(cache_salt=None, request_id="invalid", num_prompt_tokens=100,
                               status=SimpleNamespace(name="FINISHED_ABORTED"))
     try:
         connector.record_request_cache_event(request, "admitted", local_tokens=-1,
@@ -174,7 +176,7 @@ def test_request_attribution_disabled_has_no_per_request_state(tmp_path, monkeyp
     connector = fixtures._make_connector(tmp_path, 0, role=connector_module.KVConnectorRole.SCHEDULER)
     try:
         assert not connector.request_cache_events_enabled
-        connector.record_request_cache_event(SimpleNamespace(request_id="off"), "admitted")
+        connector.record_request_cache_event(SimpleNamespace(cache_salt=None, request_id="off"), "admitted")
         assert connector._request_attribution == {}
     finally:
         connector.shutdown()

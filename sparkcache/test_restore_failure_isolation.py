@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from sparkcache.request_cache_scope import UNSALTED_SCOPE
+
 from types import SimpleNamespace
 from unittest import mock
 
@@ -39,6 +41,7 @@ def test_failed_restore_preserves_unrelated_hybrid_request(
                     failed_groups[0],
                     False,
                     block_ids_by_group=failed_groups,
+                    request_scope=UNSALTED_SCOPE,
                 )
             ]
         )
@@ -65,8 +68,8 @@ def test_failed_restore_preserves_unrelated_hybrid_request(
         scheduler.block_size = 256
         tables = {"failed": failed_groups, "unrelated": unrelated_groups}
         scheduler.kv_cache_manager = SimpleNamespace(get_block_ids=tables.__getitem__)
-        failed = SimpleNamespace(request_id="failed", num_computed_tokens=8192)
-        unrelated = SimpleNamespace(request_id="unrelated", num_computed_tokens=4096)
+        failed = SimpleNamespace(cache_salt=None, request_id="failed", num_computed_tokens=8192)
+        unrelated = SimpleNamespace(cache_salt=None, request_id="unrelated", num_computed_tokens=4096)
         affected, recomputed, _ = scheduler._update_requests_with_invalid_blocks(
             [failed, unrelated], invalid, {}, evict_blocks
         )

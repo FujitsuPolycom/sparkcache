@@ -1,7 +1,8 @@
 # Qwen3.8 Flash Next persistent cache
 
-Status: **qualified for the bounded TP2 and TP4 configurations below**. This is
-not long-duration or general multimodal accuracy qualification.
+Status: **implemented**, with bounded qualification for the exact TP2 and TP4
+compositions below. Request-salt isolation is a separate change; those records
+do not qualify it. This is not long-duration or general multimodal accuracy qualification.
 The profile is `qwen38-flash-next-hybrid` in
 `sparkcache/spark_context_cache_profiles.py`.
 
@@ -54,9 +55,9 @@ do not establish runtime persistence correctness.
 
 The [TP4 qualification record](qwen38-tp4-cache-qualification.json) binds
 SparkRing 2026.09.3, Qwen QAD revision `629bc321`, TP4/DCP1 and the matching
-64-group snapshot library. The packaged SparkCache runtime source is identical
-to the Qwen-support implementation in this repository; the record identifies
-the full commits, image digest and configuration.
+64-group snapshot library. The record identifies the exact Qwen-support source
+commits, image digest and configuration. Its source correspondence does not
+extend to the separate request-salt isolation changes.
 
 Two independent text fixtures restored 7,200 tokens each on all four physical
 ranks after every serving process restarted, with correct exact answers.

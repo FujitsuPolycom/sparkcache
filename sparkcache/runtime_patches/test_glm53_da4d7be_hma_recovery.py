@@ -137,7 +137,7 @@ def _run(
     scheduler = _patched_scheduler_class()()
     scheduler.block_size = 256
     scheduler.kv_cache_manager = _BlockManager(groups)
-    request = SimpleNamespace(request_id="request", num_computed_tokens=1024)
+    request = SimpleNamespace(cache_salt=None, request_id="request", num_computed_tokens=1024)
     result = scheduler._update_requests_with_invalid_blocks(
         [request], invalid, {}, evict_blocks
     )

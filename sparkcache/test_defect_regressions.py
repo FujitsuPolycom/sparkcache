@@ -6,6 +6,8 @@ shared with test_spark_context_cache_connector, which installs them at import.
 
 from __future__ import annotations
 
+from sparkcache.request_cache_scope import UNSALTED_SCOPE
+
 import hashlib
 import json
 import tempfile
@@ -47,7 +49,7 @@ class DefectD19SkippedAsyncPublicationCompletionTests(unittest.TestCase):
 
     @staticmethod
     def _plan(request_id: str = "request") -> _ReqPlan:
-        return _ReqPlan(request_id, "a" * 64, 512, (2, 5), True)
+        return _ReqPlan(request_id, "a" * 64, 512, (2, 5), True, request_scope=UNSALTED_SCOPE)
 
     def _assert_terminal_skip(self, *, busy: bool, present: bool) -> None:
         plan = self._plan()
@@ -59,7 +61,7 @@ class DefectD19SkippedAsyncPublicationCompletionTests(unittest.TestCase):
 
         connector.wait_for_save()
 
-        request = types.SimpleNamespace(request_id=plan.request_id)
+        request = types.SimpleNamespace(cache_salt=None, request_id=plan.request_id)
         self.assertEqual(
             connector.request_finished_all_groups(request, ([2, 5], [7])),
             (True, None),
@@ -100,8 +102,8 @@ class DefectD19SkippedAsyncPublicationCompletionTests(unittest.TestCase):
         connector._async_page_capture_eligible = set()
         connector.counters = {"store_skipped_delayed_limit": 0}
         first = self._plan("first")
-        second = _ReqPlan("second", "b" * 64, 512, (7, 8), True)
-        load = _ReqPlan("load", "d" * 64, 512, (9, 10), False)
+        second = _ReqPlan("second", "b" * 64, 512, (7, 8), True, request_scope=UNSALTED_SCOPE)
+        load = _ReqPlan("load", "d" * 64, 512, (9, 10), False, request_scope=UNSALTED_SCOPE)
         metadata = SparkCacheConnectorMetadata(plans=[first, second, load])
 
         connector._reserve_async_page_capture_plans(metadata)
@@ -140,7 +142,7 @@ class DefectD19SkippedAsyncPublicationCompletionTests(unittest.TestCase):
             workers.append((connector, plan))
 
         for connector, plan in workers:
-            request = types.SimpleNamespace(request_id=plan.request_id)
+            request = types.SimpleNamespace(cache_salt=None, request_id=plan.request_id)
             self.assertEqual(
                 connector.request_finished_all_groups(request, ([2, 5], [7])),
                 (True, None),
@@ -152,7 +154,7 @@ class DefectD19SkippedAsyncPublicationCompletionTests(unittest.TestCase):
 
     def test_second_plan_finishes_while_first_capture_remains_active(self) -> None:
         first = self._plan("first")
-        skipped = _ReqPlan("skipped", "b" * 64, 512, (7, 8), True)
+        skipped = _ReqPlan("skipped", "b" * 64, 512, (7, 8), True, request_scope=UNSALTED_SCOPE)
         runtime = AsyncPageFakeRuntime()
         connector = make_async_page_connector(first, runtime)
         connector._async_page_capture_eligible.add(skipped.request_id)
@@ -168,7 +170,7 @@ class DefectD19SkippedAsyncPublicationCompletionTests(unittest.TestCase):
         self.assertEqual(runtime.submitted, [(first, 91)])
         self.assertEqual(runtime.finished, {skipped.request_id})
         for plan in (first, skipped):
-            request = types.SimpleNamespace(request_id=plan.request_id)
+            request = types.SimpleNamespace(cache_salt=None, request_id=plan.request_id)
             self.assertEqual(
                 connector.request_finished_all_groups(request, ([2, 5], [7])),
                 (True, None),
@@ -522,7 +524,7 @@ class RestoreBacklogAdmissionTests(unittest.TestCase):
         digest = connector._digest(tokens, self.SPAN)
         connector.bind_connector_metadata(
             SparkCacheConnectorMetadata(
-                plans=[_ReqPlan("seed", digest, self.SPAN, self.BLOCKS, True)]
+                plans=[_ReqPlan("seed", digest, self.SPAN, self.BLOCKS, True, request_scope=UNSALTED_SCOPE)]
             )
         )
         connector.wait_for_save()
@@ -540,7 +542,7 @@ class RestoreBacklogAdmissionTests(unittest.TestCase):
             }
             connector._need_load.update(backlog)
             request = types.SimpleNamespace(
-                request_id="overflow", prompt_token_ids=tokens
+                cache_salt=None, request_id="overflow", prompt_token_ids=tokens
             )
             self.assertEqual(
                 connector.get_num_new_matched_tokens(request, 0), (0, False)
@@ -552,7 +554,7 @@ class RestoreBacklogAdmissionTests(unittest.TestCase):
     def test_below_bound_still_admits(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connector, tokens = self._connector_with_hit(Path(directory))
-            request = types.SimpleNamespace(request_id="fits", prompt_token_ids=tokens)
+            request = types.SimpleNamespace(cache_salt=None, request_id="fits", prompt_token_ids=tokens)
             self.assertEqual(
                 connector.get_num_new_matched_tokens(request, 0),
                 (self.SPAN, True),
@@ -622,7 +624,7 @@ class RequestFinishedCleanupTests(unittest.TestCase):
             connector._pending_async_loads["req-f"] = (digest, 1024, (1, 2))
             connector._admitted["req-f"] = (digest, frozenset({1, 2}))
             connector._store_progress["req-f"] = (digest, 1024, 256, [1, 2])
-            request = types.SimpleNamespace(request_id="req-f")
+            request = types.SimpleNamespace(cache_salt=None, request_id="req-f")
             self.assertEqual(connector.request_finished(request, [1, 2]), (False, None))
             self.assertEqual(connector._need_load, {})
             self.assertEqual(connector._pending_async_loads, {})
@@ -910,6 +912,7 @@ class HybridReuseWindowTests(unittest.TestCase):
                 source_groups[0],
                 True,
                 block_ids_by_group=source_groups,
+                request_scope=UNSALTED_SCOPE,
             )
             connector._store_one(store)
             for tensor in pools.values():
@@ -921,6 +924,7 @@ class HybridReuseWindowTests(unittest.TestCase):
                 destination_groups[0],
                 False,
                 block_ids_by_group=destination_groups,
+                request_scope=UNSALTED_SCOPE,
             )
             self.assertTrue(connector._load_one(load))
             destination_selected = connector._select_group_blocks_for_span(
@@ -980,6 +984,7 @@ class HybridReuseWindowTests(unittest.TestCase):
                     tuple(range(64)),
                     tuple(range(1, 33)),
                 ),
+                request_scope=UNSALTED_SCOPE,
             )
             first._store_one(plan)
             replacement = self._windowed_connector(root, 256)
@@ -1020,6 +1025,9 @@ class DefectD15HybridBlockDeltaTests(unittest.TestCase):
                 256,
                 [[10], [20], [30]],
             )
+            connector._remember_request_scope(types.SimpleNamespace(
+                request_id="hybrid", cache_salt=None,
+            ))
             step = types.SimpleNamespace(
                 scheduled_new_reqs=[],
                 num_scheduled_tokens={"hybrid": 256},
@@ -1116,6 +1124,7 @@ class DefectD16HybridPageBoundaryTests(unittest.TestCase):
                     True,
                     block_ids_by_group=base_groups,
                     token_ids=tokens[:base_span],
+                    request_scope=UNSALTED_SCOPE,
                 )
             )
             expected_base = {
@@ -1134,6 +1143,7 @@ class DefectD16HybridPageBoundaryTests(unittest.TestCase):
                         base_destination[0],
                         False,
                         block_ids_by_group=base_destination,
+                        request_scope=UNSALTED_SCOPE,
                     )
                 )
             )
@@ -1164,6 +1174,7 @@ class DefectD16HybridPageBoundaryTests(unittest.TestCase):
                 token_ids=tokens,
                 base_context_digest=base_digest,
                 base_span_tokens=base_span,
+                request_scope=UNSALTED_SCOPE,
             )
             result_snapshot = connector._snapshot_hybrid_store(extension_plan)
             connector._store_one(extension_plan)
@@ -1200,6 +1211,7 @@ class DefectD16HybridPageBoundaryTests(unittest.TestCase):
                         result_destination[0],
                         False,
                         block_ids_by_group=result_destination,
+                        request_scope=UNSALTED_SCOPE,
                     )
                 )
             )
@@ -1295,6 +1307,7 @@ class DefectD18ManagerPageViewTests(unittest.TestCase):
                 source_groups[0],
                 True,
                 block_ids_by_group=source_groups,
+                request_scope=UNSALTED_SCOPE,
             )
 
             connector._store_one(plan)
@@ -1310,6 +1323,7 @@ class DefectD18ManagerPageViewTests(unittest.TestCase):
                         destination_groups[0],
                         False,
                         block_ids_by_group=destination_groups,
+                        request_scope=UNSALTED_SCOPE,
                     )
                 )
             )
@@ -1373,6 +1387,7 @@ class DefectD18ManagerPageViewTests(unittest.TestCase):
                 (source_block,),
                 True,
                 block_ids_by_group=((source_block,),),
+                request_scope=UNSALTED_SCOPE,
             )
             connector._store_one(plan)
             backing[36 * destination_block : 36 * (destination_block + 1)].zero_()
@@ -1386,6 +1401,7 @@ class DefectD18ManagerPageViewTests(unittest.TestCase):
                         (destination_block,),
                         False,
                         block_ids_by_group=((destination_block,),),
+                        request_scope=UNSALTED_SCOPE,
                     )
                 )
             )
@@ -1488,7 +1504,7 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
         output = types.SimpleNamespace(
             scheduled_new_reqs=[
                 types.SimpleNamespace(
-                    req_id=request_id,
+                    cache_salt=None, req_id=request_id,
                     prompt_token_ids=list(range(cls.PROMPT_TOKENS)),
                     block_ids=cls._tables(),
                     num_computed_tokens=0,
@@ -1627,6 +1643,7 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
                         destination[0],
                         False,
                         block_ids_by_group=destination,
+                        request_scope=UNSALTED_SCOPE,
                     )
                 )
             )
@@ -1848,7 +1865,7 @@ class DefectD17RecurrentBoundaryMetadataTests(unittest.TestCase):
                         "dflash-recurrent-boundary", connector._store_progress
                     )
                     connector.request_finished(
-                        types.SimpleNamespace(request_id="dflash-recurrent-boundary"),
+                        types.SimpleNamespace(cache_salt=None, request_id="dflash-recurrent-boundary"),
                         [],
                     )
                     self.assertNotIn(
@@ -2144,6 +2161,7 @@ class DefectD18LatePublicationBaseQuorumTests(unittest.TestCase):
                         block_ids_by_group=fixture._tables(),
                         token_ids=tuple(token_ids[: self.BASE_BOUNDARY]),
                         recurrent_boundary_blocks=((1, fixture.BOUNDARY_BLOCK),),
+                        request_scope=UNSALTED_SCOPE,
                     )
                 )
                 workers.append(worker)
@@ -2213,7 +2231,7 @@ class StoreSpanCompletenessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(Path(directory), 0, 64)
             connector.register_kv_caches(_make_pools(8, 64))
-            plan = _ReqPlan("truncated", "e" * 64, 1024, (3, 0, 5, 1), True)
+            plan = _ReqPlan("truncated", "e" * 64, 1024, (3, 0, 5, 1), True, request_scope=UNSALTED_SCOPE)
             snapshot = connector._snapshot_store(plan)
             from sparkcache.spark_context_cache_connector import _SnapshotChunks
 
@@ -2306,7 +2324,7 @@ class FailureInvalidationTests(unittest.TestCase):
             root = Path(directory)
             connector = _make_connector(root, 0, 64)
             connector.register_kv_caches(_make_pools(8, 64))
-            plan = _ReqPlan("repair", "9" * 64, 1024, (3, 0, 5, 1), True)
+            plan = _ReqPlan("repair", "9" * 64, 1024, (3, 0, 5, 1), True, request_scope=UNSALTED_SCOPE)
             connector._store_one(plan)
             connector._held.add(plan.digest)
             chunk_path = next((root / "chunks").glob("*.spcc"))
@@ -2330,7 +2348,7 @@ class IntegritySweepPublicationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             connector = _make_connector(Path(directory), 0, 64)
             connector.register_kv_caches(_make_pools(8, 64))
-            existing = _ReqPlan("existing", "a" * 64, 1024, (3, 0, 5, 1), True)
+            existing = _ReqPlan("existing", "a" * 64, 1024, (3, 0, 5, 1), True, request_scope=UNSALTED_SCOPE)
             connector._store_one(existing)
             connector._held.add(existing.digest)
             published_during_sweep = "b" * 64
@@ -2385,7 +2403,7 @@ class DefectD19MultimodalPromptAliasingTests(unittest.TestCase):
         return types.SimpleNamespace(
             scheduled_new_reqs=[
                 types.SimpleNamespace(
-                    req_id=request.request_id,
+                    cache_salt=None, req_id=request.request_id,
                     prompt_token_ids=request.prompt_token_ids,
                     num_computed_tokens=0,
                     block_ids=([10, 11, 12, 13],),
@@ -2413,12 +2431,12 @@ class DefectD19MultimodalPromptAliasingTests(unittest.TestCase):
             )
             token_ids = list(range(1100))
             red = types.SimpleNamespace(
-                request_id="red-image-prompt",
+                cache_salt=None, request_id="red-image-prompt",
                 prompt_token_ids=token_ids,
                 mm_features=[self._feature("image-red")],
             )
             blue = types.SimpleNamespace(
-                request_id="blue-image-prompt",
+                cache_salt=None, request_id="blue-image-prompt",
                 prompt_token_ids=token_ids,
                 mm_features=[self._feature("image-blue")],
             )
@@ -2447,27 +2465,27 @@ class DefectD19MultimodalPromptAliasingTests(unittest.TestCase):
             )
             token_ids = list(range(1100))
             red = types.SimpleNamespace(
-                request_id="red-image-prompt",
+                cache_salt=None, request_id="red-image-prompt",
                 prompt_token_ids=token_ids,
                 mm_features=[self._feature("image-red")],
             )
             second_red = types.SimpleNamespace(
-                request_id="same-red-image-prompt",
+                cache_salt=None, request_id="same-red-image-prompt",
                 prompt_token_ids=token_ids,
                 mm_features=[self._feature("image-red")],
             )
             blue = types.SimpleNamespace(
-                request_id="blue-image-prompt",
+                cache_salt=None, request_id="blue-image-prompt",
                 prompt_token_ids=token_ids,
                 mm_features=[self._feature("image-blue")],
             )
             moved_red = types.SimpleNamespace(
-                request_id="moved-red-image-prompt",
+                cache_salt=None, request_id="moved-red-image-prompt",
                 prompt_token_ids=token_ids,
                 mm_features=[self._feature("image-red", offset=64)],
             )
             text = types.SimpleNamespace(
-                request_id="text-prompt",
+                cache_salt=None, request_id="text-prompt",
                 prompt_token_ids=token_ids,
                 mm_features=[],
             )
@@ -2519,7 +2537,7 @@ class DefectD19MultimodalPromptAliasingTests(unittest.TestCase):
             short_tokens = list(range(1100))
             feature = self._feature("image-red")
             short = types.SimpleNamespace(
-                request_id="short-image-prompt",
+                cache_salt=None, request_id="short-image-prompt",
                 prompt_token_ids=short_tokens,
                 mm_features=[feature],
             )
@@ -2528,7 +2546,7 @@ class DefectD19MultimodalPromptAliasingTests(unittest.TestCase):
             ).plans[0]
             connector._quorum[short_plan.digest] = {0, 1, 2, 3}
             extended = types.SimpleNamespace(
-                request_id="extended-image-prompt",
+                cache_salt=None, request_id="extended-image-prompt",
                 prompt_token_ids=short_tokens + list(range(1100, 1400)),
                 mm_features=[feature],
             )
@@ -2549,12 +2567,12 @@ class DefectD19MultimodalPromptAliasingTests(unittest.TestCase):
             )
             token_ids = list(range(1100))
             text = types.SimpleNamespace(
-                request_id="text-prompt",
+                cache_salt=None, request_id="text-prompt",
                 prompt_token_ids=token_ids,
                 mm_features=[],
             )
             image = types.SimpleNamespace(
-                request_id="image-prompt",
+                cache_salt=None, request_id="image-prompt",
                 prompt_token_ids=token_ids,
                 mm_features=[self._feature("image-red")],
             )
@@ -2591,7 +2609,7 @@ class DefectD19MultimodalPromptAliasingTests(unittest.TestCase):
             first = types.SimpleNamespace(
                 scheduled_new_reqs=[
                     types.SimpleNamespace(
-                        req_id=request_id,
+                        cache_salt=None, req_id=request_id,
                         prompt_token_ids=token_ids,
                         num_computed_tokens=0,
                         block_ids=(list(range(10, 18)),),
@@ -2643,7 +2661,7 @@ class DefectD19MultimodalPromptAliasingTests(unittest.TestCase):
             self.assertNotEqual(legacy_digest, connector._digest(token_ids, span))
             connector._quorum[legacy_digest] = {0, 1, 2, 3}
             text = types.SimpleNamespace(
-                request_id="text-prompt",
+                cache_salt=None, request_id="text-prompt",
                 prompt_token_ids=token_ids,
                 mm_features=[],
             )
@@ -2661,12 +2679,12 @@ class DefectD19MultimodalPromptAliasingTests(unittest.TestCase):
             )
             token_ids = list(range(1100))
             missing_identifier = types.SimpleNamespace(
-                request_id="missing-identifier",
+                cache_salt=None, request_id="missing-identifier",
                 prompt_token_ids=token_ids,
                 mm_features=[self._feature(identifier=None)],
             )
             legacy_hash_only = types.SimpleNamespace(
-                request_id="legacy-hash-only",
+                cache_salt=None, request_id="legacy-hash-only",
                 prompt_token_ids=token_ids,
                 mm_hashes=["image-red"],
             )
@@ -2731,7 +2749,7 @@ class DefectD20GenericCheckpointOfferTests(unittest.TestCase):
         ]
         return types.SimpleNamespace(
             scheduled_new_reqs=[types.SimpleNamespace(
-                req_id=request_id,
+                cache_salt=None, req_id=request_id,
                 prompt_token_ids=list(range(8192)),
                 block_ids=((1, 2, 3, 4), tuple(range(10, 30)), tuple(range(30, 50))),
                 num_computed_tokens=start,
@@ -2785,6 +2803,7 @@ class DefectD20GenericCheckpointOfferTests(unittest.TestCase):
                 self.assertTrue(worker._load_one(_ReqPlan(
                     "restored", plan.digest, 6144, destination[0], False,
                     block_ids_by_group=destination,
+                    request_scope=UNSALTED_SCOPE,
                 )))
                 self.assertTrue(torch.equal(pools["full"][[110, 111, 112]], expected["full"]))
                 self.assertTrue(torch.equal(pools["recurrent"][[113]], expected["recurrent"]))

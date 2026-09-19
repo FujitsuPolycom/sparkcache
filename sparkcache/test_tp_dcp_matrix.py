@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from sparkcache.request_cache_scope import UNSALTED_SCOPE
+
 import dataclasses
 import tempfile
 from pathlib import Path
@@ -101,6 +103,7 @@ def test_target_tp_dcp_matrix_round_trips_each_physical_rank() -> None:
                 span_tokens=_SPAN,
                 block_ids=block_ids,
                 is_store=True,
+                request_scope=UNSALTED_SCOPE,
             )
             for physical_rank in range(tp):
                 connector = _connector(

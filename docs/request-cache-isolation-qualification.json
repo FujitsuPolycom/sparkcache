@@ -1,0 +1,458 @@
+{
+  "schema": "sparkcache-request-scope-qualification/v1",
+  "status": "qualified for the bounded cases listed; not general stability qualification",
+  "candidate_image_id": "sha256:c7a92265c93a4b9f18a487919c8fdb1e7372184431462f6bc836481d8a3d3095",
+  "parent_image_id": "sha256:bc16a9819d853b42c28823c9c937638b545787a7d305917ff00f2ff902d04855",
+  "sparkcache_source_commit": "677b172fed46845d55e8b3409622c4ec11acec7d",
+  "main_reconciled_commit": "27ef4454af3d8bd729b10a4049cb9fcd628e55fd",
+  "source_compatibility": "Serving package is identical between the two SparkCache commits; native libraries and vLLM/B12X are unchanged from the parent image.",
+  "checkpoint": {
+    "repository": "local-inference-lab/Qwen3.8-Flash-Next-NVFP4",
+    "revision": "629bc3218833a38b475b719f34aa571666f4a03e"
+  },
+  "conditions": {
+    "dcp": 1,
+    "prompt_tokens": 8194,
+    "kv_gib_per_rank": 24,
+    "cache_disk_gib_per_rank": 4,
+    "max_model_len": 262144,
+    "max_num_seqs": 16,
+    "max_num_batched_tokens": 8192,
+    "speculation": "MTP3",
+    "local_prefix_reset": "idle-only reset without external-store reset; developer API loopback-only via SSH"
+  },
+  "topologies": [
+    {
+      "tp": 2,
+      "cases": [
+        {
+          "case": "seed",
+          "cached_tokens": [
+            0
+          ],
+          "worker_restore_totals": [
+            {
+              "rank": 0,
+              "tokens": 0
+            },
+            {
+              "rank": 1,
+              "tokens": 0
+            }
+          ]
+        },
+        {
+          "case": "warm",
+          "cached_tokens": [
+            5696
+          ],
+          "worker_restore_totals": [
+            {
+              "rank": 0,
+              "tokens": 5696
+            },
+            {
+              "rank": 1,
+              "tokens": 5696
+            }
+          ]
+        },
+        {
+          "case": "different",
+          "cached_tokens": [
+            0
+          ],
+          "worker_restore_totals": [
+            {
+              "rank": 0,
+              "tokens": 0
+            },
+            {
+              "rank": 1,
+              "tokens": 0
+            }
+          ]
+        },
+        {
+          "case": "different-warm",
+          "cached_tokens": [
+            5696
+          ],
+          "worker_restore_totals": [
+            {
+              "rank": 0,
+              "tokens": 5696
+            },
+            {
+              "rank": 1,
+              "tokens": 5696
+            }
+          ]
+        },
+        {
+          "case": "unsalted",
+          "cached_tokens": [
+            0
+          ],
+          "worker_restore_totals": [
+            {
+              "rank": 0,
+              "tokens": 0
+            },
+            {
+              "rank": 1,
+              "tokens": 0
+            }
+          ]
+        },
+        {
+          "case": "unsalted-warm",
+          "cached_tokens": [
+            5696
+          ],
+          "worker_restore_totals": [
+            {
+              "rank": 0,
+              "tokens": 5696
+            },
+            {
+              "rank": 1,
+              "tokens": 5696
+            }
+          ]
+        },
+        {
+          "case": "concurrent",
+          "cached_tokens": [
+            5696,
+            5696,
+            5696,
+            5696,
+            0
+          ],
+          "worker_restore_totals": [
+            {
+              "rank": 0,
+              "tokens": 22784
+            },
+            {
+              "rank": 1,
+              "tokens": 22784
+            }
+          ]
+        },
+        {
+          "case": "after-restart",
+          "cached_tokens": [
+            5696,
+            5696,
+            0
+          ],
+          "worker_restore_totals": [
+            {
+              "rank": 0,
+              "tokens": 11392
+            },
+            {
+              "rank": 1,
+              "tokens": 11392
+            }
+          ]
+        }
+      ],
+      "evidence": [
+        {
+          "artifact": "pr69-tp2-loopback-tests/pre-controller.json",
+          "sha256": "f45df53b18585a7081b1bbc9d2406f4a1fb89f797de903eb3f7fcd5a6137f39b"
+        },
+        {
+          "artifact": "pr69-tp2-loopback-tests/post-controller.json",
+          "sha256": "149c10c3fa92ff6fa665eb2e01ec783c287b6c39c6c2086c2343f298a3ab505f"
+        }
+      ]
+    },
+    {
+      "tp": 4,
+      "cases": [
+        {
+          "case": "seed",
+          "cached_tokens": [
+            0
+          ],
+          "worker_restore_totals": [
+            {
+              "rank": 0,
+              "tokens": 0
+            },
+            {
+              "rank": 1,
+              "tokens": 0
+            },
+            {
+              "rank": 2,
+              "tokens": 0
+            },
+            {
+              "rank": 3,
+              "tokens": 0
+            }
+          ]
+        },
+        {
+          "case": "warm",
+          "cached_tokens": [
+            7200
+          ],
+          "worker_restore_totals": [
+            {
+              "rank": 0,
+              "tokens": 7200
+            },
+            {
+              "rank": 1,
+              "tokens": 7200
+            },
+            {
+              "rank": 2,
+              "tokens": 7200
+            },
+            {
+              "rank": 3,
+              "tokens": 7200
+            }
+          ]
+        },
+        {
+          "case": "different",
+          "cached_tokens": [
+            0
+          ],
+          "worker_restore_totals": [
+            {
+              "rank": 0,
+              "tokens": 0
+            },
+            {
+              "rank": 1,
+              "tokens": 0
+            },
+            {
+              "rank": 2,
+              "tokens": 0
+            },
+            {
+              "rank": 3,
+              "tokens": 0
+            }
+          ]
+        },
+        {
+          "case": "different-warm",
+          "cached_tokens": [
+            7200
+          ],
+          "worker_restore_totals": [
+            {
+              "rank": 0,
+              "tokens": 7200
+            },
+            {
+              "rank": 1,
+              "tokens": 7200
+            },
+            {
+              "rank": 2,
+              "tokens": 7200
+            },
+            {
+              "rank": 3,
+              "tokens": 7200
+            }
+          ]
+        },
+        {
+          "case": "unsalted",
+          "cached_tokens": [
+            0
+          ],
+          "worker_restore_totals": [
+            {
+              "rank": 0,
+              "tokens": 0
+            },
+            {
+              "rank": 1,
+              "tokens": 0
+            },
+            {
+              "rank": 2,
+              "tokens": 0
+            },
+            {
+              "rank": 3,
+              "tokens": 0
+            }
+          ]
+        },
+        {
+          "case": "unsalted-warm",
+          "cached_tokens": [
+            7200
+          ],
+          "worker_restore_totals": [
+            {
+              "rank": 0,
+              "tokens": 7200
+            },
+            {
+              "rank": 1,
+              "tokens": 7200
+            },
+            {
+              "rank": 2,
+              "tokens": 7200
+            },
+            {
+              "rank": 3,
+              "tokens": 7200
+            }
+          ]
+        },
+        {
+          "case": "concurrent",
+          "cached_tokens": [
+            7200,
+            7200,
+            7200,
+            7200,
+            0
+          ],
+          "worker_restore_totals": [
+            {
+              "rank": 0,
+              "tokens": 28800
+            },
+            {
+              "rank": 1,
+              "tokens": 28800
+            },
+            {
+              "rank": 2,
+              "tokens": 28800
+            },
+            {
+              "rank": 3,
+              "tokens": 28800
+            }
+          ]
+        },
+        {
+          "case": "after-restart",
+          "cached_tokens": [
+            7200,
+            7200,
+            0
+          ],
+          "worker_restore_totals": [
+            {
+              "rank": 0,
+              "tokens": 14400
+            },
+            {
+              "rank": 1,
+              "tokens": 14400
+            },
+            {
+              "rank": 2,
+              "tokens": 14400
+            },
+            {
+              "rank": 3,
+              "tokens": 14400
+            }
+          ]
+        }
+      ],
+      "evidence": [
+        {
+          "artifact": "pr69-tp4-loopback-tests/pre-controller.json",
+          "sha256": "1c4fea4a19d4db3a10338b2662819a19bf138161303117a2465ccf4f582cbf22"
+        },
+        {
+          "artifact": "pr69-tp4-loopback-tests/post-controller.json",
+          "sha256": "90ea4d13ba5245ed36497aae4ab645ad20c1fc0ef4df81596595816482f4353a"
+        }
+      ]
+    }
+  ],
+  "limitations": [
+    "Concurrent client submission does not prove internal shared-flight joining; same-scope joining and cross-scope exclusion retain separate GPU-free tests.",
+    "Legacy-entry hardware replay was performed on TP4 only; TP2 tested an empty namespace and scoped isolation.",
+    "No full-context pressure, throughput or long-duration transport stability claim.",
+    "The candidate image is private; this record does not upgrade or qualify the published parent image with request-scope isolation."
+  ],
+  "cache_namespace_impact": "All pre-scope entries, including unsalted ones, miss under sparkcache-context-v3-request-scope. CacheIdentity wire format and chunk geometry are unchanged.",
+  "legacy_tp4": {
+    "cases": [
+      {
+        "case": "legacy-miss",
+        "cached_tokens": 0,
+        "worker_restore_totals": [
+          {
+            "rank": 0,
+            "tokens": 0
+          },
+          {
+            "rank": 1,
+            "tokens": 0
+          },
+          {
+            "rank": 2,
+            "tokens": 0
+          },
+          {
+            "rank": 3,
+            "tokens": 0
+          }
+        ]
+      },
+      {
+        "case": "scoped-warm",
+        "cached_tokens": 7200,
+        "worker_restore_totals": [
+          {
+            "rank": 0,
+            "tokens": 7200
+          },
+          {
+            "rank": 1,
+            "tokens": 7200
+          },
+          {
+            "rank": 2,
+            "tokens": 7200
+          },
+          {
+            "rank": 3,
+            "tokens": 7200
+          }
+        ]
+      }
+    ],
+    "legacy_bytes_unchanged": true,
+    "evidence": [
+      {
+        "artifact": "pr69-legacy-tp4-preflight.json",
+        "sha256": "458c8180adaed4f86f84ace8e2f1f7a109df899b05eb842c0c902f361efa27ac"
+      },
+      {
+        "artifact": "pr69-legacy-tp4-staged.json",
+        "sha256": "1551337f473ce52eb72408391ab2b08a5152a709bc48c6ee0c978b43a35b9c3f"
+      },
+      {
+        "artifact": "pr69-legacy-tp4-tests/report.json",
+        "sha256": "d03482f039141a9bb1e276d2c06252545b73e06782debb66e459554aa9fee240"
+      }
+    ]
+  }
+}

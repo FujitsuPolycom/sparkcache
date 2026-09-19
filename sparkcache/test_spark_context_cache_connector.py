@@ -7,6 +7,8 @@ vLLM is stubbed the same way as the sibling backend suites.
 
 from __future__ import annotations
 
+from sparkcache.request_cache_scope import UNSALTED_SCOPE
+
 from concurrent.futures import ThreadPoolExecutor
 import dataclasses
 import hashlib
@@ -43,7 +45,9 @@ def test_qwen_chunk_geometry_reaches_prefix_digest_call_site():
     connector.counters = {'prefix_digest_cache_hits': 0, 'prefix_digest_cache_misses': 0}
     tokens = list(range(6000))
     candidates = connector._request_prefix_candidates('request', tokens, 5696)
-    assert candidates[-1] == (5696, codec.context_prefix_digest(tokens, 'qwen-profile-identity', token_count=5696))
+    assert candidates[-1] == (5696, codec.context_prefix_digest(
+        tokens, connector._scope_salt(UNSALTED_SCOPE), token_count=5696,
+    ))
     assert connector._request_prefix_candidates('request', tokens, 5696) == candidates
     assert connector.counters['prefix_digest_cache_hits'] == 1
 
@@ -429,7 +433,7 @@ class HybridAllocatorContractTests(unittest.TestCase):
 
             self.assertEqual(
                 connector.request_finished_all_groups(
-                    types.SimpleNamespace(request_id="hma"),
+                    types.SimpleNamespace(cache_salt=None, request_id="hma"),
                     ([1, 2], [3], [4, 5]),
                 ),
                 (False, None),
@@ -708,6 +712,7 @@ class HybridPageRoundTripTests(unittest.TestCase):
                     True,
                     block_ids_by_group=((3,), (4,)),
                     token_ids=tokens[:256],
+                    request_scope=UNSALTED_SCOPE,
                 )
             )
 
@@ -722,6 +727,7 @@ class HybridPageRoundTripTests(unittest.TestCase):
                     token_ids=tokens,
                     base_context_digest=base_digest,
                     base_span_tokens=256,
+                    request_scope=UNSALTED_SCOPE,
                 )
             )
 
@@ -763,6 +769,7 @@ class HybridPageRoundTripTests(unittest.TestCase):
                     True,
                     block_ids_by_group=((3,), (4,)),
                     token_ids=tokens[:512],
+                    request_scope=UNSALTED_SCOPE,
                 )
             )
             plan = _ReqPlan(
@@ -775,6 +782,7 @@ class HybridPageRoundTripTests(unittest.TestCase):
                 token_ids=tokens,
                 base_context_digest=base_digest,
                 base_span_tokens=512,
+                request_scope=UNSALTED_SCOPE,
             )
             with mock.patch.object(
                 connector._store,
@@ -805,7 +813,7 @@ class HybridPageRoundTripTests(unittest.TestCase):
                     dataclasses.replace(
                         plan,
                         request_id="wrong-digest",
-                        digest="f" * 64,
+                        scope_binding="", digest="f" * 64,
                     )
                 )
             self.assertFalse(
@@ -852,6 +860,7 @@ class HybridPageRoundTripTests(unittest.TestCase):
                     True,
                     block_ids_by_group=base_groups,
                     token_ids=tokens[:512],
+                    request_scope=UNSALTED_SCOPE,
                 )
             )
             expected_full = full[[3, 5]].clone()
@@ -868,6 +877,7 @@ class HybridPageRoundTripTests(unittest.TestCase):
                     token_ids=tokens,
                     base_context_digest=base_digest,
                     base_span_tokens=512,
+                    request_scope=UNSALTED_SCOPE,
                 )
             )
             for tensor in pools.values():
@@ -882,6 +892,7 @@ class HybridPageRoundTripTests(unittest.TestCase):
                     destination[0],
                     False,
                     block_ids_by_group=destination,
+                    request_scope=UNSALTED_SCOPE,
                 )
             )
 
@@ -929,6 +940,7 @@ class HybridPageRoundTripTests(unittest.TestCase):
                             destination[0],
                             False,
                             block_ids_by_group=destination,
+                            request_scope=UNSALTED_SCOPE,
                         )
                     )
                 )
@@ -976,6 +988,7 @@ class HybridPageRoundTripTests(unittest.TestCase):
                     token_ids=tokens,
                     base_context_digest=base_digest,
                     base_span_tokens=512,
+                    request_scope=UNSALTED_SCOPE,
                 )
             )
             repaired = connector._store.lookup(
@@ -1024,6 +1037,7 @@ class HybridPageRoundTripTests(unittest.TestCase):
                 True,
                 block_ids_by_group=source_groups,
                 token_ids=tuple(range(1024)),
+                request_scope=UNSALTED_SCOPE,
             )
             connector._store_one(store_plan)
             self.assertEqual(
@@ -1040,6 +1054,7 @@ class HybridPageRoundTripTests(unittest.TestCase):
                 destination_groups[0],
                 False,
                 block_ids_by_group=destination_groups,
+                request_scope=UNSALTED_SCOPE,
             )
 
             self.assertTrue(connector._load_one(load_plan))
@@ -1234,7 +1249,7 @@ class CheckpointIdentityTests(unittest.TestCase):
             tokens = UnsliceableTokens(range(1100))
             expected = codec.context_digest(
                 range(1024),
-                connector._context_digest_salt,
+                connector._scope_salt(),
             )
             connector._identity = mock.Mock(
                 side_effect=AssertionError(
@@ -1592,6 +1607,7 @@ class CudaRestoreSelectionTests(unittest.TestCase):
                 1024,
                 (3, 0, 5, 1),
                 False,
+                request_scope=UNSALTED_SCOPE,
             )
             connector.bind_connector_metadata(
                 SparkCacheConnectorMetadata(
@@ -1658,6 +1674,7 @@ class CudaRestoreSelectionTests(unittest.TestCase):
                 1024,
                 (3, 0, 5, 1),
                 False,
+                request_scope=UNSALTED_SCOPE,
             )
             connector.bind_connector_metadata(
                 SparkCacheConnectorMetadata(
@@ -1820,6 +1837,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                 (1,),
                 False,
                 block_ids_by_group=((1,), (2,)),
+                request_scope=UNSALTED_SCOPE,
             )
             for index in range(16)
         ]
@@ -1978,6 +1996,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                 (3,),
                 False,
                 block_ids_by_group=((3,), (4,)),
+                request_scope=UNSALTED_SCOPE,
             )
 
             def lookup(_identity, digest, **_kwargs):
@@ -2069,6 +2088,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                 (3,),
                 False,
                 block_ids_by_group=((3,), (4,)),
+                request_scope=UNSALTED_SCOPE,
             )
 
             def lookup(_identity, digest, **_kwargs):
@@ -2157,7 +2177,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
             connector.start_load_kv(None)
             self.assertTrue(leader_entered.wait(timeout=5))
             connector.request_finished(
-                types.SimpleNamespace(request_id="shared-0"),
+                types.SimpleNamespace(cache_salt=None, request_id="shared-0"),
                 [],
             )
             allow_leader_resolve.set()
@@ -2309,6 +2329,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                     (1,),
                     False,
                     block_ids_by_group=((1,), (2,)),
+                    request_scope=UNSALTED_SCOPE,
                 )
                 for index in range(16)
             ]
@@ -2319,6 +2340,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                 (3,),
                 False,
                 block_ids_by_group=((3,), (4,)),
+                request_scope=UNSALTED_SCOPE,
             )
 
             def lookup(_identity, digest, **_kwargs):
@@ -2379,6 +2401,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                     (1,),
                     False,
                     block_ids_by_group=((1,), (2,)),
+                    request_scope=UNSALTED_SCOPE,
                 )
                 for index in range(8)
             ]
@@ -2407,6 +2430,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                     (1,),
                     False,
                     block_ids_by_group=((1,), (2,)),
+                    request_scope=UNSALTED_SCOPE,
                 )
                 runnable, deferred, keys = connector._prepare_page_base_read_cohorts(
                     [singleton]
@@ -2469,6 +2493,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                 tuple(range(4)),
                 True,
                 token_ids=common,
+                request_scope=UNSALTED_SCOPE,
             )
         )
         connector._store_one(
@@ -2481,6 +2506,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                 token_ids=tokens_a,
                 base_context_digest=base_digest,
                 base_span_tokens=1024,
+                request_scope=UNSALTED_SCOPE,
             )
         )
         for tensor in connector._layer_tensors.values():
@@ -2495,6 +2521,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                 token_ids=tokens_b,
                 base_context_digest=base_digest,
                 base_span_tokens=1024,
+                request_scope=UNSALTED_SCOPE,
             )
         )
         return connector, tokens_a, tokens_b, base_digest, digest_a, digest_b
@@ -2507,13 +2534,13 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
             for digest in (base_digest, digest_a, digest_b):
                 connector._quorum[digest] = {0, 1, 2, 3}
             leader = types.SimpleNamespace(
-                request_id="tail-flight-leader", prompt_token_ids=tokens_a
+                cache_salt=None, request_id="tail-flight-leader", prompt_token_ids=tokens_a
             )
             distinct = types.SimpleNamespace(
-                request_id="tail-flight-distinct", prompt_token_ids=tokens_b
+                cache_salt=None, request_id="tail-flight-distinct", prompt_token_ids=tokens_b
             )
             same_root = types.SimpleNamespace(
-                request_id="tail-flight-same-root", prompt_token_ids=tokens_a
+                cache_salt=None, request_id="tail-flight-same-root", prompt_token_ids=tokens_a
             )
 
             self.assertEqual(
@@ -2563,6 +2590,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                     tuple(range(8, 16)),
                     False,
                     shared_segments=((base_digest, 1024),),
+                    request_scope=UNSALTED_SCOPE,
                 )
             )
 
@@ -2632,6 +2660,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                     True,
                     block_ids_by_group=base_groups,
                     token_ids=common,
+                    request_scope=UNSALTED_SCOPE,
                 )
             )
             for request_id, digest, tokens in (
@@ -2649,15 +2678,16 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                         token_ids=tokens,
                         base_context_digest=base_digest,
                         base_span_tokens=512,
+                        request_scope=UNSALTED_SCOPE,
                     )
                 )
             for digest in (base_digest, digest_a, digest_b):
                 connector._quorum[digest] = {0, 1}
             leader = types.SimpleNamespace(
-                request_id="page-exact-a", prompt_token_ids=tokens_a
+                cache_salt=None, request_id="page-exact-a", prompt_token_ids=tokens_a
             )
             divergent = types.SimpleNamespace(
-                request_id="page-exact-b", prompt_token_ids=tokens_b
+                cache_salt=None, request_id="page-exact-b", prompt_token_ids=tokens_b
             )
 
             self.assertEqual(
@@ -2688,6 +2718,7 @@ class ConnectorRoundTripTests(unittest.TestCase):
             span_tokens=self.SPAN,
             block_ids=(3, 0, 5, 1),
             is_store=True,
+            request_scope=UNSALTED_SCOPE,
         )
 
     def test_four_rank_store_wipe_restore_is_byte_exact(self) -> None:
@@ -2819,7 +2850,7 @@ class SchedulerChunkedPrefillTests(unittest.TestCase):
             )
             token_ids = list(range(1100))
             request = types.SimpleNamespace(
-                request_id="uncached-request",
+                cache_salt=None, request_id="uncached-request",
                 prompt_token_ids=token_ids,
             )
 
@@ -2830,7 +2861,7 @@ class SchedulerChunkedPrefillTests(unittest.TestCase):
             output = types.SimpleNamespace(
                 scheduled_new_reqs=[
                     types.SimpleNamespace(
-                        req_id=request.request_id,
+                        cache_salt=None, req_id=request.request_id,
                         prompt_token_ids=token_ids,
                         num_computed_tokens=0,
                         block_ids=([10, 11, 12, 13],),
@@ -2865,7 +2896,7 @@ class SchedulerChunkedPrefillTests(unittest.TestCase):
             output = types.SimpleNamespace(
                 scheduled_new_reqs=[
                     types.SimpleNamespace(
-                        req_id="tail-plan",
+                        cache_salt=None, req_id="tail-plan",
                         prompt_token_ids=token_ids,
                         num_computed_tokens=0,
                         block_ids=([10, 11, 12, 13],),
@@ -2893,7 +2924,7 @@ class SchedulerChunkedPrefillTests(unittest.TestCase):
             step1 = types.SimpleNamespace(
                 scheduled_new_reqs=[
                     types.SimpleNamespace(
-                        req_id="req-c",
+                        cache_salt=None, req_id="req-c",
                         prompt_token_ids=token_ids,
                         num_computed_tokens=0,
                         block_ids=([10, 11],),
@@ -2940,7 +2971,7 @@ class SchedulerChunkedPrefillTests(unittest.TestCase):
             step = types.SimpleNamespace(
                 scheduled_new_reqs=[
                     types.SimpleNamespace(
-                        req_id="already-cached",
+                        cache_salt=None, req_id="already-cached",
                         prompt_token_ids=token_ids,
                         num_computed_tokens=0,
                         block_ids=([10, 11],),
@@ -2969,7 +3000,7 @@ class SchedulerChunkedPrefillTests(unittest.TestCase):
             first = types.SimpleNamespace(
                 scheduled_new_reqs=[
                     types.SimpleNamespace(
-                        req_id="becomes-cached",
+                        cache_salt=None, req_id="becomes-cached",
                         prompt_token_ids=token_ids,
                         num_computed_tokens=0,
                         block_ids=([10, 11],),
@@ -3026,6 +3057,7 @@ class PrefixAliasConnectorTests(unittest.TestCase):
                 tuple(range(32)),
                 True,
                 token_ids=tuple(tokens[: self.SPAN]),
+                request_scope=UNSALTED_SCOPE,
             )
 
             connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[plan]))
@@ -3060,7 +3092,7 @@ class PrefixAliasConnectorTests(unittest.TestCase):
 
             connector._quorum[prefix_digest] = {0, 1, 2, 3}
             continued = types.SimpleNamespace(
-                request_id="scheduler-alias-probe",
+                cache_salt=None, request_id="scheduler-alias-probe",
                 prompt_token_ids=tokens[: self.PREFIX + 100],
             )
             self.assertEqual(
@@ -3082,6 +3114,7 @@ class PrefixAliasConnectorTests(unittest.TestCase):
                 self.PREFIX,
                 tuple(range(16)),
                 False,
+                request_scope=UNSALTED_SCOPE,
             )
             self.assertTrue(connector._load_one(load_plan))
             self.assertEqual(connector.counters["prefix_alias_restore_hit"], 1)
@@ -3121,6 +3154,7 @@ class PrefixAliasConnectorTests(unittest.TestCase):
                 (3, 0, 5, 1),
                 True,
                 token_ids=tuple(tokens),
+                request_scope=UNSALTED_SCOPE,
             )
             connector._store.publish_prefix_aliases = mock.Mock(
                 side_effect=OSError("alias directory unavailable")
@@ -3151,6 +3185,7 @@ class PrefixAliasConnectorTests(unittest.TestCase):
                 (3, 0, 5, 1),
                 True,
                 token_ids=tokens,
+                request_scope=UNSALTED_SCOPE,
             )
             snapshot = connector._snapshot_store(plan)
             connector._streaming_snapshots_enabled = True
@@ -3196,7 +3231,7 @@ class StartupDiscoveryTests(unittest.TestCase):
             root = Path(directory) / "rank1"
             writer = _make_connector(root, 1, 64)
             writer.register_kv_caches(_make_pools(8, 64))
-            plan = _ReqPlan("seed", "a" * 64, 1024, (3, 0, 5, 1), True)
+            plan = _ReqPlan("seed", "a" * 64, 1024, (3, 0, 5, 1), True, request_scope=UNSALTED_SCOPE)
             writer._store_one(plan)
 
             restarted = _make_connector(root, 1, 64)
@@ -3223,7 +3258,7 @@ class StartupDiscoveryTests(unittest.TestCase):
             root = Path(directory) / "rank1"
             writer = _make_connector(root, 1, 64)
             writer.register_kv_caches(_make_pools(8, 64))
-            plan = _ReqPlan("seed", "b" * 64, 1024, (3, 0, 5, 1), True)
+            plan = _ReqPlan("seed", "b" * 64, 1024, (3, 0, 5, 1), True, request_scope=UNSALTED_SCOPE)
             writer._store_one(plan)
             manifest_path = next((root / "manifests").rglob("*.json"))
             manifest = manifest_path.read_bytes()
@@ -3241,7 +3276,7 @@ class StartupDiscoveryTests(unittest.TestCase):
             root = Path(directory) / "rank1"
             writer = _make_connector(root, 1, 64)
             writer.register_kv_caches(_make_pools(8, 64))
-            plan = _ReqPlan("seed", "c" * 64, 1024, (3, 0, 5, 1), True)
+            plan = _ReqPlan("seed", "c" * 64, 1024, (3, 0, 5, 1), True, request_scope=UNSALTED_SCOPE)
             writer._store_one(plan)
             chunk_path = next((root / "chunks").glob("*.spcc"))
             manifest_path = next((root / "manifests").rglob("*.json"))
@@ -3261,11 +3296,11 @@ class StartupDiscoveryTests(unittest.TestCase):
             root = Path(directory) / "rank1"
             writer = _make_connector(root, 1, 64)
             writer.register_kv_caches(_make_pools(8, 64))
-            healthy = _ReqPlan("healthy", "1" * 64, 1024, (3, 0, 5, 1), True)
+            healthy = _ReqPlan("healthy", "1" * 64, 1024, (3, 0, 5, 1), True, request_scope=UNSALTED_SCOPE)
             malicious = dataclasses.replace(
                 healthy,
                 request_id="malicious",
-                digest="2" * 64,
+                scope_binding="", digest="2" * 64,
             )
             writer._store_one(healthy)
             writer._store_one(malicious)
@@ -3294,7 +3329,7 @@ class StartupDiscoveryTests(unittest.TestCase):
             root = Path(directory) / "rank1"
             writer = _make_connector(root, 1, 64)
             writer.register_kv_caches(_make_pools(8, 64))
-            existing = _ReqPlan("existing", "3" * 64, 1024, (3, 0, 5, 1), True)
+            existing = _ReqPlan("existing", "3" * 64, 1024, (3, 0, 5, 1), True, request_scope=UNSALTED_SCOPE)
             writer._store_one(existing)
 
             restarted = _make_connector(root, 1, 64)
@@ -3336,7 +3371,7 @@ class StartupDiscoveryTests(unittest.TestCase):
             root = Path(directory) / "rank1"
             writer = _make_connector(root, 1, 64)
             writer.register_kv_caches(_make_pools(8, 64))
-            plan = _ReqPlan("missing", "d" * 64, 1024, (3, 0, 5, 1), True)
+            plan = _ReqPlan("missing", "d" * 64, 1024, (3, 0, 5, 1), True, request_scope=UNSALTED_SCOPE)
             writer._store_one(plan)
             next((root / "chunks").glob("*.spcc")).unlink()
 
@@ -3357,7 +3392,7 @@ class StartupDiscoveryTests(unittest.TestCase):
             root = Path(directory) / "rank1"
             writer = _make_connector(root, 1, 64)
             writer.register_kv_caches(_make_pools(8, 64))
-            plan = _ReqPlan("short", "f" * 64, 1024, (3, 0, 5, 1), True)
+            plan = _ReqPlan("short", "f" * 64, 1024, (3, 0, 5, 1), True, request_scope=UNSALTED_SCOPE)
             writer._store_one(plan)
             chunk_path = next((root / "chunks").glob("*.spcc"))
             encoded = chunk_path.read_bytes()
@@ -3386,7 +3421,7 @@ class StartupDiscoveryTests(unittest.TestCase):
             root = Path(directory) / "rank1"
             writer = _make_connector(root, 1, 64)
             writer.register_kv_caches(_make_pools(8, 64))
-            plan = _ReqPlan("corrupt", "e" * 64, 1024, (3, 0, 5, 1), True)
+            plan = _ReqPlan("corrupt", "e" * 64, 1024, (3, 0, 5, 1), True, request_scope=UNSALTED_SCOPE)
             writer._store_one(plan)
             chunk_path = next((root / "chunks").glob("*.spcc"))
             encoded = bytearray(chunk_path.read_bytes())
@@ -3632,7 +3667,7 @@ class CapacityPolicyConnectorTests(unittest.TestCase):
                 extra_config={"spark_cache_ttl_seconds": "1"},
             )
             connector.register_kv_caches(_make_pools(8, 64))
-            plan = _ReqPlan("expired", "e" * 64, 1024, (3, 4, 5, 6), True)
+            plan = _ReqPlan("expired", "e" * 64, 1024, (3, 4, 5, 6), True, request_scope=UNSALTED_SCOPE)
             connector._store_one(plan)
             manifest = next((root / "manifests").rglob("*.json"))
             old_ns = time.time_ns() - 2 * 10**9
@@ -4102,7 +4137,7 @@ class SweepTests(unittest.TestCase):
             connector = _make_connector(root, 1, 64)
             pool = _make_pools(8, 64)
             connector.register_kv_caches(pool)
-            plan = _ReqPlan("req-s", "a" * 64, 1024, (3, 0, 5, 1), True)
+            plan = _ReqPlan("req-s", "a" * 64, 1024, (3, 0, 5, 1), True, request_scope=UNSALTED_SCOPE)
             connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[plan]))
             connector.wait_for_save()
             _drain_store(connector)
@@ -4137,6 +4172,7 @@ class AsyncStoreTests(unittest.TestCase):
                 1024,
                 (3, 0, 5, 1),
                 True,
+                request_scope=UNSALTED_SCOPE,
             )
             connector.bind_connector_metadata(
                 SparkCacheConnectorMetadata(plans=[plan])
@@ -4168,6 +4204,7 @@ class AsyncStoreTests(unittest.TestCase):
                 1024,
                 (3, 0, 5, 1),
                 True,
+                request_scope=UNSALTED_SCOPE,
             )
             writer.bind_connector_metadata(
                 SparkCacheConnectorMetadata(plans=[plan])
@@ -4234,6 +4271,7 @@ class AsyncStoreTests(unittest.TestCase):
                 (0, 1, 2, 3),
                 True,
                 token_ids=tokens[:1024],
+                request_scope=UNSALTED_SCOPE,
             )
             connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[base]))
             connector.wait_for_save()
@@ -4249,6 +4287,7 @@ class AsyncStoreTests(unittest.TestCase):
                 token_ids=tokens,
                 base_context_digest=base_digest,
                 base_span_tokens=1024,
+                request_scope=UNSALTED_SCOPE,
             )
             snapshot = connector._snapshot_store(extension)
             self.assertEqual(snapshot.logical_start, 1024)
@@ -4305,7 +4344,7 @@ class AsyncStoreTests(unittest.TestCase):
                 },
             )
             connector.register_kv_caches(_make_pools(8, 64))
-            plan = _ReqPlan("fast-path", "2" * 64, 1024, (3, 0, 5, 1), True)
+            plan = _ReqPlan("fast-path", "2" * 64, 1024, (3, 0, 5, 1), True, request_scope=UNSALTED_SCOPE)
             original_lookup = connector._store.lookup
             connector._store.lookup = mock.Mock(
                 side_effect=AssertionError(
@@ -4335,7 +4374,7 @@ class AsyncStoreTests(unittest.TestCase):
                 },
             )
             connector.register_kv_caches(_make_pools(8, 64))
-            plan = _ReqPlan("reported-eviction", "6" * 64, 1024, (3, 0, 5, 1), True)
+            plan = _ReqPlan("reported-eviction", "6" * 64, 1024, (3, 0, 5, 1), True, request_scope=UNSALTED_SCOPE)
             entry = EntryKey(connector._identity(0).storage_key, plan.digest)
             connector._store.maintain = mock.Mock(
                 return_value=MaintenanceReport(
@@ -4373,7 +4412,7 @@ class AsyncStoreTests(unittest.TestCase):
                 },
             )
             connector.register_kv_caches(_make_pools(8, 64))
-            plan = _ReqPlan("partial", "4" * 64, 1024, (3, 0, 5, 1), True)
+            plan = _ReqPlan("partial", "4" * 64, 1024, (3, 0, 5, 1), True, request_scope=UNSALTED_SCOPE)
             connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[plan]))
 
             def unlink_then_fail(_policy):
@@ -4402,7 +4441,7 @@ class AsyncStoreTests(unittest.TestCase):
                 },
             )
             connector.register_kv_caches(_make_pools(8, 64))
-            plan = _ReqPlan("estimate", "3" * 64, 1024, (3, 0, 5, 1), True)
+            plan = _ReqPlan("estimate", "3" * 64, 1024, (3, 0, 5, 1), True, request_scope=UNSALTED_SCOPE)
             connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[plan]))
             connector.wait_for_save()
             self.assertTrue(connector.wait_for_pending_stores(timeout=5))
@@ -4428,7 +4467,7 @@ class AsyncStoreTests(unittest.TestCase):
             digest = "5" * 64
             connector.bind_connector_metadata(
                 SparkCacheConnectorMetadata(
-                    plans=[_ReqPlan("bounded", digest, 1024, (3, 0, 5, 1), True)]
+                    plans=[_ReqPlan("bounded", digest, 1024, (3, 0, 5, 1), True, request_scope=UNSALTED_SCOPE)]
                 )
             )
             maintenance_started = threading.Event()
@@ -4469,6 +4508,7 @@ class AsyncStoreTests(unittest.TestCase):
                             1024,
                             (3, 0, 5, 1),
                             True,
+                            request_scope=UNSALTED_SCOPE,
                         )
                     ]
                 )
@@ -4535,6 +4575,7 @@ class AsyncStoreTests(unittest.TestCase):
                 1024,
                 (3, 0, 5, 1),
                 True,
+                request_scope=UNSALTED_SCOPE,
             )
             connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[plan]))
             commit_started = threading.Event()
@@ -4590,6 +4631,7 @@ class AsyncStoreTests(unittest.TestCase):
                 1024,
                 (3, 0, 5, 1),
                 True,
+                request_scope=UNSALTED_SCOPE,
             )
             connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[plan]))
             connector.wait_for_save()
@@ -4631,11 +4673,12 @@ class AsyncStoreTests(unittest.TestCase):
                 1024,
                 (3, 0, 5, 1),
                 True,
+                request_scope=UNSALTED_SCOPE,
             )
             second = dataclasses.replace(
                 first,
                 request_id="store-b",
-                digest="9" * 64,
+                scope_binding="", digest="9" * 64,
             )
             commit_started = threading.Event()
             release_commit = threading.Event()
@@ -4683,6 +4726,7 @@ class AsyncStoreTests(unittest.TestCase):
                 1024,
                 (3, 0, 5, 1),
                 True,
+                request_scope=UNSALTED_SCOPE,
             )
             connector.bind_connector_metadata(
                 SparkCacheConnectorMetadata(plans=[existing])
@@ -4700,7 +4744,7 @@ class AsyncStoreTests(unittest.TestCase):
             active = dataclasses.replace(
                 existing,
                 request_id="active",
-                digest="b" * 64,
+                scope_binding="", digest="b" * 64,
             )
             commit_started = threading.Event()
             release_commit = threading.Event()
@@ -4742,11 +4786,12 @@ class AsyncStoreTests(unittest.TestCase):
                 1024,
                 (3, 0, 5, 1),
                 True,
+                request_scope=UNSALTED_SCOPE,
             )
             retry = dataclasses.replace(
                 failed,
                 request_id="store-retry",
-                digest="b" * 64,
+                scope_binding="", digest="b" * 64,
             )
             original_commit = connector._store.commit
             connector._store.commit = mock.Mock(
@@ -4791,6 +4836,7 @@ class AsyncStoreTests(unittest.TestCase):
                                 1024,
                                 (3, 0, 5, 1),
                                 True,
+                                request_scope=UNSALTED_SCOPE,
                             )
                         ]
                     )
@@ -4829,6 +4875,7 @@ class AsyncStoreTests(unittest.TestCase):
                                 1024,
                                 (3, 0, 5, 1),
                                 True,
+                                request_scope=UNSALTED_SCOPE,
                             )
                         ]
                     )
@@ -4858,6 +4905,7 @@ class AsyncStoreTests(unittest.TestCase):
                             1024,
                             (3, 0, 5, 1),
                             True,
+                            request_scope=UNSALTED_SCOPE,
                         )
                     ]
                 )
@@ -4879,6 +4927,7 @@ class AsyncStoreTests(unittest.TestCase):
                 1024,
                 (3, 0, 5, 1),
                 True,
+                request_scope=UNSALTED_SCOPE,
             )
             connector.bind_connector_metadata(
                 SparkCacheConnectorMetadata(plans=[initial])
@@ -4895,7 +4944,7 @@ class AsyncStoreTests(unittest.TestCase):
             after_shutdown = dataclasses.replace(
                 initial,
                 request_id="too-late",
-                digest="e" * 64,
+                scope_binding="", digest="e" * 64,
             )
             connector.bind_connector_metadata(
                 SparkCacheConnectorMetadata(plans=[after_shutdown])
@@ -4920,7 +4969,7 @@ class SchedulerRetirementTests(unittest.TestCase):
             pool = _make_pools(8, 64)
             connector.register_kv_caches(pool)
             digest = "b" * 64
-            plan = _ReqPlan("req-r", digest, 1024, (3, 0, 5, 1), True)
+            plan = _ReqPlan("req-r", digest, 1024, (3, 0, 5, 1), True, request_scope=UNSALTED_SCOPE)
             connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[plan]))
             connector.wait_for_save()
             _drain_store(connector)
@@ -4954,7 +5003,7 @@ class SchedulerRetirementTests(unittest.TestCase):
             digest = "c" * 64
             connector.bind_connector_metadata(
                 SparkCacheConnectorMetadata(
-                    plans=[_ReqPlan("req-k", digest, 1024, (3, 0, 5, 1), True)]
+                    plans=[_ReqPlan("req-k", digest, 1024, (3, 0, 5, 1), True, request_scope=UNSALTED_SCOPE)]
                 )
             )
             connector.wait_for_save()
@@ -4974,7 +5023,7 @@ class QuorumAdmissionTests(unittest.TestCase):
 
     def _request(self, tokens: int = 1100):
         return types.SimpleNamespace(
-            request_id="req-q", prompt_token_ids=list(range(tokens))
+            cache_salt=None, request_id="req-q", prompt_token_ids=list(range(tokens))
         )
 
     def test_no_offer_until_every_rank_confirms(self) -> None:
@@ -4986,7 +5035,7 @@ class QuorumAdmissionTests(unittest.TestCase):
             # store exists locally but nobody has confirmed yet
             c.bind_connector_metadata(
                 SparkCacheConnectorMetadata(
-                    plans=[_ReqPlan("s", digest, 1024, (3, 0, 5, 1), True)]
+                    plans=[_ReqPlan("s", digest, 1024, (3, 0, 5, 1), True, request_scope=UNSALTED_SCOPE)]
                 )
             )
             c.wait_for_save()
@@ -5027,7 +5076,7 @@ class QuorumAdmissionTests(unittest.TestCase):
             shorter = connector._digest(tokens, 1024)
             connector.bind_connector_metadata(
                 SparkCacheConnectorMetadata(
-                    plans=[_ReqPlan("stored-turn", shorter, 1024, (3, 0, 5, 1), True)]
+                    plans=[_ReqPlan("stored-turn", shorter, 1024, (3, 0, 5, 1), True, request_scope=UNSALTED_SCOPE)]
                 )
             )
             connector.wait_for_save()
@@ -5048,7 +5097,7 @@ class QuorumAdmissionTests(unittest.TestCase):
                 )
 
             request = types.SimpleNamespace(
-                request_id="extended-turn",
+                cache_salt=None, request_id="extended-turn",
                 prompt_token_ids=tokens,
             )
             self.assertEqual(
@@ -5070,7 +5119,7 @@ class QuorumAdmissionTests(unittest.TestCase):
             ):
                 connector.bind_connector_metadata(
                     SparkCacheConnectorMetadata(
-                        plans=[_ReqPlan(request_id, digest, span, blocks, True)]
+                        plans=[_ReqPlan(request_id, digest, span, blocks, True, request_scope=UNSALTED_SCOPE)]
                     )
                 )
                 connector.wait_for_save()
@@ -5086,7 +5135,7 @@ class QuorumAdmissionTests(unittest.TestCase):
                     )
                 )
             request = types.SimpleNamespace(
-                request_id="fallback",
+                cache_salt=None, request_id="fallback",
                 prompt_token_ids=tokens,
             )
             self.assertEqual(
@@ -5115,7 +5164,7 @@ class QuorumAdmissionTests(unittest.TestCase):
             connector._quorum[digest] = {0, 1, 2, 3}
             connector._scheduler_probe = "none"
             request = types.SimpleNamespace(
-                request_id="oversized-prefix",
+                cache_salt=None, request_id="oversized-prefix",
                 prompt_token_ids=tokens,
             )
             self.assertEqual(
@@ -5131,7 +5180,7 @@ class QuorumAdmissionTests(unittest.TestCase):
             digest = c._digest(list(req.prompt_token_ids), 1024)
             c.bind_connector_metadata(
                 SparkCacheConnectorMetadata(
-                    plans=[_ReqPlan("s", digest, 1024, (3, 0, 5, 1), True)]
+                    plans=[_ReqPlan("s", digest, 1024, (3, 0, 5, 1), True, request_scope=UNSALTED_SCOPE)]
                 )
             )
             c.wait_for_save()
@@ -5189,7 +5238,7 @@ class QuorumAdmissionTests(unittest.TestCase):
             digest = "a" * 64
             c.bind_connector_metadata(
                 SparkCacheConnectorMetadata(
-                    plans=[_ReqPlan("s", digest, 1024, (3, 0, 5, 1), True)]
+                    plans=[_ReqPlan("s", digest, 1024, (3, 0, 5, 1), True, request_scope=UNSALTED_SCOPE)]
                 )
             )
             c.wait_for_save()
@@ -5232,6 +5281,7 @@ class AsyncRestoreTests(unittest.TestCase):
                         self.SPAN,
                         tuple(block_ids or self.BLOCKS),
                         True,
+                        request_scope=UNSALTED_SCOPE,
                     )
                 ]
             )
@@ -5307,6 +5357,7 @@ class AsyncRestoreTests(unittest.TestCase):
                             self.SPAN,
                             self.BLOCKS,
                             False,
+                            request_scope=UNSALTED_SCOPE,
                         )
                     ]
                 )
@@ -5382,6 +5433,7 @@ class AsyncRestoreTests(unittest.TestCase):
                             self.SPAN,
                             self.BLOCKS,
                             False,
+                            request_scope=UNSALTED_SCOPE,
                         )
                     ]
                 )
@@ -5431,6 +5483,7 @@ class AsyncRestoreTests(unittest.TestCase):
                             self.SPAN,
                             self.BLOCKS,
                             False,
+                            request_scope=UNSALTED_SCOPE,
                         ),
                         _ReqPlan(
                             "ordered-b",
@@ -5438,6 +5491,7 @@ class AsyncRestoreTests(unittest.TestCase):
                             self.SPAN,
                             (2, 4, 6, 7),
                             False,
+                            request_scope=UNSALTED_SCOPE,
                         ),
                     ]
                 )
@@ -5475,9 +5529,9 @@ class AsyncRestoreTests(unittest.TestCase):
             connector = self._cohort_connector(Path(directory))
             tokens = list(range(1100))
             digest = self._offer(connector, tokens)
-            leader = types.SimpleNamespace(request_id="leader", prompt_token_ids=tokens)
+            leader = types.SimpleNamespace(cache_salt=None, request_id="leader", prompt_token_ids=tokens)
             follower = types.SimpleNamespace(
-                request_id="follower", prompt_token_ids=tokens
+                cache_salt=None, request_id="follower", prompt_token_ids=tokens
             )
 
             self.assertEqual(
@@ -5524,7 +5578,7 @@ class AsyncRestoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             connector = self._cohort_connector(Path(directory))
             request = types.SimpleNamespace(
-                request_id="capacity-waiter",
+                cache_salt=None, request_id="capacity-waiter",
                 prompt_token_ids=list(range(1100)),
             )
 
@@ -5555,13 +5609,13 @@ class AsyncRestoreTests(unittest.TestCase):
             tokens = list(range(1100))
             digest = self._offer(connector, tokens)
             leader = types.SimpleNamespace(
-                request_id="partial-prefix-leader", prompt_token_ids=tokens
+                cache_salt=None, request_id="partial-prefix-leader", prompt_token_ids=tokens
             )
             partial = types.SimpleNamespace(
-                request_id="partial-prefix-follower", prompt_token_ids=tokens
+                cache_salt=None, request_id="partial-prefix-follower", prompt_token_ids=tokens
             )
             joined_then_local = types.SimpleNamespace(
-                request_id="joined-then-local", prompt_token_ids=tokens
+                cache_salt=None, request_id="joined-then-local", prompt_token_ids=tokens
             )
 
             self.assertEqual(
@@ -5598,13 +5652,13 @@ class AsyncRestoreTests(unittest.TestCase):
             tokens = list(range(1100))
             digest = self._offer(connector, tokens)
             leader = types.SimpleNamespace(
-                request_id="lease-leader", prompt_token_ids=tokens
+                cache_salt=None, request_id="lease-leader", prompt_token_ids=tokens
             )
             early = types.SimpleNamespace(
-                request_id="early-follower", prompt_token_ids=tokens
+                cache_salt=None, request_id="early-follower", prompt_token_ids=tokens
             )
             late = types.SimpleNamespace(
-                request_id="late-follower", prompt_token_ids=tokens
+                cache_salt=None, request_id="late-follower", prompt_token_ids=tokens
             )
 
             connector.get_num_new_matched_tokens(leader, 0)
@@ -5646,7 +5700,7 @@ class AsyncRestoreTests(unittest.TestCase):
             tokens = list(range(1100))
             digest = self._offer(connector, tokens)
             leader = types.SimpleNamespace(
-                request_id="retained-leader", prompt_token_ids=tokens
+                cache_salt=None, request_id="retained-leader", prompt_token_ids=tokens
             )
             connector.get_num_new_matched_tokens(leader, 0)
             connector.update_state_after_alloc(
@@ -5674,7 +5728,7 @@ class AsyncRestoreTests(unittest.TestCase):
                 )
 
             attached = types.SimpleNamespace(
-                request_id="retained-follower", prompt_token_ids=tokens
+                cache_salt=None, request_id="retained-follower", prompt_token_ids=tokens
             )
             with mock.patch(
                 "sparkcache.spark_context_cache_connector.time.monotonic",
@@ -5687,7 +5741,7 @@ class AsyncRestoreTests(unittest.TestCase):
             connector.shared_prefix_lease_attached(attached.request_id, digest)
 
             late = types.SimpleNamespace(
-                request_id="expired-follower", prompt_token_ids=tokens
+                cache_salt=None, request_id="expired-follower", prompt_token_ids=tokens
             )
             with mock.patch(
                 "sparkcache.spark_context_cache_connector.time.monotonic",
@@ -5711,7 +5765,7 @@ class AsyncRestoreTests(unittest.TestCase):
             connector._quorum[leader_digest] = {0, 1, 2, 3}
             connector._quorum[trunk_digest] = {0, 1, 2, 3}
             leader = types.SimpleNamespace(
-                request_id="segment-leader", prompt_token_ids=leader_tokens
+                cache_salt=None, request_id="segment-leader", prompt_token_ids=leader_tokens
             )
             self.assertEqual(
                 connector.get_num_new_matched_tokens(leader, 0),
@@ -5726,7 +5780,7 @@ class AsyncRestoreTests(unittest.TestCase):
                 digest = connector._digest(tokens, self.SPAN)
                 connector._quorum[digest] = {0, 1, 2, 3}
                 follower = types.SimpleNamespace(
-                    request_id=f"segment-follower-{index}",
+                    cache_salt=None, request_id=f"segment-follower-{index}",
                     prompt_token_ids=tokens,
                 )
                 followers.append(follower)
@@ -5769,14 +5823,14 @@ class AsyncRestoreTests(unittest.TestCase):
             for digest in (leader_digest, distinct_digest, trunk_digest):
                 connector._quorum[digest] = {0, 1, 2, 3}
             leader = types.SimpleNamespace(
-                request_id="ordered-segment-leader", prompt_token_ids=leader_tokens
+                cache_salt=None, request_id="ordered-segment-leader", prompt_token_ids=leader_tokens
             )
             distinct = types.SimpleNamespace(
-                request_id="ordered-distinct-follower",
+                cache_salt=None, request_id="ordered-distinct-follower",
                 prompt_token_ids=distinct_tokens,
             )
             same_root = types.SimpleNamespace(
-                request_id="ordered-same-root-follower",
+                cache_salt=None, request_id="ordered-same-root-follower",
                 prompt_token_ids=leader_tokens,
             )
 
@@ -5850,10 +5904,10 @@ class AsyncRestoreTests(unittest.TestCase):
             ):
                 connector._quorum[connector._digest(tokens, span)] = {0, 1, 2, 3}
             leader = types.SimpleNamespace(
-                request_id="partial-segment-leader", prompt_token_ids=leader_tokens
+                cache_salt=None, request_id="partial-segment-leader", prompt_token_ids=leader_tokens
             )
             partial = types.SimpleNamespace(
-                request_id="partial-segment-follower", prompt_token_ids=follower_tokens
+                cache_salt=None, request_id="partial-segment-follower", prompt_token_ids=follower_tokens
             )
 
             connector.get_num_new_matched_tokens(leader, 0)
@@ -5868,10 +5922,10 @@ class AsyncRestoreTests(unittest.TestCase):
             leader_tokens = list(range(1100))
             self._offer(connector, leader_tokens)
             leader = types.SimpleNamespace(
-                request_id="unrelated-leader", prompt_token_ids=leader_tokens
+                cache_salt=None, request_id="unrelated-leader", prompt_token_ids=leader_tokens
             )
             cold = types.SimpleNamespace(
-                request_id="unrelated-cold",
+                cache_salt=None, request_id="unrelated-cold",
                 prompt_token_ids=list(range(50_000, 51_100)),
             )
 
@@ -5886,12 +5940,12 @@ class AsyncRestoreTests(unittest.TestCase):
             span = connector._aligned_span(len(tokens))
             for boundary, digest in codec.chunk_prefix_digests(
                 tokens,
-                connector._context_digest_salt,
+                connector._scope_salt(),
                 boundaries=range(256, span + 1, 256),
             ):
                 connector._quorum[digest] = {0, 1, 2, 3}
             request = types.SimpleNamespace(
-                request_id="bounded-segment-roots", prompt_token_ids=tokens
+                cache_salt=None, request_id="bounded-segment-roots", prompt_token_ids=tokens
             )
 
             self.assertEqual(
@@ -5915,10 +5969,10 @@ class AsyncRestoreTests(unittest.TestCase):
             ):
                 connector._quorum[connector._digest(tokens, span)] = {0, 1, 2, 3}
             leader = types.SimpleNamespace(
-                request_id="cancel-segment-leader", prompt_token_ids=leader_tokens
+                cache_salt=None, request_id="cancel-segment-leader", prompt_token_ids=leader_tokens
             )
             follower = types.SimpleNamespace(
-                request_id="cancel-segment-follower", prompt_token_ids=follower_tokens
+                cache_salt=None, request_id="cancel-segment-follower", prompt_token_ids=follower_tokens
             )
 
             connector.get_num_new_matched_tokens(leader, 0)
@@ -5950,6 +6004,7 @@ class AsyncRestoreTests(unittest.TestCase):
             self.BLOCKS,
             False,
             shared_segments=((segment_digest, 768),),
+            request_scope=UNSALTED_SCOPE,
         )
         results = []
         with tempfile.TemporaryDirectory() as directory:
@@ -5988,10 +6043,10 @@ class AsyncRestoreTests(unittest.TestCase):
             for digest in (leader_digest, trunk_digest, follower_digest):
                 connector._quorum[digest] = {0, 1, 2, 3}
             leader = types.SimpleNamespace(
-                request_id="failed-segment-leader", prompt_token_ids=leader_tokens
+                cache_salt=None, request_id="failed-segment-leader", prompt_token_ids=leader_tokens
             )
             follower = types.SimpleNamespace(
-                request_id="released-segment-follower",
+                cache_salt=None, request_id="released-segment-follower",
                 prompt_token_ids=follower_tokens,
             )
             connector.get_num_new_matched_tokens(leader, 0)
@@ -6022,7 +6077,7 @@ class AsyncRestoreTests(unittest.TestCase):
             tokens = list(range(1100))
             digest = self._offer(connector, tokens)
             leader = types.SimpleNamespace(
-                request_id="expiring-leader", prompt_token_ids=tokens
+                cache_salt=None, request_id="expiring-leader", prompt_token_ids=tokens
             )
             connector.get_num_new_matched_tokens(leader, 0)
             connector.update_state_after_alloc(leader, self._blocks_stub(), self.SPAN)
@@ -6039,7 +6094,7 @@ class AsyncRestoreTests(unittest.TestCase):
                 connector.shared_prefix_lease_published(leader.request_id, digest)
 
             late = types.SimpleNamespace(
-                request_id="after-expiry", prompt_token_ids=tokens
+                cache_salt=None, request_id="after-expiry", prompt_token_ids=tokens
             )
             with mock.patch(
                 "sparkcache.spark_context_cache_connector.time.monotonic",
@@ -6059,7 +6114,7 @@ class AsyncRestoreTests(unittest.TestCase):
             tokens = list(range(1100))
             digest = self._offer(connector, tokens)
             leader = types.SimpleNamespace(
-                request_id="bounded-leader", prompt_token_ids=tokens
+                cache_salt=None, request_id="bounded-leader", prompt_token_ids=tokens
             )
             connector.get_num_new_matched_tokens(leader, 0)
             connector.update_state_after_alloc(leader, self._blocks_stub(), self.SPAN)
@@ -6073,7 +6128,7 @@ class AsyncRestoreTests(unittest.TestCase):
 
             for index in range(16):
                 follower = types.SimpleNamespace(
-                    request_id=f"bounded-follower-{index}",
+                    cache_salt=None, request_id=f"bounded-follower-{index}",
                     prompt_token_ids=tokens,
                 )
                 self.assertEqual(
@@ -6081,7 +6136,7 @@ class AsyncRestoreTests(unittest.TestCase):
                     (digest, self.SPAN),
                 )
             overflow = types.SimpleNamespace(
-                request_id="bounded-overflow", prompt_token_ids=tokens
+                cache_salt=None, request_id="bounded-overflow", prompt_token_ids=tokens
             )
             self.assertIsNone(connector.get_shared_prefix_lease_candidate(overflow))
             self.assertEqual(connector.counters["restore_flight_follower_overflow"], 1)
@@ -6095,7 +6150,7 @@ class AsyncRestoreTests(unittest.TestCase):
                 digest = self._offer(connector, tokens)
                 digests.append(digest)
                 leader = types.SimpleNamespace(
-                    request_id=f"hot-leader-{index}", prompt_token_ids=tokens
+                    cache_salt=None, request_id=f"hot-leader-{index}", prompt_token_ids=tokens
                 )
                 self.assertEqual(
                     connector.get_num_new_matched_tokens(leader, 0),
@@ -6124,10 +6179,10 @@ class AsyncRestoreTests(unittest.TestCase):
             tokens = list(range(1100))
             digest = self._offer(connector, tokens)
             leader = types.SimpleNamespace(
-                request_id="rejected-publish-leader", prompt_token_ids=tokens
+                cache_salt=None, request_id="rejected-publish-leader", prompt_token_ids=tokens
             )
             follower = types.SimpleNamespace(
-                request_id="rejected-publish-follower", prompt_token_ids=tokens
+                cache_salt=None, request_id="rejected-publish-follower", prompt_token_ids=tokens
             )
             connector.get_num_new_matched_tokens(leader, 0)
             connector.get_num_new_matched_tokens(follower, 0)
@@ -6156,7 +6211,7 @@ class AsyncRestoreTests(unittest.TestCase):
             tokens = list(range(1100))
             digest = self._offer(connector, tokens)
             leader = types.SimpleNamespace(
-                request_id="drained-abort", prompt_token_ids=tokens
+                cache_salt=None, request_id="drained-abort", prompt_token_ids=tokens
             )
             connector.get_num_new_matched_tokens(leader, 0)
             connector.update_state_after_alloc(leader, self._blocks_stub(), self.SPAN)
@@ -6182,7 +6237,7 @@ class AsyncRestoreTests(unittest.TestCase):
                 self._offer(connector, tokens)
                 requests.append(
                     types.SimpleNamespace(
-                        request_id=f"request-{index}", prompt_token_ids=tokens
+                        cache_salt=None, request_id=f"request-{index}", prompt_token_ids=tokens
                     )
                 )
 
@@ -6195,7 +6250,7 @@ class AsyncRestoreTests(unittest.TestCase):
                 (self.SPAN, True),
             )
             same_digest = types.SimpleNamespace(
-                request_id="same-digest",
+                cache_salt=None, request_id="same-digest",
                 prompt_token_ids=requests[0].prompt_token_ids,
             )
             self.assertEqual(
@@ -6215,10 +6270,10 @@ class AsyncRestoreTests(unittest.TestCase):
             tokens = list(range(1100))
             digest = self._offer(connector, tokens)
             leader = types.SimpleNamespace(
-                request_id="bad-leader", prompt_token_ids=tokens
+                cache_salt=None, request_id="bad-leader", prompt_token_ids=tokens
             )
             follower = types.SimpleNamespace(
-                request_id="waiting-follower", prompt_token_ids=tokens
+                cache_salt=None, request_id="waiting-follower", prompt_token_ids=tokens
             )
             connector.get_num_new_matched_tokens(leader, 0)
             self.assertEqual(
@@ -6247,10 +6302,10 @@ class AsyncRestoreTests(unittest.TestCase):
             tokens = list(range(1100))
             digest = self._offer(connector, tokens)
             leader = types.SimpleNamespace(
-                request_id="aborted-leader", prompt_token_ids=tokens
+                cache_salt=None, request_id="aborted-leader", prompt_token_ids=tokens
             )
             follower = types.SimpleNamespace(
-                request_id="patient-follower", prompt_token_ids=tokens
+                cache_salt=None, request_id="patient-follower", prompt_token_ids=tokens
             )
             connector.get_num_new_matched_tokens(leader, 0)
             connector.get_num_new_matched_tokens(follower, 0)
@@ -6261,7 +6316,7 @@ class AsyncRestoreTests(unittest.TestCase):
             self.assertIn(digest, connector._restore_flights)
             self.assertTrue(connector._restore_flights[digest].leader_finished)
             newcomer = types.SimpleNamespace(
-                request_id="newcomer", prompt_token_ids=tokens
+                cache_salt=None, request_id="newcomer", prompt_token_ids=tokens
             )
             self.assertEqual(
                 connector.get_num_new_matched_tokens(newcomer, 0),
@@ -6282,10 +6337,10 @@ class AsyncRestoreTests(unittest.TestCase):
             tokens = list(range(1100))
             digest = self._offer(connector, tokens)
             leader = types.SimpleNamespace(
-                request_id="live-leader", prompt_token_ids=tokens
+                cache_salt=None, request_id="live-leader", prompt_token_ids=tokens
             )
             follower = types.SimpleNamespace(
-                request_id="gone-follower", prompt_token_ids=tokens
+                cache_salt=None, request_id="gone-follower", prompt_token_ids=tokens
             )
             connector.get_num_new_matched_tokens(leader, 0)
             connector.get_num_new_matched_tokens(follower, 0)
@@ -6306,7 +6361,7 @@ class AsyncRestoreTests(unittest.TestCase):
             digest = connector._digest(tokens, self.SPAN)
             connector.bind_connector_metadata(
                 SparkCacheConnectorMetadata(
-                    plans=[_ReqPlan("seed", digest, self.SPAN, self.BLOCKS, True)]
+                    plans=[_ReqPlan("seed", digest, self.SPAN, self.BLOCKS, True, request_scope=UNSALTED_SCOPE)]
                 )
             )
             connector.wait_for_save()
@@ -6327,7 +6382,7 @@ class AsyncRestoreTests(unittest.TestCase):
                 )
 
             request = types.SimpleNamespace(
-                request_id="restore-me", prompt_token_ids=tokens
+                cache_salt=None, request_id="restore-me", prompt_token_ids=tokens
             )
             self.assertEqual(
                 connector.get_num_new_matched_tokens(request, 0),
@@ -6349,7 +6404,7 @@ class AsyncRestoreTests(unittest.TestCase):
             digest = "d" * 64
             connector.bind_connector_metadata(
                 SparkCacheConnectorMetadata(
-                    plans=[_ReqPlan("seed", digest, self.SPAN, self.BLOCKS, True)]
+                    plans=[_ReqPlan("seed", digest, self.SPAN, self.BLOCKS, True, request_scope=UNSALTED_SCOPE)]
                 )
             )
             connector.wait_for_save()
@@ -6384,6 +6439,7 @@ class AsyncRestoreTests(unittest.TestCase):
                                 self.SPAN,
                                 self.BLOCKS,
                                 False,
+                                request_scope=UNSALTED_SCOPE,
                             )
                         ]
                     )
@@ -6440,6 +6496,7 @@ class AsyncRestoreTests(unittest.TestCase):
                             self.SPAN,
                             self.BLOCKS,
                             False,
+                            request_scope=UNSALTED_SCOPE,
                         )
                     ]
                 )
@@ -6492,6 +6549,7 @@ class AsyncRestoreTests(unittest.TestCase):
                             self.SPAN,
                             self.BLOCKS,
                             False,
+                            request_scope=UNSALTED_SCOPE,
                         )
                     ]
                 )
@@ -6531,6 +6589,7 @@ class AsyncRestoreTests(unittest.TestCase):
                             self.SPAN,
                             self.BLOCKS,
                             False,
+                            request_scope=UNSALTED_SCOPE,
                         )
                     ]
                 )
@@ -6567,6 +6626,7 @@ class AsyncRestoreTests(unittest.TestCase):
                                 self.SPAN,
                                 blocks,
                                 True,
+                                request_scope=UNSALTED_SCOPE,
                             )
                         ]
                     )
@@ -6578,8 +6638,8 @@ class AsyncRestoreTests(unittest.TestCase):
             connector.bind_connector_metadata(
                 SparkCacheConnectorMetadata(
                     plans=[
-                        _ReqPlan("restore-a", digest_a, self.SPAN, blocks_a, False),
-                        _ReqPlan("restore-b", digest_b, self.SPAN, blocks_b, False),
+                        _ReqPlan("restore-a", digest_a, self.SPAN, blocks_a, False, request_scope=UNSALTED_SCOPE),
+                        _ReqPlan("restore-b", digest_b, self.SPAN, blocks_b, False, request_scope=UNSALTED_SCOPE),
                     ]
                 )
             )
@@ -6600,7 +6660,7 @@ class AsyncRestoreTests(unittest.TestCase):
             self._store_entry(connector, digest)
             self._confirm_quorum(connector, digest)
             request = types.SimpleNamespace(
-                request_id="restore-me", prompt_token_ids=tokens
+                cache_salt=None, request_id="restore-me", prompt_token_ids=tokens
             )
             self.assertEqual(
                 connector.get_num_new_matched_tokens(request, 0),
@@ -6612,7 +6672,7 @@ class AsyncRestoreTests(unittest.TestCase):
             resumed = types.SimpleNamespace(
                 scheduled_new_reqs=[
                     types.SimpleNamespace(
-                        req_id="restore-me",
+                        cache_salt=None, req_id="restore-me",
                         prompt_token_ids=tokens,
                         num_computed_tokens=self.SPAN,
                         block_ids=(list(self.BLOCKS),),
@@ -6638,7 +6698,7 @@ class AsyncRestoreTests(unittest.TestCase):
             self._store_entry(connector, digest)
             self._confirm_quorum(connector, digest)
             request = types.SimpleNamespace(
-                request_id="restore-me", prompt_token_ids=tokens
+                cache_salt=None, request_id="restore-me", prompt_token_ids=tokens
             )
             connector.get_num_new_matched_tokens(request, 0)
             connector.update_state_after_alloc(request, self._blocks_stub(), self.SPAN)
@@ -6653,7 +6713,7 @@ class AsyncRestoreTests(unittest.TestCase):
             recompute = types.SimpleNamespace(
                 scheduled_new_reqs=[
                     types.SimpleNamespace(
-                        req_id="restore-me",
+                        cache_salt=None, req_id="restore-me",
                         prompt_token_ids=tokens,
                         num_computed_tokens=0,
                         block_ids=(list(self.BLOCKS),),
@@ -6678,7 +6738,7 @@ class AsyncRestoreTests(unittest.TestCase):
             connector._max_span = 1024
             tokens = list(range(2200))
             request = types.SimpleNamespace(
-                request_id="too-big", prompt_token_ids=tokens
+                cache_salt=None, request_id="too-big", prompt_token_ids=tokens
             )
             self.assertEqual(
                 connector.get_num_new_matched_tokens(request, 0), (0, False)
@@ -6687,7 +6747,7 @@ class AsyncRestoreTests(unittest.TestCase):
             step = types.SimpleNamespace(
                 scheduled_new_reqs=[
                     types.SimpleNamespace(
-                        req_id="too-big",
+                        cache_salt=None, req_id="too-big",
                         prompt_token_ids=tokens,
                         num_computed_tokens=0,
                         block_ids=([10, 11],),
@@ -7176,7 +7236,7 @@ class StreamingLifecycleScaffoldingTests(unittest.TestCase):
             connector.handle_preemptions(metadata)
             self.assertEqual(
                 connector.request_finished(
-                    types.SimpleNamespace(request_id="finished"),
+                    types.SimpleNamespace(cache_salt=None, request_id="finished"),
                     [1, 2],
                 ),
                 (False, None),
@@ -7192,7 +7252,7 @@ class StreamingLifecycleScaffoldingTests(unittest.TestCase):
 
             connector.handle_preemptions(metadata)
             delayed = connector.request_finished(
-                types.SimpleNamespace(request_id="finished"),
+                types.SimpleNamespace(cache_salt=None, request_id="finished"),
                 [9, 3, 7],
             )
 
@@ -7274,7 +7334,7 @@ class StreamingSnapshotConnectorSeamTests(unittest.TestCase):
             first = types.SimpleNamespace(
                 scheduled_new_reqs=[
                     types.SimpleNamespace(
-                        req_id="streamed",
+                        cache_salt=None, req_id="streamed",
                         prompt_token_ids=tokens,
                         num_computed_tokens=0,
                         block_ids=([10, 11],),
@@ -7322,7 +7382,7 @@ class StreamingSnapshotConnectorSeamTests(unittest.TestCase):
             start = types.SimpleNamespace(
                 scheduled_new_reqs=[
                     types.SimpleNamespace(
-                        req_id="resumed",
+                        cache_salt=None, req_id="resumed",
                         prompt_token_ids=tokens,
                         num_computed_tokens=0,
                         block_ids=([10, 11],),
@@ -7352,7 +7412,7 @@ class StreamingSnapshotConnectorSeamTests(unittest.TestCase):
             tail = types.SimpleNamespace(
                 scheduled_new_reqs=[
                     types.SimpleNamespace(
-                        req_id="tail",
+                        cache_salt=None, req_id="tail",
                         prompt_token_ids=tokens,
                         num_computed_tokens=0,
                         block_ids=([30, 31, 32, 33],),
@@ -7391,11 +7451,11 @@ class StreamingSnapshotConnectorSeamTests(unittest.TestCase):
             )
             offer = connector_module._StreamingSnapshotOffer(
                 "after-forward", "a" * 64, 1024, 512, (3, 0)
-            )
+            , request_scope=UNSALTED_SCOPE)
             connector.bind_connector_metadata(
                 SparkCacheConnectorMetadata(
                     plans=[
-                        _ReqPlan("end-of-prefill", "b" * 64, 1024, (3, 0, 5, 1), True)
+                        _ReqPlan("end-of-prefill", "b" * 64, 1024, (3, 0, 5, 1), True, request_scope=UNSALTED_SCOPE)
                     ],
                     streaming_snapshot_offers=[offer],
                 )
@@ -7498,7 +7558,7 @@ class StreamingSnapshotConnectorSeamTests(unittest.TestCase):
             output = types.SimpleNamespace(
                 scheduled_new_reqs=[
                     types.SimpleNamespace(
-                        req_id="tiny",
+                        cache_salt=None, req_id="tiny",
                         prompt_token_ids=list(range(32)),
                         num_computed_tokens=0,
                         block_ids=([10],),
@@ -7520,7 +7580,7 @@ class StreamingSnapshotConnectorSeamTests(unittest.TestCase):
 
             scheduler_requests = {"tiny": object()}
             delayed, _ = scheduler.request_finished(
-                types.SimpleNamespace(request_id="tiny"),
+                types.SimpleNamespace(cache_salt=None, request_id="tiny"),
                 [10],
             )
             self.assertFalse(delayed)
@@ -7612,6 +7672,7 @@ class StreamingSnapshotModelServingBoundaryTests(unittest.TestCase):
                 span_tokens=256,
                 completed_tokens=256,
                 block_ids=(10,),
+                request_scope=UNSALTED_SCOPE,
             )
             identity = connector._identity(0)
 
@@ -7980,6 +8041,7 @@ class DCP2RoundTripTests(unittest.TestCase):
                 span_tokens=self.SPAN,
                 block_ids=block_ids,
                 is_store=True,
+                request_scope=UNSALTED_SCOPE,
             )
             store_meta = SparkCacheConnectorMetadata(plans=[plan])
             for connector in connectors:
@@ -8319,6 +8381,7 @@ class DeepSeekTP4HMAPageTests(unittest.TestCase):
                     source_tables[0],
                     True,
                     block_ids_by_group=source_tables,
+                    request_scope=UNSALTED_SCOPE,
                 )
                 connector._store_one(store)
                 for tensor in pools.values():

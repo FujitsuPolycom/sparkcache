@@ -9,7 +9,7 @@ def make_case(tmp_path):
     fixture = fixtures.AsyncRestoreTests()
     connector = fixture._cohort_connector(tmp_path)
     request = SimpleNamespace(
-        request_id="private-owner", prompt_token_ids=list(range(1100))
+        cache_salt=None, request_id="private-owner", prompt_token_ids=list(range(1100))
     )
     digest = fixture._offer(connector, request.prompt_token_ids)
     return connector, request, digest

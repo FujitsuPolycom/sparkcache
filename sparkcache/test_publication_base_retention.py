@@ -1,5 +1,7 @@
 """Bounded publication-base retention across asynchronous capture and eviction."""
 
+from sparkcache.request_cache_scope import UNSALTED_SCOPE
+
 import os
 from dataclasses import replace
 from types import SimpleNamespace
@@ -40,7 +42,7 @@ def retained_base(tmp_path, monkeypatch):
     connector._async_page_capture_runtime = runtime
     plan = _ReqPlan("extension", result, 512, (0, 1), True,
         block_ids_by_group=((0, 1),), token_ids=tokens[:512],
-        base_context_digest=base, base_span_tokens=256)
+        base_context_digest=base, base_span_tokens=256, request_scope=UNSALTED_SCOPE)
     connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[plan]))
     monkeypatch.setattr("torch.cuda.current_stream", lambda: SimpleNamespace(cuda_stream=123))
     yield connector, runtime, plan, identity, layout, base_bytes
@@ -66,7 +68,7 @@ def test_completed_result_is_protected_until_capacity_reconciliation(retained_ba
     connector.wait_for_save()
     connector._store.commit_page_extension(identity=identity,
         base_context_digest=plan.base_context_digest, token_ids=plan.token_ids,
-        identity_salt=connector._context_digest_salt, layout=layout,
+        identity_salt=connector._scope_salt(plan.request_scope), layout=layout,
         base_block_counts=(1,), result_block_counts=(2,),
         base_boundary_tokens=256, result_boundary_tokens=512,
         result_snapshot=encode_page_snapshot(layout, (2,), {"page": b"a" * 128}))
@@ -98,7 +100,7 @@ def test_terminal_store_releases_retention_and_capacity_can_recover(retained_bas
     assert not report.capacity_satisfied
     assert connector._store.lookup(identity, plan.base_context_digest).is_hit
     # The single inflight admission prevents another protected publication.
-    connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[replace(plan, digest="c" * 64)]))
+    connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[replace(plan, scope_binding="", digest="c" * 64)]))
     connector.wait_for_save()
     assert connector._store_inflight == 1
     connector._finish_store(plan.digest, committed=committed)
