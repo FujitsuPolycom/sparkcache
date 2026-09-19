@@ -13,7 +13,7 @@
  * page IDs are transient and never enter persistent data.
  */
 #define SPARK_CACHE_PAGE_CAPTURE_CONTRACT_VERSION 1u
-#define SPARK_CACHE_PAGE_CAPTURE_MAX_GROUPS 16u
+#define SPARK_CACHE_PAGE_CAPTURE_MAX_GROUPS 64u
 #define SPARK_CACHE_PAGE_CAPTURE_MAX_SOURCES 256u
 
 typedef struct SparkCachePageCaptureSource {
