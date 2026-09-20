@@ -5316,6 +5316,7 @@ class AsyncRestoreTests(unittest.TestCase):
         *,
         max_pending: int = 2,
         lease_ttl_seconds: float = 15.0,
+        role: KVConnectorRole = KVConnectorRole.WORKER,
     ):
         connector = _make_connector(
             root,
@@ -5327,6 +5328,7 @@ class AsyncRestoreTests(unittest.TestCase):
                     lease_ttl_seconds
                 ),
             },
+            role=role,
         )
         connector._scheduler_probe = "none"
         return connector
