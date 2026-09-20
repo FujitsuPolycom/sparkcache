@@ -80,9 +80,10 @@ _PAGE_SNAPSHOT_OBJECT_BYTES = 64 * 1024 * 1024
 _MAX_PAGE_SNAPSHOT_OBJECT_BYTES = 64 * 1024 * 1024
 _PAGE_SNAPSHOT_WRITE_BATCH_SIZE = 2
 _PAGE_SNAPSHOT_READ_BATCH_SIZE = 4
-# Two delta roots cap reconstruction at two full-snapshot applications. A
-# following extension is compacted by the connector into a fresh flat root.
-_MAX_PAGE_DELTA_DEPTH = 2
+# Delta-root chains are bounded so reconstruction and graph walks stay linear
+# and per-chain metadata stays small. Deeper chains let one publication
+# lineage cover evolving agent sessions without per-turn full snapshots.
+_MAX_PAGE_DELTA_DEPTH = 8
 _CLEAR_ONCE_SCHEMA = "sparkcache-clear-once/v1"
 _CLEAR_ONCE_MARKER_DIRECTORY = ".sparkcache-clear-once"
 _CLEAR_ONCE_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}\Z")
@@ -187,6 +188,23 @@ def _is_page_delta_root(value: Any) -> bool:
         isinstance(value, Mapping)
         and value.get("schema") in _PAGE_DELTA_MANIFEST_SCHEMAS
     )
+
+
+def _chain_stages_through_boundary(
+    stages: Sequence[Mapping[str, Any]],
+    boundary_tokens: int,
+) -> int:
+    """Count the chain stages whose application reaches ``boundary_tokens``.
+
+    Every delta stage authenticates its exact result boundary, so a chain can
+    be reconstructed up to any stored stage boundary. A request restoring a
+    prefix names a stored boundary; naming a boundary no stage produced is a
+    format error, never a silent truncation.
+    """
+    for count, stage in enumerate(stages, start=1):
+        if int(stage["committed_tokens"]) == boundary_tokens:
+            return count
+    raise CacheFormatError("page delta chain has no stage at the requested boundary")
 
 
 def _is_page_snapshot_root(value: Any) -> bool:
@@ -3843,11 +3861,16 @@ class ManifestStore:
                 identity=identity,
                 context_digest=manifest["context_digest"],
             )
+            stages = manifest["delta_stages"]
+            applied_stages = _chain_stages_through_boundary(
+                stages, result_boundary_tokens
+            )
+            stage = stages[applied_stages - 1]
             if (
                 manifest["layout_sha256"] != layout.digest
-                or tuple(manifest["result_block_counts"])
+                or tuple(stage["result_block_counts"])
                 != tuple(result_block_counts)
-                or manifest["committed_tokens"] != result_boundary_tokens
+                or stage["committed_tokens"] != result_boundary_tokens
             ):
                 raise CacheFormatError("flat page delta restore geometry differs")
             base_lookup = LookupResult(
@@ -3873,9 +3896,9 @@ class ManifestStore:
                 _verify_page_snapshot_bytes,
             )
 
-            if len(manifest["delta_stages"]) == 1:
+            if applied_stages == 1:
                 # A single result needs no intermediate allocation to avoid.
-                stage = manifest["delta_stages"][0]
+                stage = stages[0]
                 encoded_delta = self._read_page_delta_objects(
                     stage["delta_objects"],
                     encoded_bytes=stage["delta_encoded_bytes"],
@@ -3894,7 +3917,7 @@ class ManifestStore:
                 manifest["base_committed_tokens"],
             )
             del snapshot
-            for stage in manifest["delta_stages"]:
+            for stage in stages[:applied_stages]:
                 encoded_delta = self._read_page_delta_objects(
                     stage["delta_objects"],
                     encoded_bytes=stage["delta_encoded_bytes"],

@@ -118,16 +118,22 @@ class CohortTests(unittest.TestCase):
     def test_depth_limit_flattens_ancestry_without_a_complete_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            receipt = run_page_tail_qualification(root, steps=(1, 1, 1))
+            # Nine extensions over one base: stages 1-8 stay within the
+            # delta-chain depth limit, and the ninth crosses it, which
+            # flattens the ancestry onto a deeper root instead of publishing
+            # a complete snapshot.
+            receipt = run_page_tail_qualification(root, steps=(1,) * 9)
             self.assertEqual(validate_receipt(receipt), [])
             schemas = [step["manifest_schema"] for step in receipt["deltas"]]
             self.assertEqual(
                 schemas,
-                [PAGE_DELTA_SCHEMA, PAGE_DELTA_SCHEMA, PAGE_DELTA_SCHEMA],
+                [PAGE_DELTA_SCHEMA] * 8 + [PAGE_DELTA_SCHEMA],
             )
-            self.assertTrue(receipt["deltas"][2]["flattened"])
-            self.assertFalse(receipt["deltas"][2]["compacted"])
+            self.assertTrue(receipt["deltas"][8]["flattened"])
+            self.assertFalse(receipt["deltas"][8]["compacted"])
             self.assertFalse(receipt["deltas"][0]["compacted"])
+            for index in range(1, 8):
+                self.assertFalse(receipt["deltas"][index]["flattened"])
 
     def test_restart_restoration_succeeds_without_in_memory_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
