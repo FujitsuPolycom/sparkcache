@@ -491,6 +491,26 @@ statistics channel. Reports may stop refreshing while the engine is idle;
 scraping Prometheus again does not make a cached age a live clock.
 
 Use report freshness when correlating idle-probe slowdowns with pending work.
+
+Restore and store admission decisions are exported as cumulative counters
+summed across physical ranks. They explain why a span was not restored or
+published without enabling per-request tracing:
+
+| Counter | Meaning |
+|---|---|
+| `vllm:sparkcache_restore_hits` | External restores admitted by the scheduler. |
+| `vllm:sparkcache_restore_skip_local_prefix` | Lookups refused because the request already held locally cached prefix blocks. |
+| `vllm:sparkcache_restore_skip_oversize` | Lookups whose aligned span exceeded the maximum span. |
+| `vllm:sparkcache_restore_skip_backlog` | Lookups refused because pending restores reached the configured limit. |
+| `vllm:sparkcache_quorum_incomplete` | Lookups with no fully quorum-covered candidate manifest. |
+| `vllm:sparkcache_multimodal_bypass` | Requests skipped because a multimodal feature could not be proven. |
+| `vllm:sparkcache_store_skipped_delayed_limit` | Store plans dropped because delayed capture jobs reached the configured limit. |
+| `vllm:sparkcache_load_verified` | Worker restores whose bytes verified. |
+| `vllm:sparkcache_load_failed` | Worker restores that failed verification and degraded to recompute. |
+| `vllm:sparkcache_attribution_requests_complete` | Requests whose attribution summary completed cleanly (requires `SPARK_CONTEXT_CACHE_TRACE_REUSE=1`). |
+| `vllm:sparkcache_attribution_requests_incomplete` | Requests whose attribution summary was incomplete (requires `SPARK_CONTEXT_CACHE_TRACE_REUSE=1`). |
+
+Counters reset with the workers, like the other statistics-channel gauges.
 The existing streaming-publication handoff count remains separate from saver
 admissions and capture ownership.
 

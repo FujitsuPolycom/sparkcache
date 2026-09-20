@@ -182,3 +182,47 @@ def test_prometheus_work_gauges_convert_age_to_seconds_and_reset():
     assert gauges["vllm:sparkcache_publication_pending_rank_slots"].value == 0
     assert gauges["vllm:sparkcache_publication_oldest_pending_seconds"].value == 0
     assert gauges["vllm:sparkcache_maintenance_active_ranks"].value == 0
+
+
+def test_restore_decision_counters_reduce_across_ranks():
+    stats = connector_module.SparkCacheStats(data={"reports": [
+        {"rank": 0, "held": [],
+         "counters": {"restore_hit": 2, "restore_skip_local_prefix": 5}},
+    ]})
+    stats.aggregate(connector_module.SparkCacheStats(data={"reports": [
+        {"rank": 1, "held_count": 1,
+         "counters": {"restore_hit": 3, "restore_skip_local_prefix": 1}},
+    ]}))
+    reduced = stats.reduce()
+    assert reduced["sparkcache_counter_restore_hit"] == 5
+    assert reduced["sparkcache_counter_restore_skip_local_prefix"] == 6
+    # A report without a counters section reduces as zeros, not as an error.
+    legacy = connector_module.SparkCacheStats(data={"reports": [{"rank": 2, "held": []}]})
+    legacy.aggregate(stats)
+    assert legacy.reduce()["sparkcache_counter_restore_hit"] == 5
+
+
+def test_prometheus_decision_counter_gauges_sum_ranks_and_reset():
+    gauges = {}
+
+    class Gauge:
+        def __init__(self, *, name, **kwargs):
+            gauges[name] = self
+
+        def labels(self, *args):
+            return self
+
+        def set(self, value):
+            self.value = value
+
+    metrics = connector_module.SparkCachePromMetrics(SimpleNamespace(), {object: Gauge}, [], {0: []})
+    metrics.observe({"reports": [
+        {"rank": 0, "held": [], "counters": {"restore_hit": 2,
+                                             "restore_skip_local_prefix": 5}},
+        {"rank": 1, "held": [], "counters": {"restore_hit": 3}},
+    ]})
+    assert gauges["vllm:sparkcache_restore_hits"].value == 5
+    assert gauges["vllm:sparkcache_restore_skip_local_prefix"].value == 5
+    # Ranks reporting without counters (or without the key) count as zero.
+    metrics.observe({"reports": [{"rank": 0, "held": []}]})
+    assert gauges["vllm:sparkcache_restore_hits"].value == 0
