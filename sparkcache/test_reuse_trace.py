@@ -180,3 +180,65 @@ def test_request_attribution_disabled_has_no_per_request_state(tmp_path, monkeyp
         assert connector._request_attribution == {}
     finally:
         connector.shutdown()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_restore_admission_creates_the_attribution_ledger(tmp_path, monkeypatch, enabled):
+    """A restore hit must open the request ledger so 'finished' can summarize it.
+
+    Without this emission the ledger is only created by external callers, and
+    per-request attribution can never fire for real restores even with tracing
+    enabled.
+    """
+    monkeypatch.setenv("SPARK_CONTEXT_CACHE_TRACE_REUSE", "1" if enabled else "0")
+    connector = fixtures.AsyncRestoreTests()._cohort_connector(
+        tmp_path, role=connector_module.KVConnectorRole.SCHEDULER)
+    monkeypatch.setenv("SPARK_CONTEXT_CACHE_TRACE_REUSE", "0" if enabled else "1")
+    tokens = list(range(1100))
+    fixtures.AsyncRestoreTests._offer(connector, tokens)
+    request = SimpleNamespace(cache_salt=None, request_id="admit", prompt_token_ids=tokens)
+    try:
+        assert connector.get_num_new_matched_tokens(request, 0) == (1024, True)
+        if enabled:
+            ledger = connector._request_attribution["admit"]
+            assert ledger.attempt.offered_external == 1024
+            assert ledger.attempt.pending_restore is True
+        else:
+            assert connector._request_attribution == {}
+    finally:
+        connector.shutdown()
+
+
+def test_restore_admission_then_finished_emits_one_complete_attribution(tmp_path, monkeypatch):
+    monkeypatch.setenv("SPARK_CONTEXT_CACHE_TRACE_REUSE", "1")
+    records = _records(monkeypatch)
+    connector = fixtures.AsyncRestoreTests()._cohort_connector(
+        tmp_path, role=connector_module.KVConnectorRole.SCHEDULER)
+    monkeypatch.setenv("SPARK_CONTEXT_CACHE_TRACE_REUSE", "0")
+    tokens = list(range(1100))
+    fixtures.AsyncRestoreTests._offer(connector, tokens)
+    request = SimpleNamespace(cache_salt=None, request_id="admit",
+                              num_prompt_tokens=1100, prompt_token_ids=tokens,
+                              status=SimpleNamespace(name="FINISHED_STOPPED"))
+    try:
+        assert connector.get_num_new_matched_tokens(request, 0) == (1024, True)
+        # The all-rank receive outcome finalizes the restore before any
+        # prompt step runs: verified prefix 1024, success clears the
+        # pending-restore boundary so prompt work may consume it.
+        connector.record_request_cache_event(request, "restore_finalized",
+                                             success=True, valid_prefix_tokens=1024)
+        # The restore covers tokens 0..1024; the scheduler computes the rest.
+        # The final prompt token is recomputed for sampling logits, so the
+        # last step's interval ends at the full prompt length.
+        connector.record_request_cache_event(request, "prompt_step_completed",
+                                             start_token=1024, end_token=1100)
+        connector.record_request_cache_event(request, "finished")
+        assert connector._request_attribution == {}
+        attribution = [r for r in records if r["event"] == "request_cache_attribution"]
+        assert len(attribution) == 1
+        assert attribution[0]["attribution_complete"] is True
+        assert attribution[0]["external_tokens_reused"] == 1024
+        assert attribution[0]["prompt_tokens_computed"] == 76
+        assert connector.counters["attribution_requests_complete"] == 1
+    finally:
+        connector.shutdown()

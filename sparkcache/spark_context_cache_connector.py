@@ -586,6 +586,21 @@ class SparkCacheStats(KVConnectorStats):
                 int(r.get("held_count", len(r.get("held", [])))) for r in reports
             ),
         }
+        counters: list[dict[str, Any]] = [
+            report["counters"]
+            for report in reports
+            if isinstance(report.get("counters"), dict)
+        ]
+        if counters:
+            keys = {key for status in counters for key in status}
+            reduced.update(
+                {
+                    f"sparkcache_counter_{key}": sum(
+                        int(status.get(key, 0)) for status in counters
+                    )
+                    for key in keys
+                }
+            )
         streaming = [
             report.get("streaming")
             for report in reports
@@ -877,6 +892,61 @@ class SparkCachePromMetrics(KVConnectorPromMetrics):
         "sparkcache_capture_uncertain_ranks": (
             "vllm:sparkcache_capture_ownership_uncertain_ranks",
             "Physical ranks whose SparkCache capture-page ownership is uncertain.",
+            1.0,
+        ),
+        "sparkcache_counter_restore_hit": (
+            "vllm:sparkcache_restore_hits",
+            "Cumulative external restores admitted by the scheduler; resets with workers.",
+            1.0,
+        ),
+        "sparkcache_counter_restore_skip_local_prefix": (
+            "vllm:sparkcache_restore_skip_local_prefix",
+            "Cumulative restore lookups refused because the request already held locally cached prefix blocks; resets with workers.",
+            1.0,
+        ),
+        "sparkcache_counter_restore_skip_oversize": (
+            "vllm:sparkcache_restore_skip_oversize",
+            "Cumulative lookups whose aligned span exceeded the maximum span; resets with workers.",
+            1.0,
+        ),
+        "sparkcache_counter_restore_skip_backlog": (
+            "vllm:sparkcache_restore_skip_backlog",
+            "Cumulative lookups refused because pending restores reached the configured limit; resets with workers.",
+            1.0,
+        ),
+        "sparkcache_counter_quorum_incomplete": (
+            "vllm:sparkcache_quorum_incomplete",
+            "Cumulative lookups with no fully quorum-covered candidate manifest; resets with workers.",
+            1.0,
+        ),
+        "sparkcache_counter_multimodal_bypass": (
+            "vllm:sparkcache_multimodal_bypass",
+            "Cumulative requests skipped because a multimodal feature could not be proven; resets with workers.",
+            1.0,
+        ),
+        "sparkcache_counter_store_skipped_delayed_limit": (
+            "vllm:sparkcache_store_skipped_delayed_limit",
+            "Cumulative store plans dropped because delayed capture jobs reached the configured limit; resets with workers.",
+            1.0,
+        ),
+        "sparkcache_counter_load_verified": (
+            "vllm:sparkcache_load_verified",
+            "Cumulative worker restores whose bytes verified; resets with workers.",
+            1.0,
+        ),
+        "sparkcache_counter_load_failed": (
+            "vllm:sparkcache_load_failed",
+            "Cumulative worker restores that failed verification and degraded to recompute; resets with workers.",
+            1.0,
+        ),
+        "sparkcache_counter_attribution_requests_complete": (
+            "vllm:sparkcache_attribution_requests_complete",
+            "Cumulative requests whose attribution summary completed cleanly; resets with workers.",
+            1.0,
+        ),
+        "sparkcache_counter_attribution_requests_incomplete": (
+            "vllm:sparkcache_attribution_requests_incomplete",
+            "Cumulative requests whose attribution summary was incomplete; resets with workers.",
             1.0,
         ),
     }
@@ -1360,6 +1430,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             "streaming_capacity_retries": 0,
             "streaming_capacity_invalid_receipts": 0,
             "streaming_capacity_shutdown_dropped": 0,
+            "restore_skip_local_prefix": 0,
+            "restore_skip_oversize": 0,
+            "restore_skip_backlog": 0,
+            "quorum_incomplete": 0,
+            "attribution_requests_complete": 0,
+            "attribution_requests_incomplete": 0,
+            "attribution_invalid_events": 0,
         }
         logger.info(
             "sparkcache: config role=%s root=%s dcp=%d access_mode=%s"
@@ -2356,6 +2433,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._restore_flight_leaders[request_id] = digest
         self.counters["restore_flights_started"] += 1
         self._need_load[request_id] = (digest, span)
+        self.record_request_cache_event(
+            request, "admitted", local_tokens=num_computed_tokens,
+            external_tokens=span - num_computed_tokens, preemptions=0,
+        )
         self._trace_reuse(
             "external_restore_offer", request_id,
             digest=digest[:12], selected_span_tokens=span,
@@ -6899,6 +6980,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 async_capture["store_inflight"] = bool(self._store_inflight)
             report["async_capture"] = async_capture
         report["publication"] = self._store.publication_telemetry_snapshot().as_dict()
+        report["counters"] = dict(self.counters)
         return SparkCacheStats(data={"reports": [report]})
 
     def get_handshake_metadata(self) -> SparkCacheHandshakeMetadata | None:
