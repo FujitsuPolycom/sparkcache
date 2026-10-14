@@ -24,8 +24,10 @@ from sparkcache.persistent_context_cache.cache_manifest import (
     CacheFormatError,
     CacheIdentity,
     StateRecord,
+    _authenticated_delta_header,
     _is_page_delta_root,
     _read_object_extent,
+    _remember_authenticated_delta_header,
     _is_page_snapshot_root,
     _validate_page_delta_root,
     _validate_page_snapshot_root,
@@ -35,6 +37,7 @@ from sparkcache.spark_context_cache_hybrid import (
     HybridCodecError,
     PageLayout,
     encode_page_snapshot_header,
+    page_delta_header_prefix,
     page_snapshot_encoded_size,
     plan_page_delta,
     plan_page_snapshot,
@@ -484,6 +487,18 @@ def plan_cuda_page_delta_restore(
         prefetched_bytes += source.encoded_bytes
         return authenticated
 
+    def delta_header(source: CudaPageObject) -> bytes:
+        # A cached header was taken from bytes hashed to this object's
+        # content address; tails are still checked against its digests.
+        cached = _authenticated_delta_header(source.sha256, source.encoded_bytes)
+        if cached is not None:
+            return cached
+        header = page_delta_header_prefix(read_header_object(source).payload)
+        _remember_authenticated_delta_header(
+            source.sha256, source.encoded_bytes, header
+        )
+        return header
+
     root = manifest
     root_digest = context_digest
     try:
@@ -506,10 +521,9 @@ def plan_cuda_page_delta_restore(
                 )
                 flat_stages.append((stage, objects))
             for stage, objects in flat_stages:
-                authenticated = read_header_object(objects[0])
                 delta_plan = plan_page_delta(
                     layout,
-                    authenticated.payload,
+                    delta_header(objects[0]),
                     base_block_counts=stage["base_block_counts"],
                     result_block_counts=stage["result_block_counts"],
                     base_boundary_tokens=stage["base_committed_tokens"],
@@ -519,7 +533,6 @@ def plan_cuda_page_delta_restore(
                 stages_newest_first.append(
                     _CudaPageDeltaStage(delta_plan, objects)
                 )
-                del authenticated
             root_digest = root["base_context_digest"]
             root = base_root
         else:
@@ -544,10 +557,9 @@ def plan_cuda_page_delta_restore(
                     arena_bytes=arena_bytes,
                     label="page delta",
                 )
-                authenticated = read_header_object(objects[0])
                 delta_plan = plan_page_delta(
                     layout,
-                    authenticated.payload,
+                    delta_header(objects[0]),
                     base_block_counts=root["base_block_counts"],
                     result_block_counts=root["result_block_counts"],
                     base_boundary_tokens=root["base_committed_tokens"],
@@ -557,7 +569,6 @@ def plan_cuda_page_delta_restore(
                 stages_newest_first.append(
                     _CudaPageDeltaStage(delta_plan, objects)
                 )
-                del authenticated
                 if base_root.get("committed_tokens") != root["base_committed_tokens"]:
                     raise CudaHybridRestoreError(
                         "page-delta base boundary differs"
