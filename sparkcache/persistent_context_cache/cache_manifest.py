@@ -1784,6 +1784,95 @@ def _read_page_snapshot_object_batch(
         return tuple(pool.map(read_one, descriptors))
 
 
+def _object_extent_pieces(
+    object_root: Path,
+    descriptors: Sequence[Mapping[str, Any]],
+    start: int,
+    end: int,
+) -> tuple[tuple[Path, int, int, int], ...]:
+    """Map one encoded-stream byte range onto its macro objects.
+
+    Each piece is ``(path, object_bytes, object_offset, length)``. Descriptor
+    geometry must already be validated by the manifest validator.
+    """
+
+    if start < 0 or end < start:
+        raise CacheFormatError("page object extent is invalid")
+    pieces = []
+    cursor = start
+    for descriptor in descriptors:
+        object_start = int(descriptor["encoded_start"])
+        object_end = int(descriptor["encoded_end"])
+        piece_start = max(cursor, object_start)
+        piece_end = min(end, object_end)
+        if piece_start >= piece_end:
+            continue
+        pieces.append(
+            (
+                object_root / f"{descriptor['sha256']}.spcc",
+                int(descriptor["bytes"]),
+                piece_start - object_start,
+                piece_end - piece_start,
+            )
+        )
+        cursor = piece_end
+        if cursor == end:
+            break
+    if cursor != end:
+        raise CacheFormatError("page object extent is not covered")
+    return tuple(pieces)
+
+
+def _read_object_extent(
+    pieces: Sequence[tuple[Path, int, int, int]],
+) -> bytearray:
+    """Read unauthenticated byte ranges from immutable macro objects.
+
+    The caller must authenticate the returned bytes against a digest bound by
+    already-authenticated metadata before using them. Each object must still
+    be a regular file of its descriptor length.
+    """
+
+    total = sum(length for _path, _size, _offset, length in pieces)
+    result = bytearray(total)
+    view = memoryview(result)
+    cursor = 0
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        for path, object_bytes, offset, length in pieces:
+            try:
+                descriptor = os.open(path, flags)
+            except OSError as error:
+                raise CacheFormatError(f"page object is unavailable: {error}") from error
+            try:
+                metadata = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_size != object_bytes
+                ):
+                    raise CacheFormatError("page object length differs")
+                completed = 0
+                while completed < length:
+                    if hasattr(os, "pread"):
+                        chunk = os.pread(
+                            descriptor, length - completed, offset + completed
+                        )
+                    else:  # pragma: no cover - Windows test fallback
+                        os.lseek(descriptor, offset + completed, os.SEEK_SET)
+                        chunk = os.read(descriptor, length - completed)
+                    if not chunk:
+                        raise CacheFormatError("page object read was truncated")
+                    view[cursor + completed : cursor + completed + len(chunk)] = chunk
+                    completed += len(chunk)
+            finally:
+                os.close(descriptor)
+            cursor += length
+    finally:
+        view.release()
+    return result
+
+
 class ManifestTransaction:
     """Incrementally publish chunks, then expose them with one final manifest.
 
@@ -3868,47 +3957,53 @@ class ManifestStore:
                 result_boundary_tokens=manifest["base_committed_tokens"],
             )
             from sparkcache.spark_context_cache_hybrid import (
-                _PageHistoryReconstruction,
-                _apply_verified_page_delta,
-                _verify_page_snapshot_bytes,
+                compose_page_history,
+                plan_page_delta,
             )
 
-            if len(manifest["delta_stages"]) == 1:
-                # A single result needs no intermediate allocation to avoid.
-                stage = manifest["delta_stages"][0]
-                encoded_delta = self._read_page_delta_objects(
-                    stage["delta_objects"],
-                    encoded_bytes=stage["delta_encoded_bytes"],
-                    encoded_sha256=stage["delta_sha256"],
+            # Authenticate each stage header through its first macro object,
+            # then read every layer tail at most once. A tail superseded by a
+            # later stage is never read; every byte that is read is checked
+            # against its header-bound tail digest before it is copied, and
+            # the complete result is checked against the newest stage's
+            # result digest before it escapes.
+            object_root = self.root / "chunks"
+            stages = manifest["delta_stages"]
+            plans = []
+            for stage in stages:
+                (header_object,) = _read_page_delta_object_batch(
+                    object_root, stage["delta_objects"][:1]
                 )
-                return _apply_verified_page_delta(
-                    layout, _verify_page_snapshot_bytes(snapshot), encoded_delta,
-                    base_block_counts=stage["base_block_counts"],
-                    result_block_counts=stage["result_block_counts"],
-                    base_boundary_tokens=stage["base_committed_tokens"],
-                    result_boundary_tokens=stage["committed_tokens"],
-                ).payload
+                plans.append(
+                    plan_page_delta(
+                        layout,
+                        header_object,
+                        base_block_counts=stage["base_block_counts"],
+                        result_block_counts=stage["result_block_counts"],
+                        base_boundary_tokens=stage["base_committed_tokens"],
+                        result_boundary_tokens=stage["committed_tokens"],
+                        total_bytes=stage["delta_encoded_bytes"],
+                    )
+                )
+                del header_object
 
-            reconstruction = _PageHistoryReconstruction(
-                layout, snapshot, manifest["base_block_counts"],
-                manifest["base_committed_tokens"],
+            def read_tail(stage_index: int, tail: Any) -> bytearray:
+                return _read_object_extent(
+                    _object_extent_pieces(
+                        object_root,
+                        stages[stage_index]["delta_objects"],
+                        tail.source_start,
+                        tail.source_end,
+                    )
+                )
+
+            return compose_page_history(
+                layout,
+                snapshot,
+                manifest["base_block_counts"],
+                plans,
+                read_tail,
             )
-            del snapshot
-            for stage in manifest["delta_stages"]:
-                encoded_delta = self._read_page_delta_objects(
-                    stage["delta_objects"],
-                    encoded_bytes=stage["delta_encoded_bytes"],
-                    encoded_sha256=stage["delta_sha256"],
-                )
-                reconstruction.apply(
-                    encoded_delta,
-                    base_block_counts=stage["base_block_counts"],
-                    result_block_counts=stage["result_block_counts"],
-                    base_boundary_tokens=stage["base_committed_tokens"],
-                    result_boundary_tokens=stage["committed_tokens"],
-                )
-                del encoded_delta
-            return reconstruction.finish()
         if _depth >= _MAX_PAGE_DELTA_DEPTH:
             raise CacheFormatError("page delta graph exceeds the depth limit")
         evidence = self.page_delta_base_read_evidence(

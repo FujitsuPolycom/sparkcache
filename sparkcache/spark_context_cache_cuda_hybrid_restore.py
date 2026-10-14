@@ -25,6 +25,7 @@ from sparkcache.persistent_context_cache.cache_manifest import (
     CacheIdentity,
     StateRecord,
     _is_page_delta_root,
+    _read_object_extent,
     _is_page_snapshot_root,
     _validate_page_delta_root,
     _validate_page_snapshot_root,
@@ -96,8 +97,26 @@ class CudaPageObject:
 
 
 @dataclass(frozen=True)
+class CudaPageTailExtent:
+    """One delta layer tail authenticated by its header-bound SHA-256.
+
+    ``path`` is a process-local cache key, not a file. The bytes come from
+    ``pieces`` ``(object path, object bytes, object offset, length)`` and are
+    usable only after their digest equals ``sha256``, which an authenticated
+    delta header supplied.
+    """
+
+    path: Path
+    sha256: str
+    encoded_bytes: int
+    encoded_start: int
+    encoded_end: int
+    pieces: tuple[tuple[Path, int, int, int], ...]
+
+
+@dataclass(frozen=True)
 class CudaAuthenticatedPageObject:
-    source: CudaPageObject
+    source: CudaPageObject | CudaPageTailExtent
     payload: bytes
 
 
@@ -105,7 +124,7 @@ class CudaAuthenticatedPageObject:
 class CudaPageSourceSpan:
     """One final logical payload range backed by an authenticated object."""
 
-    source: CudaPageObject
+    source: CudaPageObject | CudaPageTailExtent
     source_offset_bytes: int
     snapshot_offset_bytes: int
     destination_byte_offset: int
@@ -211,6 +230,75 @@ def _read_authenticated_page_object(
     if hashlib.sha256(payload).hexdigest() != source.sha256:
         raise CudaHybridRestoreError(
             f"page object SHA-256 mismatch for {source.path}"
+        )
+    return CudaAuthenticatedPageObject(source, bytes(payload))
+
+
+def _tail_extents(
+    objects: Sequence[CudaPageObject],
+    plan: PageDeltaPlan,
+    *,
+    max_bytes: int,
+) -> tuple[CudaPageTailExtent, ...] | None:
+    """Return per-layer tail sources, or None when a tail exceeds a bound.
+
+    Tail-granular sources let a restore read each surviving tail once instead
+    of re-reading complete macro objects for every destination layer.
+    """
+
+    extents = []
+    for tail in plan.tails:
+        size = tail.source_end - tail.source_start
+        if size <= 0 or size > max_bytes:
+            return None
+        pieces = []
+        cursor = tail.source_start
+        for source in objects:
+            start = max(cursor, source.encoded_start)
+            end = min(tail.source_end, source.encoded_end)
+            if start >= end:
+                continue
+            pieces.append(
+                (source.path, source.encoded_bytes, start - source.encoded_start,
+                 end - start)
+            )
+            cursor = end
+            if cursor == tail.source_end:
+                break
+        if cursor != tail.source_end:
+            raise CudaHybridRestoreError("page-delta tail is not covered by objects")
+        extents.append(
+            CudaPageTailExtent(
+                path=Path(
+                    f"{objects[0].path}#tail-{tail.source_start}-{tail.source_end}"
+                ),
+                sha256=tail.sha256,
+                encoded_bytes=size,
+                encoded_start=tail.source_start,
+                encoded_end=tail.source_end,
+                pieces=tuple(pieces),
+            )
+        )
+    return tuple(extents)
+
+
+def _read_authenticated_source(
+    source: CudaPageObject | CudaPageTailExtent,
+) -> CudaAuthenticatedPageObject:
+    if not isinstance(source, CudaPageTailExtent):
+        return _read_authenticated_page_object(source)
+    try:
+        payload = _read_object_extent(source.pieces)
+    except CacheFormatError as error:
+        raise CudaHybridRestoreError(
+            f"page-delta tail read failed for {source.path}: {error}"
+        ) from error
+    if (
+        len(payload) != source.encoded_bytes
+        or hashlib.sha256(payload).hexdigest() != source.sha256
+    ):
+        raise CudaHybridRestoreError(
+            f"page-delta tail SHA-256 mismatch for {source.path}"
         )
     return CudaAuthenticatedPageObject(source, bytes(payload))
 
@@ -570,12 +658,14 @@ def plan_cuda_page_delta_restore(
         )
     current_counts = base_counts
     current_sha256 = root["snapshot_sha256"]
+    tail_bound = min(arena_bytes, _MAX_PAGE_OBJECT_PREFETCH_BYTES)
     for stage in stages:
         if (
             stage.plan.base_block_counts != current_counts
             or stage.plan.base_snapshot_sha256 != current_sha256
         ):
             raise CudaHybridRestoreError("page-delta stage base identity differs")
+        extents = _tail_extents(stage.objects, stage.plan, max_bytes=tail_bound)
         for destination_index, tail in enumerate(stage.plan.tails):
             existing = ranges[destination_index]
             cutoff = tail.destination_byte_offset
@@ -604,7 +694,11 @@ def plan_cuda_page_delta_restore(
                     destination_start=cutoff,
                     destination_end=cutoff + tail.source_end - tail.source_start,
                     source_start=tail.source_start,
-                    objects=stage.objects,
+                    objects=(
+                        stage.objects
+                        if extents is None
+                        else (extents[destination_index],)
+                    ),
                 )
             )
             ranges[destination_index] = kept
@@ -1336,7 +1430,7 @@ def _execute_page_delta_restore(
                 if pending:
                     started = time.perf_counter()
                     authenticated = tuple(
-                        read_pool.map(_read_authenticated_page_object, pending)
+                        read_pool.map(_read_authenticated_source, pending)
                     )
                     read_ms += 1e3 * (time.perf_counter() - started)
                     for item in authenticated:
@@ -1650,6 +1744,7 @@ __all__ = [
     "CudaPageRestoreResult",
     "CudaPageSlab",
     "CudaPageSourceSpan",
+    "CudaPageTailExtent",
     "build_page_copy_spans",
     "build_page_object_spans",
     "execute_cuda_direct_restore",

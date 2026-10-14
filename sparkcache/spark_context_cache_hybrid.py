@@ -13,7 +13,7 @@ import hashlib
 import json
 import struct
 from dataclasses import asdict, dataclass
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 _MAGIC = b"SPHP1\x00"
 _DELTA_MAGIC = b"SPHD1\x00"
@@ -696,6 +696,24 @@ def encode_page_delta_from_capture(
     )
 
 
+def page_delta_header_prefix(encoded: bytes | bytearray | memoryview) -> bytes:
+    """Return the SPHD1 magic, length, and JSON header of one encoded delta.
+
+    The prefix is sufficient for ``plan_page_delta`` with ``total_bytes``.
+    Callers must take it only from bytes they have authenticated.
+    """
+
+    prefix_bytes = len(_DELTA_MAGIC) + _HEADER_LENGTH.size
+    view = memoryview(encoded).cast("B")
+    if len(view) < prefix_bytes or bytes(view[: len(_DELTA_MAGIC)]) != _DELTA_MAGIC:
+        raise HybridCodecError("hybrid page delta has an invalid prefix")
+    (header_length,) = _HEADER_LENGTH.unpack_from(view, len(_DELTA_MAGIC))
+    header_end = prefix_bytes + header_length
+    if header_length <= 0 or header_end > len(view):
+        raise HybridCodecError("hybrid page delta header is truncated")
+    return bytes(view[:header_end])
+
+
 def apply_page_delta(
     layout: PageLayout,
     base_snapshot: bytes,
@@ -862,6 +880,103 @@ class _PageHistoryReconstruction:
         if not self._valid:
             raise HybridCodecError("hybrid page history has an unverified stage")
         return b"".join((self._header, *self._layers))
+
+
+def compose_page_history(
+    layout: PageLayout,
+    base_snapshot: bytes | bytearray,
+    base_block_counts: Sequence[int],
+    stage_plans: Sequence[PageDeltaPlan],
+    read_tail: Callable[[int, PageDeltaTail], bytes | bytearray],
+) -> bytes:
+    """Compose an ordered delta history by reading each surviving tail once.
+
+    ``stage_plans`` must come from authenticated delta headers, oldest first.
+    Each final layer byte has exactly one writer: the newest stage whose tail
+    covers it, or the base snapshot. Tails that no later stage supersedes are
+    read through ``read_tail`` and checked against their header-bound SHA-256
+    before any byte is copied; superseded tails are never requested.
+
+    Every stage header binds the digest of its base, so consecutive headers
+    form a chain from the base snapshot's computed digest to the newest
+    result digest. The composed result is hashed once and must equal that
+    newest digest. Intermediate results are not materialized or rehashed:
+    no byte of an intermediate result reaches the output unless it is also a
+    byte of the final result, which the final digest authenticates.
+    """
+
+    if not stage_plans:
+        raise HybridCodecError("page history contains no delta")
+    base = _verify_page_snapshot_bytes(base_snapshot)
+    base_plan = plan_page_snapshot(layout, base.payload, base_block_counts)
+    # Per destination layer: [destination_start, destination_end, stage, start]
+    # where stage -1 is the base snapshot and start is the source byte offset
+    # of destination_start (base: snapshot offset; delta: offset in the tail).
+    ranges: list[list[tuple[int, int, int, int]]] = [
+        [(0, span.source_end - span.source_start, -1, span.source_start)]
+        for span in base_plan.spans
+    ]
+    current_counts = base_plan.block_counts
+    current_sha256 = base.sha256
+    for stage_index, plan in enumerate(stage_plans):
+        if (
+            plan.base_block_counts != current_counts
+            or plan.base_snapshot_sha256 != current_sha256
+            or len(plan.tails) != len(ranges)
+        ):
+            raise HybridCodecError("hybrid page delta identity or base differs")
+        for destination_index, tail in enumerate(plan.tails):
+            cutoff = tail.destination_byte_offset
+            kept = []
+            for start, end, owner, source in ranges[destination_index]:
+                if start >= cutoff:
+                    break
+                kept.append((start, min(end, cutoff), owner, source))
+            if (kept[-1][1] if kept else 0) != cutoff:
+                raise HybridCodecError("hybrid page delta prefix coverage differs")
+            length = tail.source_end - tail.source_start
+            if length:
+                kept.append((cutoff, cutoff + length, stage_index, 0))
+            ranges[destination_index] = kept
+        current_counts = plan.result_block_counts
+        current_sha256 = plan.result_snapshot_sha256
+
+    header = encode_page_snapshot_header(layout, current_counts)
+    total = page_snapshot_encoded_size(layout, current_counts)
+    result_plan = plan_page_snapshot(layout, header, current_counts, total_bytes=total)
+    result = bytearray(total)
+    result[: len(header)] = header
+    with memoryview(result) as output, memoryview(base.payload) as base_view:
+        for destination_index, (span, layer_ranges) in enumerate(
+            zip(result_plan.spans, ranges, strict=True)
+        ):
+            covered = 0
+            for start, end, owner, source in layer_ranges:
+                if start != covered:
+                    raise HybridCodecError("hybrid page history coverage has a gap")
+                target = output[span.source_start + start : span.source_start + end]
+                if owner < 0:
+                    target[:] = base_view[source : source + end - start]
+                else:
+                    tail = stage_plans[owner].tails[destination_index]
+                    payload = read_tail(owner, tail)
+                    if (
+                        len(payload) != tail.source_end - tail.source_start
+                        or hashlib.sha256(payload).hexdigest() != tail.sha256
+                    ):
+                        raise HybridCodecError(
+                            "hybrid page delta payload checksum mismatch"
+                        )
+                    with memoryview(payload) as tail_view:
+                        target[:] = tail_view[: end - start]
+                    del payload
+                target.release()
+                covered = end
+            if covered != span.source_end - span.source_start:
+                raise HybridCodecError("hybrid page history coverage differs")
+    if hashlib.sha256(result).hexdigest() != current_sha256:
+        raise HybridCodecError("hybrid page delta result checksum mismatch")
+    return bytes(result)
 
 
 def materialize_page_extension_capture(
