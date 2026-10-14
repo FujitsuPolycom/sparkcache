@@ -843,6 +843,8 @@ def test_flat_delta_history_has_bounded_header_object_retention(tmp_path, monkey
         digest = context_prefix_digest(tokens, fixture.salt, token_count=len(tokens))
     lookup = fixture.store.lookup(fixture.identity, digest, verify_chunks=False)
     assert len(lookup._manifest["delta_stages"]) == 9
+    # Model a reader that has not authenticated these headers before.
+    cache_manifest._clear_authenticated_delta_headers()
     live_bytes = 0
     peak_bytes = 0
     read_bytes = 0
@@ -1337,6 +1339,8 @@ def test_page_delta_planner_rejects_identity_layout_and_object_hash_mismatch(
     damaged = bytearray(healthy)
     damaged[-1] ^= 1
     object_path.write_bytes(damaged)
+    # A reader without a cached header must authenticate the damaged object.
+    cache_manifest._clear_authenticated_delta_headers()
     with pytest.raises(
         cuda_hybrid.CudaHybridRestoreError,
         match="SHA-256 mismatch",
@@ -2199,3 +2203,58 @@ def test_flat_history_restore_rejects_a_tampered_surviving_tail(tmp_path, monkey
             arena_bytes=fixture.object_bytes,
         )
     assert not adapter.transaction.can_resume
+
+
+def test_cached_delta_headers_skip_header_object_reads_only_after_authentication(
+    tmp_path, monkeypatch
+):
+    fixture = _mixed_flat_history(tmp_path, monkeypatch)
+    stages = fixture.lookup._manifest["delta_stages"]
+    first_objects = {
+        tmp_path / "chunks" / f"{stage['delta_objects'][0]['sha256']}.spcc"
+        for stage in stages
+    }
+    whole_reads = []
+    original_whole = cuda_hybrid._read_authenticated_page_object
+
+    def read_whole(source):
+        whole_reads.append(source.path)
+        return original_whole(source)
+
+    monkeypatch.setattr(cuda_hybrid, "_read_authenticated_page_object", read_whole)
+
+    def plan():
+        return plan_cuda_page_delta_restore(
+            fixture.lookup, cache_root=tmp_path, layout=fixture.layout,
+            group_slots=(tuple(range(1, fixture.final_blocks + 1)), (1,)),
+            expected_span_tokens=fixture.final_blocks * 256,
+            arena_bytes=fixture.object_bytes,
+        )
+
+    # Publication recorded every header it wrote: planning reads no stage
+    # header object.
+    warm = plan()
+    assert not first_objects & set(whole_reads)
+
+    # A cold reader authenticates each header object once, then caches it.
+    cache_manifest._clear_authenticated_delta_headers()
+    whole_reads.clear()
+    cold = plan()
+    assert first_objects <= set(whole_reads)
+    assert cold.source_spans == warm.source_spans
+    whole_reads.clear()
+    plan()
+    assert not first_objects & set(whole_reads)
+
+    # A damaged header object is rejected and never enters the cache.
+    cache_manifest._clear_authenticated_delta_headers()
+    descriptor = stages[-1]["delta_objects"][0]
+    path = tmp_path / "chunks" / f"{descriptor['sha256']}.spcc"
+    damaged = bytearray(path.read_bytes())
+    damaged[0] ^= 1
+    path.write_bytes(damaged)
+    with pytest.raises(cuda_hybrid.CudaHybridRestoreError, match="SHA-256 mismatch"):
+        plan()
+    assert cache_manifest._authenticated_delta_header(
+        descriptor["sha256"], descriptor["bytes"]
+    ) is None

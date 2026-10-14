@@ -188,7 +188,18 @@ def test_page_extension_reads_each_authenticated_base_object_once(
             reads[path] += 1
         return original_read(path)
 
-    with mock.patch.object(Path, "read_bytes", record_read):
+    original_extent = m._read_object_extent
+
+    def record_extent(pieces):
+        for path, *_rest in pieces:
+            if path in base_paths:
+                reads[path] += 1
+        return original_extent(pieces)
+
+    with (
+        mock.patch.object(Path, "read_bytes", record_read),
+        mock.patch.object(m, "_read_object_extent", record_extent),
+    ):
         extend(base_chunks + 1)
 
     assert set(reads) == base_paths

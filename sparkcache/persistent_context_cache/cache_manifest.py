@@ -16,7 +16,7 @@ import struct
 import threading
 import time
 import uuid
-from collections import Counter
+from collections import Counter, OrderedDict
 from contextlib import AbstractContextManager
 from contextvars import ContextVar
 from dataclasses import dataclass, field as dataclass_field, replace
@@ -1871,6 +1871,77 @@ def _read_object_extent(
     finally:
         view.release()
     return result
+
+
+# Process-local cache of page-delta headers taken from authenticated bytes.
+# Keys are (object SHA-256, object bytes) of a delta's first macro object; the
+# value is that object's SPHD1 header prefix. An entry is inserted only after
+# this process hashed the object to its key, or wrote the object under that
+# key, so the content address fixes the header. A hit therefore proves the
+# same header a re-read would. Tail bytes are still read and checked against
+# the header's per-layer digests, so later damage to an object on disk is
+# detected whenever a damaged byte would be used.
+_AUTHENTICATED_DELTA_HEADER_BYTES = 16 * 1024 * 1024
+_authenticated_delta_headers: OrderedDict[tuple[str, int], bytes] = OrderedDict()
+_authenticated_delta_header_bytes = 0
+_authenticated_delta_header_lock = threading.Lock()
+
+
+def _authenticated_delta_header(object_sha256: str, object_bytes: int) -> bytes | None:
+    key = (object_sha256, int(object_bytes))
+    with _authenticated_delta_header_lock:
+        header = _authenticated_delta_headers.get(key)
+        if header is not None:
+            _authenticated_delta_headers.move_to_end(key)
+        return header
+
+
+def _remember_authenticated_delta_header(
+    object_sha256: str,
+    object_bytes: int,
+    header: bytes,
+) -> None:
+    """Record a header prefix of an object authenticated by this process."""
+
+    global _authenticated_delta_header_bytes
+    if len(header) > min(int(object_bytes), _AUTHENTICATED_DELTA_HEADER_BYTES):
+        return
+    key = (object_sha256, int(object_bytes))
+    with _authenticated_delta_header_lock:
+        previous = _authenticated_delta_headers.pop(key, None)
+        if previous is not None:
+            _authenticated_delta_header_bytes -= len(previous)
+        _authenticated_delta_headers[key] = bytes(header)
+        _authenticated_delta_header_bytes += len(header)
+        while _authenticated_delta_header_bytes > _AUTHENTICATED_DELTA_HEADER_BYTES:
+            _, evicted = _authenticated_delta_headers.popitem(last=False)
+            _authenticated_delta_header_bytes -= len(evicted)
+
+
+def _clear_authenticated_delta_headers() -> None:
+    global _authenticated_delta_header_bytes
+    with _authenticated_delta_header_lock:
+        _authenticated_delta_headers.clear()
+        _authenticated_delta_header_bytes = 0
+
+
+def _authenticated_page_delta_header(
+    object_root: Path,
+    descriptor: Mapping[str, Any],
+) -> bytes:
+    """Return a delta's header from the cache or its authenticated first object."""
+
+    from sparkcache.spark_context_cache_hybrid import page_delta_header_prefix
+
+    cached = _authenticated_delta_header(descriptor["sha256"], descriptor["bytes"])
+    if cached is not None:
+        return cached
+    (header_object,) = _read_page_delta_object_batch(object_root, (descriptor,))
+    header = page_delta_header_prefix(header_object)
+    _remember_authenticated_delta_header(
+        descriptor["sha256"], descriptor["bytes"], header
+    )
+    return header
 
 
 class ManifestTransaction:
@@ -3786,6 +3857,17 @@ class ManifestStore:
                     objects.clear()
             if objects:
                 _publish_immutable_batch(objects)
+            from sparkcache.spark_context_cache_hybrid import (
+                page_delta_header_prefix,
+            )
+
+            # This process encoded the delta and wrote its first object under
+            # this digest, so the header is authenticated for later restores.
+            _remember_authenticated_delta_header(
+                descriptors[0]["sha256"],
+                descriptors[0]["bytes"],
+                page_delta_header_prefix(delta),
+            )
             base_root = dict(publication_base._manifest)
             if identity.publication_schema == "page-tail-cow-v2":
                 if base._manifest.get("schema") == _PAGE_DELTA_MANIFEST_SCHEMA_V3:
@@ -3957,6 +4039,7 @@ class ManifestStore:
                 result_boundary_tokens=manifest["base_committed_tokens"],
             )
             from sparkcache.spark_context_cache_hybrid import (
+                PageDeltaPayloadChecksumError,
                 compose_page_history,
                 plan_page_delta,
             )
@@ -3971,13 +4054,13 @@ class ManifestStore:
             stages = manifest["delta_stages"]
             plans = []
             for stage in stages:
-                (header_object,) = _read_page_delta_object_batch(
-                    object_root, stage["delta_objects"][:1]
+                header = _authenticated_page_delta_header(
+                    object_root, stage["delta_objects"][0]
                 )
                 plans.append(
                     plan_page_delta(
                         layout,
-                        header_object,
+                        header,
                         base_block_counts=stage["base_block_counts"],
                         result_block_counts=stage["result_block_counts"],
                         base_boundary_tokens=stage["base_committed_tokens"],
@@ -3985,7 +4068,6 @@ class ManifestStore:
                         total_bytes=stage["delta_encoded_bytes"],
                     )
                 )
-                del header_object
 
             def read_tail(stage_index: int, tail: Any) -> bytearray:
                 return _read_object_extent(
@@ -3997,13 +4079,17 @@ class ManifestStore:
                     )
                 )
 
-            return compose_page_history(
-                layout,
-                snapshot,
-                manifest["base_block_counts"],
-                plans,
-                read_tail,
-            )
+            try:
+                return compose_page_history(
+                    layout,
+                    snapshot,
+                    manifest["base_block_counts"],
+                    plans,
+                    read_tail,
+                )
+            except PageDeltaPayloadChecksumError as error:
+                # Stored bytes differ from authenticated metadata: corruption.
+                raise CacheFormatError(str(error)) from error
         if _depth >= _MAX_PAGE_DELTA_DEPTH:
             raise CacheFormatError("page delta graph exceeds the depth limit")
         evidence = self.page_delta_base_read_evidence(

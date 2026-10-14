@@ -160,12 +160,16 @@ flattening against an earlier verified base.
 not periodically rewrite a large flattened delta.
 
 The v2 descriptor list grows with the number of stored extensions. Restore
-authenticates every retained stage header through its first macro object,
-then reads each layer tail that no later stage supersedes exactly once. Each
-tail is checked against its header-bound SHA-256 before any byte is copied,
-and the composed result is checked against the newest stage's result digest.
-Intermediate results are neither materialized nor rehashed, so restore reads
-about one final snapshot plus one header object per stage.
+authenticates each retained stage header, then reads each layer tail that no
+later stage supersedes exactly once.
+
+Each tail is checked against its header-bound SHA-256 before any byte is
+copied. The composed result must match the newest stage's result digest;
+intermediate results are neither materialized nor rehashed.
+
+A stage header is authenticated by hashing the stage's first macro object.
+Each worker process keeps a bounded cache of headers it has authenticated or
+published, so a warm restore reads about one final snapshot.
 
 ## SparkCache CUDA restore
 

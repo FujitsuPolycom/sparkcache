@@ -24,6 +24,10 @@ class HybridCodecError(ValueError):
     """A block-page snapshot does not match its declared layout."""
 
 
+class PageDeltaPayloadChecksumError(HybridCodecError):
+    """Stored delta tail bytes differ from their authenticated header digest."""
+
+
 @dataclass(frozen=True)
 class PageLayer:
     name: str
@@ -964,7 +968,7 @@ def compose_page_history(
                         len(payload) != tail.source_end - tail.source_start
                         or hashlib.sha256(payload).hexdigest() != tail.sha256
                     ):
-                        raise HybridCodecError(
+                        raise PageDeltaPayloadChecksumError(
                             "hybrid page delta payload checksum mismatch"
                         )
                     with memoryview(payload) as tail_view:
