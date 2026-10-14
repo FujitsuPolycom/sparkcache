@@ -38,7 +38,9 @@ def _history(tmp_path, stages=3):
     return store, identity, layout, digests[-1], snapshots
 
 
-def test_flat_history_hashes_each_intermediate_snapshot_once(tmp_path, monkeypatch):
+def test_flat_history_hashes_only_the_final_snapshot(tmp_path, monkeypatch):
+    # Intermediate results are never materialized: consecutive headers chain
+    # base and result digests, and the composed result is hashed exactly once.
     store, identity, layout, digest, snapshots = _history(tmp_path)
     counts = Counter()
     original = hashlib.sha256
@@ -66,7 +68,7 @@ def test_flat_history_hashes_each_intermediate_snapshot_once(tmp_path, monkeypat
     restored = store.restore_page_snapshot(store.lookup(identity, digest, verify_chunks=False),
         layout=layout, result_block_counts=(5,), result_boundary_tokens=1280)
     assert restored == snapshots[-1]
-    assert [counts[len(snapshot)] for snapshot in snapshots[1:]] == [1, 1, 1]
+    assert [counts[len(snapshot)] for snapshot in snapshots[1:]] == [0, 0, 1]
 
 
 def test_flat_history_does_not_materialize_complete_intermediate_snapshots(tmp_path, monkeypatch):
@@ -203,7 +205,7 @@ def test_verified_snapshot_proof_does_not_alias_mutable_input(tmp_path):
 
 
 @pytest.mark.parametrize("alter_result", [False, True])
-def test_flat_history_rejects_wrong_intermediate_proof_even_when_final_stage_overwrites_it(tmp_path, alter_result):
+def test_flat_history_chains_intermediate_digests_and_authenticates_the_final_result(tmp_path, alter_result):
     store, identity, layout, digest, snapshots = _history(tmp_path, stages=2)
     path = tmp_path / "manifests" / identity.storage_key / f"{digest}.json"
     manifest = json.loads(path.read_bytes())
@@ -228,6 +230,89 @@ def test_flat_history_rejects_wrong_intermediate_proof_even_when_final_stage_ove
     path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
     lookup = store.lookup(identity, digest, verify_chunks=False)
     assert lookup.is_hit
-    with pytest.raises(hybrid.HybridCodecError, match="result checksum mismatch" if alter_result else "base differs"):
-        store.restore_page_snapshot(lookup, layout=layout,
-                                    result_block_counts=(4,), result_boundary_tokens=1024)
+    if not alter_result:
+        with pytest.raises(hybrid.HybridCodecError, match="base differs"):
+            store.restore_page_snapshot(lookup, layout=layout,
+                                        result_block_counts=(4,), result_boundary_tokens=1024)
+        return
+    # A self-consistent but altered intermediate digest names only bytes that
+    # the final stage overwrites completely. None of them can reach the
+    # result, which still has to match the final stage's authenticated digest.
+    # The SparkCache CUDA reader applies the same rule.
+    restored = store.restore_page_snapshot(lookup, layout=layout,
+                                           result_block_counts=(4,), result_boundary_tokens=1024)
+    assert restored == snapshots[-1]
+
+
+def _mixed_history():
+    layout = hybrid.PageLayout((
+        hybrid.PageGroup(256, (
+            hybrid.PageLayer("a", "u8", (32,), 32),
+            hybrid.PageLayer("b", "u8", (17,), 17),
+        )),
+        hybrid.PageGroup(1, (hybrid.PageLayer("recurrent", "u8", (13,), 13),)),
+    ))
+    counts = [(2, 1), (3, 1), (4, 1), (4, 1)]
+    payloads = [
+        {"a": b"a" * 64, "b": b"b" * 34, "recurrent": b"r" * 13},
+        {"a": b"a" * 96, "b": b"b" * 51, "recurrent": b"s" * 13},
+        {"a": b"z" * 128, "b": b"b" * 68, "recurrent": b"s" * 13},
+        {"a": b"z" * 128, "b": b"b" * 68, "recurrent": b"t" * 13},
+    ]
+    snapshots = [hybrid.encode_page_snapshot(layout, count, payload)
+                 for count, payload in zip(counts, payloads, strict=True)]
+    deltas, plans = [], []
+    for index in range(1, len(snapshots)):
+        arguments = dict(base_block_counts=counts[index - 1], result_block_counts=counts[index],
+                         base_boundary_tokens=index * 256, result_boundary_tokens=(index + 1) * 256)
+        delta = hybrid.encode_page_delta(layout, snapshots[index - 1], snapshots[index], **arguments)
+        deltas.append(delta)
+        plans.append(hybrid.plan_page_delta(layout, delta, **arguments))
+    return layout, counts, snapshots, deltas, plans
+
+
+def test_composed_history_reads_only_surviving_tails_once():
+    layout, counts, snapshots, deltas, plans = _mixed_history()
+    requested = []
+
+    def read_tail(stage, tail):
+        requested.append((stage, tail.layer_name))
+        return deltas[stage][tail.source_start:tail.source_end]
+
+    composed = hybrid.compose_page_history(layout, snapshots[0], counts[0], plans, read_tail)
+    assert type(composed) is bytes
+    assert composed == snapshots[-1]
+    # The second stage changes page 0 of "a", so it rewrites both full-group
+    # layers completely and supersedes the first stage's tails. The final
+    # stage rewrites only the recurrent page and carries empty full tails.
+    assert sorted(requested) == [(1, "a"), (1, "b"), (2, "recurrent")]
+    assert len(requested) == len(set(requested))
+
+
+def test_composed_history_rejects_tail_bytes_that_differ_from_their_header_digest():
+    layout, counts, snapshots, deltas, plans = _mixed_history()
+
+    def read_tail(stage, tail):
+        payload = bytearray(deltas[stage][tail.source_start:tail.source_end])
+        if stage == 2:
+            payload[0] ^= 1
+        return payload
+
+    with pytest.raises(hybrid.HybridCodecError, match="payload checksum mismatch"):
+        hybrid.compose_page_history(layout, snapshots[0], counts[0], plans, read_tail)
+
+
+def test_composed_history_rejects_a_broken_digest_chain():
+    layout, counts, snapshots, deltas, plans = _mixed_history()
+    plans[1] = replace(plans[1], base_snapshot_sha256="f" * 64)
+    with pytest.raises(hybrid.HybridCodecError, match="base differs"):
+        hybrid.compose_page_history(layout, snapshots[0], counts[0], plans,
+                                    lambda stage, tail: deltas[stage][tail.source_start:tail.source_end])
+
+
+def test_composed_history_rejects_a_self_consistent_wrong_final_result():
+    layout, counts, snapshots, deltas, plans = _mixed_history()
+    plans[-1] = replace(plans[-1], result_snapshot_sha256="f" * 64)
+    with pytest.raises(hybrid.HybridCodecError, match="result checksum mismatch"):
+        hybrid.compose_page_history(layout, snapshots[0], counts[0], plans,
+                                    lambda stage, tail: deltas[stage][tail.source_start:tail.source_end])

@@ -243,6 +243,14 @@ def _shared_base_delta_fixture(tmp_path, monkeypatch):
     )
 
 
+def _source_bytes(source) -> bytes:
+    """Return the encoded bytes behind a whole-object or tail-extent source."""
+
+    if isinstance(source, cuda_hybrid.CudaPageTailExtent):
+        return bytes(cache_manifest._read_object_extent(source.pieces))
+    return source.path.read_bytes()
+
+
 class _PageCaptureArena:
     arena_mode = cuda_hybrid.cuda.ARENA_MAPPED_HOST
 
@@ -796,7 +804,7 @@ def test_flat_page_delta_planner_reads_descriptor_stages(
         arena_bytes=fixture.object_bytes,
     )
     reconstructed = b"".join(
-        span.source.path.read_bytes()[
+        _source_bytes(span.source)[
             span.source_offset_bytes : span.source_offset_bytes + span.byte_count
         ]
         for span in final_plan.source_spans
@@ -864,7 +872,7 @@ def test_flat_delta_history_has_bounded_header_object_retention(tmp_path, monkey
     assert plan.planning_read_source_bytes == read_bytes
     assert read_bytes > sum(len(item.payload) for item in plan.prefetched_objects)
     reconstructed = b"".join(
-        span.source.path.read_bytes()[
+        _source_bytes(span.source)[
             span.source_offset_bytes:span.source_offset_bytes + span.byte_count
         ] for span in plan.source_spans
     )
@@ -1021,7 +1029,7 @@ def test_nested_page_deltas_resolve_newest_over_middle_over_flat_base(
     )
 
     reconstructed_payload = b"".join(
-        span.source.path.read_bytes()[
+        _source_bytes(span.source)[
             span.source_offset_bytes : span.source_offset_bytes + span.byte_count
         ]
         for span in plan.source_spans
@@ -2073,3 +2081,121 @@ def test_page_object_spans_exclude_header_and_cover_payload_contiguously() -> No
     assert sum(span.byte_count for span in (*first, *second)) == 16
     assert first[0].arena_offset_bytes == plan.header_bytes
     assert second[0].arena_offset_bytes == 0
+
+
+def _mixed_flat_history(tmp_path, monkeypatch, *, stages=6, object_bytes=2048):
+    layout = PageLayout((
+        PageGroup(256, (
+            PageLayer("a", "torch.uint8", (128,), 128),
+            PageLayer("b", "torch.uint8", (64,), 64),
+        )),
+        PageGroup(256, (PageLayer("recurrent", "torch.uint8", (1024,), 1024),),
+                  reuse_policy="recurrent_align"),
+    ))
+    monkeypatch.setattr(cache_manifest, "_PAGE_SNAPSHOT_OBJECT_BYTES", object_bytes)
+    monkeypatch.setattr(cache_manifest, "_PAGE_DELTA_OBJECT_BYTES", object_bytes)
+    identity = CacheIdentity(
+        target_checkpoint="1" * 64, draft_checkpoint="2" * 64,
+        quantization_layout="test-block-pages-v1", rope_layout="test-rope-v1",
+        tp_degree=1, dcp_degree=1, record_schema=("target_ckv", "logical_positions"),
+        publication_schema="page-tail-cow-v2",
+    )
+
+    def snapshot(blocks, stage):
+        return encode_page_snapshot(layout, (blocks, 1), {
+            "a": b"".join(bytes((index % 251,)) * 128 for index in range(blocks)),
+            "b": b"".join(bytes(((index + 7) % 251,)) * 64 for index in range(blocks)),
+            "recurrent": bytes((200 + stage,)) * 1024,
+        })
+
+    store = ManifestStore(tmp_path)
+    salt = "mixed-flat-history"
+    final_blocks = 8 * (stages + 1)
+    tokens = tuple(range(final_blocks * 256))
+    digests = [context_prefix_digest(tokens, salt, token_count=8 * (index + 1) * 256)
+               for index in range(stages + 1)]
+    snapshots = [snapshot(8 * (index + 1), index) for index in range(stages + 1)]
+    store.commit_page_snapshot(identity=identity, context_digest=digests[0],
+                               span_tokens=8 * 256, snapshot=snapshots[0])
+    for index in range(1, stages + 1):
+        store.commit_page_extension(
+            identity=identity, base_context_digest=digests[index - 1],
+            token_ids=tokens, identity_salt=salt, layout=layout,
+            base_block_counts=(8 * index, 1), result_block_counts=(8 * (index + 1), 1),
+            base_boundary_tokens=8 * index * 256,
+            result_boundary_tokens=8 * (index + 1) * 256, result_snapshot=snapshots[index],
+        )
+    lookup = store.lookup(identity, digests[-1], verify_chunks=False)
+    assert len(lookup._manifest["delta_stages"]) == stages
+    return SimpleNamespace(layout=layout, lookup=lookup, snapshot=snapshots[-1],
+                           final_blocks=final_blocks, object_bytes=object_bytes)
+
+
+def test_flat_history_restore_reads_each_surviving_tail_once(tmp_path, monkeypatch):
+    fixture = _mixed_flat_history(tmp_path, monkeypatch)
+    extent_reads = []
+    whole_reads = []
+    original_extent = cuda_hybrid._read_object_extent
+    original_whole = cuda_hybrid._read_authenticated_page_object
+
+    def read_extent(pieces):
+        extent_reads.append(tuple(pieces))
+        return original_extent(pieces)
+
+    def read_whole(source):
+        whole_reads.append(source.path)
+        return original_whole(source)
+
+    monkeypatch.setattr(cuda_hybrid, "_read_object_extent", read_extent)
+    monkeypatch.setattr(cuda_hybrid, "_read_authenticated_page_object", read_whole)
+    monkeypatch.setattr(
+        cuda_hybrid.cuda, "arena_memoryview",
+        lambda arena, *, length: memoryview(arena.payload)[:length],
+    )
+    adapter = _PageCaptureAdapter(fixture.object_bytes)
+    execute_cuda_hybrid_restore(
+        adapter=adapter, request_id="request", lookup=fixture.lookup,
+        cache_root=tmp_path, layout=fixture.layout,
+        group_slots=(tuple(range(1, fixture.final_blocks + 1)), (1,)),
+        expected_span_tokens=fixture.final_blocks * 256,
+        arena_bytes=fixture.object_bytes,
+    )
+    assert adapter.transaction.can_resume
+    plan = plan_page_snapshot(fixture.layout, fixture.snapshot, (fixture.final_blocks, 1))
+    placed = bytearray(len(fixture.snapshot) - plan.header_bytes)
+    for offset, _destination, _destination_offset, payload in adapter.transaction.submissions:
+        placed[offset:offset + len(payload)] = payload
+    assert bytes(placed) == fixture.snapshot[plan.header_bytes:]
+    # Six stages each carry three layer tails. The five superseded recurrent
+    # tails are never read, and no surviving tail is read twice.
+    assert len(extent_reads) == 6 * 2 + 1
+    assert len(set(extent_reads)) == len(extent_reads)
+    # Whole-object reads are limited to one header object per stage plus the
+    # base snapshot objects, each read once.
+    base_objects = len(fixture.lookup._manifest["base_root"]["snapshot_objects"])
+    assert len(whole_reads) <= 6 + base_objects
+    assert len(set(whole_reads)) == len(whole_reads)
+
+
+def test_flat_history_restore_rejects_a_tampered_surviving_tail(tmp_path, monkeypatch):
+    fixture = _mixed_flat_history(tmp_path, monkeypatch)
+    stage = fixture.lookup._manifest["delta_stages"][-1]
+    descriptor = stage["delta_objects"][-1]
+    path = tmp_path / "chunks" / f"{descriptor['sha256']}.spcc"
+    damaged = bytearray(path.read_bytes())
+    damaged[-1] ^= 1
+    path.write_bytes(damaged)
+    monkeypatch.setattr(
+        cuda_hybrid.cuda, "arena_memoryview",
+        lambda arena, *, length: memoryview(arena.payload)[:length],
+    )
+    adapter = _PageCaptureAdapter(fixture.object_bytes)
+    with pytest.raises(cuda_hybrid.CudaHybridRestoreError, match="tail SHA-256 mismatch"):
+        execute_cuda_hybrid_restore(
+            adapter=adapter, request_id="request", lookup=fixture.lookup,
+            cache_root=tmp_path, layout=fixture.layout,
+            group_slots=(tuple(range(1, fixture.final_blocks + 1)), (1,)),
+            expected_span_tokens=fixture.final_blocks * 256,
+            arena_bytes=fixture.object_bytes,
+        )
+    assert not adapter.transaction.can_resume
