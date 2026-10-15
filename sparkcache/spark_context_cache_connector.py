@@ -1121,7 +1121,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._chunk_tokens = config.chunk_tokens
         self._root = config.root
         self._store = ManifestStore(
-            self._root, page_delta_stage_limit_count=config.page_delta_stage_limit_count,
+            self._root,
+            page_delta_stage_limit_count=config.page_delta_stage_limit_count,
+            hot_page_snapshot_bytes=config.hot_page_snapshot_bytes,
         )
         self._clear_once_token = config.clear_once_token
         self._cache_available = True
@@ -5225,22 +5227,30 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     )
                     + int(getattr(result, "skipped_base_object_bytes", 0))
                 )
+            if getattr(result, "hot_snapshot_hit", False):
+                self.counters["native_hot_snapshot_hits"] = (
+                    self.counters.get("native_hot_snapshot_hits", 0) + 1
+                )
             _debug_log(
                 "spark-context-cache: SparkCache CUDA restore verified %d bytes"
                 " read_source_bytes=%d skipped_base_bytes=%d"
-                " slabs=%d read_hash=%.1f ms placement=%.1f ms"
+                " slabs=%d read_hash=%.1f ms (planning=%.1f ms)"
+                " final_hash=%.1f ms placement=%.1f ms"
                 " (arena_wait=%.1f ms host_copy=%.1f ms submit_call=%.1f ms)"
-                " finish=%.1f ms",
+                " finish=%.1f ms hot_snapshot=%d",
                 result.source_bytes,
                 int(getattr(result, "read_source_bytes", 0)),
                 int(getattr(result, "skipped_base_object_bytes", 0)),
                 result.slabs,
                 result.read_and_hash_ms,
+                float(getattr(result, "planning_ms", 0.0)),
+                float(getattr(result, "final_hash_ms", 0.0)),
                 result.copy_and_submit_ms,
                 result.arena_wait_ms,
                 result.host_copy_ms,
                 result.submit_call_ms,
                 result.finish_ms,
+                int(bool(getattr(result, "hot_snapshot_hit", False))),
             )
             return True
         restore_started = time.perf_counter_ns()

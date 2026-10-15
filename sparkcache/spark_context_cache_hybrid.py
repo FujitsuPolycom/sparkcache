@@ -503,6 +503,7 @@ def encode_page_delta(
     result_block_counts: Sequence[int],
     base_boundary_tokens: int,
     result_boundary_tokens: int,
+    base_snapshot_sha256: str | None = None,
 ) -> bytes:
     """Encode changed page suffixes relative to one authenticated snapshot.
 
@@ -512,9 +513,16 @@ def encode_page_delta(
     a page, changed bytes make that complete terminal page part of the delta;
     preceding byte-identical pages remain reusable. The base snapshot digest
     and both semantic boundaries are bound into the delta header.
+
+    ``base_snapshot_sha256`` is the digest the caller already verified the
+    base bytes against; when given, the base is not hashed again.
     """
 
     _validate_delta_boundaries(base_boundary_tokens, result_boundary_tokens)
+    if base_snapshot_sha256 is None:
+        base_snapshot_sha256 = hashlib.sha256(base_snapshot).hexdigest()
+    elif not _is_sha256(base_snapshot_sha256):
+        raise HybridCodecError("base snapshot digest is invalid")
     base_counts = tuple(int(value) for value in base_block_counts)
     result_counts = tuple(int(value) for value in result_block_counts)
     if len(base_counts) != len(layout.groups) or len(result_counts) != len(
@@ -563,7 +571,7 @@ def encode_page_delta(
         {
             "schema": "sparkcache-hybrid-page-delta/v1",
             "layout_sha256": layout.digest,
-            "base_snapshot_sha256": hashlib.sha256(base_snapshot).hexdigest(),
+            "base_snapshot_sha256": base_snapshot_sha256,
             "result_snapshot_sha256": hashlib.sha256(result_snapshot).hexdigest(),
             "base_block_counts": base_counts,
             "result_block_counts": result_counts,
@@ -580,7 +588,7 @@ def encode_page_delta(
     )
 
 
-def encode_page_delta_from_capture(
+def _encode_page_delta_from_capture(
     layout: PageLayout,
     base_snapshot: bytes | bytearray | memoryview | _VerifiedPageSnapshot,
     captured_tail: object,
@@ -590,14 +598,14 @@ def encode_page_delta_from_capture(
     reused_pages_by_group: Sequence[int],
     base_boundary_tokens: int,
     result_boundary_tokens: int,
-) -> bytes:
-    """Encode an authenticated delta directly from selected captured pages.
+    base_snapshot_sha256: str | None,
+    materialize_result: bool,
+) -> tuple[bytes, bytearray | None]:
+    """Shared encoder behind the two public capture-delta entry points.
 
-    The caller supplies reuse counts established before native capture. The
-    captured payload must contain each layer's non-reused result pages in
-    layout order. The result snapshot checksum is computed incrementally from
-    the verified base prefixes and captured page bytes, so no complete result
-    snapshot or page-by-page comparison is required.
+    With ``materialize_result`` the complete result snapshot is assembled in
+    one buffer and hashed as a whole; otherwise its digest is accumulated
+    from the verified base prefixes and captured tails without assembling it.
     """
 
     _validate_delta_boundaries(base_boundary_tokens, result_boundary_tokens)
@@ -624,8 +632,13 @@ def encode_page_delta_from_capture(
     ):
         raise HybridCodecError("captured page extension counts are invalid")
 
-    base = _verify_page_snapshot_bytes(base_snapshot)
-    base_view = memoryview(base.payload).cast("B")
+    if isinstance(base_snapshot, _VerifiedPageSnapshot):
+        # The carrier already proves its digest; never hash it again.
+        if base_snapshot_sha256 is None:
+            base_snapshot_sha256 = base_snapshot.sha256
+        base_view = memoryview(base_snapshot.payload).cast("B")
+    else:
+        base_view = memoryview(base_snapshot).cast("B")
     base_plan = plan_page_snapshot(
         layout,
         base_view,
@@ -648,7 +661,18 @@ def encode_page_delta_from_capture(
     ):
         raise HybridCodecError("captured page extension payload is invalid")
 
-    result_digest = hashlib.sha256(encode_page_snapshot_header(layout, result_counts))
+    result_header = encode_page_snapshot_header(layout, result_counts)
+    result_buffer: bytearray | None = None
+    result_view: memoryview | None = None
+    result_cursor = 0
+    if materialize_result:
+        result_buffer = bytearray(page_snapshot_encoded_size(layout, result_counts))
+        result_view = memoryview(result_buffer)
+        result_view[: len(result_header)] = result_header
+        result_cursor = len(result_header)
+        result_digest = None
+    else:
+        result_digest = hashlib.sha256(result_header)
     payload_parts: list[bytes] = []
     layer_tails: list[dict[str, object]] = []
     cursor = 0
@@ -668,8 +692,15 @@ def encode_page_delta_from_capture(
             tail = read_range(cursor, end)
             if not isinstance(tail, bytes) or len(tail) != tail_bytes:
                 raise HybridCodecError("captured page extension range differs")
-            result_digest.update(prefix)
-            result_digest.update(tail)
+            if result_view is not None:
+                prefix_bytes = prefix_end - span.source_start
+                result_view[result_cursor : result_cursor + prefix_bytes] = prefix
+                result_cursor += prefix_bytes
+                result_view[result_cursor : result_cursor + tail_bytes] = tail
+                result_cursor += tail_bytes
+            else:
+                result_digest.update(prefix)
+                result_digest.update(tail)
             payload_parts.append(tail)
             layer_tails.append(
                 {
@@ -681,13 +712,26 @@ def encode_page_delta_from_capture(
             cursor = end
     if cursor != total_bytes:
         raise HybridCodecError("captured page extension has trailing bytes")
+    if result_view is not None:
+        if result_cursor != len(result_buffer):
+            raise HybridCodecError("captured page extension result is incomplete")
+        result_view.release()
+        # The retained result is hashed as one buffer, so the digest bound
+        # into the header is the digest of exactly the bytes returned.
+        result_sha256 = hashlib.sha256(result_buffer).hexdigest()
+    else:
+        result_sha256 = result_digest.hexdigest()
+    if base_snapshot_sha256 is None:
+        base_snapshot_sha256 = hashlib.sha256(base_view).hexdigest()
+    elif not _is_sha256(base_snapshot_sha256):
+        raise HybridCodecError("base snapshot digest is invalid")
 
     header = json.dumps(
         {
             "schema": "sparkcache-hybrid-page-delta/v1",
             "layout_sha256": layout.digest,
-            "base_snapshot_sha256": base.sha256,
-            "result_snapshot_sha256": result_digest.hexdigest(),
+            "base_snapshot_sha256": base_snapshot_sha256,
+            "result_snapshot_sha256": result_sha256,
             "base_block_counts": base_counts,
             "result_block_counts": result_counts,
             "base_boundary_tokens": base_boundary_tokens,
@@ -698,9 +742,87 @@ def encode_page_delta_from_capture(
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-    return b"".join(
+    delta = b"".join(
         (_DELTA_MAGIC, _HEADER_LENGTH.pack(len(header)), header, *payload_parts)
     )
+    return delta, result_buffer
+
+
+def encode_page_delta_from_capture(
+    layout: PageLayout,
+    base_snapshot: bytes | bytearray | memoryview,
+    captured_tail: object,
+    *,
+    base_block_counts: Sequence[int],
+    result_block_counts: Sequence[int],
+    reused_pages_by_group: Sequence[int],
+    base_boundary_tokens: int,
+    result_boundary_tokens: int,
+    base_snapshot_sha256: str | None = None,
+) -> bytes:
+    """Encode an authenticated delta directly from selected captured pages.
+
+    The caller supplies reuse counts established before native capture. The
+    captured payload must contain each layer's non-reused result pages in
+    layout order. The result snapshot checksum is computed incrementally from
+    the verified base prefixes and captured page bytes, so no complete result
+    snapshot or page-by-page comparison is required.
+
+    ``base_snapshot_sha256`` is the digest the caller already verified the
+    base bytes against. When it is given, the base is not hashed again; the
+    caller is responsible for passing the bytes that hashed to it.
+    """
+
+    delta, _result = _encode_page_delta_from_capture(
+        layout,
+        base_snapshot,
+        captured_tail,
+        base_block_counts=base_block_counts,
+        result_block_counts=result_block_counts,
+        reused_pages_by_group=reused_pages_by_group,
+        base_boundary_tokens=base_boundary_tokens,
+        result_boundary_tokens=result_boundary_tokens,
+        base_snapshot_sha256=base_snapshot_sha256,
+        materialize_result=False,
+    )
+    return delta
+
+
+def encode_page_delta_from_capture_with_result(
+    layout: PageLayout,
+    base_snapshot: bytes | bytearray | memoryview,
+    captured_tail: object,
+    *,
+    base_block_counts: Sequence[int],
+    result_block_counts: Sequence[int],
+    reused_pages_by_group: Sequence[int],
+    base_boundary_tokens: int,
+    result_boundary_tokens: int,
+    base_snapshot_sha256: str | None = None,
+) -> tuple[bytes, bytearray]:
+    """Encode a delta as ``encode_page_delta_from_capture`` and keep the result.
+
+    Returns ``(delta, result_snapshot)``. The result snapshot is the complete
+    encoded result whose SHA-256 the delta header binds as
+    ``result_snapshot_sha256``; the digest was computed over that buffer. The
+    caller owns the buffer and must not modify it if it retains it under
+    that digest.
+    """
+
+    delta, result = _encode_page_delta_from_capture(
+        layout,
+        base_snapshot,
+        captured_tail,
+        base_block_counts=base_block_counts,
+        result_block_counts=result_block_counts,
+        reused_pages_by_group=reused_pages_by_group,
+        base_boundary_tokens=base_boundary_tokens,
+        result_boundary_tokens=result_boundary_tokens,
+        base_snapshot_sha256=base_snapshot_sha256,
+        materialize_result=True,
+    )
+    assert result is not None
+    return delta, result
 
 
 def page_delta_header_prefix(encoded: bytes | bytearray | memoryview) -> bytes:

@@ -849,29 +849,50 @@ def test_flat_delta_history_has_bounded_header_object_retention(tmp_path, monkey
     live_bytes = 0
     peak_bytes = 0
     read_bytes = 0
+    lock = threading.Lock()
     original = cuda_hybrid._read_authenticated_page_object
+    original_header = cuda_hybrid._authenticated_header_from_object
 
     def released(size):
         nonlocal live_bytes
-        live_bytes -= size
+        with lock:
+            live_bytes -= size
 
     def track(source):
         nonlocal live_bytes, peak_bytes, read_bytes
         item = original(source)
-        read_bytes += source.encoded_bytes
-        live_bytes += len(item.payload)
-        peak_bytes = max(peak_bytes, live_bytes)
+        with lock:
+            read_bytes += source.encoded_bytes
+            live_bytes += len(item.payload)
+            peak_bytes = max(peak_bytes, live_bytes)
         weakref.finalize(item, released, len(item.payload))
         return item
 
+    def track_header(source):
+        # Concurrent header authentication holds one whole object per worker
+        # only while hashing it.
+        nonlocal live_bytes, peak_bytes, read_bytes
+        with lock:
+            live_bytes += source.encoded_bytes
+            peak_bytes = max(peak_bytes, live_bytes)
+        try:
+            return original_header(source)
+        finally:
+            with lock:
+                live_bytes -= source.encoded_bytes
+                read_bytes += source.encoded_bytes
+
     monkeypatch.setattr(cuda_hybrid, "_read_authenticated_page_object", track)
+    monkeypatch.setattr(cuda_hybrid, "_authenticated_header_from_object", track_header)
     plan = plan_cuda_page_delta_restore(
         lookup, cache_root=tmp_path, layout=fixture.layout,
         group_slots=(tuple(range(blocks)),), expected_span_tokens=blocks * 256,
         arena_bytes=fixture.object_bytes,
     )
     assert sum(len(item.payload) for item in plan.prefetched_objects) <= fixture.object_bytes
-    assert peak_bytes <= 2 * fixture.object_bytes
+    assert peak_bytes <= (
+        1 + cuda_hybrid._MAX_PAGE_OBJECT_READ_WORKERS
+    ) * fixture.object_bytes
     assert plan.planning_read_source_bytes == read_bytes
     assert read_bytes > sum(len(item.payload) for item in plan.prefetched_objects)
     reconstructed = b"".join(
@@ -1144,16 +1165,29 @@ def test_page_delta_restore_reuses_one_bounded_read_pool(
         counted_pool,
     )
 
+    original_tail_read = cuda_hybrid._read_authenticated_tail_into
+
     def observed_read(source):
         if adapter.transaction.submit_count:
             reads_after_submit.append(source.path)
             assert adapter.transaction.state is RestoreState.PARKED
         return original_read(source)
 
+    def observed_tail_read(source, target):
+        if adapter.transaction.submit_count:
+            reads_after_submit.append(source.path)
+            assert adapter.transaction.state is RestoreState.PARKED
+        return original_tail_read(source, target)
+
     monkeypatch.setattr(
         cuda_hybrid,
         "_read_authenticated_page_object",
         observed_read,
+    )
+    monkeypatch.setattr(
+        cuda_hybrid,
+        "_read_authenticated_tail_into",
+        observed_tail_read,
     )
 
     execute_cuda_hybrid_restore(
@@ -1168,7 +1202,9 @@ def test_page_delta_restore_reuses_one_bounded_read_pool(
         io_workers=8,
     )
 
-    assert pool_sizes == [4]
+    # One pool serves the whole transaction; its size is the configured
+    # worker count bounded by the tail-read lane.
+    assert pool_sizes == [min(8, cuda_hybrid._MAX_PAGE_TAIL_READ_WORKERS)]
     assert reads_after_submit
 
 
@@ -2143,15 +2179,22 @@ def test_flat_history_restore_reads_each_surviving_tail_once(tmp_path, monkeypat
     original_extent = cuda_hybrid._read_object_extent
     original_whole = cuda_hybrid._read_authenticated_page_object
 
+    original_extent_into = cuda_hybrid._read_object_extent_into
+
     def read_extent(pieces):
         extent_reads.append(tuple(pieces))
         return original_extent(pieces)
+
+    def read_extent_into(pieces, target):
+        extent_reads.append(tuple(pieces))
+        return original_extent_into(pieces, target)
 
     def read_whole(source):
         whole_reads.append(source.path)
         return original_whole(source)
 
     monkeypatch.setattr(cuda_hybrid, "_read_object_extent", read_extent)
+    monkeypatch.setattr(cuda_hybrid, "_read_object_extent_into", read_extent_into)
     monkeypatch.setattr(cuda_hybrid, "_read_authenticated_page_object", read_whole)
     monkeypatch.setattr(
         cuda_hybrid.cuda, "arena_memoryview",
@@ -2217,12 +2260,18 @@ def test_cached_delta_headers_skip_header_object_reads_only_after_authentication
     }
     whole_reads = []
     original_whole = cuda_hybrid._read_authenticated_page_object
+    original_header = cuda_hybrid._authenticated_header_from_object
 
     def read_whole(source):
         whole_reads.append(source.path)
         return original_whole(source)
 
+    def read_header(source):
+        whole_reads.append(source.path)
+        return original_header(source)
+
     monkeypatch.setattr(cuda_hybrid, "_read_authenticated_page_object", read_whole)
+    monkeypatch.setattr(cuda_hybrid, "_authenticated_header_from_object", read_header)
 
     def plan():
         return plan_cuda_page_delta_restore(
