@@ -6120,7 +6120,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     )
                     if (
                         reused_pages is not None
-                        and self._publication_schema != "page-tail-cow-v2"
+                        and not self._publication_schema.startswith("page-tail-cow-v")
                     ):
                         base = self._store.lookup(
                             snapshot.identity,

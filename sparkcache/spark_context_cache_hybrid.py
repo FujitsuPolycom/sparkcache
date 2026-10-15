@@ -10,6 +10,7 @@ geometry to either one.
 from __future__ import annotations
 
 import hashlib
+import zlib
 import json
 import struct
 from dataclasses import asdict, dataclass
@@ -18,8 +19,56 @@ from typing import Callable, Mapping, Sequence
 _MAGIC = b"SPHP1\x00"
 _DELTA_MAGIC = b"SPHD1\x00"
 _HEADER_LENGTH = struct.Struct("<I")
+_DELTA_HEADER_SCHEMA_V1 = "sparkcache-hybrid-page-delta/v1"
+_DELTA_HEADER_SCHEMA_V2 = "sparkcache-hybrid-page-delta/v2"
+
+# Payload integrity modes. ``sha256`` is the content-addressed format
+# (publication schema ``page-tail-cow-v2``): every payload byte hashes to a
+# digest bound by authenticated metadata. ``fast`` and ``none`` are the
+# ``page-tail-cow-v3-*`` schemas: identities, manifests and stage headers stay
+# cryptographic, bulk payloads carry a CRC32 per object and per layer tail
+# (``fast``) or no check beyond length and geometry (``none``), and the
+# digest fields of headers and manifests hold boundary tokens (digests of the
+# boundary's identity, not of its bytes).
+PAYLOAD_INTEGRITY_MODES = ("sha256", "fast", "none")
+FLAT_PAGE_SCHEMAS = ("page-tail-cow-v2", "page-tail-cow-v3-fast", "page-tail-cow-v3-none")
 
 
+def payload_integrity_for_schema(publication_schema: str) -> str:
+    """Return the payload integrity mode a publication schema implies."""
+
+    if publication_schema == "page-tail-cow-v3-fast":
+        return "fast"
+    if publication_schema == "page-tail-cow-v3-none":
+        return "none"
+    return "sha256"
+
+
+def boundary_token(context_digest: str, committed_tokens: int) -> str:
+    """Digest naming one published boundary without hashing its bytes."""
+
+    return hashlib.sha256(
+        b"sparkcache-boundary-token/v1\x00"
+        + f"{context_digest}:{int(committed_tokens)}".encode("ascii")
+    ).hexdigest()
+
+
+def payload_checksum(data) -> int:
+    """The ``fast`` payload checksum: CRC32 as zlib computes it."""
+
+    return zlib.crc32(data) & 0xFFFFFFFF
+
+
+def payload_matches(integrity: str, data, *, sha256: str | None, crc32: int | None) -> bool:
+    """Check payload bytes under one integrity mode (length is checked by callers)."""
+
+    if integrity == "sha256":
+        return hashlib.sha256(data).hexdigest() == sha256
+    if integrity == "fast":
+        return crc32 is not None and payload_checksum(data) == crc32
+    if integrity == "none":
+        return True
+    raise HybridCodecError("payload integrity mode is unsupported")
 class HybridCodecError(ValueError):
     """A block-page snapshot does not match its declared layout."""
 
@@ -115,12 +164,18 @@ class PageDeltaTail:
     source_start: int
     source_end: int
     destination_byte_offset: int
-    sha256: str
+    sha256: str | None
+    crc32: int | None = None
 
 
 @dataclass(frozen=True)
 class PageDeltaPlan:
-    """Validated delta header geometry without materializing its base."""
+    """Validated delta header geometry without materializing its base.
+
+    Under ``integrity`` ``sha256`` the two snapshot digests are SHA-256 of the
+    base and result bytes; under ``fast`` and ``none`` they are boundary
+    tokens and the tails carry CRC32 values instead of digests.
+    """
 
     header_bytes: int
     total_bytes: int
@@ -132,6 +187,7 @@ class PageDeltaPlan:
     result_snapshot_sha256: str
     reused_pages_by_group: tuple[int, ...]
     tails: tuple[PageDeltaTail, ...]
+    integrity: str = "sha256"
 
 
 @dataclass(frozen=True)
@@ -378,7 +434,16 @@ def plan_page_delta(
         "reused_pages_by_group",
         "layer_tails",
     }
-    if not isinstance(header, dict) or set(header) != expected_keys:
+    if not isinstance(header, dict):
+        raise HybridCodecError("hybrid page delta header fields differ")
+    if header.get("schema") == _DELTA_HEADER_SCHEMA_V2:
+        expected_keys = expected_keys | {"integrity"}
+        integrity = header.get("integrity")
+        if integrity not in ("fast", "none"):
+            raise HybridCodecError("hybrid page delta integrity mode is invalid")
+    else:
+        integrity = "sha256"
+    if set(header) != expected_keys:
         raise HybridCodecError("hybrid page delta header fields differ")
     raw_base_counts = header["base_block_counts"]
     raw_result_counts = header["result_block_counts"]
@@ -406,7 +471,7 @@ def plan_page_delta(
     ):
         raise HybridCodecError("page delta block counts do not extend the base")
     if (
-        header["schema"] != "sparkcache-hybrid-page-delta/v1"
+        header["schema"] not in (_DELTA_HEADER_SCHEMA_V1, _DELTA_HEADER_SCHEMA_V2)
         or header["layout_sha256"] != layout.digest
         or tuple(raw_base_counts) != base_counts
         or tuple(raw_result_counts) != result_counts
@@ -455,13 +520,28 @@ def plan_page_delta(
             expected_bytes = (
                 result_counts[group_index] - reused_pages
             ) * layer.bytes_per_page
+            if integrity == "sha256":
+                valid = (
+                    isinstance(descriptor, dict)
+                    and set(descriptor) == {"name", "bytes", "sha256"}
+                    and _is_sha256(descriptor["sha256"])
+                )
+            else:
+                valid = (
+                    isinstance(descriptor, dict)
+                    and set(descriptor) == {"name", "bytes", "crc32"}
+                    and (
+                        descriptor["crc32"] is None
+                        if integrity == "none"
+                        else type(descriptor["crc32"]) is int
+                        and 0 <= descriptor["crc32"] <= 0xFFFFFFFF
+                    )
+                )
             if (
-                not isinstance(descriptor, dict)
-                or set(descriptor) != {"name", "bytes", "sha256"}
+                not valid
                 or descriptor["name"] != layer.name
                 or type(descriptor["bytes"]) is not int
                 or descriptor["bytes"] != expected_bytes
-                or not _is_sha256(descriptor["sha256"])
             ):
                 raise HybridCodecError("hybrid page delta layer descriptor differs")
             source_end = source_offset + expected_bytes
@@ -474,7 +554,8 @@ def plan_page_delta(
                     source_start=source_offset,
                     source_end=source_end,
                     destination_byte_offset=reused_pages * layer.bytes_per_page,
-                    sha256=descriptor["sha256"],
+                    sha256=descriptor.get("sha256"),
+                    crc32=descriptor.get("crc32"),
                 )
             )
             source_offset = source_end
@@ -491,7 +572,24 @@ def plan_page_delta(
         result_snapshot_sha256=header["result_snapshot_sha256"],
         reused_pages_by_group=tuple(reused),
         tails=tuple(tails),
+        integrity=integrity,
     )
+
+
+def _tail_descriptor(integrity: str, name: str, tail: bytes) -> dict[str, object]:
+    if integrity == "sha256":
+        return {"name": name, "bytes": len(tail), "sha256": hashlib.sha256(tail).hexdigest()}
+    return {
+        "name": name,
+        "bytes": len(tail),
+        "crc32": payload_checksum(tail) if integrity == "fast" else None,
+    }
+
+
+def _delta_header_fields(integrity: str) -> dict[str, object]:
+    if integrity == "sha256":
+        return {"schema": _DELTA_HEADER_SCHEMA_V1}
+    return {"schema": _DELTA_HEADER_SCHEMA_V2, "integrity": integrity}
 
 
 def encode_page_delta(
@@ -504,6 +602,8 @@ def encode_page_delta(
     base_boundary_tokens: int,
     result_boundary_tokens: int,
     base_snapshot_sha256: str | None = None,
+    integrity: str = "sha256",
+    result_snapshot_sha256: str | None = None,
 ) -> bytes:
     """Encode changed page suffixes relative to one authenticated snapshot.
 
@@ -519,6 +619,12 @@ def encode_page_delta(
     """
 
     _validate_delta_boundaries(base_boundary_tokens, result_boundary_tokens)
+    if integrity not in PAYLOAD_INTEGRITY_MODES:
+        raise HybridCodecError("payload integrity mode is unsupported")
+    if integrity != "sha256" and not (
+        _is_sha256(base_snapshot_sha256) and _is_sha256(result_snapshot_sha256)
+    ):
+        raise HybridCodecError("boundary tokens are required without payload digests")
     if base_snapshot_sha256 is None:
         base_snapshot_sha256 = hashlib.sha256(base_snapshot).hexdigest()
     elif not _is_sha256(base_snapshot_sha256):
@@ -560,19 +666,15 @@ def encode_page_delta(
         for layer in group.layers:
             tail = result_payloads[layer.name][reusable * layer.bytes_per_page :]
             payload_parts.append(tail)
-            layer_tails.append(
-                {
-                    "name": layer.name,
-                    "bytes": len(tail),
-                    "sha256": hashlib.sha256(tail).hexdigest(),
-                }
-            )
+            layer_tails.append(_tail_descriptor(integrity, layer.name, tail))
+    if integrity == "sha256":
+        result_snapshot_sha256 = hashlib.sha256(result_snapshot).hexdigest()
     header = json.dumps(
         {
-            "schema": "sparkcache-hybrid-page-delta/v1",
+            **_delta_header_fields(integrity),
             "layout_sha256": layout.digest,
             "base_snapshot_sha256": base_snapshot_sha256,
-            "result_snapshot_sha256": hashlib.sha256(result_snapshot).hexdigest(),
+            "result_snapshot_sha256": result_snapshot_sha256,
             "base_block_counts": base_counts,
             "result_block_counts": result_counts,
             "base_boundary_tokens": base_boundary_tokens,
@@ -600,6 +702,8 @@ def _encode_page_delta_from_capture(
     result_boundary_tokens: int,
     base_snapshot_sha256: str | None,
     materialize_result: bool,
+    integrity: str = "sha256",
+    result_snapshot_sha256: str | None = None,
 ) -> tuple[bytes, bytearray | None]:
     """Shared encoder behind the two public capture-delta entry points.
 
@@ -609,6 +713,12 @@ def _encode_page_delta_from_capture(
     """
 
     _validate_delta_boundaries(base_boundary_tokens, result_boundary_tokens)
+    if integrity not in PAYLOAD_INTEGRITY_MODES:
+        raise HybridCodecError("payload integrity mode is unsupported")
+    if integrity != "sha256" and not (
+        _is_sha256(base_snapshot_sha256) and _is_sha256(result_snapshot_sha256)
+    ):
+        raise HybridCodecError("boundary tokens are required without payload digests")
     try:
         base_counts = tuple(int(value) for value in base_block_counts)
         result_counts = tuple(int(value) for value in result_block_counts)
@@ -671,8 +781,10 @@ def _encode_page_delta_from_capture(
         result_view[: len(result_header)] = result_header
         result_cursor = len(result_header)
         result_digest = None
-    else:
+    elif integrity == "sha256":
         result_digest = hashlib.sha256(result_header)
+    else:
+        result_digest = None
     payload_parts: list[bytes] = []
     layer_tails: list[dict[str, object]] = []
     cursor = 0
@@ -698,17 +810,11 @@ def _encode_page_delta_from_capture(
                 result_cursor += prefix_bytes
                 result_view[result_cursor : result_cursor + tail_bytes] = tail
                 result_cursor += tail_bytes
-            else:
+            elif result_digest is not None:
                 result_digest.update(prefix)
                 result_digest.update(tail)
             payload_parts.append(tail)
-            layer_tails.append(
-                {
-                    "name": layer.name,
-                    "bytes": tail_bytes,
-                    "sha256": hashlib.sha256(tail).hexdigest(),
-                }
-            )
+            layer_tails.append(_tail_descriptor(integrity, layer.name, tail))
             cursor = end
     if cursor != total_bytes:
         raise HybridCodecError("captured page extension has trailing bytes")
@@ -716,6 +822,9 @@ def _encode_page_delta_from_capture(
         if result_cursor != len(result_buffer):
             raise HybridCodecError("captured page extension result is incomplete")
         result_view.release()
+    if integrity != "sha256":
+        result_sha256 = result_snapshot_sha256
+    elif result_view is not None:
         # The retained result is hashed as one buffer, so the digest bound
         # into the header is the digest of exactly the bytes returned.
         result_sha256 = hashlib.sha256(result_buffer).hexdigest()
@@ -728,7 +837,7 @@ def _encode_page_delta_from_capture(
 
     header = json.dumps(
         {
-            "schema": "sparkcache-hybrid-page-delta/v1",
+            **_delta_header_fields(integrity),
             "layout_sha256": layout.digest,
             "base_snapshot_sha256": base_snapshot_sha256,
             "result_snapshot_sha256": result_sha256,
@@ -759,6 +868,8 @@ def encode_page_delta_from_capture(
     base_boundary_tokens: int,
     result_boundary_tokens: int,
     base_snapshot_sha256: str | None = None,
+    integrity: str = "sha256",
+    result_snapshot_sha256: str | None = None,
 ) -> bytes:
     """Encode an authenticated delta directly from selected captured pages.
 
@@ -784,6 +895,8 @@ def encode_page_delta_from_capture(
         result_boundary_tokens=result_boundary_tokens,
         base_snapshot_sha256=base_snapshot_sha256,
         materialize_result=False,
+        integrity=integrity,
+        result_snapshot_sha256=result_snapshot_sha256,
     )
     return delta
 
@@ -799,6 +912,8 @@ def encode_page_delta_from_capture_with_result(
     base_boundary_tokens: int,
     result_boundary_tokens: int,
     base_snapshot_sha256: str | None = None,
+    integrity: str = "sha256",
+    result_snapshot_sha256: str | None = None,
 ) -> tuple[bytes, bytearray]:
     """Encode a delta as ``encode_page_delta_from_capture`` and keep the result.
 
@@ -820,6 +935,8 @@ def encode_page_delta_from_capture_with_result(
         result_boundary_tokens=result_boundary_tokens,
         base_snapshot_sha256=base_snapshot_sha256,
         materialize_result=True,
+        integrity=integrity,
+        result_snapshot_sha256=result_snapshot_sha256,
     )
     assert result is not None
     return delta, result
@@ -1093,7 +1210,10 @@ def compose_page_history(
                     payload = read_tail(owner, tail)
                     if (
                         len(payload) != tail.source_end - tail.source_start
-                        or hashlib.sha256(payload).hexdigest() != tail.sha256
+                        or not payload_matches(
+                            stage_plans[owner].integrity, payload,
+                            sha256=tail.sha256, crc32=tail.crc32,
+                        )
                     ):
                         raise PageDeltaPayloadChecksumError(
                             "hybrid page delta payload checksum mismatch"
@@ -1105,7 +1225,12 @@ def compose_page_history(
                 covered = end
             if covered != span.source_end - span.source_start:
                 raise HybridCodecError("hybrid page history coverage differs")
-    if hashlib.sha256(result).hexdigest() != current_sha256:
+    # Under fast and none the result digest is a boundary token, so the
+    # composed bytes are bound by their per-tail checks alone.
+    if (
+        stage_plans[-1].integrity == "sha256"
+        and hashlib.sha256(result).hexdigest() != current_sha256
+    ):
         raise HybridCodecError("hybrid page delta result checksum mismatch")
     immutable = bytes(result)
     if _return_verified:

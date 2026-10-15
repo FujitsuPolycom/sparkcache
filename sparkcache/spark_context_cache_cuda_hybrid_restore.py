@@ -43,8 +43,14 @@ from sparkcache.spark_context_cache_hybrid import (
     encode_page_snapshot_header,
     page_delta_header_prefix,
     page_snapshot_encoded_size,
+    payload_matches,
     plan_page_delta,
     plan_page_snapshot,
+)
+from sparkcache.persistent_context_cache.cache_manifest import (
+    _PAGE_TAIL_SCHEMAS,
+    _descriptor_integrity,
+    _read_header_prefix,
 )
 from sparkcache.spark_context_cache_cuda_placement import (
     CudaPlacementContractError,
@@ -114,6 +120,10 @@ class CudaPageObject:
     encoded_bytes: int
     encoded_start: int
     encoded_end: int
+    # Payload check the descriptor declares: "sha256" (content address),
+    # "fast" (CRC32 in ``crc32``) or "none" (length and geometry only).
+    integrity: str = "sha256"
+    crc32: int | None = None
 
 
 @dataclass(frozen=True)
@@ -127,11 +137,13 @@ class CudaPageTailExtent:
     """
 
     path: Path
-    sha256: str
+    sha256: str | None
     encoded_bytes: int
     encoded_start: int
     encoded_end: int
     pieces: tuple[tuple[Path, int, int, int], ...]
+    integrity: str = "sha256"
+    crc32: int | None = None
 
 
 @dataclass(frozen=True)
@@ -161,6 +173,9 @@ class CudaPageDeltaRestorePlan:
     referenced_object_bytes: int
     skipped_base_object_bytes: int
     planning_read_source_bytes: int = 0
+    # Payload integrity of the newest stage: "sha256" verifies the composed
+    # result against its digest, "fast" and "none" rely on per-tail checks.
+    integrity: str = "sha256"
     # The complete result from the process-local hot snapshot cache. When set,
     # source_spans is empty and the executor places these bytes directly.
     hot_snapshot: bytes | bytearray | None = None
@@ -200,7 +215,7 @@ def _page_objects(
     objects = []
     expected_keys = {"sha256", "bytes", "encoded_start", "encoded_end"}
     for index, raw in enumerate(descriptors):
-        if not isinstance(raw, dict) or set(raw) != expected_keys:
+        if not isinstance(raw, dict) or set(raw) - {"crc32"} != expected_keys:
             raise CudaHybridRestoreError(
                 f"{label} object {index} has an invalid descriptor"
             )
@@ -208,9 +223,12 @@ def _page_objects(
         size = raw["bytes"]
         start = raw["encoded_start"]
         end = raw["encoded_end"]
+        crc32 = raw.get("crc32")
+        integrity = _descriptor_integrity(raw)
         if (
             not isinstance(digest, str)
             or _DIGEST.fullmatch(digest) is None
+            or (integrity == "fast" and (type(crc32) is not int or not 0 <= crc32 <= 0xFFFFFFFF))
             or isinstance(size, bool)
             or not isinstance(size, int)
             or size <= 0
@@ -233,12 +251,24 @@ def _page_objects(
                 encoded_bytes=size,
                 encoded_start=start,
                 encoded_end=end,
+                integrity=integrity,
+                crc32=crc32,
             )
         )
         expected_start = end
     if not objects or expected_start != total_bytes:
         raise CudaHybridRestoreError(f"{label} objects do not cover the payload")
     return tuple(objects)
+
+
+def _source_payload_matches(source, data) -> bool:
+    """Apply the source's declared payload check to ``data``."""
+
+    if len(data) != source.encoded_bytes:
+        return False
+    return payload_matches(
+        source.integrity, data, sha256=source.sha256, crc32=source.crc32
+    )
 
 
 def _read_authenticated_page_object(
@@ -250,7 +280,7 @@ def _read_authenticated_page_object(
         _pread_exact_into(source.path, source.encoded_bytes, view)
     finally:
         view.release()
-    if hashlib.sha256(payload).hexdigest() != source.sha256:
+    if not _source_payload_matches(source, payload):
         raise CudaHybridRestoreError(
             f"page object SHA-256 mismatch for {source.path}"
         )
@@ -300,6 +330,8 @@ def _tail_extents(
                 encoded_start=tail.source_start,
                 encoded_end=tail.source_end,
                 pieces=tuple(pieces),
+                integrity=plan.integrity,
+                crc32=tail.crc32,
             )
         )
     return tuple(extents)
@@ -316,10 +348,7 @@ def _read_authenticated_source(
         raise CudaHybridRestoreError(
             f"page-delta tail read failed for {source.path}: {error}"
         ) from error
-    if (
-        len(payload) != source.encoded_bytes
-        or hashlib.sha256(payload).hexdigest() != source.sha256
-    ):
+    if not _source_payload_matches(source, payload):
         raise CudaHybridRestoreError(
             f"page-delta tail SHA-256 mismatch for {source.path}"
         )
@@ -345,10 +374,7 @@ def _read_authenticated_tail_into(
             raise CudaHybridRestoreError(
                 f"page-delta tail read failed for {source.path}: {error}"
             ) from error
-        if (
-            len(target) != source.encoded_bytes
-            or hashlib.sha256(target).hexdigest() != source.sha256
-        ):
+        if not _source_payload_matches(source, target):
             raise CudaHybridRestoreError(
                 f"page-delta tail SHA-256 mismatch for {source.path}"
             )
@@ -371,7 +397,7 @@ def _authenticated_header_from_object(source: CudaPageObject) -> bytes:
         _pread_exact_into(source.path, source.encoded_bytes, view)
     finally:
         view.release()
-    if hashlib.sha256(payload).hexdigest() != source.sha256:
+    if not _source_payload_matches(source, payload):
         raise CudaHybridRestoreError(
             f"page object SHA-256 mismatch for {source.path}"
         )
@@ -582,8 +608,7 @@ def plan_cuda_page_delta_restore(
             f"page-delta root identity was rejected: {error}"
         ) from error
     if (
-        identity.publication_schema
-        not in ("page-tail-cow-v1", "page-tail-cow-v2")
+        identity.publication_schema not in _PAGE_TAIL_SCHEMAS
         or identity.required_records
         != frozenset((StateRecord.TARGET_CKV, StateRecord.LOGICAL_POSITIONS))
         or persisted != manifest
@@ -616,13 +641,22 @@ def plan_cuda_page_delta_restore(
         prefetched_bytes += source.encoded_bytes
         return authenticated
 
-    def delta_header(source: CudaPageObject) -> bytes:
+    def delta_header(source: CudaPageObject, header_sha256: str | None = None) -> bytes:
         # A cached header was taken from bytes hashed to this object's
-        # content address; tails are still checked against its digests.
+        # content address, or checked against the manifest-bound header
+        # digest; tails are still checked against its digests or checksums.
         cached = _authenticated_delta_header(source.sha256, source.encoded_bytes)
         if cached is not None:
             return cached
-        header = page_delta_header_prefix(read_header_object(source).payload)
+        if header_sha256 is not None:
+            try:
+                header = _read_header_prefix(source.path, header_sha256)
+            except CacheFormatError as error:
+                raise CudaHybridRestoreError(
+                    f"page-delta header rejected for {source.path}: {error}"
+                ) from error
+        else:
+            header = page_delta_header_prefix(read_header_object(source).payload)
         _remember_authenticated_delta_header(
             source.sha256, source.encoded_bytes, header
         )
@@ -655,10 +689,11 @@ def plan_cuda_page_delta_restore(
             # retained beyond the header prefix.
             unseen = []
             seen_paths = set()
-            for _stage, objects in flat_stages:
+            for stage, objects in flat_stages:
                 first = objects[0]
                 if (
-                    first.path in seen_paths
+                    stage.get("header_sha256") is not None
+                    or first.path in seen_paths
                     or first.path in prefetched
                     or _authenticated_delta_header(first.sha256, first.encoded_bytes)
                     is not None
@@ -684,7 +719,7 @@ def plan_cuda_page_delta_restore(
             for stage, objects in flat_stages:
                 delta_plan = plan_page_delta(
                     layout,
-                    delta_header(objects[0]),
+                    delta_header(objects[0], stage.get("header_sha256")),
                     base_block_counts=stage["base_block_counts"],
                     result_block_counts=stage["result_block_counts"],
                     base_boundary_tokens=stage["base_committed_tokens"],
@@ -928,6 +963,7 @@ def plan_cuda_page_delta_restore(
         result_snapshot_sha256=current_sha256,
         source_spans=tuple(source_spans),
         prefetched_objects=tuple(prefetched.values()),
+        integrity=stages[-1].plan.integrity,
         referenced_object_bytes=sum(
             source.encoded_bytes for source in referenced.values()
         ),
@@ -1200,8 +1236,7 @@ def _plan_page_objects(
             f"flat page root identity was rejected: {error}"
         ) from error
     if (
-        identity.publication_schema
-        not in ("", "page-tail-cow-v1", "page-tail-cow-v2")
+        identity.publication_schema not in ("", *_PAGE_TAIL_SCHEMAS)
         or identity.required_records
         != frozenset((StateRecord.TARGET_CKV, StateRecord.LOGICAL_POSITIONS))
         or persisted != manifest
@@ -1312,7 +1347,7 @@ def _execute_page_object_restore(
     first_payload = bytearray(first.encoded_bytes)
     started = time.perf_counter()
     _pread_exact_into(first.path, first.encoded_bytes, memoryview(first_payload))
-    if hashlib.sha256(first_payload).hexdigest() != first.sha256:
+    if not _source_payload_matches(first, first_payload):
         raise CudaHybridRestoreError(f"page object SHA-256 mismatch for {first.path}")
     read_ms = 1e3 * (time.perf_counter() - started)
     page_plan = plan_page_snapshot(
@@ -1389,7 +1424,7 @@ def _execute_page_object_restore(
                 )
             finally:
                 target.release()
-            if hashlib.sha256(buffer).hexdigest() != page_object.sha256:
+            if not _source_payload_matches(page_object, buffer):
                 raise CudaHybridRestoreError(
                     f"page object SHA-256 mismatch for {page_object.path}"
                 )
@@ -1631,6 +1666,9 @@ def _execute_page_delta_restore(
     final_hash_ms = 0.0
     result_header = encode_page_snapshot_header(layout, plan.page_plan.block_counts)
     final_sha256 = hashlib.sha256(result_header)
+    # Under fast and none the result digest is a boundary token; every placed
+    # byte was already checked by its own object or tail check.
+    verify_result = plan.integrity == "sha256"
     # With a hot snapshot budget, keep a private copy of the composed result
     # so a later restore or publication of this boundary needs no object
     # read. It is retained only after the final digest check passes.
@@ -1651,7 +1689,8 @@ def _execute_page_delta_restore(
         pending_hash = None
         started = time.perf_counter()
         try:
-            final_sha256.update(view)
+            if verify_result:
+                final_sha256.update(view)
             if retained is not None:
                 start = header_bytes + offset
                 retained[start : start + len(view)] = view
@@ -1814,7 +1853,7 @@ def _execute_page_delta_restore(
                 item = None  # drop the last payload reference with the batch
                 loaded.clear()
             hash_pending()
-        if final_sha256.hexdigest() != plan.result_snapshot_sha256:
+        if verify_result and final_sha256.hexdigest() != plan.result_snapshot_sha256:
             raise CudaHybridRestoreError(
                 "page-delta reconstructed snapshot checksum mismatch"
             )
