@@ -357,6 +357,22 @@ For interval 16,384, base 14,336 to result 16,384 selects full capture;
 base 16,384 to result 18,432 remains sparse. This is a token cadence, not a
 universal bound on history depth for arbitrary prompt increments.
 
+`spark_cache_payload_integrity` selects how stored KV and recurrent payloads are
+checked. Its environment fallback is `SPARK_CONTEXT_CACHE_PAYLOAD_INTEGRITY`.
+
+| Value | Payload check | Schema | Default for |
+|---|---|---|---|
+| `fast` | CRC32 per object and layer tail, checked while copying | `page-tail-cow-v3-fast` | `tail-cow-v2` publication |
+| `none` | none; lengths and geometry only | `page-tail-cow-v3-none` | — |
+| `sha256` | SHA-256 per object and composed result | the content-addressed schemas | every other schema |
+
+Keys, cache identity, manifests and stage headers stay SHA-256 in every mode.
+`fast` detects torn writes and media corruption, not deliberate tampering. Use
+`sha256` for cache roots other parties can write.
+
+The v3 schemas have their own cache identity. Entries written in one mode miss
+cleanly in another, and readers without the v3 schemas miss them.
+
 `spark_cache_page_delta_stage_limit_count` bounds the stages in a
 `tail-cow-v2` entry. The default `0` sets no limit; a positive value caps the stage count. Its environment
 fallback is `SPARK_CONTEXT_CACHE_PAGE_DELTA_STAGE_LIMIT_COUNT`.
