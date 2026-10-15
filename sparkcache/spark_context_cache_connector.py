@@ -1120,7 +1120,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         )
         self._chunk_tokens = config.chunk_tokens
         self._root = config.root
-        self._store = ManifestStore(self._root)
+        self._store = ManifestStore(
+            self._root, page_delta_stage_limit_count=config.page_delta_stage_limit_count,
+        )
         self._clear_once_token = config.clear_once_token
         self._cache_available = True
         if self._clear_once_token:

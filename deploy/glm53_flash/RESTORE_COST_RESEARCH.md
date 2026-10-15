@@ -67,3 +67,26 @@ The source record is `sircl-handoff/research/ring8-hw-20261013/` under
 per-turn logs contain the measurements; `scripts/analyze_rf.py` and
 `scripts/make_tables_rf.py` generate the tables. These evidence files are
 retained outside this repository.
+
+## Stage-limit write cost
+
+Status: **implemented; hardware tuning remains research-only**. The connector
+defaults to four `tail-cow-v2` stages; `spark_cache_page_delta_stage_limit_count`
+set to `0` disables compaction. Appending a fifth stage writes the complete
+result, including that turn's attention tail and recurrent checkpoint, from
+CPU publication data. The full result does not pass through the GPU capture slot.
+
+For GLM-5.3-Flash CSF at TP2, full attention costs **6,732 B per new token**
+and every stage also writes about **76 MB of recurrent state** (76,323,851 B
+in the CPU fixture). A sparse extension of d tokens therefore writes about
+6,732*d + 76,323,851 bytes, excluding headers and page rounding.
+
+Compaction at T retained tokens writes about 6,732*T + 76,323,851 bytes.
+Relative to a sparse extension, it adds 6,732*(T-d) bytes: the retained
+attention prefix is rewritten, while recurrent state is still written once.
+Compaction does not erase earlier published boundaries or guarantee disk savings.
+
+Four stages limit metadata traversal and overwritten recurrent history while
+amortizing complete writes across five extensions. This default follows the
+chain-depth study's tuning direction; it is not a measured optimum. The CPU
+benchmark accepts `--stage-limit 4` and `--stage-limit 0` for comparison.

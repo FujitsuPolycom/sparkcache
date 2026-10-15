@@ -156,8 +156,8 @@ regardless of the configured duration. The equivalent environment variable is
 Manager-page `tail-cow-v1` graphs admit at most two nested deltas before
 flattening against an earlier verified base.
 
-`tail-cow-v2` retains a flat ordered stage list, so growing conversations do
-not periodically rewrite a large flattened delta.
+`tail-cow-v2` retains a flat ordered stage list. A configurable limit bounds
+its length by publishing complete CPU-composed snapshots.
 
 The v2 descriptor list grows with the number of stored extensions. Restore
 authenticates each retained stage header, then reads each layer tail that no
@@ -339,6 +339,26 @@ zero. The choice happens before sparse capture, without reading history.
 For interval 16,384, base 14,336 to result 16,384 selects full capture;
 base 16,384 to result 18,432 remains sparse. This is a token cadence, not a
 universal bound on history depth for arbitrary prompt increments.
+
+`spark_cache_page_delta_stage_limit_count` bounds the stages in a
+`tail-cow-v2` entry. The default is `4`; `0` disables the limit. Its environment
+fallback is `SPARK_CONTEXT_CACHE_PAGE_DELTA_STAGE_LIMIT_COUNT`.
+
+Appending beyond the limit publishes a full snapshot of the result. The
+background saver composes the verified base with this turn's captured tail
+on the CPU. It requires no full GPU capture and cannot overflow the capture slot.
+
+The snapshot includes the result boundary's recurrent state. It uses the same
+format and readers as a periodic full capture; preceding published boundaries
+remain restorable. The policy does not affect `tail-cow-v1`.
+
+Four stages bound metadata traversal and overwritten recurrent history while
+allowing several sparse writes between snapshots. This is an implemented
+default, not a hardware-qualified optimum; full rewrites increase SSD traffic.
+
+For full attention, each compaction rewrites all retained tokens rather than
+only the appended tokens. Recurrent state is written once per publication.
+See the model deployment evidence for the measured geometry and byte costs.
 
 Full captures keep the same cache identity and format. Before selecting one,
 the worker calculates its exact raw page bytes from the registered layout.

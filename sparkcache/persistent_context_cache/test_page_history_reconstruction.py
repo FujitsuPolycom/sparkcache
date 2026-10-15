@@ -20,7 +20,7 @@ def _history(tmp_path, stages=3):
         hybrid.PageLayer("b", "u8", (256,), 256),
     )),))
     identity = replace(_identity(), publication_schema="page-tail-cow-v2")
-    store = ManifestStore(tmp_path)
+    store = ManifestStore(tmp_path, page_delta_stage_limit_count=0)
     tokens = tuple(range((stages + 2) * 256))
     digests = [context_prefix_digest(tokens, "history", token_count=count * 256)
                for count in range(2, stages + 3)]
