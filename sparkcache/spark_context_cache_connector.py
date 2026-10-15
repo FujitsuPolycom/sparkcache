@@ -6108,7 +6108,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     reused_pages = getattr(
                         result_snapshot, "reused_pages_by_group", None
                     )
-                    if reused_pages is not None:
+                    if (
+                        reused_pages is not None
+                        and self._publication_schema != "page-tail-cow-v2"
+                    ):
                         base = self._store.lookup(
                             snapshot.identity,
                             snapshot.plan.base_context_digest,
@@ -6129,15 +6132,14 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                             result_block_counts=base_counts,
                             result_boundary_tokens=snapshot.plan.base_span_tokens,
                         )
-                        if self._publication_schema != "page-tail-cow-v2":
-                            result_snapshot = materialize_page_extension_capture(
-                                layout,
-                                base_snapshot,
-                                result_snapshot,
-                                base_block_counts=base_counts,
-                                result_block_counts=snapshot.block_counts,
-                                reused_pages_by_group=reused_pages,
-                            )
+                        result_snapshot = materialize_page_extension_capture(
+                            layout,
+                            base_snapshot,
+                            result_snapshot,
+                            base_block_counts=base_counts,
+                            result_block_counts=snapshot.block_counts,
+                            reused_pages_by_group=reused_pages,
+                        )
                         verified_base_snapshot = base_snapshot
                     try:
                         receipt = self._store.commit_page_extension(

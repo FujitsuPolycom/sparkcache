@@ -25,7 +25,10 @@ from functools import wraps
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from types import MappingProxyType
-from typing import Any, Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
+
+if TYPE_CHECKING:
+    from sparkcache.spark_context_cache_hybrid import _VerifiedPageSnapshot
 
 from sparkcache.page_base_read_flights import PageBaseReadEvidence
 from sparkcache.publication_telemetry import (
@@ -1823,6 +1826,41 @@ def _object_extent_pieces(
     return tuple(pieces)
 
 
+_PUBLICATION_READ_FILES = 64
+_publication_read_files: ContextVar[Any] = ContextVar("publication_read_files", default=None)
+
+
+class _PublicationReadFiles(AbstractContextManager):
+    """Bound open-file reuse to one synchronous publication base restore.
+
+    No payload or file descriptor survives the context. Each range is still
+    checked against its authenticated tail digest, including on a handle hit.
+    """
+
+    def __init__(self) -> None:
+        self.files: OrderedDict[Path, int] = OrderedDict()
+
+    def __enter__(self):
+        self.token = _publication_read_files.set(self)
+        return self
+
+    def open(self, path: Path, flags: int) -> int:
+        descriptor = self.files.pop(path, None)
+        if descriptor is None:
+            if len(self.files) >= _PUBLICATION_READ_FILES:
+                _, evicted = self.files.popitem(last=False)
+                os.close(evicted)
+            descriptor = os.open(path, flags)
+        self.files[path] = descriptor
+        return descriptor
+
+    def __exit__(self, *_args):
+        _publication_read_files.reset(self.token)
+        for descriptor in self.files.values():
+            os.close(descriptor)
+        self.files.clear()
+
+
 def _read_object_extent(
     pieces: Sequence[tuple[Path, int, int, int]],
 ) -> bytearray:
@@ -1839,10 +1877,11 @@ def _read_object_extent(
     cursor = 0
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
+    files = _publication_read_files.get()
     try:
         for path, object_bytes, offset, length in pieces:
             try:
-                descriptor = os.open(path, flags)
+                descriptor = files.open(path, flags) if files is not None else os.open(path, flags)
             except OSError as error:
                 raise CacheFormatError(f"page object is unavailable: {error}") from error
             try:
@@ -1866,7 +1905,8 @@ def _read_object_extent(
                     view[cursor + completed : cursor + completed + len(chunk)] = chunk
                     completed += len(chunk)
             finally:
-                os.close(descriptor)
+                if files is None:
+                    os.close(descriptor)
             cursor += length
     finally:
         view.release()
@@ -3791,7 +3831,7 @@ class ManifestStore:
                 and publication_base is base
             ):
                 from sparkcache.spark_context_cache_hybrid import (
-                    plan_page_snapshot,
+                    _verify_page_snapshot_bytes, plan_page_snapshot,
                 )
 
                 plan_page_snapshot(
@@ -3799,14 +3839,24 @@ class ManifestStore:
                     verified_base_snapshot,
                     publication_base_block_counts,
                 )
-                base_snapshot = verified_base_snapshot
-            else:
-                base_snapshot = self.restore_page_snapshot(
-                    publication_base,
-                    layout=layout,
-                    result_block_counts=publication_base_block_counts,
-                    result_boundary_tokens=publication_base_boundary,
+                base_proof = _verify_page_snapshot_bytes(verified_base_snapshot)
+                expected = self._publication_snapshot_digest(
+                    publication_base, layout=layout,
+                    block_counts=publication_base_block_counts,
+                    boundary_tokens=publication_base_boundary,
                 )
+                if base_proof.sha256 != expected:
+                    raise CacheFormatError("publication base snapshot digest differs")
+            else:
+                with _PublicationReadFiles():
+                    base_proof = self.restore_page_snapshot(
+                        publication_base,
+                        layout=layout,
+                        result_block_counts=publication_base_block_counts,
+                        result_boundary_tokens=publication_base_boundary,
+                        _return_verified=True,
+                    )
+            base_snapshot = base_proof.payload
             captured_reuse = getattr(
                 result_snapshot,
                 "reused_pages_by_group",
@@ -3844,7 +3894,7 @@ class ManifestStore:
                     )
                 delta = encode_page_delta_from_capture(
                     layout,
-                    base_snapshot,
+                    base_proof,
                     result_snapshot,
                     base_block_counts=publication_base_block_counts,
                     result_block_counts=result_block_counts,
@@ -3992,6 +4042,39 @@ class ManifestStore:
                 ),
             )
 
+    def _publication_snapshot_digest(
+        self, lookup: LookupResult, *, layout: Any,
+        block_counts: Sequence[int], boundary_tokens: int,
+    ) -> str:
+        """Bind supplied base bytes to the authenticated publication boundary."""
+        manifest = lookup._manifest
+        if _is_page_snapshot_root(manifest):
+            return manifest["snapshot_sha256"]
+        if _is_page_delta_root(manifest) and manifest.get("schema") in (
+            _PAGE_DELTA_MANIFEST_SCHEMA_V2, _PAGE_DELTA_MANIFEST_SCHEMA_V3,
+        ):
+            from sparkcache.spark_context_cache_hybrid import plan_page_delta
+
+            stage = (manifest["delta_stages"][-1]
+                     if manifest["schema"] == _PAGE_DELTA_MANIFEST_SCHEMA_V3 else manifest)
+            header = _authenticated_page_delta_header(
+                self.root / "chunks", stage["delta_objects"][0],
+            )
+            plan = plan_page_delta(
+                layout, header, base_block_counts=stage["base_block_counts"],
+                result_block_counts=block_counts,
+                base_boundary_tokens=stage["base_committed_tokens"],
+                result_boundary_tokens=boundary_tokens,
+                total_bytes=stage["delta_encoded_bytes"],
+            )
+            # A delta base denotes its composed result, never its root snapshot.
+            return plan.result_snapshot_sha256
+        proof = self.restore_page_snapshot(
+            lookup, layout=layout, result_block_counts=block_counts,
+            result_boundary_tokens=boundary_tokens, _return_verified=True,
+        )
+        return proof.sha256
+
     def restore_page_snapshot(
         self,
         lookup: LookupResult,
@@ -4005,15 +4088,20 @@ class ManifestStore:
         ]
         | None = None,
         _depth: int = 0,
-    ) -> bytes | bytearray:
+        _return_verified: bool = False,
+    ) -> bytes | bytearray | _VerifiedPageSnapshot:
         """Materialize an authenticated flat or delta-backed page snapshot.
 
-        Flat histories verify every intermediate result in private layer
-        buffers. A complete immutable snapshot is assembled only at the end.
+        Flat histories verify surviving tails and the final composed digest.
+        The private publication path retains that proof for sparse encoding.
         """
 
         if not lookup.is_hit or lookup._manifest is None:
             raise ValueError("cannot restore a cache miss")
+        from sparkcache.spark_context_cache_hybrid import (
+            _VerifiedPageSnapshot, _verify_page_snapshot_bytes,
+        )
+
         manifest = lookup._manifest
         if _is_page_snapshot_root(manifest):
             identity_wire = dict(manifest["identity"])
@@ -4027,16 +4115,20 @@ class ManifestStore:
             )
             if manifest["committed_tokens"] != result_boundary_tokens:
                 raise CacheFormatError("page snapshot restore boundary differs")
-            return self._read_page_snapshot_objects(
+            snapshot = self._read_page_snapshot_objects(
                 descriptors,
                 encoded_bytes=manifest["snapshot_encoded_bytes"],
                 encoded_sha256=manifest["snapshot_sha256"],
             )
+            if _return_verified:
+                return _VerifiedPageSnapshot(bytes(snapshot), manifest["snapshot_sha256"])
+            return snapshot
         if not _is_page_delta_root(manifest):
             chunks = self.restore(lookup)
             if chunks is None:
                 raise CacheFormatError("page snapshot restore failed")
-            return b"".join(chunk.records[StateRecord.TARGET_CKV] for chunk in chunks)
+            snapshot = b"".join(chunk.records[StateRecord.TARGET_CKV] for chunk in chunks)
+            return _verify_page_snapshot_bytes(snapshot) if _return_verified else snapshot
         if manifest.get("schema") == _PAGE_DELTA_MANIFEST_SCHEMA_V3:
             identity_wire = dict(manifest["identity"])
             if "record_schema" in identity_wire:
@@ -4072,6 +4164,7 @@ class ManifestStore:
                 layout=layout,
                 result_block_counts=manifest["base_block_counts"],
                 result_boundary_tokens=manifest["base_committed_tokens"],
+                _return_verified=True,
             )
             from sparkcache.spark_context_cache_hybrid import (
                 PageDeltaPayloadChecksumError,
@@ -4121,6 +4214,7 @@ class ManifestStore:
                     manifest["base_block_counts"],
                     plans,
                     read_tail,
+                    _return_verified=_return_verified,
                 )
             except PageDeltaPayloadChecksumError as error:
                 # Stored bytes differ from authenticated metadata: corruption.
@@ -4192,7 +4286,7 @@ class ManifestStore:
             )
         from sparkcache.spark_context_cache_hybrid import apply_page_delta
 
-        return apply_page_delta(
+        snapshot = apply_page_delta(
             layout,
             base_snapshot,
             encoded_delta,
@@ -4201,6 +4295,7 @@ class ManifestStore:
             base_boundary_tokens=manifest["base_committed_tokens"],
             result_boundary_tokens=manifest["committed_tokens"],
         )
+        return _verify_page_snapshot_bytes(snapshot) if _return_verified else snapshot
 
     def page_delta_base_read_evidence(
         self,
