@@ -5662,10 +5662,26 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             return plan
         interval = getattr(self, "_page_snapshot_interval_tokens", 0)
         if interval and plan.span_tokens // interval > plan.base_span_tokens // interval:
-            self.counters["publication_periodic_full_capture_selected"] = (
-                self.counters.get("publication_periodic_full_capture_selected", 0) + 1
+            settings = getattr(self, "_async_page_capture_settings", None)
+            layout = self._page_layout
+            # Native capture stores only the raw page body in its slot. This
+            # exact size check uses registered geometry, without GPU or disk
+            # work, and rejects every oversized full capture before submit.
+            full_bytes = (
+                sum(count * sum(layer.bytes_per_page for layer in group.layers)
+                    for count, group in zip(
+                        self._group_block_counts_for_span(plan.span_tokens),
+                        layout.groups, strict=True))
+                if settings is not None and layout is not None else 0
             )
-            return replace(plan, base_context_digest="", base_span_tokens=0)
+            if settings is None or full_bytes <= settings.slot_bytes:
+                self.counters["publication_periodic_full_capture_selected"] = (
+                    self.counters.get("publication_periodic_full_capture_selected", 0) + 1
+                )
+                return replace(plan, base_context_digest="", base_span_tokens=0)
+            self.counters["publication_full_capture_slot_fallback"] = (
+                self.counters.get("publication_full_capture_slot_fallback", 0) + 1
+            )
         if self._capacity_lock.acquire(blocking=False):
             try:
                 with self._store_cv:

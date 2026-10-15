@@ -340,12 +340,22 @@ For interval 16,384, base 14,336 to result 16,384 selects full capture;
 base 16,384 to result 18,432 remains sparse. This is a token cadence, not a
 universal bound on history depth for arbitrary prompt increments.
 
-Full captures keep the same cache identity and format. Existing ring size and
-admission limits still apply.
+Full captures keep the same cache identity and format. Before selecting one,
+the worker calculates its exact raw page bytes from the registered layout.
+
+If they exceed the capture slot, it retains and pins the offered committed
+base and captures only the delta. This check prevents repeated oversized
+full-capture submissions as the session grows.
+
+If the base cannot be retained,
+ordinary full-capture admission still applies; no unprotected tail is captured.
 
 The counter
 `publication_periodic_full_capture_selected` counts selections, including
-attempts later rejected by a busy or undersized ring.
+attempts later rejected by a busy ring.
+
+`publication_full_capture_slot_fallback` counts periodic selections diverted
+to base retention because the full page body exceeds the slot.
 
 Performance status: **research-only**. A CPU fixture used 25 extensions of
 2,048 tokens, eight appended attention layers, and four overwritten recurrent
