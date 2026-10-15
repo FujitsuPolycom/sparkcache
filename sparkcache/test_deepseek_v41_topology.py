@@ -11,12 +11,14 @@ grouping with the recorded topology inventory before hardware qualification.
 
 from __future__ import annotations
 
+import copy
 import tempfile
 import types
 import unittest
 from pathlib import Path
 
 import torch
+import pytest
 
 from sparkcache.request_cache_scope import UNSALTED_SCOPE
 from sparkcache.spark_context_cache_profiles import (
@@ -24,7 +26,9 @@ from sparkcache.spark_context_cache_profiles import (
     resolve_profile,
 )
 from sparkcache.test_spark_context_cache_config import _make_vllm_config
+from sparkcache.test_qwen38_installer_topology import UniformTypeKVCacheSpecs
 from sparkcache.test_spark_context_cache_connector import (
+    KVConnectorRole,
     _ReqPlan,
     _deepseek_tp4_hma_config,
     _make_connector,
@@ -120,7 +124,7 @@ class CircularBufferSpec(FullAttentionSpec):
         )
 
 
-def deepseek_v41_layout(*, small_pages: bool = False) -> types.SimpleNamespace:
+def deepseek_v41_layout(*, small_pages: bool = False, worker: bool = False) -> types.SimpleNamespace:
     """One manager group per V4.1 cache class, in vLLM field names.
 
     ``small_pages`` swaps the declared page sizes for tiny ones so
@@ -176,7 +180,45 @@ def deepseek_v41_layout(*, small_pages: bool = False) -> types.SimpleNamespace:
             layer_names=tuple(f"layers.{name}.ring" for name in ring_layers),
         ),
     )
+    if worker:
+        for group in groups:
+            spec = group.kv_cache_spec
+            group.kv_cache_spec = UniformTypeKVCacheSpecs(
+                block_size=spec.block_size, dcp_replicated=False,
+                page_size_bytes=spec.page_size_bytes * len(group.layer_names),
+                kv_cache_specs={name: copy.deepcopy(spec) for name in group.layer_names},
+            )
     return types.SimpleNamespace(kv_cache_groups=groups, num_blocks=512)
+
+
+@pytest.mark.parametrize("small_pages", [False, True])
+def test_qwen_hw_1_v41_scheduler_worker_topology_and_context_digest(tmp_path, small_pages):
+    from sparkcache import spark_context_cache_config as cfg
+
+    scheduler_layout = deepseek_v41_layout(small_pages=small_pages)
+    worker_layout = deepseek_v41_layout(small_pages=small_pages, worker=True)
+    assert cfg.kv_group_topology(scheduler_layout) == cfg.kv_group_topology(worker_layout)
+    assert cfg.kv_group_topology_digest(scheduler_layout) == cfg.kv_group_topology_digest(worker_layout)
+    assert _v41_identity(scheduler_layout) == _v41_identity(worker_layout)
+    scheduler = _v41_connector(tmp_path, scheduler_layout, role=KVConnectorRole.SCHEDULER)
+    worker = _v41_connector(tmp_path, worker_layout)
+    try:
+        assert scheduler._context_digest_salt == worker._context_digest_salt
+        assert scheduler._digest(list(range(2304)), 2048) == worker._digest(list(range(2304)), 2048)
+        assert scheduler._aligned_span(2304) == worker._aligned_span(2304)
+    finally:
+        scheduler.shutdown()
+        worker.shutdown()
+
+
+def test_qwen_hw_1_v41_wrapper_validates_all_non_persisted_member_states():
+    from sparkcache import spark_context_cache_config as cfg
+
+    layout = deepseek_v41_layout(worker=True)
+    members = list(layout.kv_cache_groups[-1].kv_cache_spec.kv_cache_specs.values())
+    members[-1].tokens_per_state = 2
+    with pytest.raises(RuntimeError, match="incompatible state geometry"):
+        cfg.kv_group_topology(layout)
 
 
 def span_tables(span: int) -> tuple[tuple[tuple[int, ...], ...], tuple[int, ...]]:
@@ -199,7 +241,7 @@ def span_tables(span: int) -> tuple[tuple[tuple[int, ...], ...], tuple[int, ...]
 
 
 def _v41_connector(
-    root: Path, layout: types.SimpleNamespace
+    root: Path, layout: types.SimpleNamespace, *, role=KVConnectorRole.WORKER,
 ) -> SparkContextCacheConnector:
     return _make_connector(
         root,
@@ -215,6 +257,7 @@ def _v41_connector(
         tp=1,
         dcp=1,
         kv_cache_config=layout,
+        role=role,
     )
 
 
@@ -566,11 +609,14 @@ class DeepSeekV41StoreRestoreTests(unittest.TestCase):
             self.assertEqual(selected[6], ())
             self.assertEqual(selected[7], ())
 
-    def test_store_and_restore_skip_non_persisted_groups(self) -> None:
+    def test_qwen_hw_1_store_and_restore_skip_non_persisted_groups_across_views(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             layout = deepseek_v41_layout(small_pages=True)
-            connector = _v41_connector(root, layout)
+            scheduler = _v41_connector(root, layout, role=KVConnectorRole.SCHEDULER)
+            connector = _v41_connector(root, deepseek_v41_layout(small_pages=True, worker=True))
+            self.addCleanup(scheduler.shutdown)
+            self.addCleanup(connector.shutdown)
             pools: dict[str, torch.Tensor] = {}
             generator = torch.Generator().manual_seed(20261015)
             for group in layout.kv_cache_groups:
@@ -583,8 +629,8 @@ class DeepSeekV41StoreRestoreTests(unittest.TestCase):
             connector.register_kv_caches(pools)
 
             tokens = tuple(range(self.RESULT_SPAN + REPLAY_RESERVE))
-            base_digest = connector._digest(list(tokens), self.BASE_SPAN)
-            result_digest = connector._digest(list(tokens), self.RESULT_SPAN)
+            base_digest = scheduler._digest(list(tokens), self.BASE_SPAN)
+            result_digest = scheduler._digest(list(tokens), self.RESULT_SPAN)
             base_tables, _ = span_tables(self.BASE_SPAN)
             result_tables, _ = span_tables(self.RESULT_SPAN)
 

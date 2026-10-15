@@ -2,7 +2,7 @@
 
 Both the scheduler and worker connector roles share one parsing path.
 ``parse_connector_config`` reads all SparkCache settings from a
-``VllmConfig``-like object â€” extra-config keys, environment variables,
+``VllmConfig``-like object — extra-config keys, environment variables,
 parallel degrees, model profile, and KV-cache group topology. It validates
 the verified-or-recompute deployment contract and returns an immutable
 :class:`ConnectorConfig` carrying every value the connector needs at
@@ -529,7 +529,7 @@ def kv_group_topology(
             # cache identities of deployments without them.
             group_identity["replay_tokens"] = int(reuse_window_tokens or 0)
             group_identity["tokens_per_state"] = _group_tokens_per_state(
-                spec, layers
+                group.kv_cache_spec, layers
             )
         topology.append(group_identity)
     return tuple(topology)
