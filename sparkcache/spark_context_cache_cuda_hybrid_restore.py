@@ -1037,6 +1037,9 @@ def execute_cuda_hybrid_placement(
     if len(encoded_pages) != plan.total_bytes:
         raise CudaHybridRestoreError("hybrid snapshot length differs from page plan")
     payload_bytes = plan.total_bytes - plan.header_bytes
+    # Slicing a bytes object allocates and copies the slice before the arena
+    # copy; a memoryview slice is a window onto the same bytes.
+    source = memoryview(encoded_pages).cast("B")
     try:
         transaction = adapter.begin_parked_page_restore(
             request_id,
@@ -1062,7 +1065,7 @@ def execute_cuda_hybrid_placement(
                 arena_buffer = cuda.arena_memoryview(arena, length=used)
                 source_start = plan.header_bytes + slab.payload_start
                 source_end = plan.header_bytes + slab.payload_end
-                arena_buffer[:] = encoded_pages[source_start:source_end]
+                arena_buffer[:] = source[source_start:source_end]
                 arena_buffer.release()
                 transaction.submit_page_slab(
                     arena_index=arena_index,
@@ -1086,6 +1089,8 @@ def execute_cuda_hybrid_placement(
         raise CudaHybridRestoreError(
             f"SparkCache CUDA page placement was rejected: {error}"
         ) from error
+    finally:
+        source.release()
     if (
         int(stats.slot_uploads) != 1
         or int(stats.destination_table_uploads) != 1

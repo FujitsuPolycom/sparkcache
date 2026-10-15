@@ -3414,7 +3414,10 @@ class ManifestStore:
                 end = int(descriptor["encoded_end"])
                 if start != expected_start or end != start + len(payload):
                     raise CacheFormatError("page delta object coverage differs")
-                result[start:end] = payload
+                # A memoryview source is copied in place; a bytes source
+                # would be re-allocated before the copy.
+                with memoryview(payload) as payload_view:
+                    result[start:end] = payload_view
                 digest.update(payload)
                 expected_start = end
         if expected_start != encoded_bytes or digest.hexdigest() != encoded_sha256:
@@ -3444,7 +3447,10 @@ class ManifestStore:
                 end = int(descriptor["encoded_end"])
                 if start != expected_start or end != start + len(payload):
                     raise CacheFormatError("page snapshot object coverage differs")
-                result[start:end] = payload
+                # A memoryview source is copied in place; a bytes source
+                # would be re-allocated before the copy.
+                with memoryview(payload) as payload_view:
+                    result[start:end] = payload_view
                 digest.update(payload)
                 expected_start = end
         if expected_start != encoded_bytes or digest.hexdigest() != encoded_sha256:
