@@ -822,6 +822,7 @@ def test_flat_delta_history_has_bounded_header_object_retention(tmp_path, monkey
         tmp_path, monkeypatch, publication_schema="page-tail-cow-v2",
         minimum_object_bytes=4096,
     )
+    fixture.store._page_delta_stage_limit_count = 0
     snapshot = fixture.result
     blocks = fixture.result_blocks
     digest = fixture.result_digest
@@ -2112,7 +2113,7 @@ def _mixed_flat_history(tmp_path, monkeypatch, *, stages=6, object_bytes=2048):
             "recurrent": bytes((200 + stage,)) * 1024,
         })
 
-    store = ManifestStore(tmp_path)
+    store = ManifestStore(tmp_path, page_delta_stage_limit_count=0)
     salt = "mixed-flat-history"
     final_blocks = 8 * (stages + 1)
     tokens = tuple(range(final_blocks * 256))

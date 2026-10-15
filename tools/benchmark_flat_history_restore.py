@@ -381,7 +381,7 @@ def _clear_header_cache() -> None:
 
 
 def run(geometry: Geometry, root: Path, *, interval_tokens: int,
-        cold_headers: bool) -> dict:
+        cold_headers: bool, stage_limit: int = 0) -> dict:
     """Publish the session chain and measure restores along it.
 
     Byte fields are scaled back to full-size equivalents (fixture bytes times
@@ -397,7 +397,7 @@ def run(geometry: Geometry, root: Path, *, interval_tokens: int,
     tokens = tuple(range(SESSION_BOUNDARIES[-1]))
     digests = [context_prefix_digest(tokens, salt, token_count=count)
                for count in SESSION_BOUNDARIES]
-    store = ManifestStore(root)
+    store = ManifestStore(root, page_delta_stage_limit_count=stage_limit)
     store.commit_page_snapshot(
         identity=identity,
         context_digest=digests[0],
@@ -491,6 +491,7 @@ def run(geometry: Geometry, root: Path, *, interval_tokens: int,
         "scale": scale,
         "recurrent_first": geometry.recurrent_first,
         "snapshot_interval_tokens": interval_tokens,
+        "stage_limit": stage_limit,
         "cold_headers": cold_headers,
         "final_tokens": final_tokens,
         "final_stage_count": len(lookup._manifest.get("delta_stages", ())),
@@ -512,6 +513,8 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--scale", type=int, default=64)
     parser.add_argument("--snapshot-interval-tokens", type=int, default=0)
+    parser.add_argument("--stage-limit", type=int, default=0,
+                        help="maximum delta stages; 0 disables compaction (connector default: 4)")
     parser.add_argument("--cold-headers", action="store_true")
     parser.add_argument("--recurrent-first", action="store_true")
     args = parser.parse_args(argv)
@@ -530,7 +533,8 @@ def main(argv=None) -> int:
         with tempfile.TemporaryDirectory(prefix="sparkcache-flat-") as directory:
             print(json.dumps(run(geometry, Path(directory),
                                  interval_tokens=args.snapshot_interval_tokens,
-                                 cold_headers=args.cold_headers), indent=1))
+                                 cold_headers=args.cold_headers,
+                                 stage_limit=args.stage_limit), indent=1))
     finally:
         (cache_manifest._PAGE_DELTA_OBJECT_BYTES,
          cache_manifest._MAX_PAGE_DELTA_OBJECT_BYTES,

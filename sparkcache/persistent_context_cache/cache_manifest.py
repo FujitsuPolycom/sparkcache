@@ -2201,6 +2201,12 @@ def _tracked_publication(kind: PublicationKind):
                 raise
             finally:
                 _ACTIVE_PUBLICATION.reset(token)
+            # A delta may delegate to a complete snapshot before doing any
+            # writes. Its nested publication owns the sole terminal receipt.
+            if (not attempt.has_activity
+                    and isinstance(result, CommitReceipt)
+                    and result.publication is not None):
+                return result
             receipt = attempt.finish("committed")
             if isinstance(result, (CommitReceipt, PrefixAliasReceipt)):
                 return replace(result, publication=receipt)
@@ -2219,9 +2225,13 @@ class ManifestStore:
         root: Path | str,
         *,
         publication_telemetry: PublicationTelemetry | None = None,
+        page_delta_stage_limit_count: int = 4,
     ) -> None:
+        if type(page_delta_stage_limit_count) is not int or page_delta_stage_limit_count < 0:
+            raise ValueError("page_delta_stage_limit_count must be a non-negative integer")
         self.root = Path(root)
         self.publication_telemetry = publication_telemetry or PublicationTelemetry()
+        self._page_delta_stage_limit_count = page_delta_stage_limit_count
 
     def publication_telemetry_snapshot(self) -> PublicationTelemetrySnapshot:
         """Return monotonic observational byte counters for this store."""
@@ -3802,6 +3812,31 @@ class ManifestStore:
                 "reused_pages_by_group",
                 None,
             )
+            if (
+                identity.publication_schema == "page-tail-cow-v2"
+                and self._page_delta_stage_limit_count
+                and len(base._manifest.get("delta_stages", ()))
+                >= self._page_delta_stage_limit_count
+            ):
+                from sparkcache.spark_context_cache_hybrid import (
+                    materialize_page_extension_capture, plan_page_snapshot,
+                )
+
+                # The captured tail belongs to the result boundary. Publishing
+                # the base here would silently discard this turn's state.
+                complete = (
+                    materialize_page_extension_capture(
+                        layout, base_snapshot, result_snapshot,
+                        base_block_counts=publication_base_block_counts,
+                        result_block_counts=result_block_counts,
+                        reused_pages_by_group=captured_reuse,
+                    ) if captured_reuse is not None else result_snapshot
+                )
+                plan_page_snapshot(layout, complete, result_block_counts)
+                return self.commit_page_snapshot(
+                    identity=identity, context_digest=result_context_digest,
+                    span_tokens=result_boundary_tokens, snapshot=complete,
+                )
             if captured_reuse is not None:
                 if identity.publication_schema != "page-tail-cow-v2":
                     raise ValueError(

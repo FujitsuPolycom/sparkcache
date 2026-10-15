@@ -409,6 +409,7 @@ class ConnectorConfig:
     streaming_snapshots_enabled: bool
     async_page_capture_enabled: bool
     page_snapshot_interval_tokens: int
+    page_delta_stage_limit_count: int
     cuda_restore_enabled: bool
     cuda_placement_library_path: str
     cuda_placement_library_sha256: str
@@ -659,6 +660,13 @@ def parse_connector_config(
             os.environ.get("SPARK_CONTEXT_CACHE_PAGE_SNAPSHOT_INTERVAL_TOKENS", "0"),
         ),
         "spark_cache_page_snapshot_interval_tokens",
+    )
+    page_delta_stage_limit_count = _nonnegative_config_int(
+        extra(
+            "spark_cache_page_delta_stage_limit_count",
+            os.environ.get("SPARK_CONTEXT_CACHE_PAGE_DELTA_STAGE_LIMIT_COUNT", "4"),
+        ),
+        "spark_cache_page_delta_stage_limit_count",
     )
     model_max = int(getattr(vllm_config.model_config, "max_model_len", 0) or 0)
     default_max_span = str(model_max if model_max > 0 else 1 << 30)
@@ -1002,6 +1010,7 @@ def parse_connector_config(
         streaming_snapshots_enabled=streaming_snapshots_enabled,
         async_page_capture_enabled=async_page_capture_enabled,
         page_snapshot_interval_tokens=page_snapshot_interval_tokens,
+        page_delta_stage_limit_count=page_delta_stage_limit_count,
         cuda_restore_enabled=cuda_restore_enabled,
         cuda_placement_library_path=cuda_placement_library_path,
         cuda_placement_library_sha256=cuda_placement_library_sha256,
