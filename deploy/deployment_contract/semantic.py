@@ -8,7 +8,7 @@ import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 EXPECTED_LONG = "SPARKCACHE_OK:9540"
 EXPECTED_SHORT = "SPARKCACHE_CANARY_OK"
@@ -109,21 +109,26 @@ def request_chat(
     model: str,
     prompt: str,
     max_tokens: int,
+    extra_body: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Send one deterministic OpenAI-compatible chat request."""
+    """Send one deterministic OpenAI-compatible chat request.
 
-    body = json.dumps(
-        {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_tokens,
-            "temperature": 0,
-        },
-        separators=(",", ":"),
-    ).encode("utf-8")
+    ``extra_body`` merges fixed model-specific request fields (for example a
+    reasoning toggle) into the JSON body after the deterministic defaults.
+    """
+
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": 0,
+    }
+    if extra_body:
+        body.update(extra_body)
+    payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
     request = urllib.request.Request(
         endpoint.rstrip("/") + "/v1/chat/completions",
-        data=body,
+        data=payload,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
