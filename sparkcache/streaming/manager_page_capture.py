@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
+from sparkcache.spark_context_cache_hybrid import NON_PERSISTED_REUSE_POLICIES
+
 
 PAGE_CAPTURE_CONTRACT_VERSION = 1
 MAX_CAPTURE_GROUPS = 64
@@ -310,6 +312,16 @@ def select_manager_page_extension_pages(
             raise ManagerPageCaptureError(
                 "base page count exceeds the result manager-page group"
             )
+        if policy in NON_PERSISTED_REUSE_POLICIES:
+            # Transient and replay groups publish no pages: their base and
+            # result selections stay empty at every boundary.
+            if base != 0 or group:
+                raise ManagerPageCaptureError(
+                    "extension capture must exclude non-persisted groups"
+                )
+            reused.append(0)
+            selected.append(())
+            continue
         if policy == "full":
             reusable = base if boundary % width == 0 else base - 1
         elif policy in {"sliding", "recurrent_align"}:

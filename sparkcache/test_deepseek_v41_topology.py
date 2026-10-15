@@ -16,13 +16,16 @@ import types
 import unittest
 from pathlib import Path
 
+import torch
 
+from sparkcache.request_cache_scope import UNSALTED_SCOPE
 from sparkcache.spark_context_cache_profiles import (
     ProfileError,
     resolve_profile,
 )
 from sparkcache.test_spark_context_cache_config import _make_vllm_config
 from sparkcache.test_spark_context_cache_connector import (
+    _ReqPlan,
     _deepseek_tp4_hma_config,
     _make_connector,
     SparkContextCacheConnector,
@@ -468,6 +471,281 @@ class DeepSeekV41ProfileTests(unittest.TestCase):
             fast_entry.to_wire()["publication_schema"], "page-tail-cow-v3-fast"
         )
         self.assertNotEqual(sha256_entry.storage_key, fast_entry.storage_key)
+
+
+
+class DeepSeekV41SpanTests(unittest.TestCase):
+    """Span selection leaves the replay reserve and stays state-aligned."""
+
+    def _span_connector(
+        self,
+    ) -> tuple[SparkContextCacheConnector, tempfile.TemporaryDirectory]:
+        lifetime = tempfile.TemporaryDirectory()
+        connector = _v41_connector(Path(lifetime.name), deepseek_v41_layout())
+        return connector, lifetime
+
+    def test_aligned_span_property_over_prompt_lengths(self) -> None:
+        connector, lifetime = self._span_connector()
+        try:
+            aligned = SparkContextCacheConnector._aligned_span
+            for prompt_len in range(1, 2_000_001):
+                span = aligned(connector, prompt_len)
+                self.assertLessEqual(span, max(0, prompt_len - REPLAY_RESERVE))
+                self.assertEqual(span % CHUNK_TOKENS, 0)
+                self.assertEqual(span % 2, 0)
+                if prompt_len < CHUNK_TOKENS + REPLAY_RESERVE:
+                    self.assertEqual(span, 0)
+                else:
+                    self.assertGreater(span, 0)
+        finally:
+            lifetime.cleanup()
+
+    def test_aligned_span_edges_around_the_reserve(self) -> None:
+        connector, lifetime = self._span_connector()
+        try:
+            aligned = SparkContextCacheConnector._aligned_span
+            self.assertEqual(aligned(connector, 1), 0)
+            self.assertEqual(aligned(connector, REPLAY_RESERVE), 0)
+            self.assertEqual(aligned(connector, REPLAY_RESERVE + 1), 0)
+            self.assertEqual(
+                aligned(connector, CHUNK_TOKENS + REPLAY_RESERVE), CHUNK_TOKENS
+            )
+            # A final chunk shorter than the replay reserve still recomputes
+            # whole chunks: the span stops at the last chunk boundary that
+            # leaves the full reserve.
+            self.assertEqual(
+                aligned(connector, CHUNK_TOKENS * 10 + 127), CHUNK_TOKENS * 9
+            )
+            self.assertEqual(
+                aligned(connector, CHUNK_TOKENS * 10 + 128), CHUNK_TOKENS * 10
+            )
+            self.assertEqual(
+                aligned(connector, CHUNK_TOKENS * 10 + 129), CHUNK_TOKENS * 10
+            )
+            self.assertEqual(aligned(connector, CHUNK_TOKENS * 11), CHUNK_TOKENS * 10)
+        finally:
+            lifetime.cleanup()
+
+
+class DeepSeekV41StoreRestoreTests(unittest.TestCase):
+    """Stores and restores publish only persisted groups' pages."""
+
+    BASE_SPAN = CHUNK_TOKENS * 4
+    RESULT_SPAN = CHUNK_TOKENS * 9
+
+    def test_selection_returns_empty_non_persisted_selections(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connector = _v41_connector(
+                Path(directory), deepseek_v41_layout(small_pages=True)
+            )
+            tables, _ = span_tables(self.RESULT_SPAN)
+            selected = connector._select_group_blocks_for_span(
+                tables, self.RESULT_SPAN
+            )
+            self.assertEqual(
+                connector._group_block_counts_for_span(self.RESULT_SPAN),
+                (9, 9, 9, 9, 1, 0, 0, 0),
+            )
+            self.assertEqual(selected[4], (tables[4][17],))
+            self.assertEqual(selected[5], ())
+            self.assertEqual(selected[6], ())
+            self.assertEqual(selected[7], ())
+
+    def test_store_and_restore_skip_non_persisted_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = deepseek_v41_layout(small_pages=True)
+            connector = _v41_connector(root, layout)
+            pools: dict[str, torch.Tensor] = {}
+            generator = torch.Generator().manual_seed(20261015)
+            for group in layout.kv_cache_groups:
+                width = int(group.kv_cache_spec.page_size_bytes)
+                for name in group.layer_names:
+                    pools[name] = torch.randint(
+                        0, 256, (512, 1, width), dtype=torch.uint8,
+                        generator=generator,
+                    )
+            connector.register_kv_caches(pools)
+
+            tokens = tuple(range(self.RESULT_SPAN + REPLAY_RESERVE))
+            base_digest = connector._digest(list(tokens), self.BASE_SPAN)
+            result_digest = connector._digest(list(tokens), self.RESULT_SPAN)
+            base_tables, _ = span_tables(self.BASE_SPAN)
+            result_tables, _ = span_tables(self.RESULT_SPAN)
+
+            connector._store_one(
+                _ReqPlan(
+                    "v41-base-store",
+                    base_digest,
+                    self.BASE_SPAN,
+                    base_tables[0],
+                    True,
+                    block_ids_by_group=base_tables,
+                    token_ids=tokens[: self.BASE_SPAN],
+                    request_scope=UNSALTED_SCOPE,
+                )
+            )
+            extension_plan = _ReqPlan(
+                "v41-extension-store",
+                result_digest,
+                self.RESULT_SPAN,
+                result_tables[0],
+                True,
+                block_ids_by_group=result_tables,
+                token_ids=tokens,
+                base_context_digest=base_digest,
+                base_span_tokens=self.BASE_SPAN,
+                request_scope=UNSALTED_SCOPE,
+            )
+            connector._store_one(extension_plan)
+
+            lookup = connector._store.lookup(connector._identity(0), result_digest)
+            self.assertTrue(lookup.is_hit, lookup.reason)
+            self.assertEqual(lookup.root_kind, "page_delta")
+            manifest = lookup._manifest
+            assert manifest is not None
+            self.assertEqual(
+                manifest["base_block_counts"], [4, 4, 4, 4, 1, 0, 0, 0]
+            )
+            self.assertEqual(
+                manifest["result_block_counts"], [9, 9, 9, 9, 1, 0, 0, 0]
+            )
+
+            destination = tuple(
+                tuple(range(100 + 20 * index, 100 + 20 * index + len(table)))
+                for index, table in enumerate(result_tables)
+            )
+            for index, table in enumerate(destination):
+                for block in table:
+                    for name in layout.kv_cache_groups[index].layer_names:
+                        pools[name][block].zero_()
+            self.assertTrue(
+                connector._load_one(
+                    _ReqPlan(
+                        "v41-restore",
+                        result_digest,
+                        self.RESULT_SPAN,
+                        destination[0],
+                        False,
+                        block_ids_by_group=destination,
+                        request_scope=UNSALTED_SCOPE,
+                    )
+                )
+            )
+            expected = connector._select_group_blocks_for_span(
+                result_tables, self.RESULT_SPAN
+            )
+            destination_selected = connector._select_group_blocks_for_span(
+                destination, self.RESULT_SPAN
+            )
+            for index, group in enumerate(layout.kv_cache_groups):
+                for source_block, destination_block in zip(
+                    expected[index], destination_selected[index], strict=True
+                ):
+                    for name in group.layer_names:
+                        self.assertTrue(
+                            torch.equal(
+                                pools[name][destination_block],
+                                pools[name][source_block],
+                            ),
+                            f"group {index} layer {name} restored bytes differ",
+                        )
+            # Non-persisted groups contributed zero pages: their destination
+            # blocks stay zeroed and their source blocks stay untouched.
+            for index in (5, 6, 7):
+                for block in destination[index]:
+                    for name in layout.kv_cache_groups[index].layer_names:
+                        self.assertTrue(
+                            bool((pools[name][block] == 0).all()),
+                            f"group {index} layer {name} was written on restore",
+                        )
+
+
+class DeepSeekV41LoadFailureTests(unittest.TestCase):
+    """A failed full-group load recomputes within the replay cap."""
+
+    SPAN = CHUNK_TOKENS * 9
+
+    def _stored_connector(
+        self, root: Path
+    ) -> tuple[SparkContextCacheConnector, dict[str, torch.Tensor],
+               tuple[tuple[int, ...], ...], str]:
+        layout = deepseek_v41_layout(small_pages=True)
+        connector = _v41_connector(root, layout)
+        pools: dict[str, torch.Tensor] = {}
+        generator = torch.Generator().manual_seed(20261016)
+        for group in layout.kv_cache_groups:
+            width = int(group.kv_cache_spec.page_size_bytes)
+            for name in group.layer_names:
+                pools[name] = torch.randint(
+                    0, 256, (512, 1, width), dtype=torch.uint8,
+                    generator=generator,
+                )
+        connector.register_kv_caches(pools)
+        tables, _ = span_tables(self.SPAN)
+        tokens = tuple(range(self.SPAN + REPLAY_RESERVE))
+        digest = connector._digest(list(tokens), self.SPAN)
+        connector._store_one(
+            _ReqPlan(
+                "v41-failure-store",
+                digest,
+                self.SPAN,
+                tables[0],
+                True,
+                block_ids_by_group=tables,
+                token_ids=tokens,
+                request_scope=UNSALTED_SCOPE,
+            )
+        )
+        return connector, pools, tables, digest
+
+    def test_invalid_full_block_failure_recomputes_within_replay_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connector, _pools, tables, digest = self._stored_connector(root)
+            lookup = connector._store.lookup(connector._identity(0), digest)
+            self.assertTrue(lookup.is_hit, lookup.reason)
+
+            chunks = sorted(root.rglob("*.spcc"))
+            self.assertTrue(chunks)
+            payload = bytearray(chunks[0].read_bytes())
+            payload[len(payload) // 2] ^= 0x40
+            chunks[0].write_bytes(payload)
+
+            self.assertFalse(
+                connector._load_one(
+                    _ReqPlan(
+                        "v41-failure-restore",
+                        digest,
+                        self.SPAN,
+                        tables[0],
+                        False,
+                        block_ids_by_group=tables,
+                        request_scope=UNSALTED_SCOPE,
+                    )
+                )
+            )
+            self.assertFalse(
+                connector._store.lookup(connector._identity(0), digest).is_hit,
+                "a failed load must invalidate its entry",
+            )
+            # The retry boundary is the connector's own offer for the same
+            # prompt. It must stay below the replay reserve, so the reset
+            # request recomputes the request-private suffix itself.
+            aligned = SparkContextCacheConnector._aligned_span
+            prompt_len = self.SPAN + REPLAY_RESERVE
+            for length in (prompt_len, self.SPAN, self.SPAN - 1):
+                self.assertLessEqual(
+                    aligned(connector, length), length - REPLAY_RESERVE
+                )
+            retry_span = aligned(connector, prompt_len)
+            retry_tables, _ = span_tables(retry_span)
+            retry_selection = connector._select_group_blocks_for_span(
+                retry_tables, retry_span
+            )
+            self.assertEqual(retry_selection[5], ())
+            self.assertEqual(retry_selection[6], ())
+            self.assertEqual(retry_selection[7], ())
 
 
 

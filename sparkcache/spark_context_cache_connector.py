@@ -1113,6 +1113,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._storage_mode = config.storage_mode
         self._publication_schema = config.publication_schema
         self._group_topology = config.group_topology
+        self._prefill_replay_tokens = config.prefill_replay_tokens
+        self._prefix_state_alignment = config.prefix_state_alignment
         self._recurrent_group_indexes = frozenset(
             group_index
             for group_index, topology in enumerate(self._group_topology)
@@ -1730,7 +1732,15 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             return False
 
     def _aligned_span(self, prompt_len: int) -> int:
-        alignment = self._block_size
+        # A persistent boundary must be a multiple of the engine block size,
+        # of every prefix-cacheable group's tokens_per_state (vLLM aligns
+        # prefix hits to the same quanta), and — under DCP sharding — of every
+        # sharded group's logical page width. It must also leave at least the
+        # largest per-group prefill replay reserve to recompute, so restored
+        # runs rebuild the request-private state a cache-off run rebuilds.
+        # With no replay group the reserve is zero and the boundary is the
+        # largest aligned span below the prompt end, as before.
+        alignment = math.lcm(self._block_size, self._prefix_state_alignment)
         if self._storage_mode == "block_pages_v1" and self._dcp_degree > 1:
             try:
                 sharded_page_quanta = tuple(
@@ -1743,10 +1753,14 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     "spark-context-cache: block-page DCP topology is incomplete"
                 ) from error
             alignment = math.lcm(
+                alignment,
                 self._chunk_tokens,
                 *(sharded_page_quanta or (self._block_size,)),
             )
-        span = (prompt_len - 1) // alignment * alignment
+        limit = prompt_len - max(1, self._prefill_replay_tokens)
+        if limit <= 0:
+            return 0
+        span = limit // alignment * alignment
         return span // self._chunk_tokens * self._chunk_tokens
 
     @staticmethod
@@ -1801,7 +1815,16 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             window = topology["reuse_window_tokens"]
             selected = boundary_required
             minimum_table_blocks = boundary_required
-            if policy == "sliding":
+            if policy in ("transient", "replay"):
+                # vLLM rebuilds in-flight ring and request-private state at
+                # every persistent boundary. These groups contribute no pages
+                # to a store or restore; the aligned span already leaves the
+                # replay reserve to recompute. Their request tables name only
+                # the ring's own in-flight block or the live window tail, so
+                # they need not cover the span.
+                selected = 0
+                minimum_table_blocks = 1
+            elif policy == "sliding":
                 if window is None:
                     raise HybridCodecError("sliding page group has no reuse window")
                 # The window includes the token about to be computed. Only its
@@ -1857,7 +1880,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 span_tokens + logical_tokens_per_block - 1
             ) // logical_tokens_per_block
             policy = topology["reuse_policy"]
-            if policy == "sliding":
+            if policy in ("transient", "replay"):
+                # Non-persisted groups contribute zero pages; see
+                # _select_group_blocks_for_span.
+                required = 0
+            elif policy == "sliding":
                 window = topology["reuse_window_tokens"]
                 if window is None:
                     raise HybridCodecError("sliding page group has no reuse window")
@@ -5364,6 +5391,11 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         submit_started = time.perf_counter_ns()
         with self._load_write_context():
             for page_group, block_ids in zip(layout.groups, groups):
+                if not block_ids:
+                    # Non-persisted groups published no pages. Leave their
+                    # freshly allocated manager blocks untouched: vLLM
+                    # rebuilds this state at the persistent boundary.
+                    continue
                 for layer in page_group.layers:
                     tensor = self._layer_tensors[layer.name]
                     source = torch.frombuffer(

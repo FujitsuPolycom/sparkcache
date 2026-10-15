@@ -33,6 +33,35 @@ _DELTA_HEADER_SCHEMA_V2 = "sparkcache-hybrid-page-delta/v2"
 PAYLOAD_INTEGRITY_MODES = ("sha256", "fast", "none")
 FLAT_PAGE_SCHEMAS = ("page-tail-cow-v2", "page-tail-cow-v3-fast", "page-tail-cow-v3-none")
 
+# Page groups the codec never persists. vLLM rebuilds their state at every
+# persistent boundary: transient groups hold in-flight compression rings,
+# replay groups hold request-private prefill state valid only for the last
+# replay-reserve rows. Snapshots must give them zero pages.
+NON_PERSISTED_REUSE_POLICIES = frozenset({"transient", "replay"})
+
+
+def check_group_block_policies(
+    layout: PageLayout,
+    counts: Sequence[int],
+) -> None:
+    """Enforce each group's persistence rule on parsed per-group page counts.
+
+    Persisted groups must contribute at least one page. Transient and replay
+    groups contribute exactly zero pages, so a store publishes none of their
+    bytes and a restore writes none back.
+    """
+
+    for group, count in zip(layout.groups, counts, strict=True):
+        if group.reuse_policy in NON_PERSISTED_REUSE_POLICIES:
+            if count != 0:
+                raise HybridCodecError(
+                    f"{group.reuse_policy} page group must contribute zero blocks"
+                )
+        elif count <= 0:
+            raise HybridCodecError(
+                "every page group must contribute at least one block"
+            )
+
 
 def payload_integrity_for_schema(publication_schema: str) -> str:
     """Return the payload integrity mode a publication schema implies."""
@@ -101,9 +130,15 @@ class PageGroup:
     def __post_init__(self) -> None:
         if self.block_size <= 0 or not self.layers:
             raise HybridCodecError("page group geometry is incomplete")
-        if self.reuse_policy not in {"full", "sliding", "recurrent_align"}:
+        if self.reuse_policy not in {
+            "full",
+            "sliding",
+            "recurrent_align",
+            "transient",
+            "replay",
+        }:
             raise HybridCodecError("page group reuse policy is unsupported")
-        if self.reuse_policy in {"full", "recurrent_align"} and (
+        if self.reuse_policy in {"full", "recurrent_align", "transient"} and (
             self.reuse_window_tokens is not None
         ):
             raise HybridCodecError(
@@ -113,6 +148,12 @@ class PageGroup:
             self.reuse_window_tokens is None or self.reuse_window_tokens <= 1
         ):
             raise HybridCodecError("sliding page group reuse window is invalid")
+        if self.reuse_policy == "replay" and (
+            self.reuse_window_tokens is None or self.reuse_window_tokens < 1
+        ):
+            # The window is the request-private replay reserve: the prompt
+            # suffix a persistent boundary must leave to recompute.
+            raise HybridCodecError("replay page group reuse window is invalid")
         names = [layer.name for layer in self.layers]
         if names != sorted(names) or len(names) != len(set(names)):
             raise HybridCodecError("page group layers must be sorted and unique")
@@ -236,8 +277,7 @@ def encode_page_snapshot_header(
     if len(block_counts) != len(layout.groups):
         raise HybridCodecError("block-count vector disagrees with page groups")
     counts = tuple(int(count) for count in block_counts)
-    if any(count <= 0 for count in counts):
-        raise HybridCodecError("every page group must contribute at least one block")
+    check_group_block_policies(layout, counts)
     header = json.dumps(
         {
             "schema": "sparkcache-hybrid-pages/v1",
@@ -280,8 +320,6 @@ def plan_page_snapshot(
         counts = tuple(int(count) for count in expected_block_counts)
     except (TypeError, ValueError) as error:
         raise HybridCodecError("hybrid page block counts are invalid") from error
-    if any(count <= 0 for count in counts):
-        raise HybridCodecError("hybrid page block counts must be positive")
     if (
         not isinstance(header, dict)
         or header.get("schema") != "sparkcache-hybrid-pages/v1"
@@ -290,6 +328,7 @@ def plan_page_snapshot(
         or len(counts) != len(layout.groups)
     ):
         raise HybridCodecError("hybrid page snapshot identity or block counts differ")
+    check_group_block_policies(layout, counts)
     if total_bytes is None:
         total = len(view)
     elif isinstance(total_bytes, bool) or not isinstance(total_bytes, int):
@@ -338,8 +377,7 @@ def encode_page_snapshot(
     if len(block_counts) != len(layout.groups):
         raise HybridCodecError("block-count vector disagrees with page groups")
     counts = tuple(int(count) for count in block_counts)
-    if any(count <= 0 for count in counts):
-        raise HybridCodecError("every page group must contribute at least one block")
+    check_group_block_policies(layout, counts)
     expected_names = {layer.name for group in layout.groups for layer in group.layers}
     if set(layer_payloads) != expected_names:
         raise HybridCodecError("page payload names disagree with layout")
@@ -465,11 +503,13 @@ def plan_page_delta(
         len(base_counts) != len(layout.groups)
         or len(result_counts) != len(layout.groups)
         or any(
-            base <= 0 or result < base
+            result < base
             for base, result in zip(base_counts, result_counts, strict=True)
         )
     ):
         raise HybridCodecError("page delta block counts do not extend the base")
+    check_group_block_policies(layout, base_counts)
+    check_group_block_policies(layout, result_counts)
     if (
         header["schema"] not in (_DELTA_HEADER_SCHEMA_V1, _DELTA_HEADER_SCHEMA_V2)
         or header["layout_sha256"] != layout.digest
@@ -636,9 +676,11 @@ def encode_page_delta(
     ):
         raise HybridCodecError("page delta block counts disagree with layout")
     if any(
-        base <= 0 or result < base for base, result in zip(base_counts, result_counts)
+        result < base for base, result in zip(base_counts, result_counts)
     ):
         raise HybridCodecError("page delta block counts do not extend the base")
+    check_group_block_policies(layout, base_counts)
+    check_group_block_policies(layout, result_counts)
     base_payloads = decode_page_snapshot(layout, base_snapshot, base_counts)
     result_payloads = decode_page_snapshot(layout, result_snapshot, result_counts)
 
@@ -733,14 +775,15 @@ def _encode_page_delta_from_capture(
     ):
         raise HybridCodecError("captured page extension geometry differs")
     if any(
-        base <= 0
-        or result < base
+        result < base
         or not 0 <= shared <= base
         for base, result, shared in zip(
             base_counts, result_counts, reused, strict=True
         )
     ):
         raise HybridCodecError("captured page extension counts are invalid")
+    check_group_block_policies(layout, base_counts)
+    check_group_block_policies(layout, result_counts)
 
     if isinstance(base_snapshot, _VerifiedPageSnapshot):
         # The carrier already proves its digest; never hash it again.
@@ -1260,14 +1303,15 @@ def materialize_page_extension_capture(
     ):
         raise HybridCodecError("captured page extension geometry differs")
     if any(
-        base <= 0
-        or result < base
+        result < base
         or not 0 <= shared <= base
         for base, result, shared in zip(
             base_counts, result_counts, reused, strict=True
         )
     ):
         raise HybridCodecError("captured page extension counts are invalid")
+    check_group_block_policies(layout, base_counts)
+    check_group_block_policies(layout, result_counts)
     total_bytes = getattr(captured_tail, "total_bytes", None)
     read_range = getattr(captured_tail, "read_range", None)
     if isinstance(captured_tail, (bytes, bytearray, memoryview)):

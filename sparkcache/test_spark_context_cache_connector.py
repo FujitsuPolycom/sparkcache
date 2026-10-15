@@ -607,6 +607,8 @@ class HybridPageRoundTripTests(unittest.TestCase):
         connector._chunk_tokens = 256
         connector._dcp_degree = 2
         connector._storage_mode = "block_pages_v1"
+        connector._prefix_state_alignment = 1
+        connector._prefill_replay_tokens = 0
         connector._group_topology = (
             {"dcp_shard_count": 2, "logical_tokens_per_block": 4608},
             {"dcp_shard_count": 1, "logical_tokens_per_block": 2304},
