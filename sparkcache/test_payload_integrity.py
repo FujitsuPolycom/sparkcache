@@ -123,7 +123,8 @@ def test_v3_round_trip_matches_sha256_bytes_without_payload_digests(tmp_path, mo
     # several times (object names, tails, delta digest, base and result).
     payload_bytes = sum(len(snapshot) for snapshot in history.snapshots)
     assert reference_hashed["sha256_bytes"] - hashed["sha256_bytes"] > 2 * payload_bytes
-    for index in range(1, TURNS):
+    # Every boundary, including the flat snapshot root at index 0.
+    for index in range(0, TURNS):
         assert history.python_restore(index) == history.snapshots[index]
         hashed = Counter()
         with counting(hashed):

@@ -1258,7 +1258,7 @@ def _plan_page_objects(
     objects = []
     expected_keys = {"sha256", "bytes", "encoded_start", "encoded_end"}
     for index, raw in enumerate(raw_objects):
-        if not isinstance(raw, dict) or set(raw) != expected_keys:
+        if not isinstance(raw, dict) or set(raw) - {"crc32"} != expected_keys:
             raise CudaHybridRestoreError(
                 f"flat page object {index} has an invalid descriptor"
             )
@@ -1266,9 +1266,12 @@ def _plan_page_objects(
         size = raw["bytes"]
         start = raw["encoded_start"]
         end = raw["encoded_end"]
+        crc32 = raw.get("crc32")
+        integrity = _descriptor_integrity(raw)
         if (
             not isinstance(digest, str)
             or _DIGEST.fullmatch(digest) is None
+            or (integrity == "fast" and (type(crc32) is not int or not 0 <= crc32 <= 0xFFFFFFFF))
             or isinstance(size, bool)
             or not isinstance(size, int)
             or size <= 0
@@ -1290,6 +1293,8 @@ def _plan_page_objects(
                 encoded_bytes=size,
                 encoded_start=start,
                 encoded_end=end,
+                integrity=integrity,
+                crc32=crc32,
             )
         )
         expected_start = end
