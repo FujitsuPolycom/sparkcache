@@ -1,0 +1,28 @@
+{
+  "glm53-csf": {
+    "attempts": {
+      "canonical-pin-manifest-sha256": "b53c22c6c39bda7ddc4d6df32698a29565b8d19f180e0e5b6b0a593d44ca2207",
+      "deepseek-manifest-v1-all-pinned-files": "0690677549ddf59031b8ac2e04efe0f65a773b2cc352aabdb6c0ae697f87b85f",
+      "hf-revision-v1": "f5f4dcccc845eb1afaedcc1f70dc906cd37ef174da534365685af927e66cee75",
+      "manifest-file-sha256": "658421711fb132c391ef4a09707a385bd85dbaf6e5cb8345cb5296cf7accea8d",
+      "sparkcache-checkpoint-identity/v1": "5b1fe919aa6aa9d7458b28e911182feafbd73366c51bb27efeb67bad10ab46d0"
+    },
+    "recorded_checkpoint_sha256": "6af0343976eefbfa0fb59d87befcf6d10f02fef90ba0e7881dd1201fe0ecd76e",
+    "repository": "local-inference-lab/GLM-5.3-Flash-NVFP4-MXFP8-CSF-QAD",
+    "revision": "dec48abd33efa73c3bb7c95b74eee10cad34f9be",
+    "source": "FujitsuPolycom/sparkring@68a995125bef:profiles/glm53-flash-nvfp4-sparkcache-tp2/config.json"
+  },
+  "qwen38-step4000": {
+    "attempts": {
+      "canonical-pin-manifest-sha256": "b2609b877bb97602a38d8c080e81b717ee66397acc22d20b2cdaa70a5385d5f4",
+      "deepseek-manifest-v1-all-pinned-files": "a11b9a5e9c6317b943a6ea1abf449f01ce37abe69a4f20cb296c927b0dc9d8e9",
+      "hf-revision-v1": "d2f0ffa47d71a97cc3c57c2f27fbc0df40bdfd2c024595777df49f5bc6ff8e3b",
+      "manifest-file-sha256": "7010732c06ac7d9a40c954ec9f19ebbd2ff70106f2702effe7f8d86ba5939325",
+      "sparkcache-checkpoint-identity/v1": "0eea73645ef60556fa0b6e91f70d34a584e7139091588e280408408739f79453"
+    },
+    "recorded_checkpoint_sha256": "036c2f7994466d32514130f0417ccd117705ca01e2038c1ce5745f84813829ba",
+    "repository": "local-inference-lab/Qwen3.8-Flash-Next-NVFP4",
+    "revision": "629bc3218833a38b475b719f34aa571666f4a03e",
+    "source": "FujitsuPolycom/sparkring@68a995125bef:profiles/qwen38-flash-next-qad-tp4/sparkcache.json"
+  }
+}

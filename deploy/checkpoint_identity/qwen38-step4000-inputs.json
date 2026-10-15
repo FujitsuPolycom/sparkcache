@@ -1,0 +1,23 @@
+{
+  "artifacts": {
+    "manifest_sha256": "7010732c06ac7d9a40c954ec9f19ebbd2ff70106f2702effe7f8d86ba5939325"
+  },
+  "draft": {
+    "config": {
+      "attention_backend": "B12X",
+      "method": "mtp",
+      "moe_backend": "b12x",
+      "num_speculative_tokens": 3
+    },
+    "mode": "embedded"
+  },
+  "model_config": {
+    "sha256": "2d655dfa625c3c018f9685031367bc83f8532d3faf3333d7c838b2bdc13b8a7e"
+  },
+  "quantization": {
+    "encoding": "safetensors",
+    "method": "modelopt_mixed"
+  },
+  "repository": "local-inference-lab/Qwen3.8-Flash-Next-NVFP4",
+  "revision": "629bc3218833a38b475b719f34aa571666f4a03e"
+}
