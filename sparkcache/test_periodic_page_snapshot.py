@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -136,3 +137,70 @@ def test_periodic_full_capture_publishes_independent_existing_format(retained_ba
         result_block_counts=(2,), result_boundary_tokens=512)
     assert restored == encode_page_snapshot(layout, (2,), {"page": b"a" * 128})
     assert connector.counters["publication_periodic_full_capture_selected"] == 1
+
+
+@pytest.mark.parametrize("job_leased", [False, True])
+def test_d23_oversized_periodic_snapshot_keeps_publishing(retained_base, job_leased):
+    """A bounded slot accepts each tail after the full snapshot stops fitting."""
+    from sparkcache.streaming.manager_page_capture import (
+        ManagerPageSource, plan_manager_page_capture,
+    )
+
+    connector, _, original, identity, layout, *_ = retained_base
+    connector._page_snapshot_interval_tokens = 256
+    connector._async_page_capture_settings = SimpleNamespace(slot_bytes=64)
+    connector._group_topology = ({"logical_tokens_per_block": 256,
+                                  "reuse_policy": "full"},)
+    connector._select_group_blocks_for_span = lambda groups, *args, **kw: groups
+
+    class BoundedRing(FakeSparseRing):
+        submitted = []
+
+        def submit(self, **kwargs):
+            groups = kwargs["physical_pages_by_group"]
+            plan_manager_page_capture(
+                (ManagerPageSource(4096, 16, 64, 64, 0, 0),), groups,
+                slot_bytes=64,
+            )
+            self.submitted.append(groups)
+            self.payload = memoryview(bytes([groups[0][0] + 97]) * 64)
+            return super().submit(**kwargs)
+
+    ring = BoundedRing(b"")
+    ring.ready.set()
+    runtime = ManagerPageCaptureRuntime(
+        connector, ring=ring, progress_poll_seconds=0.001,
+        progress_thread_initializer=lambda: None,
+        job_stream_factory=lambda ready: 123,
+    )
+    connector._async_page_capture_runtime = runtime
+    tokens = tuple(range(1280))
+    base = original.base_context_digest
+    for pages in range(2, 6):
+        plan = replace(original, request_id=f"turn-{pages}", scope_binding="",
+                       digest=connector._digest(tokens, pages * 256),
+                       span_tokens=pages * 256, token_ids=tokens[:pages * 256],
+                       block_ids=tuple(range(pages)),
+                       block_ids_by_group=(tuple(range(pages)),),
+                       base_context_digest=base, base_span_tokens=(pages - 1) * 256,
+                       capture_job_id=(f"{'a' * 32}:{pages}" if job_leased else ""))
+        if job_leased:
+            connector._store_inflight = 1
+            runtime.submit(plan, producer_stream=123, producer_ready=object())
+        else:
+            connector.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[plan]))
+            connector.wait_for_save()
+        assert connector.wait_for_pending_stores(timeout=5)
+        lookup = connector._store.lookup(identity, plan.digest, verify_chunks=False)
+        assert lookup.is_hit, lookup.reason
+        assert connector._store.restore_page_snapshot(
+            lookup, layout=layout, result_block_counts=(pages,),
+            result_boundary_tokens=pages * 256,
+        ) == encode_page_snapshot(layout, (pages,), {
+            "page": b"".join(bytes([97 + index]) * 64 for index in range(pages)),
+        })
+        assert not connector._publication_base_pins
+        base = plan.digest
+    assert ring.submitted == [((index,),) for index in range(1, 5)]
+    assert connector.counters["publication_full_capture_slot_fallback"] == 4
+    assert connector.counters.get("publication_periodic_full_capture_selected", 0) == 0
