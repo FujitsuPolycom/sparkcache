@@ -400,7 +400,7 @@ class _Adapter:
         return self.transaction
 
 
-def _identity() -> CacheIdentity:
+def _identity(publication_schema: str = "page-tail-cow-v2") -> CacheIdentity:
     return CacheIdentity(
         target_checkpoint="1" * 64,
         draft_checkpoint="2" * 64,
@@ -409,7 +409,7 @@ def _identity() -> CacheIdentity:
         tp_degree=2,
         dcp_degree=1,
         record_schema=("target_ckv", "logical_positions"),
-        publication_schema="page-tail-cow-v2",
+        publication_schema=publication_schema,
     )
 
 
@@ -417,7 +417,7 @@ def _cuda_restore(geometry: Geometry, store: ManifestStore, root: Path,
                   digest: str, tokens: int, *, io_workers: int = 8) -> dict:
     layout = geometry.layout()
     counts = geometry.counts(tokens)
-    lookup = store.lookup(_identity(), digest, verify_chunks=False)
+    lookup = store.lookup(store_identity(store), digest, verify_chunks=False)
     measured = Counter()
     adapter = _Adapter(geometry.object_bytes)
     original_view = cuda_hybrid.cuda.arena_memoryview
@@ -468,6 +468,20 @@ def _cuda_restore(geometry: Geometry, store: ManifestStore, root: Path,
     }
 
 
+_SCHEMAS = {
+    "sha256": "page-tail-cow-v2",
+    "fast": "page-tail-cow-v3-fast",
+    "none": "page-tail-cow-v3-none",
+}
+_STORE_IDENTITIES: dict[int, CacheIdentity] = {}
+
+
+def store_identity(store: ManifestStore) -> CacheIdentity:
+    """Identity the run registered for this store (sha256 schema when none)."""
+
+    return _STORE_IDENTITIES.get(id(store), _identity())
+
+
 def _clear_header_cache() -> None:
     clear = getattr(cache_manifest, "_clear_authenticated_delta_headers", None)
     if clear is not None:
@@ -488,7 +502,7 @@ def _hot_snapshot_stats() -> dict:
 def run(geometry: Geometry, root: Path, *, interval_tokens: int,
         cold_headers: bool, stage_limit: int = 0,
         cold_publication_headers: bool = False, hot_snapshot_bytes: int = 0,
-        io_workers: int = 8) -> dict:
+        io_workers: int = 8, payload_integrity: str = "sha256") -> dict:
     """Publish the session chain and measure restores along it.
 
     Byte fields are scaled back to full-size equivalents (fixture bytes times
@@ -502,7 +516,7 @@ def run(geometry: Geometry, root: Path, *, interval_tokens: int,
     """
 
     layout = geometry.layout()
-    identity = _identity()
+    identity = _identity(_SCHEMAS[payload_integrity])
     salt = "flat-history-benchmark"
     tokens = tuple(range(SESSION_BOUNDARIES[-1]))
     digests = [context_prefix_digest(tokens, salt, token_count=count)
@@ -512,6 +526,7 @@ def run(geometry: Geometry, root: Path, *, interval_tokens: int,
         store_options["hot_page_snapshot_bytes"] = hot_snapshot_bytes
     _clear_hot_snapshots()
     store = ManifestStore(root, **store_options)
+    _STORE_IDENTITIES[id(store)] = identity
     store.commit_page_snapshot(
         identity=identity,
         context_digest=digests[0],
@@ -629,6 +644,7 @@ def run(geometry: Geometry, root: Path, *, interval_tokens: int,
         "hot_snapshot_bytes": hot_snapshot_bytes * scale,
         "io_workers": io_workers,
         "hot_snapshot_stats": _hot_snapshot_stats(),
+        "payload_integrity": payload_integrity,
         "final_tokens": final_tokens,
         "final_stage_count": len(lookup._manifest.get("delta_stages", ())),
         "final_snapshot_bytes": len(expected) * scale,
@@ -662,6 +678,8 @@ def main(argv=None) -> int:
                              " divided by --scale like every other size (0 disables)")
     parser.add_argument("--io-workers", type=int, default=8,
                         help="reader thread count passed to the CUDA restore (connector default: 8)")
+    parser.add_argument("--payload-integrity", choices=sorted(_SCHEMAS), default="sha256",
+                        help="publication schema: sha256 (page-tail-cow-v2), fast or none (page-tail-cow-v3)")
     parser.add_argument("--cold-headers", action="store_true")
     parser.add_argument("--cold-publication-headers", action="store_true",
                         help="clear authenticated headers before each publication")
@@ -686,7 +704,8 @@ def main(argv=None) -> int:
                                  stage_limit=args.stage_limit,
                                  cold_publication_headers=args.cold_publication_headers,
                                  hot_snapshot_bytes=args.hot_snapshot_bytes // geometry.scale,
-                                 io_workers=args.io_workers), indent=1))
+                                 io_workers=args.io_workers,
+                                 payload_integrity=args.payload_integrity), indent=1))
     finally:
         (cache_manifest._PAGE_DELTA_OBJECT_BYTES,
          cache_manifest._MAX_PAGE_DELTA_OBJECT_BYTES,

@@ -411,6 +411,7 @@ class ConnectorConfig:
     page_snapshot_interval_tokens: int
     page_delta_stage_limit_count: int
     hot_page_snapshot_bytes: int
+    payload_integrity: str
     cuda_restore_enabled: bool
     cuda_placement_library_path: str
     cuda_placement_library_sha256: str
@@ -564,6 +565,27 @@ def parse_connector_config(
                 "spark-context-cache: tail-cow-v2 requires block-page storage"
             )
         publication_schema = "page-tail-cow-v2"
+    # Payload integrity (research-only). ``sha256`` keeps the content-addressed
+    # format. ``fast`` and ``none`` select the page-tail-cow-v3 schemas, whose
+    # cache identity differs so readers of either format miss the other cleanly.
+    payload_integrity = str(
+        extra(
+            "spark_cache_payload_integrity",
+            os.environ.get("SPARK_CONTEXT_CACHE_PAYLOAD_INTEGRITY", "sha256"),
+        )
+    )
+    if payload_integrity not in ("sha256", "fast", "none"):
+        raise RuntimeError(
+            "spark-context-cache: spark_cache_payload_integrity must be"
+            " 'sha256', 'fast', or 'none'"
+        )
+    if payload_integrity != "sha256":
+        if publication_schema != "page-tail-cow-v2":
+            raise RuntimeError(
+                "spark-context-cache: spark_cache_payload_integrity fast or none"
+                " requires spark_cache_publication_schema tail-cow-v2"
+            )
+        publication_schema = f"page-tail-cow-v3-{payload_integrity}"
     group_topology = kv_group_topology(kv_cache_config, dcp_degree=dcp_degree)
     if storage_mode == "block_pages_v1" and not group_topology:
         raise RuntimeError(
@@ -1024,6 +1046,7 @@ def parse_connector_config(
         page_snapshot_interval_tokens=page_snapshot_interval_tokens,
         page_delta_stage_limit_count=page_delta_stage_limit_count,
         hot_page_snapshot_bytes=hot_page_snapshot_bytes,
+        payload_integrity=payload_integrity,
         cuda_restore_enabled=cuda_restore_enabled,
         cuda_placement_library_path=cuda_placement_library_path,
         cuda_placement_library_sha256=cuda_placement_library_sha256,

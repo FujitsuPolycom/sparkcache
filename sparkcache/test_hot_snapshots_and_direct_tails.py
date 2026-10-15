@@ -122,7 +122,7 @@ class _History:
         cache_manifest._clear_authenticated_delta_headers()
         self.root = root
         self.layout = self.geometry.layout()
-        self.identity = _identity()
+        self.identity = self._make_identity()
         self.store = ManifestStore(
             root,
             page_delta_stage_limit_count=stage_limit,
@@ -143,6 +143,9 @@ class _History:
             span_tokens=TURN_TOKENS,
             snapshot=self.snapshots[0],
         )
+
+    def _make_identity(self):
+        return _identity()
 
     def boundary(self, index: int) -> int:
         return (index + 1) * TURN_TOKENS

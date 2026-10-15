@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import zlib
 import os
 import re
 import stat
@@ -286,6 +287,8 @@ class CacheIdentity:
             "tail-cow-v1",
             "page-tail-cow-v1",
             "page-tail-cow-v2",
+            "page-tail-cow-v3-fast",
+            "page-tail-cow-v3-none",
         ):
             raise ValueError("publication_schema is unsupported")
 
@@ -597,6 +600,170 @@ def _canonical_json(value: Any) -> bytes:
 
 def _sha256(value: bytes | bytearray | memoryview) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+# Flat page-history publication schemas. ``page-tail-cow-v2`` content-addresses
+# every payload object by SHA-256; the ``v3`` schemas hash only identities,
+# manifests and stage headers, carry a CRC32 per payload object and per layer
+# tail (``fast``) or no payload check (``none``), and name objects by a digest
+# of the boundary identity, kind, index and a nonce instead of their content.
+_FLAT_PAGE_SCHEMAS = ("page-tail-cow-v2", "page-tail-cow-v3-fast", "page-tail-cow-v3-none")
+_PAGE_TAIL_SCHEMAS = ("page-tail-cow-v1", *_FLAT_PAGE_SCHEMAS)
+
+
+def _payload_integrity(publication_schema: str) -> str:
+    if publication_schema == "page-tail-cow-v3-fast":
+        return "fast"
+    if publication_schema == "page-tail-cow-v3-none":
+        return "none"
+    return "sha256"
+
+
+def _boundary_token(context_digest: str, committed_tokens: int) -> str:
+    return hashlib.sha256(
+        b"sparkcache-boundary-token/v1\x00"
+        + f"{context_digest}:{int(committed_tokens)}".encode("ascii")
+    ).hexdigest()
+
+
+def _derived_object_name(
+    identity: "CacheIdentity", context_digest: str, kind: str, index: int, nonce: str
+) -> str:
+    """Object name for payloads that are not content-addressed (v3 schemas)."""
+
+    return hashlib.sha256(
+        b"sparkcache-object-name/v1\x00"
+        + f"{identity.storage_key}:{context_digest}:{kind}:{index}:{nonce}".encode("ascii")
+    ).hexdigest()
+
+
+def _object_descriptor(
+    integrity: str, name: str, encoded: bytes, start: int, end: int
+) -> dict[str, Any]:
+    descriptor: dict[str, Any] = {
+        "sha256": name,
+        "bytes": len(encoded),
+        "encoded_start": start,
+        "encoded_end": end,
+    }
+    if integrity == "fast":
+        descriptor["crc32"] = zlib.crc32(encoded) & 0xFFFFFFFF
+    elif integrity == "none":
+        descriptor["crc32"] = None
+    return descriptor
+
+
+def _descriptor_integrity(descriptor: Mapping[str, Any]) -> str:
+    """Integrity mode a payload object descriptor declares."""
+
+    if "crc32" not in descriptor:
+        return "sha256"
+    return "none" if descriptor["crc32"] is None else "fast"
+
+
+def _payload_matches_descriptor(descriptor: Mapping[str, Any], encoded) -> bool:
+    """Length plus the descriptor's own payload check (SHA-256, CRC32, or none)."""
+
+    if len(encoded) != int(descriptor["bytes"]):
+        return False
+    mode = _descriptor_integrity(descriptor)
+    if mode == "sha256":
+        return _sha256(encoded) == descriptor["sha256"]
+    if mode == "fast":
+        return (zlib.crc32(encoded) & 0xFFFFFFFF) == descriptor["crc32"]
+    return True
+
+
+def _validate_object_descriptor_keys(descriptor: Mapping[str, Any], label: str) -> None:
+    keys = {"sha256", "bytes", "encoded_start", "encoded_end"}
+    if "crc32" in descriptor:
+        keys.add("crc32")
+        crc = descriptor["crc32"]
+        if crc is not None and (type(crc) is not int or not 0 <= crc <= 0xFFFFFFFF):
+            raise CacheFormatError(f"{label} crc32 is invalid")
+    _strict_keys(descriptor, keys, label)
+
+
+# Flat page-history publication schemas. ``page-tail-cow-v2`` content-addresses
+# every payload object by SHA-256; the ``v3`` schemas hash only identities,
+# manifests and stage headers, carry a CRC32 per payload object and per layer
+# tail (``fast``) or no payload check (``none``), and name objects by a digest
+# of the boundary identity, kind, index and a nonce instead of their content.
+_FLAT_PAGE_SCHEMAS = ("page-tail-cow-v2", "page-tail-cow-v3-fast", "page-tail-cow-v3-none")
+_PAGE_TAIL_SCHEMAS = ("page-tail-cow-v1", *_FLAT_PAGE_SCHEMAS)
+
+
+def _payload_integrity(publication_schema: str) -> str:
+    if publication_schema == "page-tail-cow-v3-fast":
+        return "fast"
+    if publication_schema == "page-tail-cow-v3-none":
+        return "none"
+    return "sha256"
+
+
+def _boundary_token(context_digest: str, committed_tokens: int) -> str:
+    return hashlib.sha256(
+        b"sparkcache-boundary-token/v1\x00"
+        + f"{context_digest}:{int(committed_tokens)}".encode("ascii")
+    ).hexdigest()
+
+
+def _derived_object_name(
+    identity: "CacheIdentity", context_digest: str, kind: str, index: int, nonce: str
+) -> str:
+    """Object name for payloads that are not content-addressed (v3 schemas)."""
+
+    return hashlib.sha256(
+        b"sparkcache-object-name/v1\x00"
+        + f"{identity.storage_key}:{context_digest}:{kind}:{index}:{nonce}".encode("ascii")
+    ).hexdigest()
+
+
+def _object_descriptor(
+    integrity: str, name: str, encoded: bytes, start: int, end: int
+) -> dict[str, Any]:
+    descriptor: dict[str, Any] = {
+        "sha256": name,
+        "bytes": len(encoded),
+        "encoded_start": start,
+        "encoded_end": end,
+    }
+    if integrity == "fast":
+        descriptor["crc32"] = zlib.crc32(encoded) & 0xFFFFFFFF
+    elif integrity == "none":
+        descriptor["crc32"] = None
+    return descriptor
+
+
+def _descriptor_integrity(descriptor: Mapping[str, Any]) -> str:
+    """Integrity mode a payload object descriptor declares."""
+
+    if "crc32" not in descriptor:
+        return "sha256"
+    return "none" if descriptor["crc32"] is None else "fast"
+
+
+def _payload_matches_descriptor(descriptor: Mapping[str, Any], encoded) -> bool:
+    """Length plus the descriptor's own payload check (SHA-256, CRC32, or none)."""
+
+    if len(encoded) != int(descriptor["bytes"]):
+        return False
+    mode = _descriptor_integrity(descriptor)
+    if mode == "sha256":
+        return _sha256(encoded) == descriptor["sha256"]
+    if mode == "fast":
+        return (zlib.crc32(encoded) & 0xFFFFFFFF) == descriptor["crc32"]
+    return True
+
+
+def _validate_object_descriptor_keys(descriptor: Mapping[str, Any], label: str) -> None:
+    keys = {"sha256", "bytes", "encoded_start", "encoded_end"}
+    if "crc32" in descriptor:
+        keys.add("crc32")
+        crc = descriptor["crc32"]
+        if crc is not None and (type(crc) is not int or not 0 <= crc <= 0xFFFFFFFF):
+            raise CacheFormatError(f"{label} crc32 is invalid")
+    _strict_keys(descriptor, keys, label)
 
 
 def _allocated_bytes(metadata: os.stat_result) -> int:
@@ -1318,7 +1485,7 @@ def _validate_page_delta_root(
         if (
             _sha256(_canonical_json(authenticated)) != metadata_digest
             or manifest["format_abi"] != FORMAT_ABI
-            or identity.publication_schema != "page-tail-cow-v2"
+            or identity.publication_schema not in _FLAT_PAGE_SCHEMAS
             or manifest["identity"] != identity.to_wire()
             or manifest["context_digest"] != context_digest
             or manifest["logical_chunk_tokens"] != identity.chunk_tokens
@@ -1353,25 +1520,28 @@ def _validate_page_delta_root(
         for stage in stages:
             if not isinstance(stage, dict):
                 raise CacheFormatError("flat page delta stage is not an object")
-            _strict_keys(
-                stage,
-                {
-                    "context_digest",
-                    "committed_tokens",
-                    "base_context_digest",
-                    "base_committed_tokens",
-                    "base_block_counts",
-                    "result_block_counts",
-                    "delta_encoded_bytes",
-                    "delta_object_bytes",
-                    "delta_objects",
-                    "delta_sha256",
-                },
-                "flat page delta stage",
-            )
+            stage_keys = {
+                "context_digest",
+                "committed_tokens",
+                "base_context_digest",
+                "base_committed_tokens",
+                "base_block_counts",
+                "result_block_counts",
+                "delta_encoded_bytes",
+                "delta_object_bytes",
+                "delta_objects",
+                "delta_sha256",
+            }
+            # The v3 schemas bind each stage header by digest here because
+            # their first object is not content-addressed.
+            if identity.publication_schema != "page-tail-cow-v2":
+                stage_keys.add("header_sha256")
+            _strict_keys(stage, stage_keys, "flat page delta stage")
             try:
                 _validate_digest(stage["context_digest"], "stage context digest")
                 _validate_digest(stage["delta_sha256"], "stage delta sha256")
+                if "header_sha256" in stage:
+                    _validate_digest(stage["header_sha256"], "stage header sha256")
             except ValueError as error:
                 raise CacheFormatError(str(error)) from error
             objects = stage["delta_objects"]
@@ -1396,10 +1566,8 @@ def _validate_page_delta_root(
                     raise CacheFormatError(
                         "flat page delta object descriptor is not an object"
                     )
-                _strict_keys(
-                    descriptor,
-                    {"sha256", "bytes", "encoded_start", "encoded_end"},
-                    "flat page delta object descriptor",
+                _validate_object_descriptor_keys(
+                    descriptor, "flat page delta object descriptor"
                 )
                 try:
                     _validate_digest(
@@ -1613,8 +1781,7 @@ def _validate_page_snapshot_root(
         or type(manifest["format_abi"]) is not int
         or manifest["format_abi"] != FORMAT_ABI
         or manifest["storage_mode"] != "block_pages_v1"
-        or identity.publication_schema
-        not in ("", "page-tail-cow-v1", "page-tail-cow-v2")
+        or identity.publication_schema not in ("", *_PAGE_TAIL_SCHEMAS)
         or identity.required_records
         != frozenset((StateRecord.TARGET_CKV, StateRecord.LOGICAL_POSITIONS))
         or manifest["identity"] != identity.to_wire()
@@ -1648,11 +1815,7 @@ def _validate_page_snapshot_root(
     for index, descriptor in enumerate(objects):
         if not isinstance(descriptor, dict):
             raise CacheFormatError("page snapshot object descriptor is not an object")
-        _strict_keys(
-            descriptor,
-            {"sha256", "bytes", "encoded_start", "encoded_end"},
-            "page snapshot object descriptor",
-        )
+        _validate_object_descriptor_keys(descriptor, "page snapshot object descriptor")
         try:
             _validate_digest(descriptor["sha256"], "page snapshot object sha256")
         except ValueError as error:
@@ -1749,10 +1912,7 @@ def _read_page_delta_object_batch(
 
     def read_one(descriptor: Mapping[str, Any]) -> bytes:
         encoded = (object_root / f"{descriptor['sha256']}.spcc").read_bytes()
-        if (
-            len(encoded) != descriptor["bytes"]
-            or _sha256(encoded) != descriptor["sha256"]
-        ):
+        if not _payload_matches_descriptor(descriptor, encoded):
             raise CacheFormatError("page delta object checksum mismatch")
         return encoded
 
@@ -1772,10 +1932,7 @@ def _read_page_snapshot_object_batch(
 
     def read_one(descriptor: Mapping[str, Any]) -> bytes:
         encoded = (object_root / f"{descriptor['sha256']}.spcc").read_bytes()
-        if (
-            len(encoded) != descriptor["bytes"]
-            or _sha256(encoded) != descriptor["sha256"]
-        ):
+        if not _payload_matches_descriptor(descriptor, encoded):
             raise CacheFormatError("page snapshot object checksum mismatch")
         return encoded
 
@@ -2137,19 +2294,60 @@ def _clear_authenticated_delta_headers() -> None:
         _authenticated_delta_header_bytes = 0
 
 
+_MAX_DELTA_HEADER_PREFIX_BYTES = 16 * 1024 * 1024
+
+
+def _read_header_prefix(path: Path, header_sha256: str) -> bytes:
+    """Read a stage header prefix and check it against its manifest-bound digest."""
+
+    from sparkcache.spark_context_cache_hybrid import page_delta_header_prefix
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise CacheFormatError(f"page object is unavailable: {error}") from error
+    try:
+        prefix = os.read(descriptor, 10)
+        if len(prefix) < 10:
+            raise CacheFormatError("page delta header prefix is truncated")
+        (header_length,) = struct.unpack_from("<I", prefix, 6)
+        if header_length <= 0 or header_length > _MAX_DELTA_HEADER_PREFIX_BYTES:
+            raise CacheFormatError("page delta header length is invalid")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        raw = os.read(descriptor, 10 + header_length)
+    finally:
+        os.close(descriptor)
+    header = page_delta_header_prefix(raw)
+    if _sha256(header) != header_sha256:
+        raise CacheFormatError("page delta header digest mismatch")
+    return header
+
+
 def _authenticated_page_delta_header(
     object_root: Path,
     descriptor: Mapping[str, Any],
+    header_sha256: str | None = None,
 ) -> bytes:
-    """Return a delta's header from the cache or its authenticated first object."""
+    """Return a delta's header from the cache or its authenticated first object.
+
+    With ``header_sha256`` (the v3 schemas) only the header prefix is read and
+    checked against that manifest-bound digest; otherwise the whole first
+    object is read and must hash to its content address.
+    """
 
     from sparkcache.spark_context_cache_hybrid import page_delta_header_prefix
 
     cached = _authenticated_delta_header(descriptor["sha256"], descriptor["bytes"])
     if cached is not None:
         return cached
-    (header_object,) = _read_page_delta_object_batch(object_root, (descriptor,))
-    header = page_delta_header_prefix(header_object)
+    if header_sha256 is not None:
+        header = _read_header_prefix(
+            object_root / f"{descriptor['sha256']}.spcc", header_sha256
+        )
+    else:
+        (header_object,) = _read_page_delta_object_batch(object_root, (descriptor,))
+        header = page_delta_header_prefix(header_object)
     _remember_authenticated_delta_header(
         descriptor["sha256"], descriptor["bytes"], header
     )
@@ -3418,9 +3616,13 @@ class ManifestStore:
                 # would be re-allocated before the copy.
                 with memoryview(payload) as payload_view:
                     result[start:end] = payload_view
-                digest.update(payload)
+                if "crc32" not in descriptor:
+                    digest.update(payload)
                 expected_start = end
-        if expected_start != encoded_bytes or digest.hexdigest() != encoded_sha256:
+        if expected_start != encoded_bytes or (
+            _descriptor_integrity(descriptors[0]) == "sha256"
+            and digest.hexdigest() != encoded_sha256
+        ):
             raise CacheFormatError("page delta payload checksum mismatch")
         return result
 
@@ -3451,9 +3653,13 @@ class ManifestStore:
                 # would be re-allocated before the copy.
                 with memoryview(payload) as payload_view:
                     result[start:end] = payload_view
-                digest.update(payload)
+                if "crc32" not in descriptor:
+                    digest.update(payload)
                 expected_start = end
-        if expected_start != encoded_bytes or digest.hexdigest() != encoded_sha256:
+        if expected_start != encoded_bytes or (
+            _descriptor_integrity(descriptors[0]) == "sha256"
+            and digest.hexdigest() != encoded_sha256
+        ):
             raise CacheFormatError("page snapshot payload checksum mismatch")
         return result
 
@@ -3799,11 +4005,7 @@ class ManifestStore:
         """
 
         _validate_digest(context_digest, "context_digest")
-        if identity.publication_schema not in (
-            "",
-            "page-tail-cow-v1",
-            "page-tail-cow-v2",
-        ):
+        if identity.publication_schema not in ("", *_PAGE_TAIL_SCHEMAS):
             raise ValueError(
                 "page snapshot publication requires the flat or page-tail"
                 " publication schema"
@@ -3839,30 +4041,34 @@ class ManifestStore:
                     "page snapshot payload must be bytes or a bounded scatter view"
                 )
 
+        integrity = _payload_integrity(identity.publication_schema)
+        nonce = uuid.uuid4().hex
         with _RootGuard(self.root, shared=True, blocking=True):
             publication = self._active_publication()
             publication.describe_payload(snapshot_bytes)
             descriptors: list[dict[str, Any]] = []
             objects: list[tuple[Path, bytes]] = []
             snapshot_digest = hashlib.sha256()
-            for start in range(0, snapshot_bytes, _PAGE_SNAPSHOT_OBJECT_BYTES):
+            for index, start in enumerate(
+                range(0, snapshot_bytes, _PAGE_SNAPSHOT_OBJECT_BYTES)
+            ):
                 end = min(snapshot_bytes, start + _PAGE_SNAPSHOT_OBJECT_BYTES)
                 encoded = read_range(start, end)
                 if not isinstance(encoded, bytes) or len(encoded) != end - start:
                     raise ValueError("page snapshot scatter range differs")
-                snapshot_digest.update(encoded)
-                object_digest = _sha256(encoded)
+                if integrity == "sha256":
+                    snapshot_digest.update(encoded)
+                    object_name = _sha256(encoded)
+                else:
+                    object_name = _derived_object_name(
+                        identity, context_digest, "snapshot", index, nonce
+                    )
                 descriptors.append(
-                    {
-                        "sha256": object_digest,
-                        "bytes": len(encoded),
-                        "encoded_start": start,
-                        "encoded_end": end,
-                    }
+                    _object_descriptor(integrity, object_name, encoded, start, end)
                 )
                 objects.append(
                     (
-                        self.root / "chunks" / f"{object_digest}.spcc",
+                        self.root / "chunks" / f"{object_name}.spcc",
                         encoded,
                     )
                 )
@@ -3882,7 +4088,11 @@ class ManifestStore:
                 "snapshot_encoded_bytes": snapshot_bytes,
                 "snapshot_object_bytes": _PAGE_SNAPSHOT_OBJECT_BYTES,
                 "snapshot_objects": descriptors,
-                "snapshot_sha256": snapshot_digest.hexdigest(),
+                "snapshot_sha256": (
+                    snapshot_digest.hexdigest()
+                    if integrity == "sha256"
+                    else _boundary_token(context_digest, span_tokens)
+                ),
                 "logical_chunk_tokens": identity.chunk_tokens,
                 "logical_chunk_count": span_tokens // identity.chunk_tokens,
             }
@@ -3933,10 +4143,7 @@ class ManifestStore:
     ) -> CommitReceipt:
         """Publish a page-semantic delta over one verified opaque snapshot."""
 
-        if identity.publication_schema not in (
-            "page-tail-cow-v1",
-            "page-tail-cow-v2",
-        ):
+        if identity.publication_schema not in _PAGE_TAIL_SCHEMAS:
             raise ValueError(
                 "page tail publication requires a page-tail-cow schema"
             )
@@ -4031,14 +4238,35 @@ class ManifestStore:
                     verified_base_snapshot,
                     publication_base_block_counts,
                 )
-                base_proof = _verify_page_snapshot_bytes(verified_base_snapshot)
                 expected = self._publication_snapshot_digest(
                     publication_base, layout=layout,
                     block_counts=publication_base_block_counts,
                     boundary_tokens=publication_base_boundary,
                 )
-                if base_proof.sha256 != expected:
-                    raise CacheFormatError("publication base snapshot digest differs")
+                if _payload_integrity(identity.publication_schema) == "sha256":
+                    base_proof = _verify_page_snapshot_bytes(verified_base_snapshot)
+                    if base_proof.sha256 != expected:
+                        raise CacheFormatError(
+                            "publication base snapshot digest differs"
+                        )
+                else:
+                    # Payload bytes are not hashed under the v3 schemas: the
+                    # supplied base is bound to the boundary token by the
+                    # caller having restored that boundary.
+                    from sparkcache.spark_context_cache_hybrid import (
+                        _VerifiedPageSnapshot,
+                    )
+
+                    base_proof = (
+                        verified_base_snapshot
+                        if isinstance(verified_base_snapshot, _VerifiedPageSnapshot)
+                        else _VerifiedPageSnapshot(
+                            verified_base_snapshot
+                            if isinstance(verified_base_snapshot, bytes)
+                            else bytes(verified_base_snapshot),
+                            expected,
+                        )
+                    )
             else:
                 with _PublicationReadFiles():
                     base_proof = self.restore_page_snapshot(
@@ -4055,7 +4283,7 @@ class ManifestStore:
                 None,
             )
             if (
-                identity.publication_schema == "page-tail-cow-v2"
+                identity.publication_schema in _FLAT_PAGE_SCHEMAS
                 and self._page_delta_stage_limit_count
                 and len(base._manifest.get("delta_stages", ()))
                 >= self._page_delta_stage_limit_count
@@ -4082,11 +4310,17 @@ class ManifestStore:
             # The base proof carries the digest the base bytes were verified
             # against, so the encoders bind it instead of hashing the base.
             base_snapshot_sha256 = base_proof.sha256
+            integrity = _payload_integrity(identity.publication_schema)
+            result_token = (
+                None
+                if integrity == "sha256"
+                else _boundary_token(result_context_digest, result_boundary_tokens)
+            )
             hot_result: bytes | bytearray | None = None
             if captured_reuse is not None:
-                if identity.publication_schema != "page-tail-cow-v2":
+                if identity.publication_schema not in _FLAT_PAGE_SCHEMAS:
                     raise ValueError(
-                        "direct sparse page deltas require page-tail-cow-v2"
+                        "direct sparse page deltas require a flat page schema"
                     )
                 from sparkcache.spark_context_cache_hybrid import (
                     encode_page_delta_from_capture_with_result,
@@ -4106,6 +4340,8 @@ class ManifestStore:
                         base_boundary_tokens=publication_base_boundary,
                         result_boundary_tokens=result_boundary_tokens,
                         base_snapshot_sha256=base_snapshot_sha256,
+                        integrity=integrity,
+                        result_snapshot_sha256=result_token,
                     )
                 else:
                     delta = encode_page_delta_from_capture(
@@ -4118,6 +4354,8 @@ class ManifestStore:
                         base_boundary_tokens=publication_base_boundary,
                         result_boundary_tokens=result_boundary_tokens,
                         base_snapshot_sha256=base_snapshot_sha256,
+                        integrity=integrity,
+                        result_snapshot_sha256=result_token,
                     )
             else:
                 if not isinstance(result_snapshot, (bytes, bytearray)):
@@ -4131,6 +4369,8 @@ class ManifestStore:
                     base_boundary_tokens=publication_base_boundary,
                     result_boundary_tokens=result_boundary_tokens,
                     base_snapshot_sha256=base_snapshot_sha256,
+                    integrity=integrity,
+                    result_snapshot_sha256=result_token,
                 )
                 if isinstance(result_snapshot, bytes):
                     hot_result = result_snapshot
@@ -4139,21 +4379,22 @@ class ManifestStore:
             descriptors: list[dict[str, Any]] = []
             objects: list[tuple[Path, bytes]] = []
             delta_view = memoryview(delta)
-            for start in range(0, len(delta), _PAGE_DELTA_OBJECT_BYTES):
+            nonce = uuid.uuid4().hex
+            for index, start in enumerate(range(0, len(delta), _PAGE_DELTA_OBJECT_BYTES)):
                 end = min(len(delta), start + _PAGE_DELTA_OBJECT_BYTES)
                 encoded = delta_view[start:end].tobytes()
-                object_digest = _sha256(encoded)
+                if integrity == "sha256":
+                    object_name = _sha256(encoded)
+                else:
+                    object_name = _derived_object_name(
+                        identity, result_context_digest, "delta", index, nonce
+                    )
                 descriptors.append(
-                    {
-                        "sha256": object_digest,
-                        "bytes": len(encoded),
-                        "encoded_start": start,
-                        "encoded_end": end,
-                    }
+                    _object_descriptor(integrity, object_name, encoded, start, end)
                 )
                 objects.append(
                     (
-                        self.root / "chunks" / f"{object_digest}.spcc",
+                        self.root / "chunks" / f"{object_name}.spcc",
                         encoded,
                     )
                 )
@@ -4190,7 +4431,7 @@ class ManifestStore:
                 ).result_snapshot_sha256
                 _remember_hot_page_snapshot(result_sha256, hot_result)
             base_root = dict(publication_base._manifest)
-            if identity.publication_schema == "page-tail-cow-v2":
+            if identity.publication_schema in _FLAT_PAGE_SCHEMAS:
                 if base._manifest.get("schema") == _PAGE_DELTA_MANIFEST_SCHEMA_V3:
                     _validate_page_delta_root(
                         base._manifest,
@@ -4208,20 +4449,25 @@ class ManifestStore:
                     flat_base_boundary = base_boundary_tokens
                     flat_base_counts = list(base_block_counts)
                     stages = []
-                stages.append(
-                    {
-                        "context_digest": result_context_digest,
-                        "committed_tokens": result_boundary_tokens,
-                        "base_context_digest": base_context_digest,
-                        "base_committed_tokens": base_boundary_tokens,
-                        "base_block_counts": list(base_block_counts),
-                        "result_block_counts": list(result_block_counts),
-                        "delta_encoded_bytes": len(delta),
-                        "delta_object_bytes": _PAGE_DELTA_OBJECT_BYTES,
-                        "delta_objects": descriptors,
-                        "delta_sha256": _sha256(delta),
-                    }
-                )
+                stage_entry = {
+                    "context_digest": result_context_digest,
+                    "committed_tokens": result_boundary_tokens,
+                    "base_context_digest": base_context_digest,
+                    "base_committed_tokens": base_boundary_tokens,
+                    "base_block_counts": list(base_block_counts),
+                    "result_block_counts": list(result_block_counts),
+                    "delta_encoded_bytes": len(delta),
+                    "delta_object_bytes": _PAGE_DELTA_OBJECT_BYTES,
+                    "delta_objects": descriptors,
+                    "delta_sha256": (
+                        _sha256(delta)
+                        if integrity == "sha256"
+                        else _boundary_token(result_context_digest, -len(delta))
+                    ),
+                }
+                if integrity != "sha256":
+                    stage_entry["header_sha256"] = _sha256(header_prefix)
+                stages.append(stage_entry)
                 root = {
                     "schema": _PAGE_DELTA_MANIFEST_SCHEMA_V3,
                     "format_abi": FORMAT_ABI,
@@ -4294,7 +4540,7 @@ class ManifestStore:
             stage = (manifest["delta_stages"][-1]
                      if manifest["schema"] == _PAGE_DELTA_MANIFEST_SCHEMA_V3 else manifest)
             header = _authenticated_page_delta_header(
-                self.root / "chunks", stage["delta_objects"][0],
+                self.root / "chunks", stage["delta_objects"][0], stage.get("header_sha256"),
             )
             plan = plan_page_delta(
                 layout, header, base_block_counts=stage["base_block_counts"],
@@ -4424,7 +4670,7 @@ class ManifestStore:
             plans = []
             for stage in stages:
                 header = _authenticated_page_delta_header(
-                    object_root, stage["delta_objects"][0]
+                    object_root, stage["delta_objects"][0], stage.get("header_sha256")
                 )
                 plans.append(
                     plan_page_delta(
@@ -4783,10 +5029,7 @@ class ManifestStore:
                     encoded_chunk = (
                         self.root / "chunks" / f"{digest}.spcc"
                     ).read_bytes()
-                    if (
-                        len(encoded_chunk) != encoded_bytes
-                        or _sha256(encoded_chunk) != digest
-                    ):
+                    if not _payload_matches_descriptor(descriptor, encoded_chunk):
                         raise CacheFormatError("chunk checksum mismatch")
                     if "encoded_start" in descriptor:
                         continue
@@ -5041,8 +5284,8 @@ class ManifestStore:
             if not verify_chunk_payloads:
                 continue
             try:
-                healthy = _sha256(chunk_path.read_bytes()) == digest
-            except OSError:
+                healthy = _payload_matches_descriptor(descriptor, chunk_path.read_bytes())
+            except (KeyError, OSError, TypeError, ValueError):
                 healthy = False
             if not healthy:
                 try:
