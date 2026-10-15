@@ -1913,6 +1913,178 @@ def _read_object_extent(
     return result
 
 
+def _read_object_extent_into(
+    pieces: Sequence[tuple[Path, int, int, int]],
+    target: memoryview,
+) -> None:
+    """Read unauthenticated byte ranges from macro objects into ``target``.
+
+    ``target`` must be a writable contiguous byte view whose length equals the
+    total of the piece lengths. On Linux each piece is read with ``preadv``
+    straight into the view, so a caller can fill a mapped placement arena
+    without an intermediate buffer. The caller must authenticate the bytes in
+    place, against a digest bound by already-authenticated metadata, before
+    submitting them anywhere.
+    """
+
+    total = sum(length for _path, _size, _offset, length in pieces)
+    if target.readonly or not target.contiguous or target.format != "B":
+        raise CacheFormatError("page object extent target must be writable bytes")
+    if len(target) != total:
+        raise CacheFormatError("page object extent target length differs")
+    cursor = 0
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    use_preadv = hasattr(os, "preadv")
+    for path, object_bytes, offset, length in pieces:
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as error:
+            raise CacheFormatError(f"page object is unavailable: {error}") from error
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_size != object_bytes
+            ):
+                raise CacheFormatError("page object length differs")
+            completed = 0
+            while completed < length:
+                if use_preadv:
+                    count = os.preadv(
+                        descriptor,
+                        [target[cursor + completed : cursor + length]],
+                        offset + completed,
+                    )
+                    if count <= 0:
+                        raise CacheFormatError("page object read was truncated")
+                else:  # pragma: no cover - Windows test fallback
+                    if hasattr(os, "pread"):
+                        chunk = os.pread(
+                            descriptor, length - completed, offset + completed
+                        )
+                    else:
+                        os.lseek(descriptor, offset + completed, os.SEEK_SET)
+                        chunk = os.read(descriptor, length - completed)
+                    if not chunk:
+                        raise CacheFormatError("page object read was truncated")
+                    count = len(chunk)
+                    target[cursor + completed : cursor + completed + count] = chunk
+                completed += count
+        except OSError as error:
+            raise CacheFormatError(f"page object read failed: {error}") from error
+        finally:
+            os.close(descriptor)
+        cursor += length
+
+
+# Process-local cache of complete page snapshots this process authenticated.
+# Keys are (snapshot SHA-256, encoded length). A value is inserted only after
+# this process computed SHA-256 over exactly those bytes and found the digest
+# equal to one bound by authenticated metadata (a snapshot manifest's
+# ``snapshot_sha256``, or the ``result_snapshot_sha256`` of a stage header
+# taken from an authenticated first object), or after it composed the bytes
+# and bound their digest into a header it published. The trust argument is
+# the one the header cache relies on: the content address fixes the value.
+# Values are never mutated after insertion. The budget is process-wide and is
+# zero (disabled) until a store sets it.
+_hot_page_snapshot_limit_bytes = 0
+_hot_page_snapshots: OrderedDict[tuple[str, int], bytes | bytearray] = OrderedDict()
+_hot_page_snapshot_bytes = 0
+_hot_page_snapshot_lock = threading.Lock()
+_hot_page_snapshot_hits = 0
+_hot_page_snapshot_misses = 0
+
+
+def _set_hot_page_snapshot_limit(limit_bytes: int) -> None:
+    global _hot_page_snapshot_limit_bytes
+    if type(limit_bytes) is not int or limit_bytes < 0:
+        raise ValueError("hot page snapshot limit must be a non-negative integer")
+    with _hot_page_snapshot_lock:
+        _hot_page_snapshot_limit_bytes = limit_bytes
+        _evict_hot_page_snapshots_locked()
+
+
+def _hot_page_snapshots_enabled() -> bool:
+    return _hot_page_snapshot_limit_bytes > 0
+
+
+def _hot_page_snapshot_fits(encoded_bytes: int) -> bool:
+    return 0 < encoded_bytes <= _hot_page_snapshot_limit_bytes
+
+
+def _evict_hot_page_snapshots_locked() -> None:
+    global _hot_page_snapshot_bytes
+    while _hot_page_snapshots and (
+        _hot_page_snapshot_bytes > _hot_page_snapshot_limit_bytes
+    ):
+        _, evicted = _hot_page_snapshots.popitem(last=False)
+        _hot_page_snapshot_bytes -= len(evicted)
+        del evicted
+
+
+def _hot_page_snapshot(snapshot_sha256: str, encoded_bytes: int) -> bytes | bytearray | None:
+    """Return this process's authenticated copy of a snapshot, or None."""
+
+    global _hot_page_snapshot_hits, _hot_page_snapshot_misses
+    if not _hot_page_snapshots_enabled():
+        return None
+    key = (snapshot_sha256, int(encoded_bytes))
+    with _hot_page_snapshot_lock:
+        payload = _hot_page_snapshots.get(key)
+        if payload is None:
+            _hot_page_snapshot_misses += 1
+            return None
+        _hot_page_snapshots.move_to_end(key)
+        _hot_page_snapshot_hits += 1
+        return payload
+
+
+def _remember_hot_page_snapshot(
+    snapshot_sha256: str,
+    payload: bytes | bytearray,
+) -> bool:
+    """Retain a snapshot this process hashed to ``snapshot_sha256``.
+
+    The caller passes ownership: the buffer must not be modified afterwards.
+    Returns whether the snapshot was retained.
+    """
+
+    global _hot_page_snapshot_bytes
+    size = len(payload)
+    if not _hot_page_snapshot_fits(size):
+        return False
+    key = (snapshot_sha256, size)
+    with _hot_page_snapshot_lock:
+        previous = _hot_page_snapshots.pop(key, None)
+        if previous is not None:
+            _hot_page_snapshot_bytes -= len(previous)
+        _hot_page_snapshots[key] = payload
+        _hot_page_snapshot_bytes += size
+        _evict_hot_page_snapshots_locked()
+    return True
+
+
+def _clear_hot_page_snapshots() -> None:
+    global _hot_page_snapshot_bytes, _hot_page_snapshot_hits, _hot_page_snapshot_misses
+    with _hot_page_snapshot_lock:
+        _hot_page_snapshots.clear()
+        _hot_page_snapshot_bytes = 0
+        _hot_page_snapshot_hits = 0
+        _hot_page_snapshot_misses = 0
+
+
+def hot_page_snapshot_stats() -> dict[str, int]:
+    with _hot_page_snapshot_lock:
+        return {
+            "limit_bytes": _hot_page_snapshot_limit_bytes,
+            "resident_bytes": _hot_page_snapshot_bytes,
+            "entries": len(_hot_page_snapshots),
+            "hits": _hot_page_snapshot_hits,
+            "misses": _hot_page_snapshot_misses,
+        }
+
+
 # Process-local cache of page-delta headers taken from authenticated bytes.
 # Keys are (object SHA-256, object bytes) of a delta's first macro object; the
 # value is that object's SPHD1 header prefix. An entry is inserted only after
@@ -2266,12 +2438,17 @@ class ManifestStore:
         *,
         publication_telemetry: PublicationTelemetry | None = None,
         page_delta_stage_limit_count: int = 0,
+        hot_page_snapshot_bytes: int | None = None,
     ) -> None:
         if type(page_delta_stage_limit_count) is not int or page_delta_stage_limit_count < 0:
             raise ValueError("page_delta_stage_limit_count must be a non-negative integer")
         self.root = Path(root)
         self.publication_telemetry = publication_telemetry or PublicationTelemetry()
         self._page_delta_stage_limit_count = page_delta_stage_limit_count
+        # The hot snapshot budget is process-wide (see _hot_page_snapshots);
+        # a store that names one sets it for every store in the process.
+        if hot_page_snapshot_bytes is not None:
+            _set_hot_page_snapshot_limit(hot_page_snapshot_bytes)
 
     def publication_telemetry_snapshot(self) -> PublicationTelemetrySnapshot:
         """Return monotonic observational byte counters for this store."""
@@ -3709,6 +3886,15 @@ class ManifestStore:
                 self._manifest_path(identity, context_digest),
                 encoded_root,
             )
+            # This process hashed the complete snapshot to the digest it just
+            # bound into the manifest. Retain immutable bytes only; a mutable
+            # buffer is copied so a caller cannot change the retained value.
+            if isinstance(snapshot, bytes):
+                _remember_hot_page_snapshot(root["snapshot_sha256"], snapshot)
+            elif isinstance(snapshot, bytearray) and _hot_page_snapshot_fits(
+                snapshot_bytes
+            ):
+                _remember_hot_page_snapshot(root["snapshot_sha256"], bytes(snapshot))
             return CommitReceipt(
                 manifest_digest=_sha256(encoded_root),
                 committed_tokens=span_tokens,
@@ -3887,21 +4073,46 @@ class ManifestStore:
                     identity=identity, context_digest=result_context_digest,
                     span_tokens=result_boundary_tokens, snapshot=complete,
                 )
+            # The base proof carries the digest the base bytes were verified
+            # against, so the encoders bind it instead of hashing the base.
+            base_snapshot_sha256 = base_proof.sha256
+            hot_result: bytes | bytearray | None = None
             if captured_reuse is not None:
                 if identity.publication_schema != "page-tail-cow-v2":
                     raise ValueError(
                         "direct sparse page deltas require page-tail-cow-v2"
                     )
-                delta = encode_page_delta_from_capture(
-                    layout,
-                    base_proof,
-                    result_snapshot,
-                    base_block_counts=publication_base_block_counts,
-                    result_block_counts=result_block_counts,
-                    reused_pages_by_group=captured_reuse,
-                    base_boundary_tokens=publication_base_boundary,
-                    result_boundary_tokens=result_boundary_tokens,
+                from sparkcache.spark_context_cache_hybrid import (
+                    encode_page_delta_from_capture_with_result,
+                    page_snapshot_encoded_size,
                 )
+
+                if _hot_page_snapshot_fits(
+                    page_snapshot_encoded_size(layout, result_block_counts)
+                ):
+                    delta, hot_result = encode_page_delta_from_capture_with_result(
+                        layout,
+                        base_proof,
+                        result_snapshot,
+                        base_block_counts=publication_base_block_counts,
+                        result_block_counts=result_block_counts,
+                        reused_pages_by_group=captured_reuse,
+                        base_boundary_tokens=publication_base_boundary,
+                        result_boundary_tokens=result_boundary_tokens,
+                        base_snapshot_sha256=base_snapshot_sha256,
+                    )
+                else:
+                    delta = encode_page_delta_from_capture(
+                        layout,
+                        base_proof,
+                        result_snapshot,
+                        base_block_counts=publication_base_block_counts,
+                        result_block_counts=result_block_counts,
+                        reused_pages_by_group=captured_reuse,
+                        base_boundary_tokens=publication_base_boundary,
+                        result_boundary_tokens=result_boundary_tokens,
+                        base_snapshot_sha256=base_snapshot_sha256,
+                    )
             else:
                 if not isinstance(result_snapshot, (bytes, bytearray)):
                     raise ValueError("page delta result snapshot is invalid")
@@ -3913,7 +4124,10 @@ class ManifestStore:
                     result_block_counts=result_block_counts,
                     base_boundary_tokens=publication_base_boundary,
                     result_boundary_tokens=result_boundary_tokens,
+                    base_snapshot_sha256=base_snapshot_sha256,
                 )
+                if isinstance(result_snapshot, bytes):
+                    hot_result = result_snapshot
             publication = self._active_publication()
             publication.describe_payload(len(delta), len(base_snapshot))
             descriptors: list[dict[str, Any]] = []
@@ -3948,11 +4162,27 @@ class ManifestStore:
 
             # This process encoded the delta and wrote its first object under
             # this digest, so the header is authenticated for later restores.
+            header_prefix = page_delta_header_prefix(delta)
             _remember_authenticated_delta_header(
                 descriptors[0]["sha256"],
                 descriptors[0]["bytes"],
-                page_delta_header_prefix(delta),
+                header_prefix,
             )
+            if hot_result is not None:
+                # The encoder hashed exactly this buffer to the result digest
+                # it bound into the header; the buffer has no other owner.
+                from sparkcache.spark_context_cache_hybrid import plan_page_delta
+
+                result_sha256 = plan_page_delta(
+                    layout,
+                    header_prefix,
+                    base_block_counts=publication_base_block_counts,
+                    result_block_counts=result_block_counts,
+                    base_boundary_tokens=publication_base_boundary,
+                    result_boundary_tokens=result_boundary_tokens,
+                    total_bytes=len(delta),
+                ).result_snapshot_sha256
+                _remember_hot_page_snapshot(result_sha256, hot_result)
             base_root = dict(publication_base._manifest)
             if identity.publication_schema == "page-tail-cow-v2":
                 if base._manifest.get("schema") == _PAGE_DELTA_MANIFEST_SCHEMA_V3:
@@ -4115,13 +4345,24 @@ class ManifestStore:
             )
             if manifest["committed_tokens"] != result_boundary_tokens:
                 raise CacheFormatError("page snapshot restore boundary differs")
+            snapshot_sha256 = manifest["snapshot_sha256"]
+            hot = _hot_page_snapshot(snapshot_sha256, manifest["snapshot_encoded_bytes"])
+            if hot is not None:
+                # Hot buffers are never modified after insertion, so the
+                # carrier may wrap one without copying it.
+                return _VerifiedPageSnapshot(hot, snapshot_sha256) if _return_verified else hot
             snapshot = self._read_page_snapshot_objects(
                 descriptors,
                 encoded_bytes=manifest["snapshot_encoded_bytes"],
-                encoded_sha256=manifest["snapshot_sha256"],
+                encoded_sha256=snapshot_sha256,
             )
+            # _read_page_snapshot_objects hashed exactly these bytes to the
+            # manifest-bound digest; the buffer is private to this call.
             if _return_verified:
-                return _VerifiedPageSnapshot(bytes(snapshot), manifest["snapshot_sha256"])
+                immutable = bytes(snapshot)
+                _remember_hot_page_snapshot(snapshot_sha256, immutable)
+                return _VerifiedPageSnapshot(immutable, snapshot_sha256)
+            _remember_hot_page_snapshot(snapshot_sha256, snapshot)
             return snapshot
         if not _is_page_delta_root(manifest):
             chunks = self.restore(lookup)
@@ -4159,16 +4400,10 @@ class ManifestStore:
                     else "manifest"
                 ),
             )
-            snapshot = self.restore_page_snapshot(
-                base_lookup,
-                layout=layout,
-                result_block_counts=manifest["base_block_counts"],
-                result_boundary_tokens=manifest["base_committed_tokens"],
-                _return_verified=True,
-            )
             from sparkcache.spark_context_cache_hybrid import (
                 PageDeltaPayloadChecksumError,
                 compose_page_history,
+                page_snapshot_encoded_size,
                 plan_page_delta,
             )
 
@@ -4196,6 +4431,21 @@ class ManifestStore:
                         total_bytes=stage["delta_encoded_bytes"],
                     )
                 )
+            # The newest authenticated header binds the result digest. A
+            # process-local copy that hashed to it is the result itself and
+            # needs neither the base nor any tail.
+            result_sha256 = plans[-1].result_snapshot_sha256
+            result_bytes = page_snapshot_encoded_size(layout, result_block_counts)
+            hot = _hot_page_snapshot(result_sha256, result_bytes)
+            if hot is not None:
+                return _VerifiedPageSnapshot(hot, result_sha256) if _return_verified else hot
+            snapshot = self.restore_page_snapshot(
+                base_lookup,
+                layout=layout,
+                result_block_counts=manifest["base_block_counts"],
+                result_boundary_tokens=manifest["base_committed_tokens"],
+                _return_verified=True,
+            )
 
             def read_tail(stage_index: int, tail: Any) -> bytearray:
                 return _read_object_extent(
@@ -4208,7 +4458,7 @@ class ManifestStore:
                 )
 
             try:
-                return compose_page_history(
+                composed = compose_page_history(
                     layout,
                     snapshot,
                     manifest["base_block_counts"],
@@ -4219,6 +4469,13 @@ class ManifestStore:
             except PageDeltaPayloadChecksumError as error:
                 # Stored bytes differ from authenticated metadata: corruption.
                 raise CacheFormatError(str(error)) from error
+            # compose_page_history hashed the immutable result to the newest
+            # header's digest before returning it.
+            _remember_hot_page_snapshot(
+                result_sha256,
+                composed.payload if isinstance(composed, _VerifiedPageSnapshot) else composed,
+            )
+            return composed
         if _depth >= _MAX_PAGE_DELTA_DEPTH:
             raise CacheFormatError("page delta graph exceeds the depth limit")
         evidence = self.page_delta_base_read_evidence(

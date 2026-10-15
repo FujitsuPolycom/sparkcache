@@ -186,6 +186,23 @@ for that stage.
 Both paths verify the final result before the request resumes.
 Cache identities, on-disk formats, and wire formats are unchanged.
 
+The CUDA reader reads each surviving layer tail straight into its slot of the
+mapped placement arena and checks it there against the header-bound tail
+digest. The reads and checks of one batch run on a bounded thread pool.
+
+Nothing from a batch is submitted until every tail in it passed. A failed
+check aborts the transaction.
+
+The sequential SHA-256 of the composed result runs while the following batch
+is read. It overlaps storage and tail verification instead of following them.
+
+A process that has not seen a history authenticates one whole first object
+per stage, as before. It hashes those objects concurrently on the object-read
+lane and retains only the header prefixes.
+
+The debug line for each CUDA restore reports `planning`, `final_hash`, and
+`hot_snapshot` alongside the existing phases.
+
 ### Flat-history restore measurements
 
 Status: **research-only**. A 32-turn synthetic agent session used the same two
@@ -371,6 +388,32 @@ whole-snapshot SHA-256 cannot be updated from only a captured tail.
 For full attention, each compaction rewrites all retained tokens rather than
 only the appended tokens. Recurrent state is written once per publication.
 See the model deployment evidence for the measured geometry and byte costs.
+
+`spark_cache_hot_snapshot_bytes` is a process-local memory budget for complete
+page snapshots the worker has itself hashed (research-only). The default `0`
+disables it. Its environment fallback is `SPARK_CONTEXT_CACHE_HOT_SNAPSHOT_BYTES`.
+
+With a budget, the saver keeps the result it composes for each publication.
+The Python reader keeps each result it composes. The CUDA reader keeps each
+result whose final digest it verified.
+
+An entry is keyed by the digest the authenticated metadata binds for that
+boundary and by the encoded length. It is inserted only after this process
+computed that digest over exactly those bytes.
+
+The bound digest is a snapshot manifest's `snapshot_sha256`, or the
+`result_snapshot_sha256` of the newest stage header, whose first object hashed
+to its manifest-bound content address.
+
+A publication whose base is resident encodes its delta without reading or
+hashing the base. A restore whose result is resident places it from memory
+without reading any object.
+
+The budget is host memory of the worker process. On unified-memory hosts it
+competes with the GPU. The oldest entries are evicted first.
+
+Cache identities, on-disk formats, and wire formats are unchanged. A reader
+without the budget reads every byte from objects as before.
 
 Full captures keep the same cache identity and format. Before selecting one,
 the worker calculates its exact raw page bytes from the registered layout.

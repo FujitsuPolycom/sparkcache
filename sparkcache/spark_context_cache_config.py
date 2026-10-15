@@ -410,6 +410,7 @@ class ConnectorConfig:
     async_page_capture_enabled: bool
     page_snapshot_interval_tokens: int
     page_delta_stage_limit_count: int
+    hot_page_snapshot_bytes: int
     cuda_restore_enabled: bool
     cuda_placement_library_path: str
     cuda_placement_library_sha256: str
@@ -667,6 +668,17 @@ def parse_connector_config(
             os.environ.get("SPARK_CONTEXT_CACHE_PAGE_DELTA_STAGE_LIMIT_COUNT", "0"),
         ),
         "spark_cache_page_delta_stage_limit_count",
+    )
+    # Process-local budget for complete page snapshots this worker has hashed
+    # (research-only; zero disables). A hit places or republishes a boundary
+    # without any object read. The memory is host memory of the worker
+    # process, which on unified-memory hosts competes with the GPU.
+    hot_page_snapshot_bytes = _nonnegative_config_int(
+        extra(
+            "spark_cache_hot_snapshot_bytes",
+            os.environ.get("SPARK_CONTEXT_CACHE_HOT_SNAPSHOT_BYTES", "0"),
+        ),
+        "spark_cache_hot_snapshot_bytes",
     )
     model_max = int(getattr(vllm_config.model_config, "max_model_len", 0) or 0)
     default_max_span = str(model_max if model_max > 0 else 1 << 30)
@@ -1011,6 +1023,7 @@ def parse_connector_config(
         async_page_capture_enabled=async_page_capture_enabled,
         page_snapshot_interval_tokens=page_snapshot_interval_tokens,
         page_delta_stage_limit_count=page_delta_stage_limit_count,
+        hot_page_snapshot_bytes=hot_page_snapshot_bytes,
         cuda_restore_enabled=cuda_restore_enabled,
         cuda_placement_library_path=cuda_placement_library_path,
         cuda_placement_library_sha256=cuda_placement_library_sha256,

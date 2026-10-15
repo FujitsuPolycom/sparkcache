@@ -25,9 +25,13 @@ from sparkcache.persistent_context_cache.cache_manifest import (
     CacheIdentity,
     StateRecord,
     _authenticated_delta_header,
+    _hot_page_snapshot,
+    _hot_page_snapshot_fits,
     _is_page_delta_root,
     _read_object_extent,
+    _read_object_extent_into,
     _remember_authenticated_delta_header,
+    _remember_hot_page_snapshot,
     _is_page_snapshot_root,
     _validate_page_delta_root,
     _validate_page_snapshot_root,
@@ -59,6 +63,10 @@ _PAGE_SNAPSHOT_MANIFEST_SCHEMA = "sparkcache-page-snapshot-manifest/v2"
 _PAGE_DELTA_MANIFEST_SCHEMA = "sparkcache-page-delta-manifest/v2"
 _PAGE_DELTA_MANIFEST_SCHEMA_V3 = "sparkcache-page-delta-manifest/v3"
 _MAX_PAGE_OBJECT_READ_WORKERS = 4
+# Tail extents and stage-header objects are authenticated independently, so
+# their reads and SHA-256 passes scale across cores; the bound keeps thread
+# count and in-flight private buffers finite on a 20-core host.
+_MAX_PAGE_TAIL_READ_WORKERS = 16
 _MAX_PAGE_OBJECT_PREFETCH_BYTES = 256 * 1024 * 1024
 _MAX_PAGE_DELTA_DEPTH = 2
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
@@ -81,6 +89,15 @@ class CudaHybridRestoreResult:
     submit_call_ms: float = 0.0
     read_source_bytes: int = 0
     skipped_base_object_bytes: int = 0
+    # Sequential SHA-256 of the composed result, overlapped with the reads of
+    # the following batch; counted separately from read_and_hash_ms.
+    final_hash_ms: float = 0.0
+    # Manifest validation, header authentication and base read before the
+    # first batch; included in read_and_hash_ms.
+    planning_ms: float = 0.0
+    # True when the result was placed from the process-local hot snapshot
+    # cache without reading or hashing any object.
+    hot_snapshot_hit: bool = False
 
 
 @dataclass(frozen=True)
@@ -144,6 +161,9 @@ class CudaPageDeltaRestorePlan:
     referenced_object_bytes: int
     skipped_base_object_bytes: int
     planning_read_source_bytes: int = 0
+    # The complete result from the process-local hot snapshot cache. When set,
+    # source_spans is empty and the executor places these bytes directly.
+    hot_snapshot: bytes | bytearray | None = None
 
 
 @dataclass(frozen=True)
@@ -306,6 +326,58 @@ def _read_authenticated_source(
     return CudaAuthenticatedPageObject(source, bytes(payload))
 
 
+def _read_authenticated_tail_into(
+    source: CudaPageTailExtent,
+    target: memoryview,
+) -> int:
+    """Read one tail extent into ``target`` and authenticate it in place.
+
+    ``target`` is a slice of a mapped placement arena. Nothing is submitted
+    from that arena until every tail in its batch has passed this check, and
+    a failure aborts the transaction, so the arena never carries unverified
+    bytes into a submitted slab. Returns the bytes read.
+    """
+
+    try:
+        try:
+            _read_object_extent_into(source.pieces, target)
+        except CacheFormatError as error:
+            raise CudaHybridRestoreError(
+                f"page-delta tail read failed for {source.path}: {error}"
+            ) from error
+        if (
+            len(target) != source.encoded_bytes
+            or hashlib.sha256(target).hexdigest() != source.sha256
+        ):
+            raise CudaHybridRestoreError(
+                f"page-delta tail SHA-256 mismatch for {source.path}"
+            )
+    finally:
+        target.release()
+    return source.encoded_bytes
+
+
+def _authenticated_header_from_object(source: CudaPageObject) -> bytes:
+    """Hash one stage's first object and return its header prefix.
+
+    The object is read into a private buffer that is discarded afterwards;
+    the header is trusted only because the whole object hashed to the
+    manifest-bound content address.
+    """
+
+    payload = bytearray(source.encoded_bytes)
+    view = memoryview(payload)
+    try:
+        _pread_exact_into(source.path, source.encoded_bytes, view)
+    finally:
+        view.release()
+    if hashlib.sha256(payload).hexdigest() != source.sha256:
+        raise CudaHybridRestoreError(
+            f"page object SHA-256 mismatch for {source.path}"
+        )
+    return page_delta_header_prefix(payload)
+
+
 def _read_authenticated_page_base(
     objects: Sequence[CudaPageObject],
 ) -> PageBaseReadResult:
@@ -320,6 +392,63 @@ def _read_authenticated_page_base(
     return PageBaseReadResult(
         value=authenticated,
         encoded_bytes=sum(item.source.encoded_bytes for item in authenticated),
+    )
+
+
+def _hot_page_delta_plan(
+    layout: PageLayout,
+    root: dict[str, Any],
+    stages: Sequence[_CudaPageDeltaStage],
+    *,
+    expected_counts: tuple[int, ...],
+    planning_read_source_bytes: int,
+) -> CudaPageDeltaRestorePlan | None:
+    """Return a plan that places the hot-cached result, or None.
+
+    The stage headers are authenticated and chain from the base snapshot's
+    manifest-bound digest to the newest result digest. A process-local
+    snapshot that hashed to that result digest is the result; it needs no
+    base or tail read. Chain continuity is checked here exactly as the full
+    planner checks it, so a hit never bypasses a validation the disk path
+    performs on the metadata.
+    """
+
+    if not _is_page_snapshot_root(root):
+        return None
+    base_counts = stages[0].plan.base_block_counts
+    if (
+        root.get("committed_tokens") != stages[0].plan.base_boundary_tokens
+        or root.get("snapshot_encoded_bytes")
+        != page_snapshot_encoded_size(layout, base_counts)
+        or root.get("snapshot_sha256") != stages[0].plan.base_snapshot_sha256
+    ):
+        raise CudaHybridRestoreError("page-delta base snapshot differs")
+    current_counts = base_counts
+    current_sha256 = root["snapshot_sha256"]
+    for stage in stages:
+        if (
+            stage.plan.base_block_counts != current_counts
+            or stage.plan.base_snapshot_sha256 != current_sha256
+        ):
+            raise CudaHybridRestoreError("page-delta stage base identity differs")
+        current_counts = stage.plan.result_block_counts
+        current_sha256 = stage.plan.result_snapshot_sha256
+    if current_counts != expected_counts:
+        raise CudaHybridRestoreError("page-delta result block counts differ")
+    result_total = page_snapshot_encoded_size(layout, current_counts)
+    hot = _hot_page_snapshot(current_sha256, result_total)
+    if hot is None:
+        return None
+    page_plan = plan_page_snapshot(layout, hot, current_counts, total_bytes=result_total)
+    return CudaPageDeltaRestorePlan(
+        page_plan=page_plan,
+        result_snapshot_sha256=current_sha256,
+        source_spans=(),
+        prefetched_objects=(),
+        referenced_object_bytes=0,
+        skipped_base_object_bytes=0,
+        planning_read_source_bytes=planning_read_source_bytes,
+        hot_snapshot=hot,
     )
 
 
@@ -520,6 +649,38 @@ def plan_cuda_page_delta_restore(
                     label="flat page delta",
                 )
                 flat_stages.append((stage, objects))
+            # A process that has not seen this history must hash one whole
+            # first object per stage to trust its header. Those objects are
+            # independent, so authenticate them concurrently; nothing is
+            # retained beyond the header prefix.
+            unseen = []
+            seen_paths = set()
+            for _stage, objects in flat_stages:
+                first = objects[0]
+                if (
+                    first.path in seen_paths
+                    or first.path in prefetched
+                    or _authenticated_delta_header(first.sha256, first.encoded_bytes)
+                    is not None
+                ):
+                    continue
+                seen_paths.add(first.path)
+                unseen.append(first)
+            if len(unseen) > 1:
+                # Each worker holds one whole object while hashing it, so the
+                # transient working set is bounded by the object-read lane.
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(_MAX_PAGE_OBJECT_READ_WORKERS, len(unseen))
+                ) as header_pool:
+                    headers = tuple(
+                        header_pool.map(_authenticated_header_from_object, unseen)
+                    )
+                for source, header in zip(unseen, headers, strict=True):
+                    _remember_authenticated_delta_header(
+                        source.sha256, source.encoded_bytes, header
+                    )
+                    planning_read_source_bytes += source.encoded_bytes
+                del headers
             for stage, objects in flat_stages:
                 delta_plan = plan_page_delta(
                     layout,
@@ -596,6 +757,16 @@ def plan_cuda_page_delta_restore(
         stages = tuple(reversed(stages_newest_first))
         if not stages:
             raise CudaHybridRestoreError("page-delta graph contains no delta")
+        expected_counts = tuple(len(group) for group in group_slots)
+        hot_plan = _hot_page_delta_plan(
+            layout,
+            root,
+            stages,
+            expected_counts=expected_counts,
+            planning_read_source_bytes=planning_read_source_bytes,
+        )
+        if hot_plan is not None:
+            return hot_plan
         shared_base_used = base_reader is not None and (
             len(stages) == 1
             or manifest.get("schema") == _PAGE_DELTA_MANIFEST_SCHEMA_V3
@@ -1101,12 +1272,37 @@ def _execute_page_object_restore(
 ) -> CudaHybridRestoreResult:
     """Authenticate each flat extent before submitting its page-copy spans."""
 
+    planning_started = time.perf_counter()
     objects, snapshot_bytes = _plan_page_objects(
         lookup,
         cache_root=cache_root,
         expected_span_tokens=expected_span_tokens,
         arena_bytes=arena_bytes,
     )
+    hot = _hot_page_snapshot(lookup._manifest["snapshot_sha256"], snapshot_bytes)
+    if hot is not None:
+        # The manifest-bound snapshot digest named a snapshot this process
+        # hashed to it (a publication or Python restore of this boundary).
+        page_plan = plan_page_snapshot(
+            layout,
+            hot,
+            tuple(len(group) for group in group_slots),
+            total_bytes=snapshot_bytes,
+        )
+        planning_ms = 1e3 * (time.perf_counter() - planning_started)
+        placed = execute_cuda_hybrid_placement(
+            adapter=adapter,
+            request_id=request_id,
+            encoded_pages=hot,
+            plan=page_plan,
+            group_slots=group_slots,
+        )
+        return replace(
+            placed,
+            read_and_hash_ms=planning_ms,
+            planning_ms=planning_ms,
+            hot_snapshot_hit=True,
+        )
     first = objects[0]
     first_payload = bytearray(first.encoded_bytes)
     started = time.perf_counter()
@@ -1373,9 +1569,28 @@ def _execute_page_delta_restore(
         arena_bytes=arena_bytes,
         base_reader=base_reader,
     )
-    read_ms = 1e3 * (time.perf_counter() - planning_started)
+    planning_ms = 1e3 * (time.perf_counter() - planning_started)
+    read_ms = planning_ms
+    if plan.hot_snapshot is not None:
+        # The newest authenticated header's result digest named a snapshot
+        # this process hashed to it. Place it as one flat snapshot.
+        placed = execute_cuda_hybrid_placement(
+            adapter=adapter,
+            request_id=request_id,
+            encoded_pages=plan.hot_snapshot,
+            plan=plan.page_plan,
+            group_slots=group_slots,
+        )
+        return replace(
+            placed,
+            read_and_hash_ms=read_ms,
+            planning_ms=planning_ms,
+            read_source_bytes=plan.planning_read_source_bytes,
+            hot_snapshot_hit=True,
+        )
     batches = _delta_submission_batches(plan.source_spans, arena_bytes=arena_bytes)
-    payload_bytes = plan.page_plan.total_bytes - plan.page_plan.header_bytes
+    header_bytes = plan.page_plan.header_bytes
+    payload_bytes = plan.page_plan.total_bytes - header_bytes
     prefetched = {
         item.source.path: item for item in plan.prefetched_objects
     }
@@ -1394,6 +1609,9 @@ def _execute_page_delta_restore(
         for batch_index, batch in enumerate(batches)
         for span in batch
     }
+    span_uses: dict[Path, int] = {}
+    for span in plan.source_spans:
+        span_uses[span.source.path] = span_uses.get(span.source.path, 0) + 1
     source_cache: OrderedDict[Path, CudaAuthenticatedPageObject] = OrderedDict()
     cache_bytes = 0
     cache_limit = min(arena_bytes, _MAX_PAGE_OBJECT_PREFETCH_BYTES)
@@ -1405,16 +1623,44 @@ def _execute_page_delta_restore(
     arena_wait_ms = 0.0
     host_copy_ms = 0.0
     submit_call_ms = 0.0
-    final_sha256 = hashlib.sha256()
-    final_sha256.update(
-        encode_page_snapshot_header(layout, plan.page_plan.block_counts)
-    )
+    final_hash_ms = 0.0
+    result_header = encode_page_snapshot_header(layout, plan.page_plan.block_counts)
+    final_sha256 = hashlib.sha256(result_header)
+    # With a hot snapshot budget, keep a private copy of the composed result
+    # so a later restore or publication of this boundary needs no object
+    # read. It is retained only after the final digest check passes.
+    retained: bytearray | None = None
+    if _hot_page_snapshot_fits(plan.page_plan.total_bytes):
+        retained = bytearray(plan.page_plan.total_bytes)
+        retained[:header_bytes] = result_header
+    # The sequential result digest of one batch runs while the next batch's
+    # tails are read and authenticated by the pool. (arena view, arena index,
+    # snapshot offset) of the batch not yet digested.
+    pending_hash: tuple[memoryview, int, int] | None = None
+
+    def hash_pending() -> None:
+        nonlocal pending_hash, final_hash_ms
+        if pending_hash is None:
+            return
+        view, _arena_index, offset = pending_hash
+        pending_hash = None
+        started = time.perf_counter()
+        try:
+            final_sha256.update(view)
+            if retained is not None:
+                start = header_bytes + offset
+                retained[start : start + len(view)] = view
+        finally:
+            view.release()
+        final_hash_ms += 1e3 * (time.perf_counter() - started)
 
     # Each submission launches CUDA work asynchronously. Reading and
-    # authenticating the following batch at the top of the next iteration
-    # therefore overlaps the preceding placement. Keep one executor for the
-    # transaction so the bounded read lane does not repeatedly create threads.
-    read_workers = min(max(1, io_workers), _MAX_PAGE_OBJECT_READ_WORKERS)
+    # authenticating the following batch therefore overlaps the preceding
+    # placement. Tail extents are read straight into the mapped arena and
+    # authenticated there by the pool; whole objects (the base, and tails
+    # above the extent bound) are authenticated in private buffers first.
+    read_workers = min(max(1, io_workers), _MAX_PAGE_TAIL_READ_WORKERS)
+    object_workers = min(max(1, io_workers), _MAX_PAGE_OBJECT_READ_WORKERS)
     with transaction:
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=read_workers
@@ -1433,15 +1679,32 @@ def _execute_page_delta_restore(
                     for path in sources
                     if path in source_cache
                 )
+                # A tail extent that one span places whole is read into its
+                # arena slot and authenticated in place.
+                direct: set[Path] = set()
+                for span in batch:
+                    source = span.source
+                    if (
+                        isinstance(source, CudaPageTailExtent)
+                        and source.path not in loaded
+                        and span_uses.get(source.path) == 1
+                        and span.source_offset_bytes == 0
+                        and span.byte_count == source.encoded_bytes
+                    ):
+                        direct.add(source.path)
                 pending = tuple(
                     source
                     for path, source in sources.items()
-                    if path not in loaded
+                    if path not in loaded and path not in direct
                 )
                 if pending:
                     started = time.perf_counter()
                     authenticated = tuple(
-                        read_pool.map(_read_authenticated_source, pending)
+                        read_pool.map(
+                            _read_authenticated_source,
+                            pending,
+                            chunksize=max(1, len(pending) // object_workers),
+                        )
                     )
                     read_ms += 1e3 * (time.perf_counter() - started)
                     for item in authenticated:
@@ -1450,41 +1713,71 @@ def _execute_page_delta_restore(
                     del authenticated, item
 
                 arena_index = batch_index % cuda.ARENA_COUNT
+                if pending_hash is not None and pending_hash[1] == arena_index:
+                    # A single-arena transaction would overwrite the batch
+                    # that has not been digested yet.
+                    hash_pending()
                 started = time.perf_counter()
                 arena = transaction.acquire_arena(arena_index)
                 arena_wait_ms += 1e3 * (time.perf_counter() - started)
                 used_bytes = sum(span.byte_count for span in batch)
                 arena_buffer = cuda.arena_memoryview(arena, length=used_bytes)
+                batch_snapshot_offset = batch[0].snapshot_offset_bytes
                 native_spans = []
+                copies: list[tuple[CudaPageSourceSpan, int]] = []
+                futures = []
                 arena_offset = 0
+                for span in batch:
+                    if span.source.path in direct:
+                        futures.append(
+                            read_pool.submit(
+                                _read_authenticated_tail_into,
+                                span.source,
+                                arena_buffer[
+                                    arena_offset : arena_offset + span.byte_count
+                                ],
+                            )
+                        )
+                    else:
+                        copies.append((span, arena_offset))
+                    native_spans.append(
+                        cuda.PageCopySpan(
+                            arena_offset,
+                            span.snapshot_offset_bytes,
+                            span.destination_byte_offset,
+                            span.byte_count,
+                            span.destination_index,
+                            0,
+                        )
+                    )
+                    arena_offset += span.byte_count
                 try:
                     started = time.perf_counter()
-                    for span in batch:
+                    for span, offset in copies:
                         payload = loaded[span.source.path].payload
                         payload_view = memoryview(payload)
                         try:
                             source_end = span.source_offset_bytes + span.byte_count
                             arena_buffer[
-                                arena_offset : arena_offset + span.byte_count
+                                offset : offset + span.byte_count
                             ] = payload_view[span.source_offset_bytes:source_end]
                         finally:
                             payload_view.release()
                         del payload
-                        native_spans.append(
-                            cuda.PageCopySpan(
-                                arena_offset,
-                                span.snapshot_offset_bytes,
-                                span.destination_byte_offset,
-                                span.byte_count,
-                                span.destination_index,
-                                0,
-                            )
-                        )
-                        arena_offset += span.byte_count
                     host_copy_ms += 1e3 * (time.perf_counter() - started)
-                    final_sha256.update(arena_buffer)
-                finally:
+                    # Digest the previous batch while this batch's tails are
+                    # still being read and authenticated.
+                    hash_pending()
+                    started = time.perf_counter()
+                    for future in futures:
+                        read_source_bytes += future.result()
+                    read_ms += 1e3 * (time.perf_counter() - started)
+                except BaseException:
+                    # Every worker releases its arena slice itself; wait so
+                    # the arena view can be released before the abort.
+                    concurrent.futures.wait(futures)
                     arena_buffer.release()
+                    raise
                 started = time.perf_counter()
                 transaction.submit_page_slab(
                     arena_index=arena_index,
@@ -1492,6 +1785,8 @@ def _execute_page_delta_restore(
                     spans=native_spans,
                 )
                 submit_call_ms += 1e3 * (time.perf_counter() - started)
+                pending_hash = (arena_buffer, arena_index, batch_snapshot_offset)
+                del futures, copies
                 # Source bytes are no longer needed by CUDA after the host
                 # copy into the fenced arena. Release their final use promptly;
                 # retain recurring objects within a separate bounded cache.
@@ -1511,12 +1806,17 @@ def _execute_page_delta_restore(
                                 del evicted
                             source_cache[path] = item
                             cache_bytes += size
-                del item
+                item = None  # drop the last payload reference with the batch
                 loaded.clear()
+            hash_pending()
         if final_sha256.hexdigest() != plan.result_snapshot_sha256:
             raise CudaHybridRestoreError(
                 "page-delta reconstructed snapshot checksum mismatch"
             )
+        if retained is not None:
+            # Exactly these bytes hashed to the header-bound result digest.
+            _remember_hot_page_snapshot(plan.result_snapshot_sha256, retained)
+            retained = None
         started = time.perf_counter()
         stats = transaction.finish()
         finish_ms = 1e3 * (time.perf_counter() - started)
@@ -1555,6 +1855,8 @@ def _execute_page_delta_restore(
         submit_call_ms=submit_call_ms,
         read_source_bytes=read_source_bytes,
         skipped_base_object_bytes=plan.skipped_base_object_bytes,
+        final_hash_ms=final_hash_ms,
+        planning_ms=planning_ms,
     )
 
 

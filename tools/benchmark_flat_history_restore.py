@@ -143,6 +143,13 @@ def counting(counter: Counter):
         counter["object_read_bytes"] += sum(piece[3] for piece in pieces)
         return original_extent(pieces)
 
+    original_extent_into = getattr(cache_manifest, "_read_object_extent_into", None)
+
+    def extent_into(pieces, target):
+        counter["object_reads"] += 1
+        counter["object_read_bytes"] += sum(piece[3] for piece in pieces)
+        return original_extent_into(pieces, target)
+
     def publish(objects):
         counter["object_writes"] += len(objects)
         counter["object_write_bytes"] += sum(len(payload) for _, payload in objects)
@@ -155,6 +162,9 @@ def counting(counter: Counter):
     if original_extent is not None:
         cache_manifest._read_object_extent = extent
         cuda_hybrid._read_object_extent = extent
+    if original_extent_into is not None:
+        cache_manifest._read_object_extent_into = extent_into
+        cuda_hybrid._read_object_extent_into = extent_into
     try:
         yield counter
     finally:
@@ -165,6 +175,9 @@ def counting(counter: Counter):
         if original_extent is not None:
             cache_manifest._read_object_extent = original_extent
             cuda_hybrid._read_object_extent = original_extent
+        if original_extent_into is not None:
+            cache_manifest._read_object_extent_into = original_extent_into
+            cuda_hybrid._read_object_extent_into = original_extent_into
 
 
 @contextlib.contextmanager
@@ -401,7 +414,7 @@ def _identity() -> CacheIdentity:
 
 
 def _cuda_restore(geometry: Geometry, store: ManifestStore, root: Path,
-                  digest: str, tokens: int) -> dict:
+                  digest: str, tokens: int, *, io_workers: int = 8) -> dict:
     layout = geometry.layout()
     counts = geometry.counts(tokens)
     lookup = store.lookup(_identity(), digest, verify_chunks=False)
@@ -423,7 +436,7 @@ def _cuda_restore(geometry: Geometry, store: ManifestStore, root: Path,
                 group_slots=tuple(tuple(range(1, count + 1)) for count in counts),
                 expected_span_tokens=tokens,
                 arena_bytes=geometry.object_bytes,
-                io_workers=2,
+                io_workers=io_workers,
             )
     finally:
         cuda_hybrid.cuda.arena_memoryview = original_view
@@ -441,6 +454,17 @@ def _cuda_restore(geometry: Geometry, store: ManifestStore, root: Path,
         "sha256_bytes": measured["sha256_bytes"] * geometry.scale,
         "placed_bytes": payload * geometry.scale,
         "slabs": result.slabs,
+        # Phase times of the reader itself, in fixture milliseconds.
+        "phase_ms": {
+            "read_and_hash": round(result.read_and_hash_ms, 2),
+            "planning": round(float(getattr(result, "planning_ms", 0.0)), 2),
+            "final_hash": round(float(getattr(result, "final_hash_ms", 0.0)), 2),
+            "host_copy": round(result.host_copy_ms, 2),
+            "arena_wait": round(result.arena_wait_ms, 2),
+            "submit_call": round(result.submit_call_ms, 2),
+            "finish": round(result.finish_ms, 2),
+        },
+        "hot_snapshot_hit": bool(getattr(result, "hot_snapshot_hit", False)),
     }
 
 
@@ -450,16 +474,31 @@ def _clear_header_cache() -> None:
         clear()
 
 
+def _clear_hot_snapshots() -> None:
+    clear = getattr(cache_manifest, "_clear_hot_page_snapshots", None)
+    if clear is not None:
+        clear()
+
+
+def _hot_snapshot_stats() -> dict:
+    stats = getattr(cache_manifest, "hot_page_snapshot_stats", None)
+    return stats() if stats is not None else {}
+
+
 def run(geometry: Geometry, root: Path, *, interval_tokens: int,
         cold_headers: bool, stage_limit: int = 0,
-        cold_publication_headers: bool = False) -> dict:
+        cold_publication_headers: bool = False, hot_snapshot_bytes: int = 0,
+        io_workers: int = 8) -> dict:
     """Publish the session chain and measure restores along it.
 
     Byte fields are scaled back to full-size equivalents (fixture bytes times
-    ``geometry.scale``). With ``cold_headers`` the process-local cache of
-    authenticated delta headers is cleared before every measured restore,
-    which models a reader that neither published nor previously read the
-    stages.
+    ``geometry.scale``). With ``cold_headers`` the process-local caches of
+    authenticated delta headers and of hot snapshots are cleared before every
+    measured restore, which models a reader that neither published nor
+    previously read the stages. ``hot_snapshot_bytes`` is the fixture-size
+    budget of the process-local hot snapshot cache (0 disables it); when it
+    is set, every CUDA restore point is measured twice, once with the hot
+    cache cleared (``disk``) and once immediately after (``hot``).
     """
 
     layout = geometry.layout()
@@ -468,7 +507,11 @@ def run(geometry: Geometry, root: Path, *, interval_tokens: int,
     tokens = tuple(range(SESSION_BOUNDARIES[-1]))
     digests = [context_prefix_digest(tokens, salt, token_count=count)
                for count in SESSION_BOUNDARIES]
-    store = ManifestStore(root, page_delta_stage_limit_count=stage_limit)
+    store_options = {"page_delta_stage_limit_count": stage_limit}
+    if hot_snapshot_bytes:
+        store_options["hot_page_snapshot_bytes"] = hot_snapshot_bytes
+    _clear_hot_snapshots()
+    store = ManifestStore(root, **store_options)
     store.commit_page_snapshot(
         identity=identity,
         context_digest=digests[0],
@@ -526,6 +569,7 @@ def run(geometry: Geometry, root: Path, *, interval_tokens: int,
 
     if cold_headers:
         _clear_header_cache()
+        _clear_hot_snapshots()
     python_restore = Counter()
     started = time.perf_counter()
     with counting(python_restore):
@@ -538,11 +582,20 @@ def run(geometry: Geometry, root: Path, *, interval_tokens: int,
     del restored
 
     curve = []
+    hot_curve = []
     for index in (1, 8, 16, 24, len(SESSION_BOUNDARIES) - 1):
         if cold_headers:
             _clear_header_cache()
+        if cold_headers or hot_snapshot_bytes:
+            _clear_hot_snapshots()
         curve.append(_cuda_restore(geometry, store, root, digests[index],
-                                   SESSION_BOUNDARIES[index]))
+                                   SESSION_BOUNDARIES[index],
+                                   io_workers=io_workers))
+        if hot_snapshot_bytes:
+            # The disk restore above retained its result; this one places it.
+            hot_curve.append(_cuda_restore(geometry, store, root, digests[index],
+                                           SESSION_BOUNDARIES[index],
+                                           io_workers=io_workers))
 
     scale = geometry.scale
 
@@ -573,6 +626,9 @@ def run(geometry: Geometry, root: Path, *, interval_tokens: int,
         "stage_limit": stage_limit,
         "cold_headers": cold_headers,
         "cold_publication_headers": cold_publication_headers,
+        "hot_snapshot_bytes": hot_snapshot_bytes * scale,
+        "io_workers": io_workers,
+        "hot_snapshot_stats": _hot_snapshot_stats(),
         "final_tokens": final_tokens,
         "final_stage_count": len(lookup._manifest.get("delta_stages", ())),
         "final_snapshot_bytes": len(expected) * scale,
@@ -591,6 +647,7 @@ def run(geometry: Geometry, root: Path, *, interval_tokens: int,
             "sha256_bytes": python_restore["sha256_bytes"] * scale,
         },
         "cuda_restore_curve": curve,
+        "cuda_restore_curve_hot": hot_curve,
     }
 
 
@@ -600,6 +657,11 @@ def main(argv=None) -> int:
     parser.add_argument("--snapshot-interval-tokens", type=int, default=0)
     parser.add_argument("--stage-limit", type=int, default=0,
                         help="maximum delta stages; 0 disables compaction (connector default: 4)")
+    parser.add_argument("--hot-snapshot-bytes", type=int, default=0,
+                        help="full-size budget of the process-local hot snapshot cache;"
+                             " divided by --scale like every other size (0 disables)")
+    parser.add_argument("--io-workers", type=int, default=8,
+                        help="reader thread count passed to the CUDA restore (connector default: 8)")
     parser.add_argument("--cold-headers", action="store_true")
     parser.add_argument("--cold-publication-headers", action="store_true",
                         help="clear authenticated headers before each publication")
@@ -622,7 +684,9 @@ def main(argv=None) -> int:
                                  interval_tokens=args.snapshot_interval_tokens,
                                  cold_headers=args.cold_headers,
                                  stage_limit=args.stage_limit,
-                                 cold_publication_headers=args.cold_publication_headers), indent=1))
+                                 cold_publication_headers=args.cold_publication_headers,
+                                 hot_snapshot_bytes=args.hot_snapshot_bytes // geometry.scale,
+                                 io_workers=args.io_workers), indent=1))
     finally:
         (cache_manifest._PAGE_DELTA_OBJECT_BYTES,
          cache_manifest._MAX_PAGE_DELTA_OBJECT_BYTES,
