@@ -20,7 +20,7 @@ ENV = "SPARK_CONTEXT_CACHE_PAGE_DELTA_STAGE_LIMIT_COUNT"
 
 def test_stage_limit_default_override_and_off(monkeypatch):
     monkeypatch.delenv(ENV, raising=False)
-    assert parse().page_delta_stage_limit_count == 4
+    assert parse().page_delta_stage_limit_count == 0
     monkeypatch.setenv(ENV, "8")
     assert parse().page_delta_stage_limit_count == 8
     assert parse({KEY: 0}).page_delta_stage_limit_count == 0
