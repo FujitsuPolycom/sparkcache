@@ -319,7 +319,23 @@ def _recurrent_state_identity(
             "spark-context-cache: recurrent group mixes incompatible state"
             " geometry: " + ", ".join(inconsistent)
         )
-    return {field: next(iter(choices)) for field, choices in values.items()}
+    identity = {field: next(iter(choices)) for field, choices in values.items()}
+    # Omit vLLM defaults to preserve namespaces on earlier source lines.
+    for field, default in (
+        ("tp_replicated", False),
+        ("prefill_checkpoint_alignment", None),
+        ("boundary_capture", False),
+    ):
+        choices = {getattr(layer_spec, field, default) for layer_spec in recurrent}
+        if len(choices) != 1:
+            raise RuntimeError(
+                "spark-context-cache: recurrent group mixes incompatible state"
+                " geometry: " + field
+            )
+        value = choices.pop()
+        if value != default:
+            identity[field] = value
+    return identity
 
 
 def kv_group_topology(
@@ -334,6 +350,15 @@ def kv_group_topology(
     groups = tuple(getattr(kv_cache_config, "kv_cache_groups", ()) or ())
     topology = []
     for group_index, group in enumerate(groups):
+        # Ephemeral replicas and host pools are not device pages we can restore.
+        role = getattr(group, "role", "default")
+        role = getattr(role, "value", role)
+        if (not getattr(group, "enable_kv_transfer", True)
+                or role != "default" or getattr(group, "host_resident", False)):
+            raise RuntimeError(
+                "spark-context-cache: unsupported non-transferable KV-cache group"
+                f" {group_index} (role={role!r})"
+            )
         spec = getattr(group, "kv_cache_spec", None)
         layers = tuple(sorted(getattr(group, "layer_names", ()) or ()))
         reuse_policy, reuse_window_tokens = _group_reuse_policy(spec, layers)

@@ -1461,6 +1461,16 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self._capacity_policy.ttl_seconds,
             self._shared_prefix_lease_ttl_seconds,
         )
+        logger.info(
+            "sparkcache: topology profile=%s groups=%d policies=%s",
+            self._profile.name,
+            len(self._group_topology),
+            ",".join(sorted({group["reuse_policy"] for group in self._group_topology})),
+        )
+        logger.debug(
+            "sparkcache: group_topology %s",
+            json.dumps(self._group_topology, default=dict, sort_keys=True, separators=(",", ":")),
+        )
 
     def _install_streaming_runtime(self, role: KVConnectorRole) -> None:
         """Resolve the opt-in runtime without importing a C++/CUDA backend."""

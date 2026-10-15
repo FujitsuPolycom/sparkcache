@@ -13,6 +13,26 @@ from deploy.glm53_flash.profile import immutable_revision_identity
 FIXTURES = Path(__file__).resolve().parents[1] / "deploy/checkpoint_identity"
 
 
+@pytest.mark.parametrize("name,expected", [
+    ("csf", "7906c93c59bf153168170b601cf36ae7cdd31927797dc4608320fe1ba8ec2c78"),
+    ("step5500", "759a6ce3138e95cddaa4dc8e53480274d2a3e75154cf1893ff275237b1ded2b6"),
+])
+def test_qwen_installer_identities_bind_pins_and_embedded_bf16_mtp(name, expected):
+    raw = (FIXTURES / f"qwen38-{name}-pins.json").read_bytes()
+    pins = json.loads(raw)
+    value = json.loads((FIXTURES / f"qwen38-{name}-inputs.json").read_text())
+    receipt = json.loads((FIXTURES / f"qwen38-{name}-receipt.json").read_text())
+    assert value["artifacts"] == {"manifest_sha256": hashlib.sha256(raw).hexdigest()}
+    assert value["repository"] == pins["repository"]
+    assert value["revision"] == pins["revision"]
+    assert value["model_config"] == {"sha256": pins["files"]["config.json"]["sha256"]}
+    assert value["draft"]["mode"] == "embedded"
+    assert value["draft"]["config"]["kv_cache_dtype"] == "auto"
+    assert receipt["inputs"] == value
+    assert receipt["checkpoint_sha256"] == derive_checkpoint_identity(value) == expected
+    assert expected != "036c2f7994466d32514130f0417ccd117705ca01e2038c1ce5745f84813829ba"
+
+
 def inputs():
     return json.loads((FIXTURES / "glm53-csf-inputs.json").read_text())
 

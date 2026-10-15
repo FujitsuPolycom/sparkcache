@@ -47,7 +47,25 @@ KV geometry, topology and runtime numerics still require their own pins.
 Adopting a v1 digest in a deployment intentionally causes cache misses against
 entries using another digest. No automatic migration or legacy alias exists.
 
-## Recorded GLM and Qwen values
+## Qwen installer inputs
+
+The release 2026.10.4 serving inputs and complete LF-normalized SparkRing pin
+manifests are copied from SparkRing `bfff0adc978acb41dd70ba569cf11c0d071f4e09`.
+Each receipt is reproducible with `python -m sparkcache.checkpoint_identity
+--input deploy/checkpoint_identity/qwen38-<name>-inputs.json`:
+
+| Name | Revision | Target and embedded draft identity |
+|---|---|---|
+| `csf` | `dc5b8ab2fa14bc4fecd6886273b7ebc6095662e2` | `7906c93c59bf153168170b601cf36ae7cdd31927797dc4608320fe1ba8ec2c78` |
+| `step5500` | `60215d26cf5e42c2db6128774032d57fc62678da` | `759a6ce3138e95cddaa4dc8e53480274d2a3e75154cf1893ff275237b1ded2b6` |
+
+Inputs use the effective CSF TP2 and QAD step-5500 TP4 loader settings and the
+complete speculative configuration, including BF16 draft KV (`auto`). Adjacent
+`-pins.json` and `-receipt.json` files preserve the preimages and outputs.
+These identities intentionally miss entries from either the other checkpoint
+or step 4000. They do not replace any recorded identity.
+
+## Recorded identity audit
 
 The fixtures copy public pin manifests and serving inputs from SparkRing commit
 `68a995125bef`. Their provenance and the full outputs of five derivation

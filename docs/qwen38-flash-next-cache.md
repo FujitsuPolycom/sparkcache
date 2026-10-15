@@ -51,6 +51,48 @@ do not establish runtime persistence correctness.
 
 ## Bounded GPU evidence
 
+### Release 2026.10.4 installer composition
+
+Status: **research-only**. CPU conformance tests cover the B12X layout on
+vLLM wheel `0.1.dev21553+gab86b7073`; no serving, CUDA restore or performance
+qualification exists for these checkpoint/runtime combinations. The fixture
+in `sparkcache/test_qwen38_installer_topology.py` is inferred from source,
+with one group per layer. Hardware gate Q2 must replace that grouping with
+the observed inventory, including the BF16 MTP group and replicated PLE state.
+
+| Checkpoint | TP | Manager page | Span setting | Effective limit |
+|---|---|---|---|---|
+| CSF `dc5b8ab2fa14bc4fecd6886273b7ebc6095662e2` | 2 | 2,848 | 49,152 | 48,416 |
+| QAD step 5500 `60215d26cf5e42c2db6128774032d57fc62678da` | 4 | 1,440 | 61,920 | 61,920 |
+
+Both checkpoints are published by Local Inference Lab. Their distinct
+[identity receipts](../deploy/checkpoint_identity/README.md#qwen-installer-inputs)
+bind the pin manifest, config, loader and embedded MTP settings. The recorded
+step-4000 digest remains unchanged. Non-default TP replication, prefill
+checkpoint alignment and boundary capture enter recurrent topology identity;
+missing/default fields retain earlier digests. Non-transferable, non-default-role
+and host-resident groups are unsupported and fail closed at construction.
+
+The expected layout has 12 target QSA full-attention layers, 36 aligned GDN
+layers, one replicated PLE convolution and one separate BF16 MTP attention
+group. Full attention includes the packed compressed index keys. Non-B12X QSA
+uses a circular-buffer spec and is unsupported. Every restorable span is a
+whole manager page, hence a multiple of both 4 and 8.
+
+QSA open-group selectors live outside the KV pool. vLLM resets them at
+connector resume, which is expected to be exact at page-aligned boundaries.
+PLE n-gram context is reconstructed from committed tokens; its convolution
+state is restored. Registered MTP pages are expected to be persisted while
+boundary hidden activations use a live forward. Actual MTP membership remains
+unconfirmed; the qualified-composition description above is not extended to it.
+
+Two 512 MiB capture slots bound host-memory pressure. With inferred attention
+cost 8,000 bytes/token/rank and 37 padded recurrent pages, the limits require
+about 448 MB at TP2 and 526 MB at TP4 before headers. Do not raise the limits
+until hardware records zero slot-overflow fallback counters. Roots must change
+when HC row sharding, MXFP8 projections, draft backends or kernel builds change,
+even if checkpoint and page geometry remain the same.
+
 ### Four-node QAD persistence and corruption recovery
 
 The [TP4 qualification record](qwen38-tp4-cache-qualification.json) binds
