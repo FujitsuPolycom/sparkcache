@@ -175,6 +175,7 @@ def test_b12x_groups_geometry_and_page_aligned_restore(tp, limit, effective):
     # Use the connector's real alignment implementation with the CPU suite's vLLM stubs.
     from sparkcache.test_spark_context_cache_connector import SparkContextCacheConnector
     connector = NS(_block_size=page, _storage_mode=parsed.storage_mode,
+                   _group_topology=parsed.group_topology,
                    _dcp_degree=1, _chunk_tokens=parsed.chunk_tokens,
                    _prefix_state_alignment=parsed.prefix_state_alignment,
                    _prefill_replay_tokens=parsed.prefill_replay_tokens)

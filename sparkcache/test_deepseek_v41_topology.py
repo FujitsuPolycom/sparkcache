@@ -1,17 +1,14 @@
-"""DeepSeek-V4.1-Flash cache-group conformance on the release 2026.10.4 vLLM line.
+"""DeepSeek-V4.1 groups recorded on release 2026.10.4, 2026-10-15.
 
-The fixture reproduces the V4.1 cache classes inferred from the model's spec
-declarations: compressed-latent and indexer-key groups at compression ratios
-2 and 1, prefix-cacheable encoder sliding-window groups, request-private
-decoder and draft sliding-window groups (prefill replay reserve 128), and
-per-request compressor rings. One group per cache class is a conformance
-fixture built from vLLM's spec field names, not a hardware dump; replace its
-grouping with the recorded topology inventory before hardware qualification.
+The 17-group worker inventory is pinned in deepseek_v41_topology.json.
+Seven encoder windows persist; one full-history group holds eight latent
+and indexer caches; one compressor ring and eight decoder/draft windows
+are request-private. Both decoder and draft reserve 128 replay tokens.
 """
 
 from __future__ import annotations
 
-import copy
+import json
 import tempfile
 import types
 import unittest
@@ -82,117 +79,67 @@ class SlidingWindowSpec(_EngineSpec):
     sliding_window = 128
 
 
-class LatentSpec(FullAttentionSpec):
-    """Compressed-latent page: 288 bytes per state at the compression ratio."""
+class MLAAttentionSpec(FullAttentionSpec):
+    """Latent and indexer pages share the engine's MLA spec class."""
 
 
-class IndexerSpec(FullAttentionSpec):
-    """DSA indexer-key page: 68 bytes per state at the compression ratio."""
-
-
-class EncoderSwaSpec(SlidingWindowSpec):
-    """Prefix-cacheable encoder sliding-window page: 528 bytes per token."""
-
-    def __init__(self, *, page_size_bytes: int) -> None:
-        super().__init__(
-            prefix_cacheable=True,
-            block_size=128,
-            page_size_bytes=page_size_bytes,
-        )
-        self.sliding_window = 128
-
-
-class RequestPrivateSwaSpec(EncoderSwaSpec):
-    """Decoder or draft sliding-window page that vLLM rebuilds from the
-    replay reserve: request-private, never prefix-cacheable."""
-
-    def __init__(self, *, page_size_bytes: int) -> None:
-        super().__init__(page_size_bytes=page_size_bytes)
-        self._prefix_cacheable = False
-        self._prefill_replay_tokens = REPLAY_RESERVE
+class SlidingWindowMLASpec(SlidingWindowSpec):
+    """Encoder and request-private decoder/draft sliding windows."""
 
 
 class CircularBufferSpec(FullAttentionSpec):
-    """vLLM compressor ring: one in-flight block per request, never
-    prefix-cacheable, no replay reserve."""
+    """Request-private compressor ring."""
 
-    def __init__(self, *, page_size_bytes: int) -> None:
-        super().__init__(
-            prefix_cacheable=False,
-            block_size=8,
-            page_size_bytes=page_size_bytes,
-        )
+
+OBSERVED_TOPOLOGY = json.loads(
+    Path(__file__).with_name("deepseek_v41_topology.json").read_text()
+)
 
 
 def deepseek_v41_layout(*, small_pages: bool = False, worker: bool = False) -> types.SimpleNamespace:
-    """One manager group per V4.1 cache class, in vLLM field names.
+    """Recorded manager packing with per-layer worker specs.
 
-    ``small_pages`` swaps the declared page sizes for tiny ones so
-    round-trip tests can allocate small pools; block sizes, policies, and
-    state quanta keep the values the model declares.
+    Small pages reduce allocation bytes only. Manager blocks, compression
+    quanta, replay reserves, layer names and ordering retain engine values.
     """
-
-    def latent(ratio: int, layers: tuple[str, ...]) -> types.SimpleNamespace:
-        page = 256 // ratio if small_pages else 288 * 128 // ratio
-        return types.SimpleNamespace(
-            kv_cache_spec=LatentSpec(tokens_per_state=ratio, page_size_bytes=page),
-            is_eagle_group=False,
-            layer_names=tuple(f"layers.{name}.latent" for name in layers),
-        )
-
-    def indexer(ratio: int, layers: tuple[str, ...]) -> types.SimpleNamespace:
-        page = 128 // ratio if small_pages else 68 * 128 // ratio
-        return types.SimpleNamespace(
-            kv_cache_spec=IndexerSpec(tokens_per_state=ratio, page_size_bytes=page),
-            is_eagle_group=False,
-            layer_names=tuple(f"layers.{name}.indexer" for name in layers),
-        )
-
-    encoder_layers = tuple(str(layer) for layer in range(20))
-    decoder_layers = tuple(str(layer) for layer in range(20, 40))
-    draft_layers = tuple(str(layer) for layer in range(40, 43))
-    ring_layers = ("2", "8", "14")
-    swa_page = 64 if small_pages else 528 * 128
-    ring_page = 32 if small_pages else 68 * 8
-    groups = (
-        latent(2, ring_layers),
-        latent(1, ("20",)),
-        indexer(2, ring_layers),
-        indexer(1, ("20",)),
-        types.SimpleNamespace(
-            kv_cache_spec=EncoderSwaSpec(page_size_bytes=swa_page),
-            is_eagle_group=False,
-            layer_names=tuple(f"layers.{name}.swa" for name in encoder_layers),
-        ),
-        types.SimpleNamespace(
-            kv_cache_spec=RequestPrivateSwaSpec(page_size_bytes=swa_page),
-            is_eagle_group=False,
-            layer_names=tuple(f"layers.{name}.swa" for name in decoder_layers),
-        ),
-        types.SimpleNamespace(
-            kv_cache_spec=RequestPrivateSwaSpec(page_size_bytes=swa_page),
-            is_eagle_group=True,
-            layer_names=tuple(f"layers.{name}.swa" for name in draft_layers),
-        ),
-        types.SimpleNamespace(
-            kv_cache_spec=CircularBufferSpec(page_size_bytes=ring_page),
-            is_eagle_group=False,
-            layer_names=tuple(f"layers.{name}.ring" for name in ring_layers),
-        ),
-    )
-    if worker:
-        for group in groups:
-            spec = group.kv_cache_spec
-            group.kv_cache_spec = UniformTypeKVCacheSpecs(
-                block_size=spec.block_size, dcp_replicated=False,
-                page_size_bytes=spec.page_size_bytes * len(group.layer_names),
-                kv_cache_specs={name: copy.deepcopy(spec) for name in group.layer_names},
+    classes = {cls.__name__: cls for cls in
+               (MLAAttentionSpec, SlidingWindowMLASpec, CircularBufferSpec)}
+    groups = []
+    for row in OBSERVED_TOPOLOGY:
+        members = {}
+        for name in row["layers"]:
+            ratio = 1
+            page = row["page_size_bytes"]
+            if row["reuse_policy"] == "full":
+                ratio = 1 if ".20." in name else 2
+                bytes_per_state = 68 if name.endswith("k_cache") else 288
+                page = 256 // ratio * bytes_per_state
+            if small_pages:
+                page = (256 // ratio if not name.endswith("k_cache") else 64 // ratio) if row["reuse_policy"] == "full" else 32
+            spec = classes[row["spec"]](
+                prefix_cacheable=row["reuse_policy"] in ("full", "sliding"),
+                prefill_replay_tokens=row.get("replay_tokens", 0),
+                block_size=row["block_size"], page_size_bytes=page,
+                tokens_per_state=ratio,
             )
-    return types.SimpleNamespace(kv_cache_groups=groups, num_blocks=512)
+            spec.storage_block_size = row["storage_block_size"]
+            members[name] = spec
+        representative = next(iter(members.values()))
+        spec = representative
+        if worker:
+            spec = UniformTypeKVCacheSpecs(
+                block_size=row["block_size"], dcp_replicated=False,
+                page_size_bytes=sum(member.page_size_bytes for member in members.values()),
+                kv_cache_specs=members,
+            )
+        groups.append(types.SimpleNamespace(
+            kv_cache_spec=spec, layer_names=tuple(members), is_eagle_group=False,
+        ))
+    return types.SimpleNamespace(kv_cache_groups=tuple(groups), num_blocks=512)
 
 
 @pytest.mark.parametrize("small_pages", [False, True])
-def test_qwen_hw_1_v41_scheduler_worker_topology_and_context_digest(tmp_path, small_pages):
+def test_dsv41_hw_1_scheduler_worker_topology_and_context_digest(tmp_path, small_pages):
     from sparkcache import spark_context_cache_config as cfg
 
     scheduler_layout = deepseek_v41_layout(small_pages=small_pages)
@@ -205,7 +152,11 @@ def test_qwen_hw_1_v41_scheduler_worker_topology_and_context_digest(tmp_path, sm
     try:
         assert scheduler._context_digest_salt == worker._context_digest_salt
         assert scheduler._digest(list(range(2304)), 2048) == worker._digest(list(range(2304)), 2048)
-        assert scheduler._aligned_span(2304) == worker._aligned_span(2304)
+        assert scheduler._block_size == worker._block_size == 256
+        assert scheduler._identity(0) == worker._identity(0)
+        for length in (*range(1, 4097), 127840, 524288):
+            expected = max(0, (length - 128) // 256 * 256)
+            assert scheduler._aligned_span(length) == worker._aligned_span(length) == expected
     finally:
         scheduler.shutdown()
         worker.shutdown()
@@ -246,7 +197,7 @@ def _v41_connector(
     return _make_connector(
         root,
         0,
-        block_size=CHUNK_TOKENS,
+        block_size=128 if role == KVConnectorRole.SCHEDULER else 256,
         extra_config={
             "spark_cache_model_profile": "deepseek-v41-b12x-hma",
             "spark_cache_min_span_tokens": str(CHUNK_TOKENS),
@@ -287,19 +238,11 @@ class DeepSeekV41TopologyTests(unittest.TestCase):
         from sparkcache import spark_context_cache_config as cfg
 
         topology = cfg.kv_group_topology(deepseek_v41_layout())
-        self.assertEqual(
-            [group["reuse_policy"] for group in topology],
-            ["full", "full", "full", "full", "sliding", "replay", "replay",
-             "transient"],
-        )
-        self.assertEqual(
-            [group["spec"] for group in topology],
-            ["LatentSpec", "LatentSpec", "IndexerSpec", "IndexerSpec",
-             "EncoderSwaSpec", "RequestPrivateSwaSpec",
-             "RequestPrivateSwaSpec", "CircularBufferSpec"],
-        )
-        self.assertEqual(topology[-1]["block_size"], 8)
-        self.assertEqual([group["eagle"] for group in topology][-2:], [True, False])
+        self.assertEqual(json.loads(json.dumps(topology)), OBSERVED_TOPOLOGY)
+        self.assertEqual(len(topology), 17)
+        self.assertEqual(sum(len(group["layers"]) for group in topology), 54)
+        self.assertEqual([group["reuse_policy"] for group in topology],
+                         ["sliding"] * 7 + ["full", "transient"] + ["replay"] * 8)
 
     def test_non_persisted_groups_record_replay_and_state_geometry(self) -> None:
         from sparkcache import spark_context_cache_config as cfg
@@ -321,21 +264,21 @@ class DeepSeekV41TopologyTests(unittest.TestCase):
 
         layout = deepseek_v41_layout()
         original = cfg.kv_group_topology_digest(layout)
-        layout.kv_cache_groups[5].kv_cache_spec._prefill_replay_tokens = 64
+        layout.kv_cache_groups[9].kv_cache_spec._prefill_replay_tokens = 64
         self.assertNotEqual(cfg.kv_group_topology_digest(layout), original)
 
         layout = deepseek_v41_layout()
         original = cfg.kv_group_topology_digest(layout)
-        layout.kv_cache_groups[7].kv_cache_spec.tokens_per_state = 2
-        layout.kv_cache_groups[7].kv_cache_spec.page_size_bytes = 68 * 4
+        layout.kv_cache_groups[8].kv_cache_spec.tokens_per_state = 2
+        layout.kv_cache_groups[8].kv_cache_spec.page_size_bytes = 68 * 4
         self.assertNotEqual(cfg.kv_group_topology_digest(layout), original)
 
         layout = deepseek_v41_layout()
         original = cfg.kv_group_topology_digest(layout)
-        layout.kv_cache_groups[5].kv_cache_spec._prefix_cacheable = True
-        layout.kv_cache_groups[5].kv_cache_spec._prefill_replay_tokens = 0
+        layout.kv_cache_groups[9].kv_cache_spec._prefix_cacheable = True
+        layout.kv_cache_groups[9].kv_cache_spec._prefill_replay_tokens = 0
         topology = cfg.kv_group_topology(layout)
-        self.assertEqual(topology[5]["reuse_policy"], "sliding")
+        self.assertEqual(topology[9]["reuse_policy"], "sliding")
         self.assertNotEqual(cfg.kv_group_topology_digest(layout), original)
 
     def test_unknown_non_prefix_cacheable_spec_is_refused(self) -> None:
@@ -500,11 +443,11 @@ class DeepSeekV41ProfileTests(unittest.TestCase):
     def test_replay_reserve_state_geometry_and_pages_fork_the_entry(self) -> None:
         original = _v41_identity(deepseek_v41_layout())
         narrower = deepseek_v41_layout()
-        narrower.kv_cache_groups[5].kv_cache_spec._prefill_replay_tokens = 64
+        narrower.kv_cache_groups[9].kv_cache_spec._prefill_replay_tokens = 64
         self.assertNotEqual(original.storage_key, _v41_identity(narrower).storage_key)
         coarser = deepseek_v41_layout()
-        coarser.kv_cache_groups[7].kv_cache_spec.tokens_per_state = 2
-        coarser.kv_cache_groups[7].kv_cache_spec.page_size_bytes = 68 * 4
+        coarser.kv_cache_groups[8].kv_cache_spec.tokens_per_state = 2
+        coarser.kv_cache_groups[8].kv_cache_spec.page_size_bytes = 68 * 4
         self.assertNotEqual(original.storage_key, _v41_identity(coarser).storage_key)
         larger_pages = deepseek_v41_layout()
         larger_pages.kv_cache_groups[0].kv_cache_spec.page_size_bytes = 288 * 256
@@ -602,14 +545,12 @@ class DeepSeekV41StoreRestoreTests(unittest.TestCase):
             )
             self.assertEqual(
                 connector._group_block_counts_for_span(self.RESULT_SPAN),
-                (9, 9, 9, 9, 1, 0, 0, 0),
+                (1,) * 7 + (9,) + (0,) * 9,
             )
             self.assertEqual(selected[4], (tables[4][17],))
-            self.assertEqual(selected[5], ())
-            self.assertEqual(selected[6], ())
-            self.assertEqual(selected[7], ())
+            self.assertEqual(selected[8:], ((),) * 9)
 
-    def test_qwen_hw_1_store_and_restore_skip_non_persisted_groups_across_views(self) -> None:
+    def test_dsv41_hw_1_incremental_save_and_restore_across_roles(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             layout = deepseek_v41_layout(small_pages=True)
@@ -619,9 +560,9 @@ class DeepSeekV41StoreRestoreTests(unittest.TestCase):
             self.addCleanup(connector.shutdown)
             pools: dict[str, torch.Tensor] = {}
             generator = torch.Generator().manual_seed(20261015)
-            for group in layout.kv_cache_groups:
-                width = int(group.kv_cache_spec.page_size_bytes)
-                for name in group.layer_names:
+            for group in deepseek_v41_layout(small_pages=True, worker=True).kv_cache_groups:
+                for name, spec in group.kv_cache_spec.kv_cache_specs.items():
+                    width = spec.page_size_bytes
                     pools[name] = torch.randint(
                         0, 256, (512, 1, width), dtype=torch.uint8,
                         generator=generator,
@@ -666,10 +607,10 @@ class DeepSeekV41StoreRestoreTests(unittest.TestCase):
             manifest = lookup._manifest
             assert manifest is not None
             self.assertEqual(
-                manifest["base_block_counts"], [4, 4, 4, 4, 1, 0, 0, 0]
+                manifest["base_block_counts"], [1] * 7 + [4] + [0] * 9
             )
             self.assertEqual(
-                manifest["result_block_counts"], [9, 9, 9, 9, 1, 0, 0, 0]
+                manifest["result_block_counts"], [1] * 7 + [9] + [0] * 9
             )
 
             destination = tuple(
@@ -713,7 +654,7 @@ class DeepSeekV41StoreRestoreTests(unittest.TestCase):
                         )
             # Non-persisted groups contributed zero pages: their destination
             # blocks stay zeroed and their source blocks stay untouched.
-            for index in (5, 6, 7):
+            for index in range(8, 17):
                 for block in destination[index]:
                     for name in layout.kv_cache_groups[index].layer_names:
                         self.assertTrue(
@@ -731,13 +672,12 @@ class DeepSeekV41LoadFailureTests(unittest.TestCase):
         self, root: Path
     ) -> tuple[SparkContextCacheConnector, dict[str, torch.Tensor],
                tuple[tuple[int, ...], ...], str]:
-        layout = deepseek_v41_layout(small_pages=True)
-        connector = _v41_connector(root, layout)
+        connector = _v41_connector(root, deepseek_v41_layout(small_pages=True, worker=True))
         pools: dict[str, torch.Tensor] = {}
         generator = torch.Generator().manual_seed(20261016)
-        for group in layout.kv_cache_groups:
-            width = int(group.kv_cache_spec.page_size_bytes)
-            for name in group.layer_names:
+        for group in deepseek_v41_layout(small_pages=True, worker=True).kv_cache_groups:
+            for name, spec in group.kv_cache_spec.kv_cache_specs.items():
+                width = spec.page_size_bytes
                 pools[name] = torch.randint(
                     0, 256, (512, 1, width), dtype=torch.uint8,
                     generator=generator,
@@ -804,10 +744,38 @@ class DeepSeekV41LoadFailureTests(unittest.TestCase):
             retry_selection = connector._select_group_blocks_for_span(
                 retry_tables, retry_span
             )
-            self.assertEqual(retry_selection[5], ())
-            self.assertEqual(retry_selection[6], ())
-            self.assertEqual(retry_selection[7], ())
+            self.assertEqual(retry_selection[8:], ((),) * 9)
 
+
+
+@pytest.mark.parametrize("worker", [False, True])
+def test_dsv41_hw_1_alignment_uses_group_lcm_and_chunk_quantum(worker):
+    from sparkcache import spark_context_cache_config as cfg
+
+    layout = deepseek_v41_layout(worker=worker)
+    group = layout.kv_cache_groups[0]
+    specs = (group.kv_cache_spec.kv_cache_specs.values() if worker
+             else (group.kv_cache_spec,))
+    for spec in specs:
+        spec.block_size = 192
+    block_size = cfg.cache_group_block_size(layout, 128 if not worker else 256)
+    assert block_size == 768
+    connector = types.SimpleNamespace(
+        _block_size=block_size, _prefix_state_alignment=5, _chunk_tokens=256,
+        _storage_mode="block_pages_v1", _dcp_degree=1, _prefill_replay_tokens=128,
+        _group_topology=(),
+    )
+    assert SparkContextCacheConnector._aligned_span(connector, 10000) == 7680
+
+
+@pytest.mark.parametrize("value", [0, -1, True, None])
+def test_dsv41_hw_1_invalid_group_block_size_is_refused(value):
+    from sparkcache import spark_context_cache_config as cfg
+
+    layout = deepseek_v41_layout()
+    layout.kv_cache_groups[7].kv_cache_spec.block_size = value
+    with pytest.raises(RuntimeError, match="block size must be positive"):
+        cfg.cache_group_block_size(layout, 256)
 
 
 if __name__ == "__main__":

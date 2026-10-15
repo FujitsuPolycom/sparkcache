@@ -144,6 +144,32 @@
         "ae4cedb4fc93d4c40ad5269c81a094fe2bbeef77f08960cc8d190c7f756924dc",
         "c7ea4b09a8c7ee0923cfc5005bac166e09781e38b69d9750501bb7f91a363dd1"
       ]
+    },
+    {
+      "fixture": "qwen_tp2",
+      "profile": "qwen38-flash-next-hybrid",
+      "tp": 2,
+      "dcp": 1,
+      "source_commit": "a5940102c99e",
+      "topology_digest": "86468e68414900525d3d45de76ce799a7a14ab79b2e8b098aa171d1116c84d7f",
+      "storage_keys": [
+        "cda65261e1b3933c114ddaef55db8ef6b90f47925ed77b155e10e6fb14226549",
+        "d2f8aa16f5588e329511251452e59c94a8279dfdcbf64ddffebe6b73e4db16ee"
+      ]
+    },
+    {
+      "fixture": "qwen_tp4",
+      "profile": "qwen38-flash-next-hybrid",
+      "tp": 4,
+      "dcp": 1,
+      "source_commit": "a5940102c99e",
+      "topology_digest": "c8baf0aa6f71c8105e55d6e1fdd9ddbf925f37253e2135ed283a6f4d24c9d365",
+      "storage_keys": [
+        "6d20acc439433775cbbdc638533b21d16337a1286222ac91b5c798759ce02206",
+        "40daa395951d564aa2cce95fe4045c117695a3d6a2bb280ab41cb3be895bcaf4",
+        "de76095cfc5fb04bf6f85eb872761c9a603a553fe175df66e7e795a5ac4c8ada",
+        "2657cf889583def47ca9da7d990e04593759fa086845521126299be16cf1d799"
+      ]
     }
   ]
 }

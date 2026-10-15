@@ -1,9 +1,10 @@
 # DeepSeek-V4.1-Flash deployment tooling (research-only)
 
-Status: **research-only**. Nothing in this directory has run against a
-serving deployment; no SparkCache entry, gate report, or measurement exists
-for DeepSeek-V4.1-Flash. Hardware qualification is a separate, authorized
-step on the DGX Spark installer profile that SparkRing maintains.
+Status: **research-only**. The 2026-10-15 hardware inventory records 17 KV
+manager groups. SparkCache at `a5940102c99e` failed scheduler startup because
+it validated the scheduler's 128-token hash block against the worker's
+256-token backend block. The role-independent group alignment is implemented
+and CPU tested; serving correctness and performance remain unqualified.
 
 The `deepseek-v41-b12x-hma` model profile in
 [`sparkcache/spark_context_cache_profiles.py`](../../sparkcache/spark_context_cache_profiles.py)
@@ -60,11 +61,14 @@ exercise the injected HTTP seam only.
 
 ## What is missing before this profile leaves research-only
 
-- A recorded hardware topology inventory (the conformance fixture in
-  [`sparkcache/test_deepseek_v41_topology.py`](../../sparkcache/test_deepseek_v41_topology.py)
-  is inferred from the model's spec declarations, not from a rank dump).
-- A derived SparkRing image layer and installer profile (SparkRing
-  repository work).
+- A successful image build and serving run of the role-independent alignment.
+  The [recorded worker topology](../../sparkcache/deepseek_v41_topology.json)
+  and [CPU tests](../../sparkcache/test_deepseek_v41_topology.py) bind seven
+  encoder sliding groups, one full-history group, one compressor ring and
+  eight decoder/draft replay groups. Both roles derive 256-token alignment
+  from the LCM of manager blocks (128, 256 and 8); replay reserve is 128.
+  Hardware must confirm scheduler/worker identity agreement and persistent
+  spans of `max(0, floor((N-128)/256)*256)`.
 - CUDA page restore and asynchronous page capture remain disabled; the
   profile refuses `spark_cache_cuda_restore`.
 - A live validation record. No `DEEPSEEK_V41_*` validation document exists

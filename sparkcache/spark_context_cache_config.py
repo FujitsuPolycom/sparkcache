@@ -437,6 +437,32 @@ def _group_tokens_per_state(spec: Any, layer_names: Sequence[str]) -> int:
     return value
 
 
+def cache_group_block_size(kv_cache_config: Any, legacy_block_size: int) -> int:
+    """Return the shared prefix-hit block alignment from manager groups.
+
+    EngineCore reduces cache_config.block_size to the smallest cacheable
+    group, while workers retain the backend default. Neither role-local
+    value describes a hybrid prefix boundary: vLLM's cache coordinator
+    aligns hits to the LCM of manager groups' block sizes. Use that LCM
+    before profile validation and span/page calculations. This also satisfies
+    the coordinator requirement that every group divides its scheduling block.
+
+    Source lines without manager groups use the legacy token-row geometry.
+    Their cache config is shared and is the only available block geometry.
+    """
+    groups = tuple(getattr(kv_cache_config, "kv_cache_groups", ()) or ())
+    if not groups:
+        return legacy_block_size
+    sizes = []
+    for group in groups:
+        spec = _group_identity_spec(group.kv_cache_spec, group.layer_names)
+        size = getattr(spec, "block_size", None)
+        if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+            raise RuntimeError("spark-context-cache: KV-cache group block size must be positive")
+        sizes.append(size)
+    return math.lcm(*sizes)
+
+
 def prefix_state_alignment(kv_cache_config: Any) -> int:
     """Least common multiple of prefix-cacheable layers' tokens_per_state.
 
@@ -656,7 +682,9 @@ def parse_connector_config(
     load-thread settings retains Python's :class:`ValueError` behavior.
     """
 
-    block_size = vllm_config.cache_config.block_size
+    block_size = cache_group_block_size(
+        kv_cache_config, vllm_config.cache_config.block_size
+    )
     parallel = vllm_config.parallel_config
     tp_degree = max(1, getattr(parallel, "tensor_parallel_size", 1))
     dcp_degree = max(1, getattr(parallel, "decode_context_parallel_size", 1))

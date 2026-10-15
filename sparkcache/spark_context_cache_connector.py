@@ -1732,7 +1732,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             return False
 
     def _aligned_span(self, prompt_len: int) -> int:
-        # A persistent boundary must be a multiple of the engine block size,
+        # A persistent boundary must be a multiple of the manager-group block LCM,
         # of every prefix-cacheable group's tokens_per_state (vLLM aligns
         # prefix hits to the same quanta), and — under DCP sharding — of every
         # sharded group's logical page width. It must also leave at least the
@@ -1740,7 +1740,19 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         # runs rebuild the request-private state a cache-off run rebuilds.
         # With no replay group the reserve is zero and the boundary is the
         # largest aligned span below the prompt end, as before.
-        alignment = math.lcm(self._block_size, self._prefix_state_alignment)
+        block_alignment = self._block_size
+        if self._storage_mode == "block_pages_v1" and any(
+            int(group.get("recurrent_state", {}).get("tokens_per_state", -1)) > 0
+            for group in self._group_topology
+        ):
+            # Fixed-quantum recurrent groups publish explicit checkpoint
+            # blocks at chunk boundaries, including partial attention pages.
+            # Missing checkpoint metadata still refuses publication below.
+            # Variable-quantum recurrent groups retain manager-page alignment.
+            block_alignment = self._chunk_tokens
+        alignment = math.lcm(
+            block_alignment, self._prefix_state_alignment, self._chunk_tokens
+        )
         if self._storage_mode == "block_pages_v1" and self._dcp_degree > 1:
             try:
                 sharded_page_quanta = tuple(
@@ -1760,8 +1772,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         limit = prompt_len - max(1, self._prefill_replay_tokens)
         if limit <= 0:
             return 0
-        span = limit // alignment * alignment
-        return span // self._chunk_tokens * self._chunk_tokens
+        return limit // alignment * alignment
 
     @staticmethod
     def _normalize_group_blocks(
