@@ -168,8 +168,64 @@ copied. The composed result must match the newest stage's result digest;
 intermediate results are neither materialized nor rehashed.
 
 A stage header is authenticated by hashing the stage's first macro object.
-Each worker process keeps a bounded cache of headers it has authenticated or
-published, so a warm restore reads about one final snapshot.
+
+Each worker process keeps an LRU cache of authenticated or published headers.
+The cache holds at most 16 MiB of header bytes, keyed by the first object's
+SHA-256 and length.
+
+Cached headers avoid repeated first-object authentication. Surviving tail
+bytes are still read and verified on every restore.
+
+An overwritten intermediate stage is authenticated by digest chaining, not by
+rehashing its full result.
+
+The CUDA reader uses tail reads when every layer tail in a stage fits its
+arena and prefetch bounds. Otherwise it uses authenticated whole-object reads
+for that stage.
+
+Both paths verify the final result before the request resumes.
+Cache identities, on-disk formats, and wire formats are unchanged.
+
+### Flat-history restore measurements
+
+Status: **research-only**. A 32-turn synthetic agent session used the same two
+DGX Sparks (Draupnir positions 6-7) for both builds, with TP2/DCP1, MTP3,
+CUDA page restore, `tail-cow-v2`, and snapshot interval 0.
+
+The [hardware evidence note](../deploy/glm53_flash/RESTORE_COST_RESEARCH.md)
+identifies the model, checkpoint, image, request procedure, and remaining
+configuration.
+
+At turn 32, the restored entry contained 31 delta stages and 186,368 tokens;
+the fresh request contained 187,889 prompt tokens.
+
+Restore and commit timings use the slower rank. Time to first token (TTFT)
+is measured by the client for the fresh request.
+
+| Measurement | Baseline `50bd6d9` | Tail-read/header-cache build `e389b32` |
+|---|---:|---:|
+| `restore_read` | 18.8 s | 1.5 s |
+| Publication commit | 19.7 s | 5.5 s |
+| Turn-32 fresh-request TTFT | 22.8 s | 3.7 s |
+| `load_failed` | 0 | 0 |
+
+A separate restart test on Draupnir positions 4-5 restored a 30-stage,
+182,272-token entry. A cold process read 3,393 MB versus 1,380 MB warm
+(2.46 times, about 2.5 times).
+
+Cold `restore_read` was 5.0-6.1 s versus 1.3-1.7 s before restart. Keeping or
+dropping the OS page cache gave similar cold timings. Repeating the request
+in the same process restored warm speed.
+
+These measurements cover one session per arm and one same-pair comparison,
+with the GPU prefix cache reset before measured requests.
+
+Digest checks passed and no loads failed. Output-token equality and
+independent bit-for-bit restore correctness were not evaluated.
+
+The results demonstrate reduced restore and publication work under these
+conditions. They do not qualify serving or guarantee performance for other
+models and topologies.
 
 ## SparkCache CUDA restore
 
