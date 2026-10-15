@@ -23,10 +23,6 @@ class MambaSpec(NS):
     pass
 
 
-class CircularBufferSpec(NS):
-    pass
-
-
 class MLAAttentionSpec(FullAttentionSpec):
     pass
 
@@ -179,7 +175,9 @@ def test_b12x_groups_geometry_and_page_aligned_restore(tp, limit, effective):
     # Use the connector's real alignment implementation with the CPU suite's vLLM stubs.
     from sparkcache.test_spark_context_cache_connector import SparkContextCacheConnector
     connector = NS(_block_size=page, _storage_mode=parsed.storage_mode,
-                   _dcp_degree=1, _chunk_tokens=parsed.chunk_tokens)
+                   _dcp_degree=1, _chunk_tokens=parsed.chunk_tokens,
+                   _prefix_state_alignment=parsed.prefix_state_alignment,
+                   _prefill_replay_tokens=parsed.prefill_replay_tokens)
     aligned = SparkContextCacheConnector._aligned_span
     assert aligned(connector, limit + 1) == effective
     for length in (4096, 12000, 32000, limit, limit + 1):
@@ -189,9 +187,22 @@ def test_b12x_groups_geometry_and_page_aligned_restore(tp, limit, effective):
 
 
 def test_non_b12x_qsa_ring_is_refused():
+    class QsaRingSpec(NS):
+        pass
+
     groups = [NS(kv_cache_spec=spec(block_size=32, tokens_per_state=4), layer_names=[name])
-              for spec, name in [(CircularBufferSpec, "ring"), (MLAAttentionSpec, "compressed")]]
-    with pytest.raises(RuntimeError, match="unsupported.*CircularBufferSpec"):
+              for spec, name in [(QsaRingSpec, "ring"), (MLAAttentionSpec, "compressed")]]
+    with pytest.raises(RuntimeError, match="unsupported.*QsaRingSpec"):
+        cfg.kv_group_topology(NS(kv_cache_groups=groups))
+
+
+def test_circular_buffer_group_requires_engine_private_properties():
+    class CircularBufferSpec(NS):
+        pass
+
+    groups = [NS(kv_cache_spec=CircularBufferSpec(block_size=8, tokens_per_state=1),
+                 layer_names=["ring"])]
+    with pytest.raises(RuntimeError, match="circular-buffer"):
         cfg.kv_group_topology(NS(kv_cache_groups=groups))
 
 

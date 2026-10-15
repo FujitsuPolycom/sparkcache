@@ -113,7 +113,7 @@ class ProfileRegistryTests(unittest.TestCase):
         for profile in PROFILES.values():
             profile.validate_for_deployment(
                 dcp_degree=1,
-                block_size=64,
+                block_size=profile.required_block_size or 64,
                 min_span_tokens=profile.chunk_tokens,
                 cuda_restore=profile.storage_mode == "per_token_rows",
             )

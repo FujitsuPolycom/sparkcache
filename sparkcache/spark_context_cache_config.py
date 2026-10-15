@@ -2,7 +2,7 @@
 
 Both the scheduler and worker connector roles share one parsing path.
 ``parse_connector_config`` reads all SparkCache settings from a
-``VllmConfig``-like object — extra-config keys, environment variables,
+``VllmConfig``-like object â€” extra-config keys, environment variables,
 parallel degrees, model profile, and KV-cache group topology. It validates
 the verified-or-recompute deployment contract and returns an immutable
 :class:`ConnectorConfig` carrying every value the connector needs at
@@ -231,10 +231,48 @@ def _freeze_config_value(value: Any) -> Any:
     return value
 
 
+def _spec_replay_tokens(spec: Any) -> int:
+    """Return one vLLM spec's request-private prefill replay reserve."""
+
+    value = getattr(spec, "prefill_replay_tokens", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise RuntimeError(
+            "spark-context-cache: prefill_replay_tokens must be a"
+            " non-negative integer"
+        )
+    return value
+
+
 def _cache_spec_reuse_policy(spec: Any) -> tuple[str, int | None]:
     """Classify one layer's supported persistent-cache reuse semantics."""
 
     class_names = {base.__name__ for base in type(spec).__mro__}
+    prefix_cacheable = getattr(spec, "prefix_cacheable", None)
+    if "CircularBufferSpec" in class_names:
+        # A vLLM compressor ring keeps one in-flight block per request whose
+        # contents only matter inside the still-open compression group. vLLM
+        # aligns prefix hits to prefix-cacheable state boundaries, where the
+        # ring holds nothing later rows consume, so the block is never
+        # persisted and the persistent span stays a multiple of every
+        # prefix-cacheable group's tokens_per_state.
+        if prefix_cacheable is not False or _spec_replay_tokens(spec):
+            raise RuntimeError(
+                "spark-context-cache: circular-buffer KV-cache spec must be"
+                " non-prefix-cacheable without a replay reserve"
+            )
+        return "transient", None
+    if prefix_cacheable is False:
+        replay_tokens = _spec_replay_tokens(spec)
+        if replay_tokens:
+            # vLLM request-private prefill state: the group's pages hold
+            # valid bytes only for the last replay_tokens computed rows, so
+            # the persistent span must leave that suffix to recompute and
+            # the pages are never persisted.
+            return "replay", replay_tokens
+        raise RuntimeError(
+            "spark-context-cache: unsupported block-page KV-cache spec "
+            f"{type(spec).__name__}"
+        )
     if "SlidingWindowSpec" in class_names:
         window = int(getattr(spec, "sliding_window", 0) or 0)
         if window <= 1:
@@ -369,6 +407,69 @@ def _group_identity_spec(spec: Any, layers: Sequence[str]) -> Any:
     return representative
 
 
+def _group_tokens_per_state(spec: Any, layer_names: Sequence[str]) -> int:
+    """Return one non-persisted group's integer token states-per-block.
+
+    The value enters the topology digest for transient and replay groups, so
+    a compression-ratio or state-geometry change forks the cache namespace.
+    """
+
+    per_layer = getattr(spec, "kv_cache_specs", None)
+    values = {
+        getattr(
+            per_layer[name] if isinstance(per_layer, dict) and name in per_layer else spec,
+            "tokens_per_state",
+            1,
+        )
+        for name in layer_names
+    }
+    if len(values) != 1:
+        raise RuntimeError(
+            "spark-context-cache: group mixes incompatible state geometry:"
+            " tokens_per_state"
+        )
+    value = next(iter(values))
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise RuntimeError(
+            "spark-context-cache: non-persisted group tokens_per_state must"
+            " be a positive integer"
+        )
+    return value
+
+
+def prefix_state_alignment(kv_cache_config: Any) -> int:
+    """Least common multiple of prefix-cacheable layers' tokens_per_state.
+
+    vLLM aligns prefix-cache hits to these state quanta, so a persistent
+    span must satisfy the same alignment to never fall inside an open
+    compression group. Only specs that declare prefix-cache participation
+    (the engine base class exposes ``prefix_cacheable`` on every spec)
+    constrain the alignment; fractional and non-positive state quanta do
+    not, matching the engine's own prefix-alignment rule.
+    """
+
+    alignment = 1
+    for group in tuple(getattr(kv_cache_config, "kv_cache_groups", ()) or ()):
+        spec = getattr(group, "kv_cache_spec", None)
+        per_layer = getattr(spec, "kv_cache_specs", None)
+        layer_names = tuple(getattr(group, "layer_names", ()) or ())
+        layer_specs = tuple(
+            per_layer[name]
+            if isinstance(per_layer, dict) and name in per_layer
+            else spec
+            for name in layer_names
+        ) or (spec,)
+        for layer_spec in layer_specs:
+            if getattr(layer_spec, "prefix_cacheable", None) is not True:
+                continue
+            value = getattr(layer_spec, "tokens_per_state", 1)
+            if isinstance(value, bool) or not isinstance(value, int):
+                continue
+            if value > 1:
+                alignment = math.lcm(alignment, value)
+    return alignment
+
+
 def kv_group_topology(
     kv_cache_config: Any,
     *,
@@ -421,6 +522,15 @@ def kv_group_topology(
         }
         if recurrent_state is not None:
             group_identity["recurrent_state"] = recurrent_state
+        if reuse_policy in ("transient", "replay"):
+            # Non-persisted groups record their replay reserve and state
+            # geometry so both enter the topology digest. The fields exist
+            # only on these groups, which preserves topology digests and
+            # cache identities of deployments without them.
+            group_identity["replay_tokens"] = int(reuse_window_tokens or 0)
+            group_identity["tokens_per_state"] = _group_tokens_per_state(
+                spec, layers
+            )
         topology.append(group_identity)
     return tuple(topology)
 
@@ -451,6 +561,13 @@ class ConnectorConfig:
     dcp_degree: int
     cp_kv_cache_interleave_size: int
     block_size: int
+    # Largest per-group request-private prefill replay reserve (zero when no
+    # group declares one). A persistent span must leave at least this many
+    # prompt tokens to recompute.
+    prefill_replay_tokens: int
+    # Least common multiple of prefix-cacheable groups' tokens_per_state; a
+    # persistent span must be a multiple of it.
+    prefix_state_alignment: int
     profile: Any
     storage_mode: str
     publication_schema: str
@@ -655,6 +772,14 @@ def parse_connector_config(
         raise RuntimeError(
             "spark-context-cache: block-page storage requires KV-cache groups"
         )
+    prefill_replay_tokens = max(
+        (
+            int(group.get("replay_tokens", 0) or 0)
+            for group in group_topology
+        ),
+        default=0,
+    )
+    state_alignment = prefix_state_alignment(kv_cache_config)
     chunk_tokens = profile.chunk_tokens
     if storage_mode == "per_token_rows" and cp_kv_cache_interleave_size != 1:
         raise RuntimeError(
@@ -996,6 +1121,7 @@ def parse_connector_config(
             block_size=block_size,
             min_span_tokens=min_span,
             cuda_restore=cuda_restore_enabled,
+            group_topology=group_topology,
         )
     except ProfileError as error:
         raise RuntimeError(f"spark-context-cache: {error}") from error
@@ -1092,6 +1218,8 @@ def parse_connector_config(
         dcp_degree=dcp_degree,
         cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
         block_size=block_size,
+        prefill_replay_tokens=prefill_replay_tokens,
+        prefix_state_alignment=state_alignment,
         profile=profile,
         storage_mode=storage_mode,
         publication_schema=publication_schema,

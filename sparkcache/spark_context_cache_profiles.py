@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Any, Mapping, Sequence
 
 # Data record kinds a profile may persist. LOGICAL_POSITIONS is implicit in
 # every chunk and is not part of this vocabulary.
@@ -78,6 +78,15 @@ class ModelProfile:
     default_family: str = "target_ckv"
     chunk_tokens: int = 256
     storage_mode: str = "per_token_rows"
+    # Engine block size the profile's page geometry is written for, when one
+    # value is required. ``None`` accepts any block size the chunk divisibility
+    # checks admit.
+    required_block_size: int | None = None
+    # True when the profile's models declare request-private groups whose
+    # pages must never be persisted; startup then refuses a topology without
+    # at least one ``replay`` group, so a model build that silently changed
+    # its cache contract cannot attach to this profile.
+    requires_replay_group: bool = False
     # True for MLA-style caches where every TP rank holds identical KV bytes.
     # The value is serialized profile metadata. Quorum, rank-local namespaces,
     # and capacity accounting deliberately remain unchanged; no implemented
@@ -98,6 +107,10 @@ class ModelProfile:
             )
         if self.chunk_tokens <= 0:
             raise ProfileError(f"profile {self.name}: chunk_tokens must be positive")
+        if self.required_block_size is not None and self.required_block_size <= 0:
+            raise ProfileError(
+                f"profile {self.name}: required_block_size must be positive"
+            )
         if self.storage_mode not in {"per_token_rows", "block_pages_v1"}:
             raise ProfileError(
                 f"profile {self.name}: unknown storage mode {self.storage_mode!r}"
@@ -166,12 +179,30 @@ class ModelProfile:
         min_span_tokens: int,
         cuda_restore: bool | None = None,
         native_restore: bool | None = None,
+        group_topology: Sequence[Mapping[str, Any]] = (),
     ) -> None:
         """Fail startup on geometry a store or restore would corrupt or
         silently truncate later.
         """
         if dcp_degree <= 0:
             raise ProfileError("dcp_degree must be positive")
+        if self.required_block_size is not None and block_size != (
+            self.required_block_size
+        ):
+            raise ProfileError(
+                f"profile {self.name}: block_size {block_size} must be"
+                f" {self.required_block_size}; the profile's page geometry"
+                " and span alignment are written for that block size"
+            )
+        if self.requires_replay_group and group_topology:
+            if not any(
+                group.get("reuse_policy") == "replay" for group in group_topology
+            ):
+                raise ProfileError(
+                    f"profile {self.name}: KV topology declares no 'replay'"
+                    " group; the model build's cache contract changed and"
+                    " request-private state would be persisted or restored"
+                )
         if self.chunk_tokens % dcp_degree:
             raise ProfileError(
                 f"profile {self.name}: chunk_tokens {self.chunk_tokens} is not"
@@ -304,6 +335,28 @@ PROFILES: Mapping[str, ModelProfile] = {
         required_families=frozenset({"target_ckv"}),
         chunk_tokens=256,
         storage_mode="block_pages_v1",
+        kv_replicated_across_tp=True,
+    ),
+    "deepseek-v41-b12x-hma": ModelProfile(
+        name="deepseek-v41-b12x-hma",
+        description=(
+            "DeepSeek-V4.1 B12X packed latent, indexer, and sliding-window"
+            " pages stored as opaque manager pages under their"
+            " hybrid-memory-allocator block tables. Request-private"
+            " sliding-window groups (prefill replay) and compressor-ring"
+            " groups are recomputed at every persistent boundary and never"
+            " persisted."
+        ),
+        quantization_layout="deepseek-v41-b12x-hma-block-pages-v1",
+        rope_layout="deepseek-v41-rope-v1",
+        boundary_hidden_policy="live_forward",
+        default_draft_kv_policy="colocated_target",
+        classification_rules=(),
+        required_families=frozenset({"target_ckv"}),
+        chunk_tokens=256,
+        storage_mode="block_pages_v1",
+        required_block_size=256,
+        requires_replay_group=True,
         kv_replicated_across_tp=True,
     ),
 }
