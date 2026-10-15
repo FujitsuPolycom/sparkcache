@@ -573,6 +573,7 @@ class IdentityBaseTests(unittest.TestCase):
             {
                 "spark_cache_model_profile": "deepseek-v4-fp8-hma",
                 "spark_cache_publication_schema": "tail-cow-v2",
+                "spark_cache_payload_integrity": "sha256",
             },
             tp=1,
             dcp=1,

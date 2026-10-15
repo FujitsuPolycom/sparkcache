@@ -565,13 +565,19 @@ def parse_connector_config(
                 "spark-context-cache: tail-cow-v2 requires block-page storage"
             )
         publication_schema = "page-tail-cow-v2"
-    # Payload integrity (research-only). ``sha256`` keeps the content-addressed
-    # format. ``fast`` and ``none`` select the page-tail-cow-v3 schemas, whose
-    # cache identity differs so readers of either format miss the other cleanly.
+    # Payload integrity. ``fast`` (the default for tail-cow-v2 publication)
+    # checks payload objects and layer tails with CRC32 and selects the
+    # page-tail-cow-v3-fast schema; ``none`` skips payload checks; ``sha256``
+    # keeps the content-addressed format, the default for every other schema.
+    # The v3 schemas have their own cache identity, so readers of one format
+    # miss entries of another cleanly.
     payload_integrity = str(
         extra(
             "spark_cache_payload_integrity",
-            os.environ.get("SPARK_CONTEXT_CACHE_PAYLOAD_INTEGRITY", "sha256"),
+            os.environ.get(
+                "SPARK_CONTEXT_CACHE_PAYLOAD_INTEGRITY",
+                "fast" if publication_schema == "page-tail-cow-v2" else "sha256",
+            ),
         )
     )
     if payload_integrity not in ("sha256", "fast", "none"):

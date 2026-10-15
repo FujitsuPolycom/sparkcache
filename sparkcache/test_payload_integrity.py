@@ -90,8 +90,11 @@ def _parse_block_pages(extra: dict):
 
 def test_payload_integrity_config_selects_the_schema(monkeypatch):
     monkeypatch.delenv("SPARK_CONTEXT_CACHE_PAYLOAD_INTEGRITY", raising=False)
-    base = _parse_block_pages({})
-    assert base.payload_integrity == "sha256"
+    # tail-cow-v2 publication defaults to fast; sha256 stays selectable.
+    default = _parse_block_pages({})
+    assert default.payload_integrity == "fast"
+    assert default.publication_schema == "page-tail-cow-v3-fast"
+    base = _parse_block_pages({"spark_cache_payload_integrity": "sha256"})
     assert base.publication_schema == "page-tail-cow-v2"
     fast = _parse_block_pages({"spark_cache_payload_integrity": "fast"})
     assert fast.publication_schema == "page-tail-cow-v3-fast"
