@@ -1,0 +1,149 @@
+{
+  "source_commit": "a136fc55db39",
+  "fixtures": [
+    {
+      "fixture": "glm52",
+      "profile": "glm52-nvfp4",
+      "dcp": 1,
+      "topology_digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "storage_keys": [
+        "d95b42f595206967af20083f70e1e77ead629676b51529ade0c10e9ed3ba7f55",
+        "d6fba45d048afa5bf56c9f47fd3cdb92a2e568bed54ec0d2995873021347a9b5",
+        "bb7180defe4cb127f6e76692812823f58256bfb07a6d6c049a11ebb0ba16f4b1",
+        "5b0d44dae0d6f95a7b407d3f29df2b2b983a56f889770ab84a7c95522c3cce6e"
+      ]
+    },
+    {
+      "fixture": "glm52",
+      "profile": "glm52-nvfp4",
+      "dcp": 2,
+      "topology_digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "storage_keys": [
+        "5b6d7cea2f46c5ef221c5a90f4e5e0ee3501299b5a9ce37f64093b93ece34a4f",
+        "7777927131ec5b4a38b6d1ca7ffc1e2a5ce239fc0f752c0dac928be305df298d",
+        "bf961d5675ddf98ccfe1160a288dd2154167b8e23fa41030465532a57b713d70",
+        "2dd5a1ee53f2efec7eab578707488b0304e3ecea743765e05fafeba061412b93"
+      ]
+    },
+    {
+      "fixture": "glm52",
+      "profile": "glm52-nvfp4",
+      "dcp": 4,
+      "topology_digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "storage_keys": [
+        "5fefa7fdce3a979efbd4a5c2f9c5b809c6e33def2931d4f911899a25a1f441cc",
+        "174e10c0bb928815fcbdfd2dcd08a861046febb913899b941a68ada50dae1fd1",
+        "73603c2cde0c4a2eb8c87e70868a4f02b57540a39f2de47cd0919c32adfe7aa3",
+        "8b1a59f47a51bafb4c149e205bedc80b7780193300b6ef1dc131e2f4387f3b4f"
+      ]
+    },
+    {
+      "fixture": "glm53",
+      "profile": "glm53-flash-hybrid",
+      "dcp": 1,
+      "topology_digest": "713bf92ba2b2156b844ba6f81cf4c9617f99edc4f9f85a47c5e63893062dd3f2",
+      "storage_keys": [
+        "778af7d6debfa0e6e013729b98a0ba3557f49522a1b45bb0aeb375529aee23dd",
+        "c1bfde14e9fd0785afc9b8235111045fba5d5dc351a1824f11f5034b31b9dee1",
+        "4800103e9e8c94ea5cba75b54685d6f842dbf6588b0b5f5b4d6028debdf4058c",
+        "7cf4bfbe99a2eff6f2338279a075aedfbeeb7430dd101b76c496494df8e5ce6e"
+      ]
+    },
+    {
+      "fixture": "glm53",
+      "profile": "glm53-flash-hybrid",
+      "dcp": 2,
+      "topology_digest": "14d4f48d8fa086794082d0b79f858a48179c2eca5a3b3c750139d56f93384740",
+      "storage_keys": [
+        "3656dc8d02aa8b200cf1aeb70e6b7b32ad1fee6a49e935fe4cb67912911ad72f",
+        "49700059f144c4083140950fa873341907fc493218873a3c361205303eb595fe",
+        "c3fb5ca5416119dc8bae7e7dafa23ba12da8f6039a058cf1eff27d5b80c0115a",
+        "96fc6b49d8dce263ccc605cb559fd42ee0fa6e3c0fdb50551cf211be8aebe3c8"
+      ]
+    },
+    {
+      "fixture": "glm53",
+      "profile": "glm53-flash-hybrid",
+      "dcp": 4,
+      "topology_digest": "da4ec4f5da9a128b21bd72d1b52f855f90dd9138d3b8cbb420ebcba86c0db7b0",
+      "storage_keys": [
+        "50cda1a78610d1688608bce747791677130cc9890abc23b016dea2abe2146581",
+        "f0d7a49a6719295e2b7e1ef3d14ce8f62366342478b30d063bd75457389de21e",
+        "5f7ad78789b1121c5c68c094d7bec6659b8a4950272409f8831a8e5320f2f33a",
+        "7f26856f528d0eb046532a67123c0588bc2ca7e9bee3baf1ea8c2671614f32cb"
+      ]
+    },
+    {
+      "fixture": "hybrid",
+      "profile": "glm53-flash-hybrid",
+      "dcp": 1,
+      "topology_digest": "adbd8d9abebf551febe970f575cacf820ce3adba7e2a5a7b572200d69d425193",
+      "storage_keys": [
+        "faad43824b745b7c9ad70ba64694a3a4a80a39d0ae3b6b72e1f5c5e1608299db",
+        "2e8ef74673dd535e1b15b00c93c230db3e114fa6c551afc351cff06b50d76ba8",
+        "f9f42e0e1b661796ab07a9284f22a4e3366775a21e36485b58af11dbf542c1fc",
+        "e2d459c6f40400667bdf26e60c0ec8d1c8bae7cb4e14000c6bc588dd1d9a35cb"
+      ]
+    },
+    {
+      "fixture": "hybrid",
+      "profile": "glm53-flash-hybrid",
+      "dcp": 2,
+      "topology_digest": "6f8ba636d4fec6c4b9ae9bc00ac959baedfda45ff6be34159397b721e80d9e8c",
+      "storage_keys": [
+        "d7504a4503600c39ae240e156cc7a4dd289fce5a34f5e85f242ce2a8a18236b0",
+        "4f2d4a97e6ca48183be6965b8fdec613257209464db96af4aeb48407045325c9",
+        "0e67ad3e839e74aa010a556bae61a14bd0757977247787f7b6846d6bd4deb7f6",
+        "c9fcc96673843fe8e83af17996980722a2c914c90b844aa0958e5a2445a22a14"
+      ]
+    },
+    {
+      "fixture": "hybrid",
+      "profile": "glm53-flash-hybrid",
+      "dcp": 4,
+      "topology_digest": "355039ebf1586e239cf0b18ce9e3111ba0f0f81eac5f1d6a4ce8bd52f5c3ce56",
+      "storage_keys": [
+        "39a911ad03fd3486baf74820c107a882b15193d19489e7d565ac4eed1ac4de7c",
+        "0d4af33713d86e5c831aa06df1c9cfbfc41e51c51feb985c67c48cca87674a9c",
+        "5c29d54e9f0de54d9dbd819e213516ce901f793d03857f03aec801feaa9e5bc0",
+        "b50e3e93876ae5864144d343d2d6a3e3a776a7550feafbec7740c894535504a4"
+      ]
+    },
+    {
+      "fixture": "deepseek_v4",
+      "profile": "deepseek-v4-fp8-hma",
+      "dcp": 1,
+      "topology_digest": "a9a654ee291fa9011d0f2571040b9584dd94bcbca7c2811b99582585751a9e5d",
+      "storage_keys": [
+        "ab124e603fb5c319e30bbaefa750ce66d84d83b3af152aaec96e05e1715f94e3",
+        "f12492fbd395b95898928541958d3775ea293fdf445cf371eb56088bae36fb53",
+        "bf9ce2556badc61748bbefbc8e0bc8615cbcbc453cb9e81541d08b037088c577",
+        "356974d20164dbb4c7e5934ddd5485b6ac5300f89e0bd7d81f255adef1a4004a"
+      ]
+    },
+    {
+      "fixture": "deepseek_v4",
+      "profile": "deepseek-v4-fp8-hma",
+      "dcp": 2,
+      "topology_digest": "490eb33420bcb729f72993949f0c8d5cbbf4243892c248881981c3f93bbae20a",
+      "storage_keys": [
+        "5e1ac4992fe861b7fbd379ba2d1ca528c47671795ad05ab4087cea4d448915d6",
+        "67b5a98ade53200ded718828f8d3b9d96cb9239326217e48417e85ae5639b854",
+        "b0593434b223d66e98f4f678d62bdb654d63d4ee3a8ce4a656991a346f4df834",
+        "9f6ee7c6f3fd6017b5bbefa8646ef1de679948614fea7a57d2005100adb67826"
+      ]
+    },
+    {
+      "fixture": "deepseek_v4",
+      "profile": "deepseek-v4-fp8-hma",
+      "dcp": 4,
+      "topology_digest": "87a230b8230ae0c43728afd71050235ecf5b182085bbffdbf85b1f684985399a",
+      "storage_keys": [
+        "9e64abee6e641ce81e5eacdb835cc5346535d21c7c0a6634a6151b6ef579046f",
+        "a2efd10c6113b3fadf529c744a1f9641acf151779d405a6701ac43a9e149d62b",
+        "ae4cedb4fc93d4c40ad5269c81a094fe2bbeef77f08960cc8d190c7f756924dc",
+        "c7ea4b09a8c7ee0923cfc5005bac166e09781e38b69d9750501bb7f91a363dd1"
+      ]
+    }
+  ]
+}

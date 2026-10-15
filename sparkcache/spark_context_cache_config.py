@@ -319,7 +319,54 @@ def _recurrent_state_identity(
             "spark-context-cache: recurrent group mixes incompatible state"
             " geometry: " + ", ".join(inconsistent)
         )
-    return {field: next(iter(choices)) for field, choices in values.items()}
+    identity = {field: next(iter(choices)) for field, choices in values.items()}
+    # Omit vLLM defaults to preserve namespaces on earlier source lines.
+    for field, default in (
+        ("tp_replicated", False),
+        ("prefill_checkpoint_alignment", None),
+        ("boundary_capture", False),
+    ):
+        choices = {getattr(layer_spec, field, default) for layer_spec in recurrent}
+        if len(choices) != 1:
+            raise RuntimeError(
+                "spark-context-cache: recurrent group mixes incompatible state"
+                " geometry: " + field
+            )
+        value = choices.pop()
+        if value != default:
+            identity[field] = value
+    return identity
+
+
+def _group_identity_spec(spec: Any, layers: Sequence[str]) -> Any:
+    """Use the per-layer representative retained by vLLM's scheduler.
+
+    UniformTypeKVCacheSpecs exists only in the worker view: vLLM's
+    generate_scheduler_kv_cache_config replaces it with the first value in
+    kv_cache_specs, preserving insertion order. Its summed page size and
+    inherited DCP default are therefore not shared identity facts. Physical
+    per-layer sizes remain in the worker's registered PageLayout.
+
+    Other spec types retain their wire identity, including aggregate specs
+    used by qualified source lines.
+    """
+    if "UniformTypeKVCacheSpecs" not in {base.__name__ for base in type(spec).__mro__}:
+        return spec
+    members = getattr(spec, "kv_cache_specs", None)
+    if not isinstance(members, dict) or not members or set(members) != set(layers):
+        raise RuntimeError("spark-context-cache: uniform KV-cache group needs every layer spec")
+    representative = next(iter(members.values()))
+    # Byte sizes may differ (for example FP8 target and BF16 MTP); manager
+    # token geometry and DCP ownership must agree across all members.
+    def geometry(member: Any) -> tuple[Any, ...]:
+        policy, _ = _cache_spec_reuse_policy(member)
+        return (type(member).__name__, getattr(member, "block_size", 0),
+                getattr(member, "storage_block_size", 0),
+                bool(getattr(member, "dcp_replicated", policy == "recurrent_align")))
+
+    if any(geometry(member) != geometry(representative) for member in members.values()):
+        raise RuntimeError("spark-context-cache: uniform KV-cache group mixes incompatible manager geometry")
+    return representative
 
 
 def kv_group_topology(
@@ -334,9 +381,21 @@ def kv_group_topology(
     groups = tuple(getattr(kv_cache_config, "kv_cache_groups", ()) or ())
     topology = []
     for group_index, group in enumerate(groups):
+        # Ephemeral replicas and host pools are not device pages we can restore.
+        role = getattr(group, "role", "default")
+        role = getattr(role, "value", role)
+        if (not getattr(group, "enable_kv_transfer", True)
+                or role != "default" or getattr(group, "host_resident", False)):
+            raise RuntimeError(
+                "spark-context-cache: unsupported non-transferable KV-cache group"
+                f" {group_index} (role={role!r})"
+            )
         spec = getattr(group, "kv_cache_spec", None)
         layers = tuple(sorted(getattr(group, "layer_names", ()) or ()))
+        identity_spec = _group_identity_spec(spec, layers)
         reuse_policy, reuse_window_tokens = _group_reuse_policy(spec, layers)
+        recurrent_state = _recurrent_state_identity(spec, layers)
+        spec = identity_spec
         dcp_replicated = bool(
             getattr(spec, "dcp_replicated", reuse_policy == "recurrent_align")
         )
@@ -360,7 +419,6 @@ def kv_group_topology(
             "eagle": bool(getattr(group, "is_eagle_group", False)),
             "layers": layers,
         }
-        recurrent_state = _recurrent_state_identity(spec, layers)
         if recurrent_state is not None:
             group_identity["recurrent_state"] = recurrent_state
         topology.append(group_identity)

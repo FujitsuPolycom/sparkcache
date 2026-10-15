@@ -33,6 +33,7 @@ Documentation = "https://github.com/FujitsuPolycom/sparkcache#readme"
 Issues = "https://github.com/FujitsuPolycom/sparkcache/issues"
 
 [project.scripts]
+sparkcache-checkpoint-identity = "sparkcache.checkpoint_identity:main"
 sparkcache-verify-vllm = "sparkcache.runtime_patches.verify_lease_contract:main"
 
 [project.optional-dependencies]

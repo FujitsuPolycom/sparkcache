@@ -1,0 +1,27 @@
+{
+  "artifacts": {
+    "manifest_sha256": "658421711fb132c391ef4a09707a385bd85dbaf6e5cb8345cb5296cf7accea8d"
+  },
+  "draft": {
+    "config": {
+      "attention_backend": "B12X",
+      "draft_sample_method": "probabilistic",
+      "draft_tensor_parallel_size": 2,
+      "kv_cache_dtype": "auto",
+      "method": "mtp",
+      "moe_backend": "marlin",
+      "num_speculative_tokens": 3,
+      "rejection_sample_method": "standard"
+    },
+    "mode": "embedded"
+  },
+  "model_config": {
+    "sha256": "d9d0b32d0fa38d0cfc7ac162670db17fe16fe02404e847e6b2aa07d71efd67f1"
+  },
+  "quantization": {
+    "encoding": "csf",
+    "method": "nvfp4_csf"
+  },
+  "repository": "local-inference-lab/GLM-5.3-Flash-NVFP4-MXFP8-CSF-QAD",
+  "revision": "dec48abd33efa73c3bb7c95b74eee10cad34f9be"
+}

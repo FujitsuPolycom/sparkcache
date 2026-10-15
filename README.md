@@ -79,6 +79,10 @@ profile.
 
 ## Deployment profiles
 
+The [checkpoint identity tool](deploy/checkpoint_identity/README.md) derives
+identities from pinned checkpoint, encoding, configuration and draft inputs.
+Recorded identities without known inputs stay pinned.
+
 Profiles keep model-specific settings, image identities, launch commands,
 measurements, and known limits out of the generic cache design.
 
