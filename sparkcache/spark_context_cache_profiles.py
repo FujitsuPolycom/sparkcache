@@ -203,6 +203,18 @@ class ModelProfile:
                     " group; the model build's cache contract changed and"
                     " request-private state would be persisted or restored"
                 )
+        if not self.requires_replay_group and any(
+            group.get("reuse_policy") in ("transient", "replay")
+            for group in group_topology
+        ):
+            # Skipping a group is safe only where the profile's model is known
+            # to rebuild that state at every persistent boundary; every other
+            # profile keeps refusing groups it cannot store.
+            raise ProfileError(
+                f"profile {self.name}: KV topology declares a non-persisted"
+                " (transient or replay) group, which this profile does not"
+                " support"
+            )
         if self.chunk_tokens % dcp_degree:
             raise ProfileError(
                 f"profile {self.name}: chunk_tokens {self.chunk_tokens} is not"

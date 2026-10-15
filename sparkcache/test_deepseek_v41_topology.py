@@ -373,6 +373,21 @@ class DeepSeekV41ProfileTests(unittest.TestCase):
                 cuda_restore=False,
             )
 
+    def test_other_profiles_refuse_non_persisted_groups(self) -> None:
+        from sparkcache import spark_context_cache_config as cfg
+
+        topology = cfg.kv_group_topology(deepseek_v41_layout())
+        for name in ("qwen38-flash-next-hybrid", "deepseek-v4-fp8-hma"):
+            profile = resolve_profile(name)
+            with self.assertRaisesRegex(ProfileError, "non-persisted"):
+                profile.validate_for_deployment(
+                    dcp_degree=1,
+                    block_size=CHUNK_TOKENS,
+                    min_span_tokens=CHUNK_TOKENS,
+                    cuda_restore=False,
+                    group_topology=topology,
+                )
+
     def test_profile_requires_a_replay_group(self) -> None:
         from sparkcache import spark_context_cache_config as cfg
 
