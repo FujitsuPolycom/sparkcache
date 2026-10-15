@@ -90,3 +90,81 @@ Four stages limit metadata traversal and overwritten recurrent history while
 amortizing complete writes across five extensions. This default follows the
 chain-depth study's tuning direction; it is not a measured optimum. The CPU
 benchmark accepts `--stage-limit 4` and `--stage-limit 0` for comparison.
+
+## CPU publication profile
+
+Status: **research-only**. The fixture in
+`tools/benchmark_flat_history_restore.py` models the 32 stored boundaries,
+34 attention layers and 12 recurrent layers above. Its final publication
+extends 182,272 tokens to 186,368 tokens: 4,096 added tokens and 31 delta stages.
+
+The comparison uses publication code at `3fc3bfa` and the implementation that
+retains verified snapshot proofs, performs one base lookup, and reuses at most
+64 macro-object file handles during reconstruction. No persistent payload
+cache is added. Handles close on both successful and failed reconstruction.
+
+Conditions: Windows, Python 3.12.10, AMD Ryzen 9 9950X3D, 16 cores/32 threads,
+scale 64, interval 0, stage limit 0, warm process header cache. Three serial
+before/after pairs ran without the test suite running concurrently. Wall times
+are medians; payload byte counts below are multiplied by 64, not actual I/O.
+
+| Work for the final publication | `3fc3bfa` | Proof and handle reuse |
+|---|---:|---:|
+| Commit wall time, fixture | 108 ms | 93 ms |
+| All 31 extensions, fixture | 2.217 s | 1.989 s |
+| SHA-256 input, full-size equivalent | 5,982,063,040 B | 4,557,457,216 B |
+| Object bytes read, full-size equivalent | 1,379,712,640 B | 1,379,712,640 B |
+| Object bytes written, full-size equivalent | 104,254,208 B | 104,254,208 B |
+| Extent file opens | 1,033 | 31 |
+| Manifest written, actual fixture bytes | 24,927 B | 24,927 B |
+
+The final commit ranged from 107 to 123 ms before and 92 to 94 ms with proof
+and handle reuse. This is about 14% lower median CPU fixture time and 24%
+fewer hashed bytes. These percentages do not establish Spark latency gains.
+
+| Final-publication phase, inclusive median | `3fc3bfa` | Proof and handle reuse |
+|---|---:|---:|
+| Base reconstruction | 73.619 ms | 61.481 ms |
+| Manifest lookup | 2.399 ms (two calls) | 1.773 ms (one call) |
+| Header authentication | 0.050 ms | 0.050 ms |
+| Sparse delta encoding | 16.632 ms | 9.179 ms |
+| Manifest serialization | 0.685 ms | 0.600 ms |
+| Manifest publication | 2.024 ms | 1.960 ms |
+
+Phase times overlap: header authentication is included in reconstruction.
+Warm header authentication read no objects. Reconstruction dominates; manifest
+rewrite and warm header access do not explain the bulk of the growth.
+
+Single-run checks: scale 16 reduced the final commit from 267 to 205 ms;
+clearing authenticated headers before each publication at scale 64 reduced
+it from 138 to 120 ms. Cold publication still read 3,392,978,560 equivalent
+bytes. These checks do not clear the OS page cache.
+
+With limit four at scale 64, the final entry has one stage. The complete
+session's 31 extensions stage 7,696,832,128 equivalent object bytes, versus
+3,590,341,632 without the limit: **2.14 times the staged writes**. The initial
+snapshot is excluded from both totals. These are not SSD/NAND write counters.
+
+## Remaining publication scaling
+
+Status: **not implemented**: publication cost proportional only to added tokens.
+Proof reuse removes a redundant base hash, not base reconstruction. Each
+publication still reads retained state and hashes the whole composed result.
+
+The delta header binds a SHA-256 of the canonical, layer-ordered snapshot.
+The snapshot header changes with the block counts, and attention extensions
+insert bytes between retained layer prefixes. A prior SHA-256 digest does not
+provide the internal hash state needed to update that serialization from its
+tail alone. Substituting the original root digest would break the chain.
+
+Strict added-token scaling requires a separately specified incremental digest
+format or authenticated persistent hash structure, including a distinct cache
+identity and reader support. This implementation preserves existing identities
+and formats and does not claim that requirement is met. The four-stage limit
+bounds metadata and overwritten-state history, not retained-state byte work.
+
+Hardware validation remains open: repeated capped and uncapped sessions,
+independent bit-for-bit boundary checks, capture-slot fallback above 512 MiB,
+publication CPU/memory pressure, commit and restore latency, cold starts,
+and NVMe write amplification. No hardware qualification is inferred from CPU
+timings or from the separate restore-cost hardware study.

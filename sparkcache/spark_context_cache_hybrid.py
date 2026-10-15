@@ -138,7 +138,7 @@ class PageDeltaPlan:
 class _VerifiedPageSnapshot:
     """Process-local immutable bytes with their verified full-snapshot digest.
 
-    Only the hashing and delta-application helpers construct this carrier.
+    Only hashing, authenticated object reads, and delta helpers construct it.
     It is never accepted from persistent metadata or a public restore caller.
     """
 
@@ -147,8 +147,10 @@ class _VerifiedPageSnapshot:
 
 
 def _verify_page_snapshot_bytes(
-    payload: bytes | bytearray,
+    payload: bytes | bytearray | memoryview | _VerifiedPageSnapshot,
 ) -> _VerifiedPageSnapshot:
+    if isinstance(payload, _VerifiedPageSnapshot):
+        return payload
     immutable = bytes(payload)
     return _VerifiedPageSnapshot(immutable, hashlib.sha256(immutable).hexdigest())
 
@@ -580,7 +582,7 @@ def encode_page_delta(
 
 def encode_page_delta_from_capture(
     layout: PageLayout,
-    base_snapshot: bytes | bytearray | memoryview,
+    base_snapshot: bytes | bytearray | memoryview | _VerifiedPageSnapshot,
     captured_tail: object,
     *,
     base_block_counts: Sequence[int],
@@ -622,7 +624,8 @@ def encode_page_delta_from_capture(
     ):
         raise HybridCodecError("captured page extension counts are invalid")
 
-    base_view = memoryview(base_snapshot).cast("B")
+    base = _verify_page_snapshot_bytes(base_snapshot)
+    base_view = memoryview(base.payload).cast("B")
     base_plan = plan_page_snapshot(
         layout,
         base_view,
@@ -683,7 +686,7 @@ def encode_page_delta_from_capture(
         {
             "schema": "sparkcache-hybrid-page-delta/v1",
             "layout_sha256": layout.digest,
-            "base_snapshot_sha256": hashlib.sha256(base_view).hexdigest(),
+            "base_snapshot_sha256": base.sha256,
             "result_snapshot_sha256": result_digest.hexdigest(),
             "base_block_counts": base_counts,
             "result_block_counts": result_counts,
@@ -888,11 +891,13 @@ class _PageHistoryReconstruction:
 
 def compose_page_history(
     layout: PageLayout,
-    base_snapshot: bytes | bytearray,
+    base_snapshot: bytes | bytearray | _VerifiedPageSnapshot,
     base_block_counts: Sequence[int],
     stage_plans: Sequence[PageDeltaPlan],
     read_tail: Callable[[int, PageDeltaTail], bytes | bytearray],
-) -> bytes:
+    *,
+    _return_verified: bool = False,
+) -> bytes | _VerifiedPageSnapshot:
     """Compose an ordered delta history by reading each surviving tail once.
 
     ``stage_plans`` must come from authenticated delta headers, oldest first.
@@ -980,7 +985,10 @@ def compose_page_history(
                 raise HybridCodecError("hybrid page history coverage differs")
     if hashlib.sha256(result).hexdigest() != current_sha256:
         raise HybridCodecError("hybrid page delta result checksum mismatch")
-    return bytes(result)
+    immutable = bytes(result)
+    if _return_verified:
+        return _VerifiedPageSnapshot(immutable, current_sha256)
+    return immutable
 
 
 def materialize_page_extension_capture(

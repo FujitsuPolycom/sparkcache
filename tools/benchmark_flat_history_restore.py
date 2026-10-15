@@ -24,13 +24,23 @@ page bytes. The boundaries below are that session's stored boundaries.
 Usage::
 
     python tools/benchmark_flat_history_restore.py [--scale 64]
-        [--snapshot-interval-tokens N] [--cold-headers] [--recurrent-first]
+        [--snapshot-interval-tokens N] [--stage-limit N]
+        [--cold-headers] [--cold-publication-headers] [--recurrent-first]
 
 ``--snapshot-interval-tokens`` publishes a complete snapshot whenever a stored
 boundary crosses a multiple of N tokens, matching the connector's periodic
 full-capture rule. Output is one JSON object. Every byte field is scaled back
 to full-size equivalents (fixture bytes multiplied by ``--scale``); seconds
 are fixture wall time on the measuring CPU and are not scaled.
+
+The benchmark defaults to unlimited stages (``--stage-limit 0``) to expose
+history growth; the connector defaults to four. ``publish_curve`` reports
+each boundary's work. Phase timings are inclusive and overlap, so they must
+not be summed. ``manifest_write_bytes`` are actual metadata bytes rather than
+scaled payload equivalents; ``extent_file_opens`` excludes snapshot-object
+reads performed by Python's file API. ``--cold-publication-headers`` clears
+the authenticated header cache before each publication; it does not clear
+the operating system's file cache.
 """
 
 from __future__ import annotations
@@ -39,6 +49,7 @@ import argparse
 import contextlib
 import hashlib
 import json
+import os
 import sys
 import tempfile
 import time
@@ -154,6 +165,65 @@ def counting(counter: Counter):
         if original_extent is not None:
             cache_manifest._read_object_extent = original_extent
             cuda_hybrid._read_object_extent = original_extent
+
+
+@contextlib.contextmanager
+def publication_phases(counter: Counter):
+    """Measure inclusive publication phases and macro extent file opens.
+
+    Nested reconstruction and header calls are counted once per outer call
+    of the same phase. Phase times overlap (headers run during reconstruction)
+    and must not be summed. Metadata byte counts are actual fixture bytes.
+    """
+    targets = (
+        (ManifestStore, "restore_page_snapshot", "base_reconstruction"),
+        (ManifestStore, "lookup", "lookup"),
+        (cache_manifest, "_authenticated_page_delta_header", "header_authentication"),
+        (hybrid, "encode_page_delta_from_capture", "delta_encode"),
+        (cache_manifest, "_canonical_json", "manifest_encode"),
+        (cache_manifest, "_publish_immutable", "manifest_write"),
+    )
+    originals = []
+    depths = Counter()
+
+    def wrap(original, name):
+        def measured(*args, **kwargs):
+            depths[name] += 1
+            started = time.perf_counter()
+            hashes = counter["sha256_bytes"]
+            reads = counter["object_read_bytes"]
+            try:
+                result = original(*args, **kwargs)
+                if name == "manifest_write":
+                    counter["manifest_write_bytes"] += len(args[1])
+                return result
+            finally:
+                depths[name] -= 1
+                if not depths[name]:
+                    counter[f"{name}_seconds"] += time.perf_counter() - started
+                    counter[f"{name}_calls"] += 1
+                    counter[f"{name}_sha256_bytes"] += counter["sha256_bytes"] - hashes
+                    counter[f"{name}_read_bytes"] += counter["object_read_bytes"] - reads
+        return measured
+
+    original_open = os.open
+
+    def opened(path, *args, **kwargs):
+        if str(path).endswith(".spcc"):
+            counter["extent_file_opens"] += 1
+        return original_open(path, *args, **kwargs)
+
+    try:
+        for owner, attribute, name in targets:
+            original = getattr(owner, attribute)
+            originals.append((owner, attribute, original))
+            setattr(owner, attribute, wrap(original, name))
+        os.open = opened
+        yield
+    finally:
+        os.open = original_open
+        for owner, attribute, original in reversed(originals):
+            setattr(owner, attribute, original)
 
 
 @dataclass(frozen=True)
@@ -381,7 +451,8 @@ def _clear_header_cache() -> None:
 
 
 def run(geometry: Geometry, root: Path, *, interval_tokens: int,
-        cold_headers: bool, stage_limit: int = 0) -> dict:
+        cold_headers: bool, stage_limit: int = 0,
+        cold_publication_headers: bool = False) -> dict:
     """Publish the session chain and measure restores along it.
 
     Byte fields are scaled back to full-size equivalents (fixture bytes times
@@ -408,9 +479,11 @@ def run(geometry: Geometry, root: Path, *, interval_tokens: int,
     for index in range(1, len(SESSION_BOUNDARIES)):
         base_tokens = SESSION_BOUNDARIES[index - 1]
         result_tokens = SESSION_BOUNDARIES[index]
+        if cold_publication_headers:
+            _clear_header_cache()
         measured = Counter()
         started = time.perf_counter()
-        with counting(measured):
+        with counting(measured), publication_phases(measured):
             if interval_tokens and (
                 result_tokens // interval_tokens > base_tokens // interval_tokens
             ):
@@ -423,16 +496,8 @@ def run(geometry: Geometry, root: Path, *, interval_tokens: int,
                 )
             else:
                 capture = _capture(geometry, base_tokens, result_tokens, index)
-                # Mirrors the connector: authenticate the base, then encode
-                # the captured extension over those verified bytes.
-                base_lookup = store.lookup(identity, digests[index - 1],
-                                           verify_chunks=False)
-                base_snapshot = store.restore_page_snapshot(
-                    base_lookup,
-                    layout=layout,
-                    result_block_counts=geometry.counts(base_tokens),
-                    result_boundary_tokens=base_tokens,
-                )
+                # The store authenticates and reconstructs the publication
+                # base while retaining its proof for sparse encoding.
                 store.commit_page_extension(
                     identity=identity,
                     base_context_digest=digests[index - 1],
@@ -444,10 +509,12 @@ def run(geometry: Geometry, root: Path, *, interval_tokens: int,
                     base_boundary_tokens=base_tokens,
                     result_boundary_tokens=result_tokens,
                     result_snapshot=capture,
-                    verified_base_snapshot=base_snapshot,
                 )
-                del base_snapshot
         measured["seconds"] = time.perf_counter() - started
+        measured["tokens"] = result_tokens
+        measured["new_tokens"] = result_tokens - base_tokens
+        measured["stages"] = len(store.lookup(
+            identity, digests[index], verify_chunks=False)._manifest.get("delta_stages", ()))
         publishes.append(measured)
 
     final_tokens = SESSION_BOUNDARIES[-1]
@@ -485,6 +552,18 @@ def run(geometry: Geometry, root: Path, *, interval_tokens: int,
             "sha256_bytes": sum(item["sha256_bytes"] for item in items) * scale,
             "object_read_bytes": sum(item["object_read_bytes"] for item in items) * scale,
             "object_write_bytes": sum(item["object_write_bytes"] for item in items) * scale,
+            "extent_file_opens": sum(item["extent_file_opens"] for item in items),
+            "manifest_write_bytes": sum(item["manifest_write_bytes"] for item in items),
+            "phases": {
+                phase: {
+                    "seconds": round(sum(item[f"{phase}_seconds"] for item in items), 6),
+                    "calls": sum(item[f"{phase}_calls"] for item in items),
+                    "sha256_bytes": sum(item[f"{phase}_sha256_bytes"] for item in items) * scale,
+                    "object_read_bytes": sum(item[f"{phase}_read_bytes"] for item in items) * scale,
+                }
+                for phase in ("base_reconstruction", "lookup", "header_authentication",
+                              "delta_encode", "manifest_encode", "manifest_write")
+            },
         }
 
     return {
@@ -493,12 +572,18 @@ def run(geometry: Geometry, root: Path, *, interval_tokens: int,
         "snapshot_interval_tokens": interval_tokens,
         "stage_limit": stage_limit,
         "cold_headers": cold_headers,
+        "cold_publication_headers": cold_publication_headers,
         "final_tokens": final_tokens,
         "final_stage_count": len(lookup._manifest.get("delta_stages", ())),
         "final_snapshot_bytes": len(expected) * scale,
         "final_stage_bytes": stage_bytes * scale,
         "publish_all": publish_summary(publishes),
         "publish_last": publish_summary(publishes[-1:]),
+        "publish_curve": [
+            {"tokens": item["tokens"], "new_tokens": item["new_tokens"],
+             "stages": item["stages"], **publish_summary([item])}
+            for item in publishes
+        ],
         "python_restore_final": {
             "seconds": round(python_seconds, 4),
             "object_reads": python_restore["object_reads"],
@@ -516,6 +601,8 @@ def main(argv=None) -> int:
     parser.add_argument("--stage-limit", type=int, default=0,
                         help="maximum delta stages; 0 disables compaction (connector default: 4)")
     parser.add_argument("--cold-headers", action="store_true")
+    parser.add_argument("--cold-publication-headers", action="store_true",
+                        help="clear authenticated headers before each publication")
     parser.add_argument("--recurrent-first", action="store_true")
     args = parser.parse_args(argv)
     geometry = Geometry(args.scale, args.recurrent_first)
@@ -534,7 +621,8 @@ def main(argv=None) -> int:
             print(json.dumps(run(geometry, Path(directory),
                                  interval_tokens=args.snapshot_interval_tokens,
                                  cold_headers=args.cold_headers,
-                                 stage_limit=args.stage_limit), indent=1))
+                                 stage_limit=args.stage_limit,
+                                 cold_publication_headers=args.cold_publication_headers), indent=1))
     finally:
         (cache_manifest._PAGE_DELTA_OBJECT_BYTES,
          cache_manifest._MAX_PAGE_DELTA_OBJECT_BYTES,

@@ -356,6 +356,18 @@ Four stages bound metadata traversal and overwritten recurrent history while
 allowing several sparse writes between snapshots. This is an implemented
 default, not a hardware-qualified optimum; full rewrites increase SSD traffic.
 
+Sparse publication retains the verified base digest through encoding. For a
+delta base, that digest belongs to the newest stage's result. Caller-supplied
+base bytes must match that authenticated digest before use.
+
+The saver reuses at most 64 open macro-object handles during base reconstruction
+and closes them before encoding. Every consumed tail still passes its checksum;
+no payload bytes or file handles are cached between publications.
+
+Publication still reconstructs the base and hashes the full result. Its cost
+therefore grows with retained tokens even with bounded stages. The existing
+whole-snapshot SHA-256 cannot be updated from only a captured tail.
+
 For full attention, each compaction rewrites all retained tokens rather than
 only the appended tokens. Recurrent state is written once per publication.
 See the model deployment evidence for the measured geometry and byte costs.
