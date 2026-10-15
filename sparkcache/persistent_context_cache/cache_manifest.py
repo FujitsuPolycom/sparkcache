@@ -2265,7 +2265,7 @@ class ManifestStore:
         root: Path | str,
         *,
         publication_telemetry: PublicationTelemetry | None = None,
-        page_delta_stage_limit_count: int = 4,
+        page_delta_stage_limit_count: int = 0,
     ) -> None:
         if type(page_delta_stage_limit_count) is not int or page_delta_stage_limit_count < 0:
             raise ValueError("page_delta_stage_limit_count must be a non-negative integer")

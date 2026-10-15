@@ -341,7 +341,7 @@ base 16,384 to result 18,432 remains sparse. This is a token cadence, not a
 universal bound on history depth for arbitrary prompt increments.
 
 `spark_cache_page_delta_stage_limit_count` bounds the stages in a
-`tail-cow-v2` entry. The default is `4`; `0` disables the limit. Its environment
+`tail-cow-v2` entry. The default `0` sets no limit; a positive value caps the stage count. Its environment
 fallback is `SPARK_CONTEXT_CACHE_PAGE_DELTA_STAGE_LIMIT_COUNT`.
 
 Appending beyond the limit publishes a full snapshot of the result. The

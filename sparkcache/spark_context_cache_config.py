@@ -664,7 +664,7 @@ def parse_connector_config(
     page_delta_stage_limit_count = _nonnegative_config_int(
         extra(
             "spark_cache_page_delta_stage_limit_count",
-            os.environ.get("SPARK_CONTEXT_CACHE_PAGE_DELTA_STAGE_LIMIT_COUNT", "4"),
+            os.environ.get("SPARK_CONTEXT_CACHE_PAGE_DELTA_STAGE_LIMIT_COUNT", "0"),
         ),
         "spark_cache_page_delta_stage_limit_count",
     )
