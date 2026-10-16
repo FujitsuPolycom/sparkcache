@@ -664,7 +664,7 @@ published without enabling per-request tracing:
 
 | Counter | Meaning |
 |---|---|
-| `vllm:sparkcache_restore_hits` | External restores admitted by the scheduler. |
+| `vllm:sparkcache_restore_hits` | Verified external restores summed across physical worker ranks; a TP2 restore counts twice. |
 | `vllm:sparkcache_restore_skip_local_prefix` | Lookups refused because the request already held locally cached prefix blocks. |
 | `vllm:sparkcache_restore_skip_oversize` | Lookups whose aligned span exceeded the maximum span. |
 | `vllm:sparkcache_restore_skip_backlog` | Lookups refused because pending restores reached the configured limit. |

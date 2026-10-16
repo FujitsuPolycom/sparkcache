@@ -2851,3 +2851,84 @@ class DefectD20GenericCheckpointOfferTests(unittest.TestCase):
             output = self._output()
             output.kv_connector_block_state.block_ids = {}
             self.assertEqual(scheduler.build_connector_meta(output).plans, [])
+
+
+class DefectD26WorkerRestoreCounterTests(unittest.TestCase):
+    """D-26: exported hit counts follow worker verification, not scheduler-local counters."""
+
+    def test_d26_verified_restore_is_exported_once_and_rejection_is_not_a_hit(self):
+        from sparkcache.test_spark_context_cache_connector import AsyncRestoreTests
+
+        for corrupt in (False, True):
+            with self.subTest(corrupt=corrupt), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                worker = _make_connector(root, 2)
+                worker.register_kv_caches(_make_pools(8, 64))
+                fixture = AsyncRestoreTests()
+                digest = "a" * 64
+                fixture._store_entry(worker, digest)
+                if corrupt:
+                    path = next((root / "chunks").glob("*.spcc"))
+                    payload = bytearray(path.read_bytes())
+                    payload[-1] ^= 1
+                    path.write_bytes(payload)
+                worker.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[
+                    _ReqPlan("restore", digest, 1024, fixture.BLOCKS, False,
+                             request_scope=UNSALTED_SCOPE),
+                ]))
+                try:
+                    worker.start_load_kv(None)
+                    self.assertTrue(worker.wait_for_pending_loads(timeout=5))
+                    self.assertEqual(worker.get_finished(set())[1], {"restore"})
+                    expected = int(not corrupt)
+                    self.assertEqual(worker.counters["restore_hit"], expected)
+                    self.assertEqual(worker.counters["load_verified"], expected)
+                    for _ in range(2):
+                        reduced = worker.get_kv_connector_stats().reduce()
+                        self.assertEqual(reduced["sparkcache_counter_restore_hit"], expected)
+                    self.assertEqual(worker.get_finished(set()), (None, None))
+                    self.assertEqual(worker.counters["restore_hit"], expected)
+                finally:
+                    worker.shutdown()
+
+
+    def test_d26_cuda_hybrid_success_and_rejection_use_worker_completion_accounting(self):
+        for rejected in (False, True):
+            with self.subTest(rejected=rejected), tempfile.TemporaryDirectory() as directory:
+                worker = _make_connector(
+                    Path(directory), 0, tp=2, dcp=1,
+                    extra_config={"spark_cache_model_profile": "deepseek-v4-fp8-hma",
+                                  "spark_cache_publication_schema": "tail-cow-v1"},
+                    kv_cache_config=_hybrid_kv_cache_config(),
+                )
+                worker.register_kv_caches({
+                    "full": torch.zeros(10, 64, 8, dtype=torch.uint8),
+                    "compressed": torch.zeros(10, 2, 8, dtype=torch.uint8),
+                    "state": torch.zeros(10, 4, 16),
+                })
+                tokens = tuple(range(512))
+                digest = worker._digest(list(tokens), 512)
+                worker._store_one(_ReqPlan("store", digest, 512, (3,), True,
+                    block_ids_by_group=((3,), (4,)), token_ids=tokens, request_scope=UNSALTED_SCOPE))
+                execute = mock.Mock(return_value=types.SimpleNamespace(
+                    source_bytes=1234, read_and_hash_ms=1., copy_and_submit_ms=1.,
+                    finish_ms=1., slabs=2, arena_wait_ms=.1, host_copy_ms=.8, submit_call_ms=.1,
+                ), side_effect=RuntimeError("verification rejected") if rejected else None)
+                worker._native_restore_enabled = True
+                worker._native_adapters = [types.SimpleNamespace(close=lambda: None)]
+                worker._native_execute_hybrid_restore = execute
+                worker.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[
+                    _ReqPlan("hybrid", digest, 512, (6,), False,
+                             block_ids_by_group=((6,), (7,)), request_scope=UNSALTED_SCOPE),
+                ]))
+                try:
+                    worker.start_load_kv(None)
+                    self.assertTrue(worker.wait_for_pending_loads(timeout=5))
+                    execute.assert_called_once()
+                    self.assertEqual(worker.counters["restore_hit"], int(not rejected))
+                    self.assertEqual(worker.counters["load_verified"], int(not rejected))
+                    self.assertEqual(worker.counters["load_failed"], int(rejected))
+                    self.assertEqual(worker.get_kv_connector_stats().reduce()[
+                        "sparkcache_counter_restore_hit"], int(not rejected))
+                finally:
+                    worker.shutdown()

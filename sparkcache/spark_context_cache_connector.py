@@ -896,7 +896,7 @@ class SparkCachePromMetrics(KVConnectorPromMetrics):
         ),
         "sparkcache_counter_restore_hit": (
             "vllm:sparkcache_restore_hits",
-            "Cumulative external restores admitted by the scheduler; resets with workers.",
+            "Cumulative verified external restores summed across physical worker ranks; resets with workers.",
             1.0,
         ),
         "sparkcache_counter_restore_skip_local_prefix": (
@@ -4560,6 +4560,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             with self._load_cv:
                 if verified:
                     self.counters["load_verified"] += 1
+                    # Metrics export worker reports, not scheduler admission counters.
+                    # All restore backends converge here after verified placement.
+                    self.counters["restore_hit"] += 1
                 else:
                     # Publish invalid blocks before the finished id while
                     # holding the same lock. vLLM collects finished ids then
