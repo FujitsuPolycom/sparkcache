@@ -604,9 +604,14 @@ filesystem failure disables caching for that connector while serving continues.
 SparkCache uses the `sparkcache:` log prefix. INFO reports a startup summary
 with profile, groups, identity prefix, integrity mode and connector settings.
 
-Restore hit/miss and save committed/refused lines include tokens, milliseconds
-and rank. Save refusals include a reason. Evictions and corruption rejections
-remain visible. Operator digests use twelve hex digits.
+The scheduler logs one line per restore: `restore hit`, `restore miss` with a
+reason, or `restore failed` when any rank rejects its shard.
+
+Each rank logs `save committed` or `save refused` with tokens, milliseconds
+and a reason, and `save skipped` when its saver is busy.
+
+The counters line lists only changed counters. Evictions and corruption
+rejections remain visible. Operator digests use twelve hex digits.
 
 DEBUG carries phase timings, layer inventories, topology dumps, capture and
 publication details. JSON records use `sparkcache: restore-timing `,

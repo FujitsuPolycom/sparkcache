@@ -313,6 +313,7 @@ class _RestoreFlight:
     lease_span_tokens: int = 0
     lease_published_at: float | None = None
     lease_expires_at: float | None = None
+    started_ns: int = 0
 
     @property
     def lease_published(self) -> bool:
@@ -824,7 +825,7 @@ class SparkCacheStats(KVConnectorStats):
         if not changed:
             return ()
         return ("sparkcache: counters " + " ".join(
-            f"{key.removeprefix('sparkcache_')}={value}"
+            f"{key.removeprefix('sparkcache_').removeprefix('counter_')}={value}"
             for key, value in sorted(changed.items())
         ),)
 
@@ -2012,6 +2013,22 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         }.get(outcome)
         if counter is not None:
             self.counters[counter] += 1
+        if outcome == "failed":
+            self._log_restore_outcome(flight, "failed")
+
+    def _log_restore_outcome(self, flight: _RestoreFlight, outcome: str) -> None:
+        # The scheduler owns the request-level result: a restore succeeds only
+        # when every rank placed its shard, so per-rank worker lines stay DEBUG.
+        elapsed_ms = (
+            (time.perf_counter_ns() - flight.started_ns) / 1_000_000
+            if flight.started_ns else 0.0
+        )
+        if outcome == "hit":
+            logger.info("sparkcache: restore hit tokens=%d ms=%.1f",
+                        flight.span_tokens, elapsed_ms)
+        else:
+            logger.info("sparkcache: restore failed tokens=%d ms=%.1f; recomputing",
+                        flight.span_tokens, elapsed_ms)
 
     def _remove_restore_follower(self, request_id: str) -> None:
         follower = self._restore_flight_followers.pop(request_id, None)
@@ -2498,6 +2515,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             digest=digest,
             span_tokens=span,
             leader_request_id=request_id,
+            started_ns=lookup_started_ns,
             shareable_prefixes=tuple(
                 (candidate_span, candidate_digest)
                 for candidate_span, candidate_digest in candidates
@@ -4683,7 +4701,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     with contextlib.suppress(Exception):
                         logger.debug("%s", timing.operator_lines()[1])
                 with contextlib.suppress(Exception):
-                    logger.info(
+                    logger.debug(
                         "sparkcache: restore %s tokens=%d ms=%.1f rank=%d",
                         "hit" if verified else "miss", plan.span_tokens,
                         timing.end_to_end_ns / 1_000_000, self._physical_rank(),
@@ -5952,8 +5970,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             if skipped_before_submit:
                 reason = ("invalid-scope" if not valid_metadata(plan) else
                           "present" if plan.digest in self._held else "busy")
-                logger.info("sparkcache: save refused tokens=%d ms=0.0 rank=%d reason=%s",
-                            plan.span_tokens, self._physical_rank(), reason)
+                (logger.debug if reason == "present" else logger.info)(
+                    "sparkcache: save skipped tokens=%d rank=%d reason=%s",
+                    plan.span_tokens, self._physical_rank(), reason)
                 if plan.capture_job_id:
                     self._capture_read_completed(plan.capture_job_id)
                     continue
@@ -7011,6 +7030,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     self._retire_restore_flight(digest, outcome="cancelled")
                 else:
                     flight.workers_finished = True
+                    self._log_restore_outcome(flight, "hit")
 
     @classmethod
     def build_kv_connector_stats(cls, data=None):

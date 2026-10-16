@@ -6535,7 +6535,8 @@ class AsyncRestoreTests(unittest.TestCase):
             self.assertGreater(record["phase_ms"]["reassembly_decode"], 0)
             self.assertGreater(record["phase_ms"]["h2d_submit"], 0)
             events = [call.args[0] % call.args[1:] for call in log_info.call_args_list]
-            assert any(line.startswith("sparkcache: restore hit tokens=") for line in events)
+            # The scheduler reports the request-level outcome; ranks log at DEBUG.
+            assert not any(line.startswith("sparkcache: restore ") for line in events)
             assert not any("sparkcache: phases" in line for line in events)
 
     def test_timing_failure_does_not_prevent_restore_completion(self) -> None:
