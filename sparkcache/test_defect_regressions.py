@@ -11,6 +11,7 @@ from sparkcache.request_cache_scope import UNSALTED_SCOPE
 import hashlib
 import json
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -33,6 +34,9 @@ from sparkcache.test_spark_context_cache_connector import (
     _drain,
     _empty_scheduler_output,
     _hybrid_kv_cache_config,
+    _deepseek_tp4_hma_config,
+    _deepseek_tp4_hma_pools,
+    _deepseek_tp4_group_tables,
     _make_connector,
     _make_pools,
     KVConnectorRole,
@@ -48,11 +52,168 @@ from sparkcache.test_async_page_capture_connector import (
 
 
 @pytest.mark.parametrize("tp", [2, 4])
+@pytest.mark.parametrize("probe", ["none", "tp0"])
+@pytest.mark.parametrize("writer_mode,reader_mode", [
+    ("fast", "sha256"), ("sha256", "fast"), ("none", "sha256"), ("tail-v1", "sha256"),
+])
+def test_r3_integrity_schema_miss_names_incompatible_entry(
+    tmp_path, tp, probe, writer_mode, reader_mode,
+):
+    config = _deepseek_tp4_hma_config()
+    tokens = list(range(1100))
+    tables = _deepseek_tp4_group_tables((1, 10, 30, 60, 400))
+    connectors = []
+
+    def make(root, rank, mode, role=KVConnectorRole.WORKER):
+        connector = _make_connector(
+            root, rank, block_size=256, tp=tp, dcp=1, role=role,
+            kv_cache_config=config,
+            extra_config={
+                "spark_cache_model_profile": "deepseek-v4-fp8-hma",
+                "spark_cache_publication_schema": "tail-cow-v1" if mode == "tail-v1" else "tail-cow-v2",
+                "spark_cache_payload_integrity": "sha256" if mode == "tail-v1" else mode,
+                "spark_cache_scheduler_probe": probe,
+            },
+        )
+        connector._worker_rank = lambda: 0
+        connectors.append(connector)
+        return connector
+
+    try:
+        # Only rank 1 has the incompatible entry; scheduler TP0 shares no
+        # evidence with it. Diagnostics must travel from that worker.
+        writer = make(tmp_path / "rank-1", 1, writer_mode)
+        writer.register_kv_caches(_deepseek_tp4_hma_pools(config, 1))
+        writer_digest = writer._digest(tokens, 1024)
+        writer._store_one(_ReqPlan(
+            "seed", writer_digest, 1024, tables[0], True,
+            block_ids_by_group=tables, token_ids=tuple(tokens[:1024]),
+            request_scope=UNSALTED_SCOPE,
+        ))
+        writer.shutdown()
+        scheduler = make(
+            tmp_path / ("rank-0" if probe == "tp0" else "scheduler"),
+            0, reader_mode, KVConnectorRole.SCHEDULER,
+        )
+        workers = [make(tmp_path / f"rank-{rank}", rank, reader_mode) for rank in range(tp)]
+        for worker in workers:
+            worker.discover_manifests()
+        scheduler.set_xfer_handshake_metadata({
+            rank: worker.get_handshake_metadata() for rank, worker in enumerate(workers)
+        })
+        assert scheduler._digest(tokens, 1024) != writer_digest
+        request = types.SimpleNamespace(cache_salt=None, request_id="schema-miss", prompt_token_ids=tokens)
+        with mock.patch.object(connector_module, "logger") as log:
+            assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+        lines = [call.args[0] % call.args[1:] for call in log.info.call_args_list]
+        assert any("reason=integrity_schema_mismatch" in line for line in lines)
+        assert not scheduler._quorum
+        request.request_id = "another-scope"
+        request.cache_salt = "separate-tenant"
+        with mock.patch.object(connector_module, "logger") as log:
+            assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+        assert any("reason=quorum" in call.args[0] % call.args[1:] for call in log.info.call_args_list)
+        request.cache_salt = None
+        request.request_id = "unrelated"
+        request.prompt_token_ids = [12345] * len(tokens)
+        with mock.patch.object(connector_module, "logger") as log:
+            assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+        assert any("reason=quorum" in call.args[0] % call.args[1:] for call in log.info.call_args_list)
+        # An alternate copy on a rank that also holds the compatible copy
+        # cannot explain another rank's absent inventory.
+        request.request_id = "compatible-rank"
+        request.prompt_token_ids = tokens
+        workers[1]._held.add(scheduler._digest(tokens, 1024))
+        scheduler.update_connector_output(types.SimpleNamespace(
+            kv_connector_stats=workers[1].get_kv_connector_stats(),
+        ))
+        with mock.patch.object(connector_module, "logger") as log:
+            assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+        assert any("reason=quorum" in call.args[0] % call.args[1:] for call in log.info.call_args_list)
+        # A worker restart retires both admission and diagnostic evidence.
+        restarted = make(tmp_path / "empty-restart", 1, reader_mode)
+        scheduler.set_xfer_handshake_metadata({1: restarted.get_handshake_metadata()})
+        assert 1 not in scheduler._worker_incompatible
+    finally:
+        for connector in connectors:
+            connector.shutdown()
+
+
+@pytest.mark.parametrize("terminal", ["committed", "failed", "evicted"])
+def test_r3_idle_publication_drains_bounded_inventory_and_terminal_failures(tmp_path, terminal):
+    worker = _make_connector(tmp_path / "worker", 0, tp=1, dcp=1)
+    scheduler = _make_connector(tmp_path / "scheduler", 0, tp=1, dcp=1, role=KVConnectorRole.SCHEDULER)
+
+    def report():
+        stats = worker.get_kv_connector_stats()
+        scheduler.update_connector_output(types.SimpleNamespace(kv_connector_stats=stats))
+        return stats.data["reports"][0]
+
+    try:
+        worker._held = {hashlib.sha256(str(i).encode()).hexdigest() for i in range(130)}
+        scheduler.set_xfer_handshake_metadata({0: worker.get_handshake_metadata()})
+        report()
+        worker._held.add("e" * 64)
+        for _ in range(4):
+            report()
+        worker._store_inflight = 1
+        report()
+        assert scheduler.has_pending_push_work()
+        assert scheduler.get_num_new_matched_tokens(
+            types.SimpleNamespace(cache_salt=None, request_id="live", prompt_token_ids=list(range(1100))), 0,
+        ) == (0, False), "incomplete publication must recompute without waiting"
+        worker._finish_store("f" * 64, committed=terminal == "committed", evicted=terminal == "evicted")
+        # Deliver a completion whose delta is an earlier replay and whose
+        # checkpoint is incomplete. Store completion alone cannot end polling.
+        worker._stats_delta_cursor = 0
+        completion = report()
+        assert completion["publication_work"]["pending"] == 0
+        if terminal == "committed":
+            assert scheduler.has_pending_push_work()
+            assert not scheduler._has_full_quorum("f" * 64)
+        for _ in range(32):
+            if not scheduler.has_pending_push_work():
+                break
+            report()
+        assert not scheduler.has_pending_push_work()
+        assert scheduler._has_full_quorum("f" * 64) == (terminal == "committed")
+    finally:
+        worker.shutdown()
+        scheduler.shutdown()
+
+
+def test_r3_schema_diagnostic_transport_is_bounded_and_never_admits(tmp_path):
+    worker = _make_connector(tmp_path / "worker", 0, tp=1, dcp=1)
+    scheduler = _make_connector(tmp_path / "scheduler", 0, tp=1, dcp=1, role=KVConnectorRole.SCHEDULER)
+    try:
+        entries = tuple(("page-tail-cow-v3-fast", hashlib.sha256(str(i).encode()).hexdigest())
+                        for i in range(600))
+        worker._incompatible_inventory = entries
+        handshake = worker.get_handshake_metadata()
+        assert len(handshake.reports) <= 8
+        assert all(len(report["incompatible"]) <= 64 for report in handshake.reports)
+        scheduler.set_xfer_handshake_metadata({0: handshake})
+        assert len(scheduler._worker_incompatible[0]) == 512
+        for _ in range(10):
+            stats = worker.get_kv_connector_stats()
+            assert len(stats.data["reports"][0]["incompatible"]) <= 64
+            scheduler.update_connector_output(types.SimpleNamespace(kv_connector_stats=stats))
+        assert scheduler._worker_incompatible[0] == set(entries)
+        assert not scheduler._quorum
+        assert not scheduler.has_pending_push_work()
+    finally:
+        worker.shutdown()
+        scheduler.shutdown()
+
+
+@pytest.mark.parametrize("tp", [2, 4])
 @pytest.mark.parametrize("report_withdrawal", [False, True])
 @pytest.mark.parametrize("scheduler_probe", ["none", "tp0"])
 @pytest.mark.parametrize("failed_ranks", [(1,), (0, 1)])
-def test_d27_corrupt_rank_republication_restores_quorum(
+@pytest.mark.parametrize("commit_after_last_step", [False, True])
+def test_d27_r3_corrupt_rank_republication_restores_quorum(
     tmp_path, tp, report_withdrawal, scheduler_probe, failed_ranks,
+    commit_after_last_step,
 ):
     """D-27: repaired entries regain full-span reuse without a worker restart."""
     span = 1024
@@ -146,10 +307,39 @@ def test_d27_corrupt_rank_republication_restores_quorum(
             for name, tensor in damaged_worker._layer_tensors.items():
                 tensor.copy_(expected[name])
             damaged_worker.bind_connector_metadata(publication)
-            damaged_worker.wait_for_save()
-            _drain_store(damaged_worker)
+            finishing = threading.Event()
+            release = threading.Event()
+            finish_store = damaged_worker._finish_store
+
+            def finish_after_output(*args, **kwargs):
+                finishing.set()
+                assert release.wait(10)
+                finish_store(*args, **kwargs)
+
+            with mock.patch.object(damaged_worker, "_finish_store", finish_after_output):
+                try:
+                    damaged_worker.wait_for_save()
+                    assert finishing.wait(10)
+                    # The recomputing request has emitted its final output;
+                    # durable publication has not reached worker inventory.
+                    if commit_after_last_step:
+                        report(damaged_worker)
+                        assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+                finally:
+                    release.set()
+                    _drain_store(damaged_worker)
             assert damaged_worker.counters["store_committed"] == 2
-            report(damaged_worker)
+            if not commit_after_last_step:
+                report(damaged_worker)
+        if commit_after_last_step:
+            # Match Scheduler.has_requests(): no live requests or capture
+            # leases remain, so only connector work can request idle steps.
+            for _ in range(32):
+                if not scheduler.has_pending_push_work():
+                    break
+                for worker in workers:
+                    report(worker)
+            assert not scheduler.has_pending_push_work()
         reader = types.SimpleNamespace(
             cache_salt=None, request_id="after-repair", prompt_token_ids=tokens,
         )

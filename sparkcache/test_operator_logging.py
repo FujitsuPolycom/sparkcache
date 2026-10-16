@@ -1,6 +1,7 @@
 """Operator logs preserve metrics and isolate verbose diagnostics at DEBUG."""
 
 from unittest import mock
+import uuid
 
 import pytest
 
@@ -22,6 +23,26 @@ def test_changed_counters_survive_reset_without_dropping_metrics():
     report["counters"]["restore_hit"] = 0
     assert stats.format_log_lines() == ("sparkcache: counters counter_restore_hit=0",)
     assert stats.reduce()["sparkcache_counter_restore_hit"] == 0
+
+
+def test_r3_counter_history_survives_logger_accumulator_replacement():
+    generation = uuid.uuid4().hex
+
+    def interval(value=2, worker_generation=generation):
+        return connector_module.SparkCacheStats(data={"reports": [{
+            "rank": 0, "generation": worker_generation, "held": [],
+            "counters": {"restore_hit": value},
+        }]})
+
+    assert interval().format_log_lines()
+    # KVConnectorLogging resets its accumulator to None each interval and
+    # reconstructs SparkCacheStats from the next observation's wire data.
+    assert interval().format_log_lines() == ()
+    assert interval().format_log_lines() == ()
+    assert interval(3).format_log_lines() == ("sparkcache: counters counter_restore_hit=3",)
+    assert interval(0).format_log_lines() == ("sparkcache: counters counter_restore_hit=0",)
+    assert interval(0).reduce()["sparkcache_counter_restore_hit"] == 0
+    assert interval(worker_generation=uuid.uuid4().hex).format_log_lines()
 
 
 @pytest.mark.parametrize("committed,reason", [(True, "ok"), (False, "error")])

@@ -41,10 +41,11 @@ import queue
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Mapping, Sequence
 
 import torch
 
@@ -160,6 +161,10 @@ _STARTUP_HANDSHAKE_MAX_DIGESTS = 8 * _QUORUM_REPORT_BATCH_SIZE
 _QUORUM_PENDING_DELTA_LIMIT = 64
 _QUORUM_RETIRED_GENERATION_LIMIT = 64
 _QUORUM_DELTA_PROTOCOL = "sparkcache-quorum-delta-v1"
+_DIAGNOSTIC_PUBLICATION_SCHEMAS = (
+    "", "tail-cow-v1", "page-tail-cow-v1", "page-tail-cow-v2",
+    "page-tail-cow-v3-fast", "page-tail-cow-v3-none",
+)
 _MAX_RESTORE_FLIGHT_FOLLOWERS = 16
 _MAX_SHARED_PREFIX_LEASES = 2
 _MAX_SHAREABLE_PREFIXES_PER_FLIGHT = 64
@@ -546,8 +551,9 @@ class SparkCacheReadCompletionMetadata(KVConnectorWorkerMetadata):
 class SparkCacheHandshakeMetadata(KVConnectorHandshakeMetadata):
     """One worker's bounded startup manifest inventory.
 
-    Each report contains at most ``_QUORUM_REPORT_BATCH_SIZE`` manifest
-    digests. The engine transports this metadata once after every worker has
+    Each report contains at most ``_QUORUM_REPORT_BATCH_SIZE`` compatible
+    digests and a separately bounded batch of incompatible-schema evidence.
+    The engine transports this metadata once after every worker has
     registered its KV caches and before it accepts requests.
     """
 
@@ -562,6 +568,11 @@ class SparkCacheStats(KVConnectorStats):
     worker->engine shared-memory queue, and a class created inside a
     function is not picklable.
     """
+
+    # vLLM replaces the stats accumulator after every logging interval.
+    # Worker UUIDs identify a serving engine without mixing its counters
+    # with other engines or retaining history across a worker restart.
+    _log_history: ClassVar[OrderedDict[tuple, dict[str, int | float]]] = OrderedDict()
 
     def reset(self):
         self.data = {"reports": []}
@@ -786,7 +797,17 @@ class SparkCacheStats(KVConnectorStats):
         """Return short human-readable summaries without dropping raw metrics."""
 
         reduced = self.reduce()
-        previous = getattr(self, "_logged_metrics", {})
+        reports = self.data.get("reports", [])
+        generations = tuple(sorted(
+            (report["rank"], report["generation"]) for report in reports
+            if type(report.get("rank")) is int
+            and isinstance(report.get("generation"), str) and report["generation"]
+        ))
+        history_key = generations if generations and len(generations) == len(reports) else None
+        previous = (
+            self._log_history.get(history_key, {}) if history_key is not None
+            else getattr(self, "_logged_metrics", {})
+        )
         changed = {
             key: value for key, value in reduced.items()
             if value != previous.get(key, 0)
@@ -795,6 +816,11 @@ class SparkCacheStats(KVConnectorStats):
         changed.update({key: 0 for key, value in previous.items()
                         if value and key not in reduced})
         self._logged_metrics = dict(reduced)
+        if history_key is not None:
+            self._log_history[history_key] = dict(reduced)
+            self._log_history.move_to_end(history_key)
+            while len(self._log_history) > 128:
+                self._log_history.popitem(last=False)
         if not changed:
             return ()
         return ("sparkcache: counters " + " ".join(
@@ -1235,6 +1261,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._stats_checkpoint_sequence = 0
         self._stats_checkpoint_cycle = 1
         self._stats_checkpoint_index = 0
+        self._incompatible_inventory: tuple[tuple[str, str], ...] = ()
+        self._incompatible_cursor = 0
         self._pending_saves: dict[str, dict[str, torch.Tensor]] = {}
         self._load_errors: set[int] = set()
         self._load_lock = threading.Lock()
@@ -1326,6 +1354,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._worker_checkpoints: dict[int, dict[str, Any]] = {}
         self._worker_desynchronized: set[int] = set()
         self._worker_requires_checkpoint: set[int] = set()
+        self._worker_publication_pending: set[int] = set()
+        self._worker_incompatible: dict[int, set[tuple[str, str]]] = {}
         # Bind reusable digest tables to immutable token values, not a mutable
         # list's identity. Availability is checked afresh by each callback.
         # Request completion releases the token snapshot and digest table.
@@ -2395,12 +2425,14 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             # Not every rank can offer a compatible manifest (or none has
             # reported yet). Treat as a plain miss: the request re-prefills
             # and republishes, which is also how a corrupted entry retires.
-            self.counters["quorum_incomplete"] = (
-                self.counters.get("quorum_incomplete", 0) + 1
+            reason = self._schema_miss_reason(
+                token_ids, candidates, multimodal_features, request_scope,
             )
-            logger.info("sparkcache: restore miss tokens=%d ms=%.1f rank=%d reason=quorum",
+            counter = "quorum_incomplete" if reason == "quorum" else f"restore_miss_{reason}"
+            self.counters[counter] = self.counters.get(counter, 0) + 1
+            logger.info("sparkcache: restore miss tokens=%d ms=%.1f rank=%d reason=%s",
                         len(token_ids), (time.perf_counter_ns() - lookup_started_ns) / 1_000_000,
-                        self._shard_rank)
+                        self._shard_rank, reason)
             return 0, False
         span, digest = selected
         flight = self._restore_flights.get(digest)
@@ -3124,7 +3156,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         )
 
     def has_pending_push_work(self) -> bool:
-        return bool(self._capture_read_leases)
+        # Capture-read completion releases source pages before the store
+        # finishes. Keep no-forward steps running until each worker's final
+        # publication inventory has reached the scheduler as well.
+        return bool(self._capture_read_leases or self._worker_publication_pending)
 
     def _capture_read_completed(self, job: str) -> None:
         if not job:
@@ -4270,6 +4305,70 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             if retry_unsatisfied:
                 self.counters["capacity_retries"] += 1
 
+    def _schema_miss_reason(
+        self,
+        token_ids: Sequence[int],
+        candidates: Sequence[tuple[int, str]],
+        multimodal_features: Sequence[MultimodalFeatureIdentity],
+        request_scope: str,
+    ) -> str:
+        """Diagnose another schema's exact prefix without admitting its bytes."""
+        evidence = set().union(*self._worker_incompatible.values())
+        compatible = dict(candidates)
+        for schema in {schema for schema, _digest in evidence}:
+            identity = replace(self._config.build_identity(0, 0), publication_schema=schema)
+            salt = f"{_CONTEXT_DIGEST_NAMESPACE}:{identity.storage_key}:{request_scope}"
+            alternate = chunk_prefix_digests(
+                token_ids, salt, boundaries=[span for span, _digest in candidates],
+                chunk_tokens=self._chunk_tokens, multimodal_features=multimodal_features,
+            )
+            if any(
+                (schema, digest) in entries
+                and compatible[span] not in self._worker_held.get(rank, ())
+                for span, digest in alternate
+                for rank, entries in self._worker_incompatible.items()
+            ):
+                return "integrity_schema_mismatch"
+        return "quorum"
+
+    def _discover_incompatible_manifests(self, identity: CacheIdentity) -> None:
+        # Only publication schema may differ. Model, topology, request scope,
+        # and geometry remain bound by identity and prefix digests. This
+        # startup metadata is diagnostic evidence, never a restore offer.
+        entries = []
+        for schema in _DIAGNOSTIC_PUBLICATION_SCHEMAS:
+            if schema == identity.publication_schema:
+                continue
+            alternate = replace(identity, publication_schema=schema)
+            root = Path(self._root) / "manifests" / alternate.storage_key
+            # Diagnostic failure must not suppress compatible inventory.
+            with contextlib.suppress(OSError, ValueError, RuntimeError):
+                for path in root.glob("*.json"):
+                    if SHA256_RE.fullmatch(path.stem) is None:
+                        continue
+                    lookup = self._store.lookup(
+                        alternate, path.stem, verify_chunks=False, verify_chunk_metadata=True,
+                    )
+                    if lookup.is_hit:
+                        entries.append((schema, path.stem))
+        self._incompatible_inventory = tuple(sorted(entries))
+        self._incompatible_cursor = 0
+
+    def _absorb_incompatible_manifests(self, rank: int, report: dict[str, Any]) -> None:
+        entries = report.get("incompatible", ())
+        if not isinstance(entries, (list, tuple)) or len(entries) > _QUORUM_REPORT_BATCH_SIZE:
+            return
+        for entry in entries:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                continue
+            schema, digest = entry
+            if (
+                schema in _DIAGNOSTIC_PUBLICATION_SCHEMAS
+                and schema != self._publication_schema
+                and isinstance(digest, str) and SHA256_RE.fullmatch(digest)
+            ):
+                self._worker_incompatible.setdefault(rank, set()).add((schema, digest))
+
     def discover_manifests(self) -> dict[str, int]:
         """Offer structurally valid exact entries and safe row aliases.
 
@@ -4290,6 +4389,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             try:
                 rank = self._worker_rank()
                 identity = self._identity(rank)
+                self._discover_incompatible_manifests(identity)
                 roots = [
                     (
                         Path(self._root) / "manifests" / identity.storage_key,
@@ -6553,6 +6653,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self, rank: int, generation: str, generation_epoch: int | None
     ) -> None:
         self._withdraw_worker_quorum(rank)
+        self._worker_publication_pending.discard(rank)
+        self._worker_incompatible.pop(rank, None)
         self._worker_generations[rank] = generation
         if generation_epoch is None:
             self._worker_generation_epochs.pop(rank, None)
@@ -6821,6 +6923,20 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     continue
                 self._absorb_worker_delta(rank, report.get("delta"))
                 self._absorb_worker_checkpoint(rank, report.get("checkpoint"))
+                self._absorb_incompatible_manifests(rank, report)
+                publication = report.get("publication_work")
+                if isinstance(publication, dict):
+                    sequence = report.get("inventory_sequence")
+                    if publication.get("pending") or (
+                        type(sequence) is int
+                        and (
+                            self._worker_report_sequences.get(rank, -1) < sequence
+                            or rank in self._worker_desynchronized
+                        )
+                    ):
+                        self._worker_publication_pending.add(rank)
+                    else:
+                        self._worker_publication_pending.discard(rank)
                 continue
             held = report.get("held")
             if not isinstance(held, list):
@@ -6983,6 +7099,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             "generation": self._stats_generation,
             "generation_epoch": self._stats_generation_epoch,
             "held_count": len(inventory),
+            "inventory_sequence": self._stats_sequence,
             # A scheduler without delta-protocol support interprets this as a
             # withdrawal instead of retaining stale full-set confirmations.
             "held": [],
@@ -6994,6 +7111,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self._stats_delta_cursor = (delta_index + 1) % len(
                 self._stats_delta_history
             )
+        start = self._incompatible_cursor
+        report["incompatible"] = self._incompatible_inventory[start:start + _QUORUM_REPORT_BATCH_SIZE]
+        self._incompatible_cursor = (
+            (start + _QUORUM_REPORT_BATCH_SIZE) % len(self._incompatible_inventory)
+            if self._incompatible_inventory else 0
+        )
         return report
 
     def get_kv_connector_stats(self):
@@ -7009,8 +7132,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         not the DCP-local rank, so TP0 and TP2 are not deduplicated
         despite sharing DCP-local rank 0 under TP4/DCP2.
 
-        Each report carries at most one bounded state delta and one bounded
-        checkpoint chunk. Sequence gaps withdraw the rank's confirmations;
+        Each report carries at most one bounded state delta, one bounded
+        checkpoint chunk, and one diagnostic batch for other schemas.
+        Sequence gaps withdraw the rank's confirmations;
         replayed deltas or a complete rolling checkpoint restore them.
         """
         if self._role is not KVConnectorRole.WORKER:
@@ -7075,8 +7199,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         registration and before the engine becomes ready. SparkCache uses that
         existing exchange to establish the same physical-rank quorum otherwise
         learned from post-request worker statistics. The handshake carries at
-        most ``_STARTUP_HANDSHAKE_MAX_DIGESTS`` entries so cache size cannot
-        make API readiness unbounded. Later bounded statistics report entries
+        most ``_STARTUP_HANDSHAKE_MAX_DIGESTS`` entries in each of the compatible
+        and incompatible inventories so cache size cannot make the readiness
+        exchange unbounded. Later bounded statistics report entries
         outside that startup subset.
         """
 
@@ -7092,8 +7217,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 math.ceil(len(held) / _QUORUM_REPORT_BATCH_SIZE),
             )
             reports = []
-            for index in range(checkpoint_count):
+            incompatible = self._incompatible_inventory[:_STARTUP_HANDSHAKE_MAX_DIGESTS]
+            report_count = max(checkpoint_count, math.ceil(len(incompatible) / _QUORUM_REPORT_BATCH_SIZE))
+            for report_index in range(report_count):
+                index = report_index % checkpoint_count
                 start = index * _QUORUM_REPORT_BATCH_SIZE
+                diagnostic_start = report_index * _QUORUM_REPORT_BATCH_SIZE
                 checkpoint_held = list(
                     held[start : start + _QUORUM_REPORT_BATCH_SIZE]
                 )
@@ -7105,6 +7234,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         "generation_epoch": self._stats_generation_epoch,
                         "held_count": len(held),
                         "held": [],
+                        "incompatible": incompatible[diagnostic_start:diagnostic_start + _QUORUM_REPORT_BATCH_SIZE],
                         "checkpoint": {
                             "state_sequence": state_sequence,
                             "cycle": self._stats_checkpoint_cycle,
