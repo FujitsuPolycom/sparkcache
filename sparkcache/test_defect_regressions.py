@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest import mock
 
 import torch
+import pytest
 import sparkcache.native.python as native_package
 import sparkcache.spark_cache_cuda as canonical_cuda
 import sparkcache.spark_cache_native as legacy_native
@@ -29,6 +30,8 @@ from sparkcache.spark_context_cache_hybrid import HybridCodecError
 from sparkcache.spark_context_cache_profiles import resolve_profile
 from sparkcache.test_spark_context_cache_connector import (
     _drain_store,
+    _drain,
+    _empty_scheduler_output,
     _hybrid_kv_cache_config,
     _make_connector,
     _make_pools,
@@ -42,6 +45,163 @@ from sparkcache.test_async_page_capture_connector import (
     FakeRuntime as AsyncPageFakeRuntime,
     _connector as make_async_page_connector,
 )
+
+
+@pytest.mark.parametrize("tp", [2, 4])
+@pytest.mark.parametrize("report_withdrawal", [False, True])
+@pytest.mark.parametrize("scheduler_probe", ["none", "tp0"])
+@pytest.mark.parametrize("failed_ranks", [(1,), (0, 1)])
+def test_d27_corrupt_rank_republication_restores_quorum(
+    tmp_path, tp, report_withdrawal, scheduler_probe, failed_ranks,
+):
+    """D-27: repaired entries regain full-span reuse without a worker restart."""
+    span = 1024
+    tokens = list(range(1100))
+    blocks = tuple(range(1, 17))
+    workers = []
+    scheduler = _make_connector(
+        tmp_path / ("rank-0" if scheduler_probe == "tp0" else "scheduler"),
+        0, tp=tp, dcp=1,
+        role=KVConnectorRole.SCHEDULER,
+        extra_config={"spark_cache_scheduler_probe": scheduler_probe},
+    )
+    digest = scheduler._digest(tokens, span)
+    request = types.SimpleNamespace(
+        cache_salt=None, request_id="reader", prompt_token_ids=tokens,
+    )
+
+    def report(worker, invalid=()):
+        scheduler.update_connector_output(types.SimpleNamespace(
+            kv_connector_stats=worker.get_kv_connector_stats(),
+            invalid_block_ids=set(invalid),
+        ))
+
+    try:
+        for rank in range(tp):
+            worker = _make_connector(tmp_path / f"rank-{rank}", rank, tp=tp, dcp=1)
+            worker._worker_rank = lambda: 0
+            workers.append(worker)
+            worker.register_kv_caches(_make_pools(20, 64))
+            worker.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[
+                _ReqPlan("seed", digest, span, blocks, True, request_scope=UNSALTED_SCOPE),
+            ]))
+            worker.wait_for_save()
+            _drain_store(worker)
+            report(worker)
+
+        assert scheduler.get_num_new_matched_tokens(request, 0) == (span, True)
+        scheduler.update_state_after_alloc(
+            request, types.SimpleNamespace(get_block_ids=lambda: (list(blocks),)), span,
+        )
+        restore = scheduler.build_connector_meta(_empty_scheduler_output())
+        for rank in failed_ranks:
+            chunk = sorted((tmp_path / f"rank-{rank}" / "chunks").glob("*.spcc"))[0]
+            damaged = bytearray(chunk.read_bytes())
+            damaged[len(damaged) // 2] ^= 0x08
+            chunk.write_bytes(damaged)
+        invalid = set()
+        for rank, worker in enumerate(workers):
+            worker.bind_connector_metadata(restore)
+            worker.start_load_kv(None)
+            assert _drain(worker) == {"reader"}
+            invalid.update(worker.get_block_ids_with_load_errors())
+            assert worker.counters["load_failed"] == int(rank in failed_ranks)
+        assert invalid
+        scheduler.update_connector_output(types.SimpleNamespace(invalid_block_ids=invalid))
+        if report_withdrawal:
+            for rank in failed_ranks:
+                report(workers[rank])
+        assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+
+        recompute = types.SimpleNamespace(
+            scheduled_new_reqs=[types.SimpleNamespace(
+                cache_salt=None, req_id="reader", prompt_token_ids=tokens,
+                num_computed_tokens=0, block_ids=(list(blocks),),
+            )],
+            num_scheduled_tokens={"reader": len(tokens)},
+            scheduled_cached_reqs=_empty_scheduler_output().scheduled_cached_reqs,
+        )
+        publication = scheduler.build_connector_meta(recompute)
+        assert len(publication.plans) == 1
+        assert publication.plans[0].is_store
+        assert publication.plans[0].digest == digest
+
+        # Healthy ranks retain their files and skip publication. The missing
+        # rank must prevent admission even after all healthy reports arrive.
+        for rank, worker in enumerate(workers):
+            if rank in failed_ranks:
+                continue
+            worker.bind_connector_metadata(publication)
+            worker.wait_for_save()
+            _drain_store(worker)
+            report(worker)
+            assert worker.counters["store_skipped_present"] == 1
+            assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+
+        expected = _make_pools(20, 64)
+        for rank in failed_ranks:
+            # No offer is permitted while even one rank still lacks a copy.
+            assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+            damaged_worker = workers[rank]
+            for name, tensor in damaged_worker._layer_tensors.items():
+                tensor.copy_(expected[name])
+            damaged_worker.bind_connector_metadata(publication)
+            damaged_worker.wait_for_save()
+            _drain_store(damaged_worker)
+            assert damaged_worker.counters["store_committed"] == 2
+            report(damaged_worker)
+        reader = types.SimpleNamespace(
+            cache_salt=None, request_id="after-repair", prompt_token_ids=tokens,
+        )
+        assert scheduler.get_num_new_matched_tokens(reader, 0) == (span, True)
+        scheduler.update_state_after_alloc(
+            reader, types.SimpleNamespace(get_block_ids=lambda: (list(blocks),)), span,
+        )
+        restored = scheduler.build_connector_meta(_empty_scheduler_output())
+        for worker in workers:
+            for tensor in worker._layer_tensors.values():
+                tensor.zero_()
+            worker.bind_connector_metadata(restored)
+            worker.start_load_kv(None)
+            assert _drain(worker) == {"after-repair"}
+            assert worker.get_block_ids_with_load_errors() == set()
+            assert worker.counters["load_verified"] >= 1
+            for name, tensor in worker._layer_tensors.items():
+                assert torch.equal(tensor[list(blocks)], expected[name][list(blocks)])
+    finally:
+        scheduler.shutdown()
+        for worker in workers:
+            worker.shutdown()
+
+
+def test_d27_eviction_supersedes_pending_readvertisement(tmp_path):
+    """A skipped store cannot renew an entry evicted before its report."""
+    worker = _make_connector(tmp_path / "worker", 0, tp=1, dcp=1)
+    scheduler = _make_connector(
+        tmp_path / "scheduler", 0, tp=1, dcp=1,
+        role=KVConnectorRole.SCHEDULER,
+    )
+    digest = "a" * 64
+    try:
+        worker._held.add(digest)
+        scheduler.update_connector_output(types.SimpleNamespace(
+            kv_connector_stats=worker.get_kv_connector_stats(),
+        ))
+        assert scheduler._has_full_quorum(digest)
+        worker.bind_connector_metadata(SparkCacheConnectorMetadata(plans=[
+            _ReqPlan("recompute", digest, 1024, tuple(range(1, 17)), True,
+                     request_scope=UNSALTED_SCOPE),
+        ]))
+        worker.wait_for_save()
+        assert worker.counters["store_skipped_present"] == 1
+        worker._held.discard(digest)
+        scheduler.update_connector_output(types.SimpleNamespace(
+            kv_connector_stats=worker.get_kv_connector_stats(),
+        ))
+        assert not scheduler._has_full_quorum(digest)
+    finally:
+        worker.shutdown()
+        scheduler.shutdown()
 
 
 class DefectD19SkippedAsyncPublicationCompletionTests(unittest.TestCase):

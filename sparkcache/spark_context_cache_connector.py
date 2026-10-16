@@ -1225,6 +1225,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         # each scheduler step proportional to the retained inventory.
         self._held = set()
         self._stats_observed_held: set[str] = set()
+        self._stats_readvertise_held: set[str] = set()
         self._stats_observed_inventory: HeldInventory | None = None
         self._stats_observed_revision = -1
         self._stats_sequence = 0
@@ -5827,6 +5828,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     )
                     skipped_before_submit = True
                 elif plan.digest in self._held:
+                    # A peer's failed restore withdraws the scheduler's whole
+                    # quorum. Recompute must renew even unchanged local offers.
+                    self._stats_readvertise_held.add(plan.digest)
                     self.counters["store_skipped_present"] += 1
                     logger.debug(
                         "sparkcache: store skipped; entry already"
@@ -6408,6 +6412,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 # is needed to make this digest eligible for quorum.
                 self._held.add(digest)
                 self._held.update(additional_digests)
+                # Withdrawal and repair can occur between inventory reports.
+                self._stats_readvertise_held.add(digest)
                 self.counters["store_committed"] += 1
             else:
                 self._held.discard(digest)
@@ -6854,21 +6860,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         for request_id, (digest, block_ids) in list(self._admitted.items()):
             if not (block_ids & invalid_blocks):
                 continue
-            # Under probe mode "none" the scheduler owns no cache root to
-            # unlink; each damaged rank retires its own entry on load
-            # failure, and dropping quorum below suppresses re-admission.
-            if self._scheduler_probe == "tp0" and self._store.invalidate(
-                self._identity(self._shard_rank), digest
-            ):
-                self.counters["scheduler_retired"] = (
-                    self.counters.get("scheduler_retired", 0) + 1
-                )
-                _warning(
-                    "sparkcache: retired entry %s after a rank"
-                    " reported load errors (request %s)",
-                    digest[:12],
-                    request_id,
-                )
+            # Each damaged worker retires its own entry. The merged block
+            # errors do not identify a rank, so even a scheduler sharing TP0's
+            # root must preserve that potentially healthy copy. Withdraw all
+            # offers until recompute renews each worker's advertisement.
             self._quorum.pop(digest, None)
             flight = self._restore_flights.get(digest)
             if flight is not None and flight.segment_digest is not None:
@@ -6882,18 +6877,6 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         # still withdraw quorum and release followers to recompute.
         for digest, flight in list(self._restore_flights.items()):
             if flight.restored_block_ids & invalid_blocks:
-                if self._scheduler_probe == "tp0" and self._store.invalidate(
-                    self._identity(self._shard_rank), digest
-                ):
-                    self.counters["scheduler_retired"] = (
-                        self.counters.get("scheduler_retired", 0) + 1
-                    )
-                    _warning(
-                        "sparkcache: retired entry %s after aborted"
-                        " leader %s reported load errors",
-                        digest[:12],
-                        flight.leader_request_id,
-                    )
                 self._quorum.pop(digest, None)
                 if flight.segment_digest is not None:
                     self._quorum.pop(flight.segment_digest, None)
@@ -6937,11 +6920,15 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         if (
             self._stats_observed_inventory is not inventory
             or self._stats_observed_revision != inventory.revision
+            or self._stats_readvertise_held
         ):
             held = inventory.copy()
-            if held != self._stats_observed_held:
-                added = held - self._stats_observed_held
-                removed = self._stats_observed_held - held
+            added = (held - self._stats_observed_held) | (
+                self._stats_readvertise_held & held
+            )
+            removed = self._stats_observed_held - held
+            self._stats_readvertise_held.clear()
+            if added or removed:
                 base_sequence = self._stats_sequence
                 self._stats_sequence += 1
                 if len(added) + len(removed) <= _QUORUM_REPORT_BATCH_SIZE:

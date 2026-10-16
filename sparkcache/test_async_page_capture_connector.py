@@ -210,6 +210,7 @@ def _connector(plan: _ReqPlan, runtime: FakeRuntime) -> SparkContextCacheConnect
     connector._store_accepting = True
     connector._store_inflight = 0
     connector._held = set()
+    connector._stats_readvertise_held = set()
     connector.counters = Counter()
     connector._get_connector_metadata = lambda: SparkCacheConnectorMetadata(
         plans=[plan]

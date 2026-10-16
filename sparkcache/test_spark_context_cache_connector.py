@@ -4967,7 +4967,7 @@ class AsyncStoreTests(unittest.TestCase):
 
 
 class SchedulerRetirementTests(unittest.TestCase):
-    def test_load_errors_retire_the_admitted_entry(self) -> None:
+    def test_load_errors_withdraw_admission_without_unlinking_healthy_tp0(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "rank0"
             connector = _make_connector(root, 0, 64)
@@ -4982,6 +4982,7 @@ class SchedulerRetirementTests(unittest.TestCase):
             self.assertTrue(connector._store.lookup(identity, digest).is_hit)
 
             connector._admitted["req-r"] = (digest, frozenset({3, 0, 5, 1}))
+            connector._quorum[digest] = set(range(4))
             other_digest = "d" * 64
             connector._admitted["req-other"] = (other_digest, frozenset({8, 9}))
             # the runtime finishes the failed request first; the digest must
@@ -4989,9 +4990,10 @@ class SchedulerRetirementTests(unittest.TestCase):
             connector.update_connector_output(
                 types.SimpleNamespace(invalid_block_ids={3, 0})
             )
-            # entry retired so the next request is a clean miss
-            self.assertFalse(connector._store.lookup(identity, digest).is_hit)
-            self.assertEqual(connector.counters["scheduler_retired"], 1)
+            # Rank ownership is absent from merged block errors. Worker-side
+            # rejection retires damaged files; the scheduler withdraws offers.
+            self.assertTrue(connector._store.lookup(identity, digest).is_hit)
+            self.assertNotIn(digest, connector._quorum)
             # an admission whose restored blocks do not intersect the
             # reported invalid blocks is untouched
             self.assertEqual(
