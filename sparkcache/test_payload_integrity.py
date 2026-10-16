@@ -163,7 +163,7 @@ def test_fast_detects_a_tampered_tail_and_a_tampered_object(tmp_path, monkeypatc
     damaged = bytearray(healthy)
     damaged[-1] ^= 1
     path.write_bytes(damaged)
-    with pytest.raises(cuda_hybrid.CudaHybridRestoreError, match="mismatch"):
+    with pytest.raises(cuda_hybrid.CudaHybridRestoreError, match=r"tail integrity rejection \(CRC32 fast\)"):
         history.cuda_restore(TURNS - 1)
     with pytest.raises(cache_manifest.CacheFormatError):
         history.python_restore(TURNS - 1)
@@ -177,7 +177,7 @@ def test_fast_detects_a_tampered_tail_and_a_tampered_object(tmp_path, monkeypatc
     base_damaged[len(base_damaged) // 2] ^= 1
     base_path.write_bytes(base_damaged)
     cache_manifest._clear_hot_page_snapshots()
-    with pytest.raises(cuda_hybrid.CudaHybridRestoreError, match="mismatch"):
+    with pytest.raises(cuda_hybrid.CudaHybridRestoreError, match="page object CRC32 fast mismatch"):
         history.cuda_restore(TURNS - 1)
     base_path.write_bytes(base_healthy)
 

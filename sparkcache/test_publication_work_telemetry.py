@@ -153,7 +153,7 @@ def test_work_reduction_sums_rank_slots_takes_max_age_and_preserves_reports():
     assert reduced["sparkcache_publication_pending_rank_slots"] == 2
     assert reduced["sparkcache_publication_oldest_pending_ms"] == 2500
     assert reduced["sparkcache_maintenance_active_ranks"] == 1
-    assert any("publication_work" in line for line in stats.format_log_lines())
+    assert any("publication_pending_rank_slots=2" in line for line in stats.format_log_lines())
     legacy = connector_module.SparkCacheStats(data={"reports": [{"rank": 2, "held": []}]})
     assert legacy.reduce() == {"sparkcache_ranks": 1, "sparkcache_entries": 0}
 

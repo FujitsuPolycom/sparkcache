@@ -274,7 +274,7 @@ def test_runtime_completes_native_capture_then_hands_off_encoded_snapshot(
         progress_thread_initializer=lambda: None,
     )
     plan = _plan()
-    with caplog.at_level("INFO", logger="vllm.spark_context_cache"):
+    with caplog.at_level("DEBUG", logger="vllm.spark_context_cache"):
         assert runtime.submit(plan, producer_stream=91)
         assert connector.completed == []
         ring.ready.set()

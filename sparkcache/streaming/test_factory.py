@@ -486,7 +486,7 @@ def test_background_writer_failure_aborts_cache_without_failing_serving(
     adapter._runtime = Runtime()
 
     with caplog.at_level(
-        logging.INFO,
+        logging.DEBUG,
         logger="vllm.spark_context_cache.streaming",
     ):
         adapter.offer_completed(
@@ -690,7 +690,7 @@ def test_bound_timing_trace_uses_the_configured_worker_logger(
     )
 
     with caplog.at_level(
-        logging.INFO,
+        logging.DEBUG,
         logger="vllm.spark_context_cache.streaming",
     ):
         adapter._timing_trace.mark(
@@ -1153,22 +1153,22 @@ def test_worker_emits_drained_after_aborted_writer_releases_final_ticket(
     }
 
     with caplog.at_level(
-        logging.INFO,
+        logging.DEBUG,
         logger="vllm.spark_context_cache.streaming",
     ):
         adapter.poll()
         first_events = [
             record.getMessage()
             for record in caplog.records
-            if record.getMessage().startswith("[sparkcache-streaming-status]")
+            if record.getMessage().startswith("sparkcache: streaming-status")
         ]
         assert not any('"event":"drained"' in event for event in first_events)
         adapter.poll()
 
     events = [
-        json.loads(record.getMessage().split("] ", 1)[1])
+        json.loads(record.getMessage().removeprefix("sparkcache: streaming-status "))
         for record in caplog.records
-        if record.getMessage().startswith("[sparkcache-streaming-status]")
+        if record.getMessage().startswith("sparkcache: streaming-status")
     ]
     drained = [event for event in events if event["event"] == "drained"]
     assert len(drained) == 1
@@ -1205,15 +1205,15 @@ def test_worker_abort_reports_request_leases_separately_from_global_leases(
     }
 
     with caplog.at_level(
-        logging.INFO,
+        logging.DEBUG,
         logger="vllm.spark_context_cache.streaming",
     ):
         adapter.poll()
 
     events = [
-        json.loads(record.getMessage().split("] ", 1)[1])
+        json.loads(record.getMessage().removeprefix("sparkcache: streaming-status "))
         for record in caplog.records
-        if record.getMessage().startswith("[sparkcache-streaming-status]")
+        if record.getMessage().startswith("sparkcache: streaming-status")
     ]
     aborted = next(event for event in events if event["event"] == "aborted")
     assert aborted["leases_after_abort"] == 0
@@ -1307,15 +1307,15 @@ def test_finished_scheduler_generation_retains_context_until_late_commit(
 
     runtime._committed = {digest: _commit_receipt(65536)}
     with caplog.at_level(
-        logging.INFO,
+        logging.DEBUG,
         logger="vllm.spark_context_cache.streaming",
     ):
         adapter.poll()
 
     events = [
-        json.loads(record.getMessage().split("] ", 1)[1])
+        json.loads(record.getMessage().removeprefix("sparkcache: streaming-status "))
         for record in caplog.records
-        if record.getMessage().startswith("[sparkcache-streaming-status]")
+        if record.getMessage().startswith("sparkcache: streaming-status")
     ]
     committed = next(event for event in events if event["event"] == "committed")
     assert committed["request_id"] == "late-commit"

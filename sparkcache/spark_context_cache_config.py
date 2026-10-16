@@ -107,12 +107,12 @@ def _compat_config_value(
             disagree = normalize(canonical_value) != normalize(legacy_value)
         except (TypeError, ValueError) as error:
             raise RuntimeError(
-                "spark-context-cache: conflicting SparkCache CUDA restore"
+                "sparkcache: conflicting SparkCache CUDA restore"
                 f" settings {canonical_key} and legacy alias {legacy_key}"
             ) from error
         if disagree:
             raise RuntimeError(
-                "spark-context-cache: conflicting SparkCache CUDA restore"
+                "sparkcache: conflicting SparkCache CUDA restore"
                 f" settings {canonical_key} and legacy alias {legacy_key}"
             )
         return canonical_value
@@ -152,7 +152,7 @@ def _access_controls(
     except KeyError as error:
         choices = ", ".join(sorted(_ACCESS_MODES))
         raise RuntimeError(
-            "spark-context-cache: spark_cache_access_mode must be one of "
+            "sparkcache: spark_cache_access_mode must be one of "
             f"{choices}"
         ) from error
 
@@ -183,10 +183,10 @@ def _nonnegative_config_int(value: Any, label: str) -> int:
         parsed = int(value)
     except (OverflowError, TypeError, ValueError) as error:
         raise RuntimeError(
-            f"spark-context-cache: {label} must be an integer"
+            f"sparkcache: {label} must be an integer"
         ) from error
     if parsed < 0:
-        raise RuntimeError(f"spark-context-cache: {label} must be non-negative")
+        raise RuntimeError(f"sparkcache: {label} must be non-negative")
     return parsed
 
 
@@ -205,15 +205,15 @@ def _bounded_positive_config_float(
         parsed = float(value)
     except (OverflowError, TypeError, ValueError) as error:
         raise RuntimeError(
-            f"spark-context-cache: {label} must be a finite number"
+            f"sparkcache: {label} must be a finite number"
         ) from error
     if not math.isfinite(parsed):
         raise RuntimeError(
-            f"spark-context-cache: {label} must be a finite number"
+            f"sparkcache: {label} must be a finite number"
         )
     if not minimum <= parsed <= maximum:
         raise RuntimeError(
-            f"spark-context-cache: {label} must be at least {minimum:g} and at most"
+            f"sparkcache: {label} must be at least {minimum:g} and at most"
             f" {maximum:g} seconds"
         )
     return parsed
@@ -237,7 +237,7 @@ def _spec_replay_tokens(spec: Any) -> int:
     value = getattr(spec, "prefill_replay_tokens", 0)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise RuntimeError(
-            "spark-context-cache: prefill_replay_tokens must be a"
+            "sparkcache: prefill_replay_tokens must be a"
             " non-negative integer"
         )
     return value
@@ -257,7 +257,7 @@ def _cache_spec_reuse_policy(spec: Any) -> tuple[str, int | None]:
         # prefix-cacheable group's tokens_per_state.
         if prefix_cacheable is not False or _spec_replay_tokens(spec):
             raise RuntimeError(
-                "spark-context-cache: circular-buffer KV-cache spec must be"
+                "sparkcache: circular-buffer KV-cache spec must be"
                 " non-prefix-cacheable without a replay reserve"
             )
         return "transient", None
@@ -270,14 +270,14 @@ def _cache_spec_reuse_policy(spec: Any) -> tuple[str, int | None]:
             # the pages are never persisted.
             return "replay", replay_tokens
         raise RuntimeError(
-            "spark-context-cache: unsupported block-page KV-cache spec "
+            "sparkcache: unsupported block-page KV-cache spec "
             f"{type(spec).__name__}"
         )
     if "SlidingWindowSpec" in class_names:
         window = int(getattr(spec, "sliding_window", 0) or 0)
         if window <= 1:
             raise RuntimeError(
-                "spark-context-cache: sliding KV-cache window must exceed one token"
+                "sparkcache: sliding KV-cache window must exceed one token"
             )
         return "sliding", window
     if "FullAttentionSpec" in class_names:
@@ -286,12 +286,12 @@ def _cache_spec_reuse_policy(spec: Any) -> tuple[str, int | None]:
         mode = str(getattr(spec, "mamba_cache_mode", "none"))
         if mode != "align":
             raise RuntimeError(
-                "spark-context-cache: recurrent block-page restore requires"
+                "sparkcache: recurrent block-page restore requires"
                 f" mamba_cache_mode 'align' (configured: {mode!r})"
             )
         return "recurrent_align", None
     raise RuntimeError(
-        "spark-context-cache: unsupported block-page KV-cache spec "
+        "sparkcache: unsupported block-page KV-cache spec "
         f"{type(spec).__name__}"
     )
 
@@ -302,7 +302,7 @@ def _group_reuse_policy(
     """Resolve one engine group's common supported reuse policy."""
 
     if not layer_names:
-        raise RuntimeError("spark-context-cache: KV-cache group has no layers")
+        raise RuntimeError("sparkcache: KV-cache group has no layers")
     per_layer = getattr(spec, "kv_cache_specs", None)
     policies = {
         _cache_spec_reuse_policy(
@@ -318,7 +318,7 @@ def _group_reuse_policy(
             for policy, window in policies
         )
         raise RuntimeError(
-            "spark-context-cache: one KV-cache group mixes incompatible reuse"
+            "sparkcache: one KV-cache group mixes incompatible reuse"
             f" policies: {rendered}"
         )
     return policies.pop()
@@ -354,7 +354,7 @@ def _recurrent_state_identity(
     inconsistent = [field for field, choices in values.items() if len(choices) != 1]
     if inconsistent:
         raise RuntimeError(
-            "spark-context-cache: recurrent group mixes incompatible state"
+            "sparkcache: recurrent group mixes incompatible state"
             " geometry: " + ", ".join(inconsistent)
         )
     identity = {field: next(iter(choices)) for field, choices in values.items()}
@@ -367,7 +367,7 @@ def _recurrent_state_identity(
         choices = {getattr(layer_spec, field, default) for layer_spec in recurrent}
         if len(choices) != 1:
             raise RuntimeError(
-                "spark-context-cache: recurrent group mixes incompatible state"
+                "sparkcache: recurrent group mixes incompatible state"
                 " geometry: " + field
             )
         value = choices.pop()
@@ -392,7 +392,7 @@ def _group_identity_spec(spec: Any, layers: Sequence[str]) -> Any:
         return spec
     members = getattr(spec, "kv_cache_specs", None)
     if not isinstance(members, dict) or not members or set(members) != set(layers):
-        raise RuntimeError("spark-context-cache: uniform KV-cache group needs every layer spec")
+        raise RuntimeError("sparkcache: uniform KV-cache group needs every layer spec")
     representative = next(iter(members.values()))
     # Byte sizes may differ (for example FP8 target and BF16 MTP); manager
     # token geometry and DCP ownership must agree across all members.
@@ -403,7 +403,7 @@ def _group_identity_spec(spec: Any, layers: Sequence[str]) -> Any:
                 bool(getattr(member, "dcp_replicated", policy == "recurrent_align")))
 
     if any(geometry(member) != geometry(representative) for member in members.values()):
-        raise RuntimeError("spark-context-cache: uniform KV-cache group mixes incompatible manager geometry")
+        raise RuntimeError("sparkcache: uniform KV-cache group mixes incompatible manager geometry")
     return representative
 
 
@@ -425,13 +425,13 @@ def _group_tokens_per_state(spec: Any, layer_names: Sequence[str]) -> int:
     }
     if len(values) != 1:
         raise RuntimeError(
-            "spark-context-cache: group mixes incompatible state geometry:"
+            "sparkcache: group mixes incompatible state geometry:"
             " tokens_per_state"
         )
     value = next(iter(values))
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise RuntimeError(
-            "spark-context-cache: non-persisted group tokens_per_state must"
+            "sparkcache: non-persisted group tokens_per_state must"
             " be a positive integer"
         )
     return value
@@ -458,7 +458,7 @@ def cache_group_block_size(kv_cache_config: Any, legacy_block_size: int) -> int:
         spec = _group_identity_spec(group.kv_cache_spec, group.layer_names)
         size = getattr(spec, "block_size", None)
         if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
-            raise RuntimeError("spark-context-cache: KV-cache group block size must be positive")
+            raise RuntimeError("sparkcache: KV-cache group block size must be positive")
         sizes.append(size)
     return math.lcm(*sizes)
 
@@ -504,7 +504,7 @@ def kv_group_topology(
     """Describe each manager group, including its DCP page ownership."""
 
     if dcp_degree <= 0:
-        raise RuntimeError("spark-context-cache: DCP degree must be positive")
+        raise RuntimeError("sparkcache: DCP degree must be positive")
     groups = tuple(getattr(kv_cache_config, "kv_cache_groups", ()) or ())
     topology = []
     for group_index, group in enumerate(groups):
@@ -514,7 +514,7 @@ def kv_group_topology(
         if (not getattr(group, "enable_kv_transfer", True)
                 or role != "default" or getattr(group, "host_resident", False)):
             raise RuntimeError(
-                "spark-context-cache: unsupported non-transferable KV-cache group"
+                "sparkcache: unsupported non-transferable KV-cache group"
                 f" {group_index} (role={role!r})"
             )
         spec = getattr(group, "kv_cache_spec", None)
@@ -530,7 +530,7 @@ def kv_group_topology(
         block_size = int(getattr(spec, "block_size", 0) or 0)
         if block_size <= 0:
             raise RuntimeError(
-                "spark-context-cache: KV-cache group block size must be positive"
+                "sparkcache: KV-cache group block size must be positive"
             )
         group_identity = {
             "group": group_index,
@@ -678,7 +678,7 @@ def parse_connector_config(
     """Parse and validate all SparkCache settings at construction time.
 
     Explicit validation failures raise :class:`RuntimeError` with the
-    ``spark-context-cache:`` prefix. Direct integer conversion for span and
+    ``sparkcache:`` prefix. Direct integer conversion for span and
     load-thread settings retains Python's :class:`ValueError` behavior.
     """
 
@@ -698,12 +698,12 @@ def parse_connector_config(
         or cp_kv_cache_interleave_size <= 0
     ):
         raise RuntimeError(
-            "spark-context-cache: cp_kv_cache_interleave_size must be a"
+            "sparkcache: cp_kv_cache_interleave_size must be a"
             " positive integer"
         )
     if tp_degree % dcp_degree:
         raise RuntimeError(
-            "spark-context-cache: decode context parallel size must divide"
+            "sparkcache: decode context parallel size must divide"
             f" tensor parallel size (tp={tp_degree},"
             f" dcp={dcp_degree})"
         )
@@ -712,7 +712,7 @@ def parse_connector_config(
         or block_size % cp_kv_cache_interleave_size
     ):
         raise RuntimeError(
-            "spark-context-cache: cache block size must be at least and"
+            "sparkcache: cache block size must be at least and"
             " divisible by cp_kv_cache_interleave_size"
         )
     pp_degree = max(1, getattr(parallel, "pipeline_parallel_size", 1))
@@ -720,7 +720,7 @@ def parse_connector_config(
         # CacheIdentity has no pipeline-stage field. Two stages would otherwise
         # publish different tensors into one manifest namespace.
         raise RuntimeError(
-            "spark-context-cache: pipeline parallelism is unsupported;"
+            "sparkcache: pipeline parallelism is unsupported;"
             f" pipeline_parallel_size={pp_degree}"
         )
     extra = kv_transfer_config.get_from_extra_config
@@ -730,14 +730,14 @@ def parse_connector_config(
     )
     if profile_value is None or not str(profile_value).strip():
         raise RuntimeError(
-            "spark-context-cache: spark_cache_model_profile is required; "
+            "sparkcache: spark_cache_model_profile is required; "
             "select a registered deployment profile explicitly"
         )
     profile_name = str(profile_value).strip()
     try:
         profile = resolve_profile(profile_name)
     except ProfileError as error:
-        raise RuntimeError(f"spark-context-cache: {error}") from error
+        raise RuntimeError(f"sparkcache: {error}") from error
     storage_mode = profile.storage_mode
     publication_schema_raw = str(
         extra(
@@ -754,7 +754,7 @@ def parse_connector_config(
         "tail-cow-v2",
     ):
         raise RuntimeError(
-            "spark-context-cache: spark_cache_publication_schema must be"
+            "sparkcache: spark_cache_publication_schema must be"
             " 'snapshot-v1', 'tail-cow-v1', or 'tail-cow-v2'"
         )
     publication_schema = ""
@@ -765,7 +765,7 @@ def parse_connector_config(
     elif publication_schema_raw == "tail-cow-v2":
         if storage_mode != "block_pages_v1":
             raise RuntimeError(
-                "spark-context-cache: tail-cow-v2 requires block-page storage"
+                "sparkcache: tail-cow-v2 requires block-page storage"
             )
         publication_schema = "page-tail-cow-v2"
     # Payload integrity. ``fast`` (the default for tail-cow-v2 publication)
@@ -785,20 +785,20 @@ def parse_connector_config(
     )
     if payload_integrity not in ("sha256", "fast", "none"):
         raise RuntimeError(
-            "spark-context-cache: spark_cache_payload_integrity must be"
+            "sparkcache: spark_cache_payload_integrity must be"
             " 'sha256', 'fast', or 'none'"
         )
     if payload_integrity != "sha256":
         if publication_schema != "page-tail-cow-v2":
             raise RuntimeError(
-                "spark-context-cache: spark_cache_payload_integrity fast or none"
+                "sparkcache: spark_cache_payload_integrity fast or none"
                 " requires spark_cache_publication_schema tail-cow-v2"
             )
         publication_schema = f"page-tail-cow-v3-{payload_integrity}"
     group_topology = kv_group_topology(kv_cache_config, dcp_degree=dcp_degree)
     if storage_mode == "block_pages_v1" and not group_topology:
         raise RuntimeError(
-            "spark-context-cache: block-page storage requires KV-cache groups"
+            "sparkcache: block-page storage requires KV-cache groups"
         )
     prefill_replay_tokens = max(
         (
@@ -811,7 +811,7 @@ def parse_connector_config(
     chunk_tokens = profile.chunk_tokens
     if storage_mode == "per_token_rows" and cp_kv_cache_interleave_size != 1:
         raise RuntimeError(
-            "spark-context-cache: per-token row storage supports only"
+            "sparkcache: per-token row storage supports only"
             " cp_kv_cache_interleave_size=1"
         )
     load_policy = str(
@@ -821,7 +821,7 @@ def parse_connector_config(
         # Every restore failure must become a clean re-prefill. Any other vLLM
         # policy can surface a failed restore as a request error.
         raise RuntimeError(
-            "spark-context-cache: kv_load_failure_policy must be"
+            "sparkcache: kv_load_failure_policy must be"
             f" 'recompute' (configured: {load_policy!r})"
         )
     root = str(
@@ -833,7 +833,7 @@ def parse_connector_config(
     clear_once_raw = extra("spark_cache_clear_once", "")
     if not isinstance(clear_once_raw, str):
         raise RuntimeError(
-            "spark-context-cache: spark_cache_clear_once must be a string"
+            "sparkcache: spark_cache_clear_once must be a string"
         )
     clear_once_token = clear_once_raw
     if clear_once_token:
@@ -843,7 +843,7 @@ def parse_connector_config(
                 clear_once_token,
             )
         except ValueError as error:
-            raise RuntimeError(f"spark-context-cache: {error}") from error
+            raise RuntimeError(f"sparkcache: {error}") from error
         root = str(validated_root)
     max_bytes = _nonnegative_config_int(
         extra(
@@ -887,7 +887,7 @@ def parse_connector_config(
             ),
         )
     except ValueError as error:
-        raise RuntimeError(f"spark-context-cache: {error}") from error
+        raise RuntimeError(f"sparkcache: {error}") from error
     min_span = int(
         extra(
             "spark_cache_min_span_tokens",
@@ -936,7 +936,7 @@ def parse_connector_config(
             )
         )
     except ValueError as error:
-        raise RuntimeError(f"spark-context-cache: {error}") from error
+        raise RuntimeError(f"sparkcache: {error}") from error
     streaming_snapshots_enabled = streaming_snapshots_requested and store_enabled
     try:
         async_page_capture_enabled = _streaming_snapshots_enabled(
@@ -947,32 +947,32 @@ def parse_connector_config(
         )
     except ValueError as error:
         raise RuntimeError(
-            "spark-context-cache: spark_cache_async_page_capture must be"
+            "sparkcache: spark_cache_async_page_capture must be"
             " 0/1 or false/true"
         ) from error
     if async_page_capture_enabled and storage_mode != "block_pages_v1":
         raise RuntimeError(
-            "spark-context-cache: asynchronous manager-page capture requires"
+            "sparkcache: asynchronous manager-page capture requires"
             " block-page storage"
         )
     if async_page_capture_enabled and not store_enabled:
         raise RuntimeError(
-            "spark-context-cache: asynchronous manager-page capture requires"
+            "sparkcache: asynchronous manager-page capture requires"
             " cache publication"
         )
     if async_page_capture_enabled and streaming_snapshots_enabled:
         raise RuntimeError(
-            "spark-context-cache: asynchronous manager-page capture and"
+            "sparkcache: asynchronous manager-page capture and"
             " row streaming snapshots are mutually exclusive"
         )
     if storage_mode == "block_pages_v1" and streaming_snapshots_enabled:
         raise RuntimeError(
-            "spark-context-cache: block-page storage does not support"
+            "sparkcache: block-page storage does not support"
             " streaming snapshots"
         )
     if publication_schema and streaming_snapshots_enabled:
         raise RuntimeError(
-            "spark-context-cache: tail-cow-v1 publication does not support"
+            "sparkcache: tail-cow-v1 publication does not support"
             " streaming snapshots"
         )
     cuda_restore_requested = _config_bool(
@@ -1028,7 +1028,7 @@ def parse_connector_config(
     except ValueError as error:
         if cuda_restore_enabled:
             raise RuntimeError(
-                "spark-context-cache: SparkCache CUDA restore requires an integer"
+                "sparkcache: SparkCache CUDA restore requires an integer"
                 " placement arena size"
             ) from error
         cuda_placement_arena_bytes = 0
@@ -1046,7 +1046,7 @@ def parse_connector_config(
     except (TypeError, ValueError) as error:
         if cuda_restore_enabled:
             raise RuntimeError(
-                "spark-context-cache: SparkCache CUDA restore requires an integer"
+                "sparkcache: SparkCache CUDA restore requires an integer"
                 " IO worker count"
             ) from error
         cuda_restore_io_workers = 8
@@ -1059,14 +1059,14 @@ def parse_connector_config(
             or cuda_placement_arena_bytes not in _CUDA_PLACEMENT_ARENA_BYTES
         ):
             raise RuntimeError(
-                "spark-context-cache: SparkCache CUDA restore requires an"
+                "sparkcache: SparkCache CUDA restore requires an"
                 " absolute CUDA placement library path, a 64-character"
                 " lowercase SHA-256, and placement arena bytes equal to"
                 " 64, 128, or 256 MiB"
             )
         if not 1 <= cuda_restore_io_workers <= 32:
             raise RuntimeError(
-                "spark-context-cache: SparkCache CUDA restore IO workers"
+                "sparkcache: SparkCache CUDA restore IO workers"
                 " must be in [1, 32]"
             )
     draft_policy = extra(
@@ -1088,7 +1088,7 @@ def parse_connector_config(
     )
     if SHA256_RE.fullmatch(target_id) is None:
         raise RuntimeError(
-            "spark-context-cache: target checkpoint identity must be a"
+            "sparkcache: target checkpoint identity must be a"
             " 64-character lowercase SHA-256; set"
             " spark_cache_target_checkpoint_sha256"
         )
@@ -1105,14 +1105,14 @@ def parse_connector_config(
     if str(draft_policy) == "colocated_target":
         if draft_id and draft_id != target_id:
             raise RuntimeError(
-                "spark-context-cache: colocated_target draft state must"
+                "sparkcache: colocated_target draft state must"
                 " use the target checkpoint identity; omit"
                 " spark_cache_draft_checkpoint_sha256"
             )
         draft_id = target_id
     elif SHA256_RE.fullmatch(draft_id) is None:
         raise RuntimeError(
-            "spark-context-cache: separate draft checkpoint identity must"
+            "sparkcache: separate draft checkpoint identity must"
             " be a 64-character lowercase SHA-256; set"
             " spark_cache_draft_checkpoint_sha256"
         )
@@ -1152,7 +1152,7 @@ def parse_connector_config(
             group_topology=group_topology,
         )
     except ProfileError as error:
-        raise RuntimeError(f"spark-context-cache: {error}") from error
+        raise RuntimeError(f"sparkcache: {error}") from error
     # "tp0" probes rank 0's local manifest store and therefore requires the
     # scheduler to share that worker's cache root. "none" admits on worker
     # quorum alone when the scheduler has no rank-local cache filesystem.
@@ -1164,7 +1164,7 @@ def parse_connector_config(
     )
     if scheduler_probe not in ("tp0", "none"):
         raise RuntimeError(
-            "spark-context-cache: spark_cache_scheduler_probe must be"
+            "sparkcache: spark_cache_scheduler_probe must be"
             f" 'tp0' or 'none' (configured: {scheduler_probe!r})"
         )
     # Each CUDA placement lane owns two arenas. Limit page concurrency by both
@@ -1196,7 +1196,7 @@ def parse_connector_config(
         lane_bytes = ARENA_COUNT * cuda_placement_arena_bytes
         if cuda_restore_arena_budget_bytes < lane_bytes:
             raise RuntimeError(
-                "spark-context-cache: spark_cache_cuda_restore_arena_budget_bytes"
+                "sparkcache: spark_cache_cuda_restore_arena_budget_bytes"
                 f" must be at least {lane_bytes} bytes for one lane's two arenas"
             )
         load_thread_limit = min(
@@ -1212,11 +1212,11 @@ def parse_connector_config(
         max_pending_restores = int(max_pending_restores_raw)
     except (TypeError, ValueError) as error:
         raise RuntimeError(
-            "spark-context-cache: spark_cache_max_pending_restores must be an integer"
+            "sparkcache: spark_cache_max_pending_restores must be an integer"
         ) from error
     if max_pending_restores < 1:
         raise RuntimeError(
-            "spark-context-cache: spark_cache_max_pending_restores must be at least 1"
+            "sparkcache: spark_cache_max_pending_restores must be at least 1"
         )
     max_delayed_stores = _nonnegative_config_int(
         extra(
@@ -1227,7 +1227,7 @@ def parse_connector_config(
     )
     if max_delayed_stores < 1:
         raise RuntimeError(
-            "spark-context-cache: spark_cache_max_delayed_stores must be at least 1"
+            "sparkcache: spark_cache_max_delayed_stores must be at least 1"
         )
     shared_prefix_lease_ttl_seconds = _bounded_positive_config_float(
         extra(

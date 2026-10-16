@@ -493,7 +493,9 @@ class StartupInventoryLogTests(unittest.TestCase):
                     {"model.layers.0.attn": split_page_tensor}
                 )
 
-        info_lines = self._render_log_calls(test_logger.info.call_args_list)
+        self.assertEqual(test_logger.info.call_count, 0)
+        info_lines = [line for line in self._render_log_calls(test_logger.debug.call_args_list)
+                      if not line.startswith("sparkcache: layer_inventory ")]
         self.assertEqual(
             info_lines,
             [
@@ -540,7 +542,8 @@ class StartupInventoryLogTests(unittest.TestCase):
                     {"model.layers.0.attn": split_page_tensor}
                 )
 
-        debug_lines = self._render_log_calls(test_logger.debug.call_args_list)
+        debug_lines = [line for line in self._render_log_calls(test_logger.debug.call_args_list)
+                       if line.startswith("sparkcache: layer_inventory ")]
         self.assertEqual(len(debug_lines), 1)
         prefix = "sparkcache: layer_inventory "
         self.assertTrue(debug_lines[0].startswith(prefix))
@@ -1896,7 +1899,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                 )
 
             connector._load_one = mock.Mock(side_effect=load_one)
-            with mock.patch.object(connector_module.logger, "info") as log_info:
+            with mock.patch.object(connector_module.logger, "debug") as log_info:
                 connector.bind_connector_metadata(
                     SparkCacheConnectorMetadata(plans=plans)
                 )
@@ -1922,7 +1925,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                 json.loads(call.args[1])
                 for call in log_info.call_args_list
                 if call.args
-                and call.args[0] == "spark-context-cache-page-base-flight:%s"
+                and call.args[0] == "sparkcache: page-base-flight %s"
             ]
             self.assertEqual(len(summaries), 1)
             self.assertEqual(
@@ -1957,7 +1960,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                     == b"authenticated-base"
                 )
             )
-            with mock.patch.object(connector_module.logger, "info") as log_info:
+            with mock.patch.object(connector_module.logger, "debug") as log_info:
                 for batch_index, batch in enumerate(
                     (plans[:8], plans[8:15], plans[15:])
                 ):
@@ -1980,7 +1983,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                 json.loads(call.args[1])
                 for call in log_info.call_args_list
                 if call.args
-                and call.args[0] == "spark-context-cache-page-base-flight:%s"
+                and call.args[0] == "sparkcache: page-base-flight %s"
             ]
             self.assertEqual(len(summaries), 1)
             connector.shutdown()
@@ -2033,7 +2036,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                 )
 
             connector._load_one = mock.Mock(side_effect=load_one)
-            with mock.patch.object(connector_module.logger, "info") as log_info:
+            with mock.patch.object(connector_module.logger, "debug") as log_info:
                 connector.bind_connector_metadata(
                     SparkCacheConnectorMetadata(plans=plans[:1])
                 )
@@ -2069,7 +2072,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                 json.loads(call.args[1])
                 for call in log_info.call_args_list
                 if call.args
-                and call.args[0] == "spark-context-cache-page-base-flight:%s"
+                and call.args[0] == "sparkcache: page-base-flight %s"
             ]
             self.assertEqual(len(summaries), 1)
             self.assertEqual(summaries[0]["participants"], 16)
@@ -2231,7 +2234,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                 connector._emit_page_base_flight_summaries()
 
             with (
-                mock.patch.object(connector_module.logger, "info") as log_info,
+                mock.patch.object(connector_module.logger, "debug") as log_info,
                 ThreadPoolExecutor(max_workers=2) as executor,
             ):
                 tuple(executor.map(complete, range(2)))
@@ -2244,7 +2247,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                 call
                 for call in log_info.call_args_list
                 if call.args
-                and call.args[0] == "spark-context-cache-page-base-flight:%s"
+                and call.args[0] == "sparkcache: page-base-flight %s"
             ]
             self.assertEqual(len(summaries), 2)
 
@@ -2459,7 +2462,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                     ),
                     b"base",
                 )
-            with mock.patch.object(connector_module.logger, "info") as log_info:
+            with mock.patch.object(connector_module.logger, "debug") as log_info:
                 connector._emit_page_base_flight_summaries()
             self.assertEqual(connector.counters["page_base_physical_reads"], 1)
             self.assertEqual(connector.counters["page_base_reads_avoided"], 8)
@@ -2467,7 +2470,7 @@ class IntegratedPublicationAndSharingTests(unittest.TestCase):
                 call.args[1]
                 for call in log_info.call_args_list
                 if call.args
-                and call.args[0] == "spark-context-cache-page-base-flight:%s"
+                and call.args[0] == "sparkcache: page-base-flight %s"
             ]
             self.assertEqual(len(summaries), 1)
             self.assertEqual(json.loads(summaries[0])["participants"], 9)
@@ -6529,14 +6532,9 @@ class AsyncRestoreTests(unittest.TestCase):
             self.assertGreater(record["phase_ms"]["restore_read"], 0)
             self.assertGreater(record["phase_ms"]["reassembly_decode"], 0)
             self.assertGreater(record["phase_ms"]["h2d_submit"], 0)
-            operator_lines = [
-                call.args[1]
-                for call in log_info.call_args_list
-                if len(call.args) == 2 and call.args[0] == "%s"
-            ]
-            self.assertTrue(operator_lines[0].startswith("sparkcache: restore tokens="))
-            self.assertIn(" tok/s", operator_lines[0])
-            self.assertTrue(operator_lines[1].startswith("sparkcache: phases read="))
+            events = [call.args[0] % call.args[1:] for call in log_info.call_args_list]
+            assert any(line.startswith("sparkcache: restore hit tokens=") for line in events)
+            assert not any("sparkcache: phases" in line for line in events)
 
     def test_timing_failure_does_not_prevent_restore_completion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -7005,19 +7003,11 @@ class QuorumStatsAggregationTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(
-            stats.format_log_lines(),
-            (
-                "sparkcache: capacity ranks=4 entries=12 "
-                "used=1.2/160.0GiB healthy=yes",
-                "sparkcache: publications count=12 payload=1.2GiB "
-                "unique=1.2GiB",
-                "sparkcache: writes staged=1.2GiB dedup=0B "
-                "aborted=0B failed=0B",
-                "sparkcache: capture requests=1 rank_slots=4 "
-                "pages=12 oldest=125ms",
-            ),
-        )
+        lines = stats.format_log_lines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("publications=12", lines[0])
+        self.assertIn("entries=12", lines[0])
+        self.assertEqual(stats.format_log_lines(), ())
         reduced = stats.reduce()
         self.assertEqual(reduced["sparkcache_capture_delayed_requests"], 1)
         self.assertEqual(reduced["sparkcache_capture_delayed_rank_slots"], 4)

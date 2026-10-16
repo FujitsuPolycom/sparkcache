@@ -216,7 +216,9 @@ def test_startup_reports_profile_group_count_and_full_topology(tmp_path):
         _make_connector(tmp_path, 0, tp=2, dcp=1, kv_cache_config=qwen_layout(2),
                         extra_config={"spark_cache_model_profile": "qwen38-flash-next-hybrid"})
     lines = [call.args[0] % call.args[1:] for call in log.info.call_args_list]
-    assert "sparkcache: topology profile=qwen38-flash-next-hybrid groups=5 policies=full,recurrent_align" in lines
+    assert len(lines) == 1
+    assert lines[0].startswith("sparkcache: startup profile=qwen38-flash-next-hybrid groups=5 policies=full,recurrent_align identity=")
+    assert "integrity=sha256" in lines[0]
     dumps = [call.args[1] for call in log.debug.call_args_list
              if call.args[0] == "sparkcache: group_topology %s"]
     assert json.loads(dumps[0])[-2]["recurrent_state"]["tp_replicated"] is True

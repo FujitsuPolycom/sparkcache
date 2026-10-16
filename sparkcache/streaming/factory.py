@@ -23,7 +23,7 @@ from typing import Any, Callable, Sequence
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _LOGGER = logging.getLogger("vllm.spark_context_cache.streaming")
-_STATUS_PREFIX = "[sparkcache-streaming-status]"
+_STATUS_PREFIX = "sparkcache: streaming-status"
 
 NATIVE_LIBRARY_CONFIG_KEY = "spark_cache_streaming_native_library"
 NATIVE_LIBRARY_ENVIRONMENT_KEY = (
@@ -375,7 +375,7 @@ class WorkerStreamingSnapshotAdapter:
 
                 timing_trace = StreamingTimingTrace(
                     enabled=True,
-                    sink=_LOGGER.info,
+                    sink=_LOGGER.debug,
                 )
             identity = self._connector._identity(rank)
             adapter.validate_identity(identity)
@@ -787,7 +787,7 @@ class WorkerStreamingSnapshotAdapter:
             self.counters["background_progress_failed"] += 1
             self._progress_wake.clear()
         _LOGGER.error(
-            "sparkcache streaming background progress stopped: %s",
+            "sparkcache: streaming background progress stopped: %s",
             self._background_progress_error,
             exc_info=error,
         )
@@ -907,7 +907,7 @@ class WorkerStreamingSnapshotAdapter:
             **fields,
             **self.status(),
         }
-        _LOGGER.info(
+        _LOGGER.debug(
             "%s %s",
             _STATUS_PREFIX,
             json.dumps(payload, sort_keys=True, separators=(",", ":")),

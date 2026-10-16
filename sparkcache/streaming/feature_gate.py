@@ -49,7 +49,7 @@ def require_live_integration() -> None:
     """
 
     raise StreamingSnapshotsUnavailable(
-        "spark-context-cache: direct streaming enable is unsupported; "
+        "sparkcache: direct streaming enable is unsupported; "
         "install the model-serving connector runtime factory or leave "
         f"{EXTRA_CONFIG_KEY}=0"
     )

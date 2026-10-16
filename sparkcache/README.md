@@ -601,14 +601,26 @@ filesystem failure disables caching for that connector while serving continues.
 
 ## Diagnostics
 
-Each asynchronous restore emits compact INFO lines with restored tokens,
-latency, effective token rate, bytes, and phase timings. A
-`sparkcache-restore-timing/v1` JSON record with the complete phase breakdown is
-available at DEBUG.
+SparkCache uses the `sparkcache:` log prefix. INFO reports a startup summary
+with profile, groups, identity prefix, integrity mode and connector settings.
 
-Asynchronous publication emits a `sparkcache: capture` INFO line when the
-progress thread observes GPU-to-host copy completion. It reports rank, digest,
-tokens, observed elapsed time, effective token rate, and copied bytes.
+Restore hit/miss and save committed/refused lines include tokens, milliseconds
+and rank. Save refusals include a reason. Evictions and corruption rejections
+remain visible. Operator digests use twelve hex digits.
+
+DEBUG carries phase timings, layer inventories, topology dumps, capture and
+publication details. JSON records use `sparkcache: restore-timing `,
+`sparkcache: page-base-flight ` and `sparkcache: reuse `.
+
+Reuse attribution also requires `SPARK_CONTEXT_CACHE_TRACE_REUSE=1`. The JSON
+schemas are unchanged. No structured file is written by default.
+
+The vLLM metrics logger must call `SparkCacheStats.format_log_lines()`.
+SparkRing's combined source composition installs this integration.
+
+The formatter emits only changed values and is silent while idle. Its baseline
+survives accumulator reset. `reduce()` and the worker reports remain complete
+for `/metrics`.
 
 The separate commit log reports durable-storage time. The two records separate
 capture interference from background storage work.

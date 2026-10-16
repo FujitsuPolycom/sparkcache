@@ -43,7 +43,7 @@ def _log_capture_observed(
         span_tokens * 1_000_000_000 / elapsed_ns if elapsed_ns else 0.0
     )
     try:
-        logger.info(
+        logger.debug(
             "sparkcache: capture rank=%d digest=%s tokens=%d observed=%.1fms"
             " rate=%s tok/s bytes=%.1fMiB",
             rank,

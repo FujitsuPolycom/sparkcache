@@ -378,7 +378,7 @@ def test_direct_tail_reads_fill_the_arena_and_reject_tampering(tmp_path, monkeyp
     path.write_bytes(damaged)
     adapter = _RecordingAdapter(history.geometry.object_bytes)
     counts = history.geometry.counts(history.boundary(TURNS - 1))
-    with pytest.raises(cuda_hybrid.CudaHybridRestoreError, match="tail SHA-256 mismatch"):
+    with pytest.raises(cuda_hybrid.CudaHybridRestoreError, match=r"tail integrity rejection \(SHA-256\)"):
         cuda_hybrid.execute_cuda_hybrid_restore(
             adapter=adapter,
             request_id="tampered",

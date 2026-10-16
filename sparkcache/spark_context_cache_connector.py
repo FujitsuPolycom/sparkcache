@@ -35,6 +35,7 @@ import importlib
 import json
 import math
 import os
+import re
 
 import queue
 import threading
@@ -139,6 +140,17 @@ def _debug_log(message: str, *args: Any) -> None:
     debug = getattr(logger, "debug", None)
     if callable(debug):
         debug(message, *args)
+
+def _operator_reason(value: object) -> str:
+    return re.sub(r"\b[0-9a-f]{64}\b", lambda match: match[0][:12], " ".join(str(value).split()))
+
+
+def _warning(message: str, *args: Any) -> None:
+    """Keep complete rejection evidence at DEBUG and shorten operator digests."""
+    _debug_log(message, *args)
+    logger.warning(message, *tuple(_operator_reason(arg) if isinstance(arg, (str, BaseException))
+                                  else arg for arg in args))
+
 
 _CAPACITY_RETRY_SECONDS = 5.0
 _CLEAR_ONCE_LOCK_TIMEOUT_SECONDS = 30.0
@@ -774,62 +786,21 @@ class SparkCacheStats(KVConnectorStats):
         """Return short human-readable summaries without dropping raw metrics."""
 
         reduced = self.reduce()
-
-        def byte_count(name: str) -> str:
-            value = int(reduced.get(name, 0))
-            for suffix, unit in (("GiB", 1024**3), ("MiB", 1024**2)):
-                if value >= unit:
-                    return f"{value / unit:.1f}{suffix}"
-            return f"{value}B"
-
-        lines = [
-            "sparkcache: capacity"
-            f" ranks={int(reduced.get('sparkcache_ranks', 0))}"
-            f" entries={int(reduced.get('sparkcache_entries', 0))}"
-            f" used={float(reduced.get('sparkcache_used_gib', 0.0)):.1f}/"
-            f"{float(reduced.get('sparkcache_limit_gib', 0.0)):.1f}GiB"
-            " healthy="
-            + ("yes" if int(reduced.get("sparkcache_healthy", 0)) else "no"),
-            "sparkcache: publications"
-            f" count={int(reduced.get('sparkcache_publications', 0))}"
-            f" payload={byte_count('sparkcache_payload_bytes')}"
-            f" unique={byte_count('sparkcache_unique_bytes')}",
-            "sparkcache: writes"
-            f" staged={byte_count('sparkcache_staged_bytes')}"
-            f" dedup={byte_count('sparkcache_dedup_bytes')}"
-            f" aborted={byte_count('sparkcache_aborted_bytes')}"
-            f" failed={byte_count('sparkcache_failed_bytes')}",
-        ]
-        delayed_rank_slots = int(
-            reduced.get("sparkcache_capture_delayed_rank_slots", 0)
-        )
-        retained_pages = int(reduced.get("sparkcache_capture_retained_pages", 0))
-        uncertain_ranks = int(
-            reduced.get("sparkcache_capture_uncertain_ranks", 0)
-        )
-        if delayed_rank_slots or retained_pages or uncertain_ranks:
-            line = (
-                "sparkcache: capture"
-                " requests="
-                f"{int(reduced.get('sparkcache_capture_delayed_requests', 0))}"
-                f" rank_slots={delayed_rank_slots}"
-                f" pages={retained_pages}"
-                " oldest="
-                f"{float(reduced.get('sparkcache_capture_oldest_delayed_ms', 0.0)):.0f}ms"
-            )
-            if uncertain_ranks:
-                line += f" uncertain_ranks={uncertain_ranks}"
-            lines.append(line)
-        pending_publications = int(reduced.get("sparkcache_publication_pending_rank_slots", 0))
-        maintenance_ranks = int(reduced.get("sparkcache_maintenance_active_ranks", 0))
-        if pending_publications or maintenance_ranks:
-            lines.append(
-                "sparkcache: publication_work"
-                f" pending_rank_slots={pending_publications}"
-                f" oldest={float(reduced.get('sparkcache_publication_oldest_pending_ms', 0.0)):.0f}ms"
-                f" maintenance_ranks={maintenance_ranks}"
-            )
-        return tuple(lines)
+        previous = getattr(self, "_logged_metrics", {})
+        changed = {
+            key: value for key, value in reduced.items()
+            if value != previous.get(key, 0)
+        }
+        # Sparse gauges disappearing from reduce() must report their return to zero.
+        changed.update({key: 0 for key, value in previous.items()
+                        if value and key not in reduced})
+        self._logged_metrics = dict(reduced)
+        if not changed:
+            return ()
+        return ("sparkcache: counters " + " ".join(
+            f"{key.removeprefix('sparkcache_')}={value}"
+            for key, value in sorted(changed.items())
+        ),)
 
     def is_empty(self) -> bool:
         return not self.data.get("reports")
@@ -1137,15 +1108,15 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 )
             except Exception as error:  # noqa: BLE001 - serving remains available
                 self._cache_available = False
-                logger.warning(
-                    "spark-context-cache: clear-once did not complete;"
+                _warning(
+                    "sparkcache: clear-once did not complete;"
                     " persistent cache is disabled for role=%s: %s",
                     role.name,
                     error,
                 )
             else:
-                logger.info(
-                    "spark-context-cache: clear-once %s for role=%s",
+                logger.debug(
+                    "sparkcache: clear-once %s for role=%s",
                     "removed owned cache data" if cleared else "already completed",
                     role.name,
                 )
@@ -1160,7 +1131,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         )
         if config.async_page_capture_enabled and not self._cache_available:
             raise RuntimeError(
-                "spark-context-cache: asynchronous manager-page capture cannot"
+                "sparkcache: asynchronous manager-page capture cannot"
                 " start while persistent cache initialization is unavailable"
             )
         self._async_page_capture_enabled = config.async_page_capture_enabled
@@ -1445,6 +1416,17 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             "attribution_invalid_events": 0,
         }
         logger.info(
+            "sparkcache: startup profile=%s groups=%d policies=%s identity=%s integrity=%s"
+            " role=%s root=%s dcp=%d access_mode=%s store=%s restore=%s"
+            " cuda_restore=%s max_span=%d",
+            self._profile.name, len(self._group_topology),
+            ",".join(sorted({group["reuse_policy"] for group in self._group_topology})),
+            self._identity(self._shard_rank).storage_key[:12], config.payload_integrity,
+            role.name, self._root, self._dcp_degree, self._access_mode,
+            self._store_enabled, self._restore_enabled, self._native_restore_enabled,
+            self._max_span,
+        )
+        logger.debug(
             "sparkcache: config role=%s root=%s dcp=%d access_mode=%s"
             " store=%s restore=%s"
             " cuda_restore=%s max_span=%d load_threads=%d max_bytes=%d"
@@ -1463,7 +1445,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self._capacity_policy.ttl_seconds,
             self._shared_prefix_lease_ttl_seconds,
         )
-        logger.info(
+        logger.debug(
             "sparkcache: topology profile=%s groups=%d policies=%s",
             self._profile.name,
             len(self._group_topology),
@@ -1480,18 +1462,18 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         factory = _STREAMING_RUNTIME_FACTORIES.get(role)
         if factory is None:
             raise RuntimeError(
-                "spark-context-cache: streaming snapshots requested but no "
+                "sparkcache: streaming snapshots requested but no "
                 f"runtime is installed for {role.name.lower()} role"
             )
         try:
             runtime = factory(self)
         except Exception as error:
             raise RuntimeError(
-                "spark-context-cache: streaming runtime installation was rejected"
+                "sparkcache: streaming runtime installation was rejected"
             ) from error
         if runtime is None:
             raise RuntimeError(
-                "spark-context-cache: streaming runtime installation was rejected"
+                "sparkcache: streaming runtime installation was rejected"
             )
         if role is KVConnectorRole.SCHEDULER:
             required = (
@@ -1515,7 +1497,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         ]
         if missing:
             raise RuntimeError(
-                "spark-context-cache: streaming "
+                "sparkcache: streaming "
                 f"{role.name.lower()} runtime is incomplete: " + ", ".join(missing)
             )
         self._streaming_runtime = runtime
@@ -1762,7 +1744,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 )
             except (KeyError, TypeError, ValueError) as error:
                 raise RuntimeError(
-                    "spark-context-cache: block-page DCP topology is incomplete"
+                    "sparkcache: block-page DCP topology is incomplete"
                 ) from error
             alignment = math.lcm(
                 alignment,
@@ -1784,7 +1766,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         if not groups or (
             not allow_empty_groups and any(not group for group in groups)
         ):
-            raise RuntimeError("spark-context-cache: KV-cache block table is empty")
+            raise RuntimeError("sparkcache: KV-cache block table is empty")
         return groups
 
     def _select_group_blocks_for_span(
@@ -2222,8 +2204,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         for phase, value in timing.phase_ns.items()
                     },
                 )
-            logger.info(
-                "spark-context-cache-reuse:%s",
+            logger.debug(
+                "sparkcache: reuse %s",
                 json.dumps(record, sort_keys=True, separators=(",", ":")),
             )
 
@@ -2302,6 +2284,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int | None, bool]:
+        lookup_started_ns = time.perf_counter_ns()
         request_scope = self._remember_request_scope(request)
         if request_scope is None:
             return 0, False
@@ -2414,6 +2397,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self.counters["quorum_incomplete"] = (
                 self.counters.get("quorum_incomplete", 0) + 1
             )
+            logger.info("sparkcache: restore miss tokens=%d ms=%.1f rank=%d reason=quorum",
+                        len(token_ids), (time.perf_counter_ns() - lookup_started_ns) / 1_000_000,
+                        self._shard_rank)
             return 0, False
         span, digest = selected
         flight = self._restore_flights.get(digest)
@@ -2460,6 +2446,9 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self.counters[f"restore_miss_{lookup.reason}"] = (
                     self.counters.get(f"restore_miss_{lookup.reason}", 0) + 1
                 )
+                logger.info("sparkcache: restore miss tokens=%d ms=%.1f rank=%d reason=%s",
+                            span, (time.perf_counter_ns() - lookup_started_ns) / 1_000_000,
+                            self._shard_rank, lookup.reason)
                 return 0, False
             if is_alias:
                 self.counters["prefix_alias_scheduler_probe_hit"] += 1
@@ -2467,7 +2456,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         # validated its own manifest at discovery or commit time, and any
         # rank's load failure still degrades to a clean recompute.
         self.counters["restore_hit"] += 1
-        logger.info(
+        logger.debug(
             "sparkcache: hit tokens=%d digest=%s",
             span,
             digest[:12],
@@ -2573,8 +2562,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
 
         def reject(reason: str) -> None:
             self.counters["recurrent_boundary_metadata_rejected"] += 1
-            logger.warning(
-                "spark-context-cache: recurrent boundary metadata rejected"
+            _warning(
+                "sparkcache: recurrent boundary metadata rejected"
                 " request=%s boundary=%d: %s",
                 request_id,
                 boundary_tokens,
@@ -2945,7 +2934,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 )
                 if len(appended) != len(blocks_by_group):
                     raise RuntimeError(
-                        "spark-context-cache: KV-cache group count changed while"
+                        "sparkcache: KV-cache group count changed while"
                         " accumulating a store"
                     )
                 if req_id in cached.resumed_req_ids:
@@ -3197,17 +3186,17 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         manager_blocks = int(getattr(self._kv_cache_config, "num_blocks", 0) or 0)
         if manager_blocks <= 0:
             raise RuntimeError(
-                "spark-context-cache: block-page storage has no manager blocks"
+                "sparkcache: block-page storage has no manager blocks"
             )
         if tensor.dim() < 2:
             raise RuntimeError(
-                f"spark-context-cache: layer {name} has unexpected"
+                f"sparkcache: layer {name} has unexpected"
                 f" shape {tuple(tensor.shape)}"
             )
         kernel_rows = int(tensor.shape[0])
         if kernel_rows % manager_blocks:
             raise RuntimeError(
-                "spark-context-cache: layer "
+                "sparkcache: layer "
                 f"{name} has {kernel_rows} kernel rows for {manager_blocks}"
                 " manager blocks"
             )
@@ -3225,7 +3214,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             logical_page_bytes <= page_bytes <= manager_page_stride
         ):
             raise RuntimeError(
-                "spark-context-cache: layer "
+                "sparkcache: layer "
                 f"{name} page geometry is incompatible: logical={logical_page_bytes}"
                 f" physical={page_bytes} stride={manager_page_stride}"
             )
@@ -3249,7 +3238,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             )
         except RuntimeError as error:
             raise RuntimeError(
-                f"spark-context-cache: layer {name} physical page view is invalid"
+                f"sparkcache: layer {name} physical page view is invalid"
             ) from error
 
     @staticmethod
@@ -3261,7 +3250,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             layer_spec = layer_specs.get(layer_name)
             if layer_spec is None:
                 raise RuntimeError(
-                    "spark-context-cache: group has no cache specification for"
+                    "sparkcache: group has no cache specification for"
                     f" layer {layer_name}"
                 )
         else:
@@ -3269,7 +3258,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         page_bytes = int(getattr(layer_spec, "page_size_bytes", 0) or 0)
         if page_bytes <= 0:
             raise RuntimeError(
-                f"spark-context-cache: layer {layer_name} has no physical page size"
+                f"sparkcache: layer {layer_name} has no physical page size"
             )
         return page_bytes
 
@@ -3285,7 +3274,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 for name in getattr(group, "layer_names", ()) or ():
                     if name in page_bytes_by_layer:
                         raise RuntimeError(
-                            "spark-context-cache: layer belongs to multiple"
+                            "sparkcache: layer belongs to multiple"
                             f" KV-cache groups: {name}"
                         )
                     page_bytes_by_layer[name] = self._layer_page_bytes(spec, name)
@@ -3293,7 +3282,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             missing = set(page_bytes_by_layer) - set(registered_tensors)
             if unassigned or missing:
                 raise RuntimeError(
-                    "spark-context-cache: registered layers disagree with KV-cache"
+                    "sparkcache: registered layers disagree with KV-cache"
                     f" groups: missing={sorted(missing)}, extra={sorted(unassigned)}"
                 )
             split_kernel_layers = 0
@@ -3330,7 +3319,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 "physical_tail_layers": physical_tail_layers,
                 "physical_tail_bytes_per_page": physical_tail_bytes,
             }
-            logger.info(
+            logger.debug(
                 "sparkcache: manager_pages blocks=%d layers=%d"
                 " split_kernel_layers=%d tail_layers=%d"
                 " tail_bytes_per_page=%d",
@@ -3350,7 +3339,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 for name in sorted(getattr(group, "layer_names", ()) or ()):
                     if name not in registered_tensors:
                         raise RuntimeError(
-                            f"spark-context-cache: group layer {name} was not"
+                            f"sparkcache: group layer {name} was not"
                             " registered"
                         )
                     tensor = registered_tensors[name]
@@ -3381,7 +3370,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             unassigned = set(registered_tensors) - assigned
             if unassigned:
                 raise RuntimeError(
-                    "spark-context-cache: registered layers lack a KV-cache"
+                    "sparkcache: registered layers lack a KV-cache"
                     " group: " + ", ".join(sorted(unassigned))
                 )
             self._page_layout = PageLayout(tuple(page_groups))
@@ -3389,7 +3378,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         for name, tensor in sorted(registered_tensors.items()):
             if tensor.dim() < 3:
                 raise RuntimeError(
-                    f"spark-context-cache: layer {name} has unexpected"
+                    f"sparkcache: layer {name} has unexpected"
                     f" shape {tuple(tensor.shape)}"
                 )
             row = tensor[0, 0]
@@ -3404,7 +3393,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         expects_named = profile.expects_draft_named_layers(policy)
         if draft_named != expects_named:
             raise RuntimeError(
-                "spark-context-cache: draft-layer registration disagrees with"
+                "sparkcache: draft-layer registration disagrees with"
                 f" the draft policy: profile {profile.name} under"
                 f" draft_kv_policy={policy} expects draft-classified layer"
                 f" names: {expects_named}; observed: {draft_named}. Set"
@@ -3458,7 +3447,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self.counters["startup_physical_tail_bytes_per_page"] = (
                 manager_page_summary["physical_tail_bytes_per_page"]
             )
-        logger.info(
+        logger.debug(
             "sparkcache: layers total=%d storage=%s records=%s item_bytes=%s"
             " draft_policy=%s",
             len(self._plans),
@@ -3484,7 +3473,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             runtime = self._streaming_runtime
             if runtime is None:
                 raise RuntimeError(
-                    "spark-context-cache: streaming worker runtime vanished"
+                    "sparkcache: streaming worker runtime vanished"
                 )
             # The adapter closes over this connector. Bind only after the
             # complete tensor inventory and canonical layer plans exist.
@@ -3499,7 +3488,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 settings = self._async_page_capture_settings
                 if settings is None:
                     raise RuntimeError(
-                        "spark-context-cache: manager-page capture settings vanished"
+                        "sparkcache: manager-page capture settings vanished"
                     )
                 runtime = build_manager_page_runtime(self, settings)
             else:
@@ -3519,7 +3508,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             ]
             if missing:
                 raise RuntimeError(
-                    "spark-context-cache: manager-page capture runtime is incomplete: "
+                    "sparkcache: manager-page capture runtime is incomplete: "
                     + ", ".join(missing)
                 )
             self._async_page_capture_runtime = runtime
@@ -3542,7 +3531,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
 
         if self._native_adapter is not None:
             raise RuntimeError(
-                "spark-context-cache: SparkCache CUDA placement is already configured"
+                "sparkcache: SparkCache CUDA placement is already configured"
             )
         if self._storage_mode == "block_pages_v1":
             self._configure_native_hybrid_restore()
@@ -3550,13 +3539,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         assert self._plans is not None
         if not self._plans:
             raise RuntimeError(
-                "spark-context-cache: SparkCache CUDA restore has no layer plans"
+                "sparkcache: SparkCache CUDA restore has no layer plans"
             )
         first_tensor = self._layer_tensors[self._plans[0].name]
         device = first_tensor.device
         if device.type != "cuda":
             raise RuntimeError(
-                "spark-context-cache: SparkCache CUDA restore requires CUDA"
+                "sparkcache: SparkCache CUDA restore requires CUDA"
                 " cache tensors"
             )
         device_ordinal = (
@@ -3573,7 +3562,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             # space; heterogeneous pool geometries would scatter into wrong
             # slots on the larger pools.
             raise RuntimeError(
-                "spark-context-cache: registered layers disagree on pool"
+                "sparkcache: registered layers disagree on pool"
                 f" geometry (slot capacities {sorted(capacities)})"
             )
         slot_capacity = capacities.pop()
@@ -3586,7 +3575,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             # stores the full chunk on every rank); an arena that cannot
             # hold one encoded chunk would fail every restore plan later.
             raise RuntimeError(
-                "spark-context-cache: SparkCache CUDA placement arena"
+                "sparkcache: SparkCache CUDA placement arena"
                 f" ({self._native_arena_bytes} bytes) cannot hold one"
                 f" encoded chunk (floor {payload_floor} bytes) at"
                 f" dcp_degree={self._dcp_degree}"
@@ -3625,7 +3614,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 )
                 if ordinal is None:
                     raise RuntimeError(
-                        f"spark-context-cache: record kind {kind} has no"
+                        f"sparkcache: record kind {kind} has no"
                         " SparkCache CUDA placement ordinal"
                     )
                 required |= 1 << int(ordinal)
@@ -3637,14 +3626,14 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 with contextlib.suppress(Exception):
                     adapter.close()
             raise RuntimeError(
-                f"spark-context-cache: SparkCache CUDA restore configuration"
+                f"sparkcache: SparkCache CUDA restore configuration"
                 f" was rejected: {error}"
             ) from error
         self._native_adapter = adapter
         self._native_execute_restore = native_execute
         self._native_required_record_mask = required
         self.counters["native_configured"] = 1
-        logger.info(
+        logger.debug(
             "sparkcache: cuda_restore library=%s"
             " sha256=%s arena_mib=%d destinations=%d slots=%d"
             " max_chunks_per_slab=%d",
@@ -3722,7 +3711,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 with contextlib.suppress(Exception):
                     adapter.close()
             raise RuntimeError(
-                "spark-context-cache: SparkCache CUDA restore configuration"
+                "sparkcache: SparkCache CUDA restore configuration"
                 f" did not complete: {error}"
             ) from error
         self._native_adapters = adapters
@@ -3730,7 +3719,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._native_execute_hybrid_restore = execute_restore
         self._native_execute_hybrid_placement = execute_placement
         self.counters["native_hybrid_configured"] = 1
-        logger.info(
+        logger.debug(
             "sparkcache: cuda_restore"
             " destinations=%d max_slots=%d arena_mib=%d lanes=%d",
             destination_count,
@@ -3804,8 +3793,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self._reconcile_held_capacity()
             if wake_worker_on_unsatisfied:
                 self._capacity_wakeup.set()
-            logger.warning(
-                "spark-context-cache: capacity maintenance failed: %s", error
+            _warning(
+                "sparkcache: capacity maintenance failed: %s", error
             )
             return None
         if report.skipped_cooldown:
@@ -3862,9 +3851,12 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self._apply_held_capacity_survivors(held_snapshot, surviving)
         if (not report.capacity_satisfied or report.work_pending) and wake_worker_on_unsatisfied:
             self._capacity_wakeup.set()
+        if report.manifests_evicted or report.bytes_reclaimed:
+            logger.info("sparkcache: eviction entries=%d bytes=%d rank=%d",
+                        report.manifests_evicted, report.bytes_reclaimed, self._physical_rank())
         if force or report.bytes_reclaimed:
-            logger.info(
-                "spark-context-cache: capacity bytes=%d max=%d reclaimed=%d"
+            logger.debug(
+                "sparkcache: capacity bytes=%d max=%d reclaimed=%d"
                 " manifests=%d chunks=%d orphans=%d satisfied=%s"
                 " deletion_attempts=%d work_pending=%s",
                 report.bytes_after,
@@ -4017,8 +4009,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 bytes_exact=False,
                 capacity_satisfied=False,
             )
-        logger.warning(
-            "spark-context-cache: dropped %d invalid streaming commit"
+        _warning(
+            "sparkcache: dropped %d invalid streaming commit"
             " receipt(s); scheduling exact capacity maintenance",
             count,
         )
@@ -4152,8 +4144,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     bytes_exact=False,
                     capacity_satisfied=False,
                 )
-                logger.warning(
-                    "spark-context-cache: capacity survivor check failed: %s",
+                _warning(
+                    "sparkcache: capacity survivor check failed: %s",
                     error,
                 )
                 return False
@@ -4348,14 +4340,14 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                                 except OSError:
                                     pass
             except (OSError, ValueError, RuntimeError) as error:
-                logger.warning(
-                    "spark-context-cache: manifest discovery aborted: %s",
+                _warning(
+                    "sparkcache: manifest discovery aborted: %s",
                     error,
                 )
             self._held = discovered
         if checked:
-            logger.info(
-                "spark-context-cache: manifest discovery checked=%d"
+            logger.debug(
+                "sparkcache: manifest discovery checked=%d"
                 " offered=%d rejected=%d",
                 checked,
                 len(discovered),
@@ -4435,8 +4427,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     verify_chunk_payloads=True,
                 ):
                     invalidated += 1
-                    logger.warning(
-                        "spark-context-cache: sweep invalidated %s (%s)",
+                    _warning(
+                        "sparkcache: sweep invalidated %s (%s)",
                         digest[:12],
                         lookup.reason,
                     )
@@ -4447,10 +4439,10 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self._held.difference_update(held_at_start - verified)
                 self._held.update(verified)
         except (OSError, ValueError, RuntimeError) as error:
-            logger.warning("spark-context-cache: sweep aborted: %s", error)
+            _warning("sparkcache: sweep aborted: %s", error)
         if checked:
-            logger.info(
-                "spark-context-cache: sweep checked=%d invalidated=%d",
+            logger.debug(
+                "sparkcache: sweep checked=%d invalidated=%d",
                 checked,
                 invalidated,
             )
@@ -4541,8 +4533,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     native_lane=lane_index,
                 )
             except Exception as error:  # noqa: BLE001
-                logger.warning(
-                    "spark-context-cache: restore rejected; recomputing"
+                _warning(
+                    "sparkcache: restore rejected; recomputing"
                     " request=%s reason=%s",
                     queued.plan.request_id,
                     error,
@@ -4588,8 +4580,13 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                             ),
                         )
                     with contextlib.suppress(Exception):
-                        for message in timing.operator_lines():
-                            logger.info("%s", message)
+                        logger.debug("%s", timing.operator_lines()[1])
+                with contextlib.suppress(Exception):
+                    logger.info(
+                        "sparkcache: restore %s tokens=%d ms=%.1f rank=%d",
+                        "hit" if verified else "miss", plan.span_tokens,
+                        timing.end_to_end_ns / 1_000_000, self._physical_rank(),
+                    )
             finally:
                 # Request completion may be published immediately after the
                 # verified placement edge, but connector quiescence includes
@@ -4914,8 +4911,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self.counters["page_base_reads_avoided"] += int(
                     summary["avoided_base_reads"]
                 )
-            logger.info(
-                "spark-context-cache-page-base-flight:%s",
+            logger.debug(
+                "sparkcache: page-base-flight %s",
                 json.dumps(summary, sort_keys=True, separators=(",", ":")),
             )
 
@@ -4961,8 +4958,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     )
                     with self._load_lock:
                         self._held.discard(digest)
-                logger.warning(
-                    "spark-context-cache: shared trunk rejected digest=%s leader=%s",
+                _warning(
+                    "sparkcache: shared trunk rejected digest=%s leader=%s",
                     digest[:12],
                     plan.digest[:12],
                 )
@@ -4994,8 +4991,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     with self._load_lock:
                         self._held.discard(plan.digest)
                     self._capacity_wakeup.set()
-                    logger.info(
-                        "spark-context-cache: worker rank %d TTL miss for %s",
+                    logger.debug(
+                        "sparkcache: worker rank %d TTL miss for %s",
                         rank,
                         plan.digest[:12],
                     )
@@ -5015,8 +5012,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         time.perf_counter_ns() - lookup_started,
                     )
             if not lookup.is_hit:
-                logger.warning(
-                    "spark-context-cache: worker rank %d miss (%s) for %s",
+                _warning(
+                    "sparkcache: worker rank %d miss (%s) for %s",
                     rank,
                     lookup.reason,
                     plan.digest[:12],
@@ -5073,8 +5070,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     # private restore blocks. Never enter Python assembly or
                     # retry those blocks: retire the entry and publish all of
                     # this request's blocks as invalid for clean recompute.
-                    logger.warning(
-                        "spark-context-cache: SparkCache CUDA restore rejected;"
+                    _warning(
+                        "sparkcache: SparkCache CUDA restore rejected;"
                         " recomputing: %s",
                         error,
                     )
@@ -5103,7 +5100,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     "native_chunks_verified", 0
                 ) + int(result.verified_chunks)
                 _debug_log(
-                    "spark-context-cache: SparkCache CUDA restore verified %d chunks"
+                    "sparkcache: SparkCache CUDA restore verified %d chunks"
                     " (%d encoded bytes, %d slabs) read_hash=%.1f ms"
                     " parse_submit=%.1f ms finish=%.1f ms",
                     result.verified_chunks,
@@ -5185,8 +5182,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     )
             return True
         except (CodecError, KeyError, RuntimeError, ValueError) as error:
-            logger.warning(
-                "spark-context-cache: restore rejected; recomputing reason=%s",
+            _warning(
+                "sparkcache: restore rejected; recomputing reason=%s",
                 error,
             )
             self._invalidate_after_failure(
@@ -5243,8 +5240,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     ),
                 )
             except Exception as error:  # noqa: BLE001
-                logger.warning(
-                    "spark-context-cache: SparkCache CUDA placement rejected: %s",
+                _warning(
+                    "sparkcache: SparkCache CUDA placement rejected: %s",
                     error,
                 )
                 self._invalidate_after_failure(plan.digest)
@@ -5283,7 +5280,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     self.counters.get("native_hot_snapshot_hits", 0) + 1
                 )
             _debug_log(
-                "spark-context-cache: SparkCache CUDA restore verified %d bytes"
+                "sparkcache: SparkCache CUDA restore verified %d bytes"
                 " read_source_bytes=%d skipped_base_bytes=%d"
                 " slabs=%d read_hash=%.1f ms (planning=%.1f ms)"
                 " final_hash=%.1f ms placement=%.1f ms"
@@ -5371,8 +5368,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     group_slots=groups,
                 )
             except Exception as error:  # noqa: BLE001
-                logger.warning(
-                    "spark-context-cache: SparkCache CUDA placement rejected: %s",
+                _warning(
+                    "sparkcache: SparkCache CUDA placement rejected: %s",
                     error,
                 )
                 self._invalidate_after_failure(plan.digest)
@@ -5389,8 +5386,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self.counters["native_hybrid_load_verified"] = (
                 self.counters.get("native_hybrid_load_verified", 0) + 1
             )
-            logger.info(
-                "spark-context-cache: SparkCache CUDA placement verified %d bytes"
+            logger.debug(
+                "sparkcache: SparkCache CUDA placement verified %d bytes"
                 " submit=%.1f ms finish=%.1f ms",
                 result.source_bytes,
                 result.copy_and_submit_ms,
@@ -5458,8 +5455,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         if removed:
             with self._load_lock:
                 self.counters["invalidated"] = self.counters.get("invalidated", 0) + 1
-            logger.warning(
-                "spark-context-cache: invalidated damaged entry %s",
+            _warning(
+                "sparkcache: invalidated damaged entry %s",
                 digest[:12],
             )
 
@@ -5559,7 +5556,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             cleanup_delay, _ = self.request_finished(request, [])
             if cleanup_delay:
                 raise RuntimeError(
-                    "spark-context-cache: manager-page cleanup encountered"
+                    "sparkcache: manager-page cleanup encountered"
                     " an incompatible row-streaming lease"
                 )
             eligible = request_id in self._async_page_capture_eligible
@@ -5569,7 +5566,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             return False, None
         if self._streaming_runtime is not None:
             raise RuntimeError(
-                "spark-context-cache: streaming snapshots do not support"
+                "sparkcache: streaming snapshots do not support"
                 " multiple KV-cache groups"
             )
         return self.request_finished(request, [])
@@ -5655,8 +5652,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self.counters["store_shutdown_thread_live"] = (
                     self.counters.get("store_shutdown_thread_live", 0) + 1
                 )
-                logger.warning(
-                    "spark-context-cache: shutdown left saver alive;"
+                _warning(
+                    "sparkcache: shutdown left saver alive;"
                     " process teardown will reclaim its CPU snapshot"
                 )
             else:
@@ -5672,8 +5669,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     )
                     + 1
                 )
-                logger.warning(
-                    "spark-context-cache: shutdown retained manager-page"
+                _warning(
+                    "sparkcache: shutdown retained manager-page"
                     " capture ring for a live durable writer"
                 )
         with self._load_cv:
@@ -5691,8 +5688,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self.counters["native_shutdown_handle_leaked"] = (
                 self.counters.get("native_shutdown_handle_leaked", 0) + 1
             )
-            logger.warning(
-                "spark-context-cache: shutdown left %d loader(s) alive;"
+            _warning(
+                "sparkcache: shutdown left %d loader(s) alive;"
                 " retaining SparkCache CUDA placement handle until process exit",
                 live_threads,
             )
@@ -5793,7 +5790,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 runtime = self._streaming_runtime
                 if runtime is None:
                     raise RuntimeError(
-                        "spark-context-cache: streaming worker runtime vanished"
+                        "sparkcache: streaming worker runtime vanished"
                     )
                 if isinstance(metadata, SparkCacheConnectorMetadata):
                     offers = metadata.streaming_snapshot_offers
@@ -5831,23 +5828,28 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     skipped_before_submit = True
                 elif plan.digest in self._held:
                     self.counters["store_skipped_present"] += 1
-                    logger.info(
-                        "spark-context-cache: store skipped; entry already"
+                    logger.debug(
+                        "sparkcache: store skipped; entry already"
                         " present digest=%s",
                         plan.digest[:12],
                     )
                     skipped_before_submit = True
                 elif not self._store_accepting or self._store_inflight:
                     self.counters["store_skipped_busy"] += 1
-                    logger.warning(
-                        "spark-context-cache: store skipped while saver busy digest=%s",
+                    logger.debug(
+                        "sparkcache: store skipped while saver busy digest=%s",
                         plan.digest[:12],
                     )
                     skipped_before_submit = True
                 else:
                     self._store_inflight = 1
                     self._store_pending_started_ns = time.perf_counter_ns()
+                    self._store_pending_tokens = plan.span_tokens
             if skipped_before_submit:
+                reason = ("invalid-scope" if not valid_metadata(plan) else
+                          "present" if plan.digest in self._held else "busy")
+                logger.info("sparkcache: save refused tokens=%d ms=0.0 rank=%d reason=%s",
+                            plan.span_tokens, self._physical_rank(), reason)
                 if plan.capture_job_id:
                     self._capture_read_completed(plan.capture_job_id)
                     continue
@@ -5918,8 +5920,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             try:
                 self._ensure_store_thread()
                 self._store_queue.put(snapshot)
-                logger.info(
-                    "spark-context-cache: rank %d snapshotted %d tokens"
+                logger.debug(
+                    "sparkcache: rank %d snapshotted %d tokens"
                     " digest=%s in %.1f ms; queued background commit",
                     snapshot.rank,
                     plan.span_tokens,
@@ -6268,8 +6270,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         snapshot.plan.digest,
                         force_maintenance=bool(alias_digests),
                     )
-                    logger.info(
-                        "spark-context-cache: rank %d committed %d tokens"
+                    logger.debug(
+                        "sparkcache: rank %d committed %d tokens"
                         " digest=%s manifest=%s in %.1f ms",
                         snapshot.rank,
                         receipt.committed_tokens,
@@ -6278,7 +6280,7 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                         1e3 * (time.perf_counter() - commit_started),
                     )
                     if receipt.publication is not None:
-                        logger.info(receipt.publication.format_compact())
+                        logger.debug(receipt.publication.format_compact())
                     self._finish_store(
                         snapshot.plan.digest,
                         committed=not evicted,
@@ -6335,8 +6337,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             )
         except Exception as error:  # noqa: BLE001 - exact entry remains usable
             self.counters["prefix_alias_publication_failed"] += 1
-            logger.warning(
-                "spark-context-cache: prefix alias publication skipped for"
+            _warning(
+                "sparkcache: prefix alias publication skipped for"
                 " exact digest=%s: %s",
                 plan.digest[:12],
                 error,
@@ -6366,8 +6368,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 )
             except Exception as error:  # noqa: BLE001 - exact commit stands
                 self.counters["prefix_alias_advertisement_failed"] += 1
-                logger.warning(
-                    "spark-context-cache: prefix alias not advertised digest=%s: %s",
+                _warning(
+                    "sparkcache: prefix alias not advertised digest=%s: %s",
                     digest[:12],
                     error,
                 )
@@ -6388,6 +6390,16 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
         error: BaseException | None = None,
     ) -> None:
         self._release_publication_base_pin(digest)
+        started_ns = getattr(self, "_store_pending_started_ns", None)
+        tokens = getattr(self, "_store_pending_tokens", 0)
+        elapsed_ms = (time.perf_counter_ns() - started_ns) / 1_000_000 if started_ns else 0.0
+        with contextlib.suppress(Exception):
+            logger.info(
+                "sparkcache: save %s tokens=%d ms=%.1f rank=%d reason=%s",
+                "committed" if committed else "refused", tokens, elapsed_ms,
+                self._physical_rank(), "ok" if committed else (
+                    "evicted" if evicted else _operator_reason(error) if error else "error"),
+            )
         with self._store_cv:
             if committed:
                 # ManifestStore publishes each fsynced immutable chunk before
@@ -6405,8 +6417,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self._store_pending_started_ns = None
             self._store_cv.notify_all()
         if error is not None:
-            logger.warning(
-                "spark-context-cache: store failed (entry skipped): %s",
+            _warning(
+                "sparkcache: store failed (entry skipped): %s",
                 error,
             )
 
@@ -6502,8 +6514,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 with self._store_cv:
                     self._held.add(plan.digest)
                     self._held.update(surviving_aliases)
-        logger.info(
-            "spark-context-cache: rank %d committed %d tokens digest=%s manifest=%s",
+        logger.debug(
+            "sparkcache: rank %d committed %d tokens digest=%s manifest=%s",
             snapshot.rank,
             receipt.committed_tokens,
             plan.digest[:12],
@@ -6851,8 +6863,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self.counters["scheduler_retired"] = (
                     self.counters.get("scheduler_retired", 0) + 1
                 )
-                logger.warning(
-                    "spark-context-cache: retired entry %s after a rank"
+                _warning(
+                    "sparkcache: retired entry %s after a rank"
                     " reported load errors (request %s)",
                     digest[:12],
                     request_id,
@@ -6876,8 +6888,8 @@ class SparkContextCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     self.counters["scheduler_retired"] = (
                         self.counters.get("scheduler_retired", 0) + 1
                     )
-                    logger.warning(
-                        "spark-context-cache: retired entry %s after aborted"
+                    _warning(
+                        "sparkcache: retired entry %s after aborted"
                         " leader %s reported load errors",
                         digest[:12],
                         flight.leader_request_id,

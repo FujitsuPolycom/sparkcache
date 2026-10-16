@@ -10,7 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 
-TIMING_PREFIX = "[sparkcache-streaming-timing] "
+TIMING_PREFIX = "sparkcache: streaming-timing "
 
 STAGES = (
     "final_watermark",
@@ -51,7 +51,7 @@ class StreamingTimingTrace:
         clock_ns: Callable[[], int] | None = None,
     ) -> None:
         self._enabled = enabled
-        self._sink = sink if sink is not None else _LOGGER.info
+        self._sink = sink if sink is not None else _LOGGER.debug
         self._clock_ns = clock_ns if clock_ns is not None else time.monotonic_ns
         self._lock = threading.Lock()
         self._final_by_request: dict[str, tuple[int, _TraceRecord]] = {}

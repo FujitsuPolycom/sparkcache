@@ -15,10 +15,10 @@ def _records(monkeypatch):
     records = []
 
     def info(message, *args, **kwargs):
-        if message.startswith("spark-context-cache-reuse:"):
-            records.append(json.loads((message % args).split(":", 1)[1]))
+        if message.startswith("sparkcache: reuse "):
+            records.append(json.loads((message % args).removeprefix("sparkcache: reuse ")))
 
-    monkeypatch.setattr(connector_module.logger, "info", info)
+    monkeypatch.setattr(connector_module.logger, "debug", info)
     return records
 
 

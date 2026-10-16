@@ -569,7 +569,7 @@ class MaxPendingRestoreParsingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(
                 RuntimeError,
-                "spark-context-cache: spark_cache_max_pending_restores must be an integer",
+                "sparkcache: spark_cache_max_pending_restores must be an integer",
             ):
                 _make_connector(
                     Path(directory),
@@ -581,7 +581,7 @@ class MaxPendingRestoreParsingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(
                 RuntimeError,
-                "spark-context-cache: spark_cache_max_pending_restores must be an integer",
+                "sparkcache: spark_cache_max_pending_restores must be an integer",
             ):
                 _make_connector(
                     Path(directory),
@@ -593,7 +593,7 @@ class MaxPendingRestoreParsingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(
                 RuntimeError,
-                "spark-context-cache: spark_cache_max_pending_restores must be an integer",
+                "sparkcache: spark_cache_max_pending_restores must be an integer",
             ):
                 _make_connector(
                     Path(directory),

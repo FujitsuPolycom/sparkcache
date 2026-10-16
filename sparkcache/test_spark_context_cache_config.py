@@ -704,7 +704,7 @@ class ErrorPathTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             cfg.parse_connector_config(vllm, vllm.kv_transfer_config, None)
         self.assertIn("must divide", str(ctx.exception))
-        self.assertIn("spark-context-cache:", str(ctx.exception))
+        self.assertIn("sparkcache:", str(ctx.exception))
 
     def test_pipeline_parallel_unsupported(self) -> None:
         vllm, _ = _make_vllm_config(pp=2)

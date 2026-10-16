@@ -73,5 +73,5 @@ while (($#)); do
 done
 args+=(--kv-transfer-config "$sparkcache_config")
 
-echo "spark-context-cache: baked runtime profile=${profile} root=${cache_root} probe=${probe}"
+echo "sparkcache: baked runtime profile=${profile} root=${cache_root} probe=${probe}"
 exec /opt/venv/bin/vllm "${args[@]}"

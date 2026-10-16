@@ -2238,7 +2238,7 @@ def test_flat_history_restore_rejects_a_tampered_surviving_tail(tmp_path, monkey
         lambda arena, *, length: memoryview(arena.payload)[:length],
     )
     adapter = _PageCaptureAdapter(fixture.object_bytes)
-    with pytest.raises(cuda_hybrid.CudaHybridRestoreError, match="tail SHA-256 mismatch"):
+    with pytest.raises(cuda_hybrid.CudaHybridRestoreError, match=r"tail integrity rejection \(SHA-256\)"):
         execute_cuda_hybrid_restore(
             adapter=adapter, request_id="request", lookup=fixture.lookup,
             cache_root=tmp_path, layout=fixture.layout,

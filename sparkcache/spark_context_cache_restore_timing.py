@@ -12,7 +12,7 @@ import json
 import time
 from dataclasses import dataclass, field
 
-RESTORE_TIMING_PREFIX = "spark-context-cache-restore-timing:"
+RESTORE_TIMING_PREFIX = "sparkcache: restore-timing "
 RESTORE_PHASES = (
     "metadata_preparation",
     "manifest_lookup",

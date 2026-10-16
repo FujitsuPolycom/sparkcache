@@ -282,7 +282,7 @@ def _read_authenticated_page_object(
         view.release()
     if not _source_payload_matches(source, payload):
         raise CudaHybridRestoreError(
-            f"page object SHA-256 mismatch for {source.path}"
+            f"page object {_integrity_label(source.integrity)} mismatch for {source.path}"
         )
     return CudaAuthenticatedPageObject(source, bytes(payload))
 
@@ -337,6 +337,11 @@ def _tail_extents(
     return tuple(extents)
 
 
+def _integrity_label(mode: str) -> str:
+    """Name the actual payload check, including disabled authentication."""
+    return {"fast": "CRC32 fast", "sha256": "SHA-256", "none": "none"}[mode]
+
+
 def _read_authenticated_source(
     source: CudaPageObject | CudaPageTailExtent,
 ) -> CudaAuthenticatedPageObject:
@@ -350,7 +355,7 @@ def _read_authenticated_source(
         ) from error
     if not _source_payload_matches(source, payload):
         raise CudaHybridRestoreError(
-            f"page-delta tail SHA-256 mismatch for {source.path}"
+            f"page-delta tail integrity rejection ({_integrity_label(source.integrity)}) for {source.path}"
         )
     return CudaAuthenticatedPageObject(source, bytes(payload))
 
@@ -376,7 +381,7 @@ def _read_authenticated_tail_into(
             ) from error
         if not _source_payload_matches(source, target):
             raise CudaHybridRestoreError(
-                f"page-delta tail SHA-256 mismatch for {source.path}"
+                f"page-delta tail integrity rejection ({_integrity_label(source.integrity)}) for {source.path}"
             )
     finally:
         target.release()
@@ -399,7 +404,7 @@ def _authenticated_header_from_object(source: CudaPageObject) -> bytes:
         view.release()
     if not _source_payload_matches(source, payload):
         raise CudaHybridRestoreError(
-            f"page object SHA-256 mismatch for {source.path}"
+            f"page object {_integrity_label(source.integrity)} mismatch for {source.path}"
         )
     return page_delta_header_prefix(payload)
 
@@ -1353,7 +1358,7 @@ def _execute_page_object_restore(
     started = time.perf_counter()
     _pread_exact_into(first.path, first.encoded_bytes, memoryview(first_payload))
     if not _source_payload_matches(first, first_payload):
-        raise CudaHybridRestoreError(f"page object SHA-256 mismatch for {first.path}")
+        raise CudaHybridRestoreError(f"page object {_integrity_label(first.integrity)} mismatch for {first.path}")
     read_ms = 1e3 * (time.perf_counter() - started)
     page_plan = plan_page_snapshot(
         layout,
@@ -1431,7 +1436,7 @@ def _execute_page_object_restore(
                 target.release()
             if not _source_payload_matches(page_object, buffer):
                 raise CudaHybridRestoreError(
-                    f"page object SHA-256 mismatch for {page_object.path}"
+                    f"page object {_integrity_label(page_object.integrity)} mismatch for {page_object.path}"
                 )
 
         with concurrent.futures.ThreadPoolExecutor(
